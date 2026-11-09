@@ -28,8 +28,22 @@ static const char k_net_js[] =
 static const char *const k_parts[] = {k_events_js, k_web_js, k_net_js};
 
 /* WM_REQUEST: a worker asks the page thread to do something; WM_REPLY (level = request id) answers it */
-/* WM_PORT / WM_PORT_CLOSE: traffic for a MessagePort one of whose ends moved to the other thread (level = port id) */
-enum { WM_DATA, WM_ERROR, WM_LOG, WM_REQUEST, WM_REPLY, WM_PORT, WM_PORT_CLOSE };
+/* WM_PORT / WM_PORT_CLOSE: traffic for a MessagePort one of whose ends moved to the other thread (level = port id)
+ * Workers started by a worker: the page thread relays between parent and child. WM_CHILD_POST / WM_CHILD_TERM go from
+ * the parent to the page (level = child id); WM_CHILD_DATA / WM_CHILD_ERROR go from the page to the parent. */
+enum {
+  WM_DATA,
+  WM_ERROR,
+  WM_LOG,
+  WM_REQUEST,
+  WM_REPLY,
+  WM_PORT,
+  WM_PORT_CLOSE,
+  WM_CHILD_POST,
+  WM_CHILD_TERM,
+  WM_CHILD_DATA,
+  WM_CHILD_ERROR
+};
 
 struct wmsg {
   struct wmsg *next;
@@ -48,6 +62,7 @@ struct wq {
 
 struct wthread {
   int id;
+  struct wthread *parent; /* the worker that started this one, or NULL for a page worker */
   int tid;
   void *stack;
   char *stack_lo;
@@ -71,7 +86,7 @@ struct wthread {
 
 static js_object *g_worker_proto; /* Worker.prototype */
 static js_object *g_wq;           /* MessagePort traffic: flat (port, data, ports) triples, drained by the pump */
-static int g_next_wid;
+static int g_next_wid;            /* worker ids, unique across the page and every worker (atomic) */
 
 /* Live workers and their page-side objects, index for index; the objects are GC roots */
 static struct wthread *g_workers[WORKER_MAX];
@@ -1146,6 +1161,36 @@ static bool wt_pump_ws(js_ctx *ctx)
 }
 
 /* A message for a port that lives here arrives from the page */
+/* A message or an error from a worker this one started */
+static void wt_dispatch_child(js_ctx *ctx, struct wmsg *m)
+{
+  js_value args[4];
+  gc_push_scope();
+  args[0] = js_number(m->level);
+  args[3] = js_undef();
+  if (m->kind == WM_CHILD_ERROR) {
+    args[1] = js_mk_cstring(ctx, "error");
+    args[2] = js_mk_cstring(ctx, m->text ? m->text : "");
+    gc_keep(args[2].u.str);
+  } else {
+    args[1] = js_mk_cstring(ctx, "message");
+    ports_clear(ctx);
+    args[2] = js_clone_read(ctx, m->clone);
+    if (args[2].type == JV_OBJ)
+      gc_keep(args[2].u.obj);
+    if (!ctx->has_exc) {
+      args[3] = ports_take(ctx);
+      gc_keep(args[3].u.obj);
+    }
+  }
+  gc_keep(args[1].u.str);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else
+    wt_hook(ctx, "onchild", args, 4);
+  gc_pop_scope();
+}
+
 static void wt_dispatch_port(js_ctx *ctx, int rid, js_clone *c)
 {
   js_value args[3];
@@ -1210,6 +1255,54 @@ static js_value wt_n_port_post(js_ctx *ctx, js_value t, js_value *args, int argc
   (void)t;
   if (c)
     wmsg_post(cur_wt, &cur_wt->out, WM_PORT, (int)js_to_number(ctx, A(0)), c, 0);
+  return js_undef();
+}
+
+/* N.spawn(url, name, module) -> id: asks the page to start a worker for this one; the page reports trouble as an
+ * error message to the parent */
+static js_value wt_n_spawn(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char url[URL_MAX], origin[URL_MAX];
+  js_object *req;
+  js_clone *c;
+  int id;
+  (void)t;
+  script_url(cur_wt->url, arg_str(ctx, A(0)), url, sizeof url);
+  if (!starts_ci(url, "blob:") && !starts_ci(url, "data:")) {
+    cors_origin(url, origin, sizeof origin);
+    if (!streq(origin, cur_wt->origin))
+      return js_throw_error(ctx, ctx->error_proto, "SecurityError", "Worker script must be same-origin");
+  }
+  id = __atomic_add_fetch(&g_next_wid, 1, __ATOMIC_RELAXED);
+  gc_push_scope();
+  req = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(req, "op", js_mk_cstring(ctx, "spawn"), P_ENUMERABLE);
+  js_def(req, "id", js_number(id), P_ENUMERABLE);
+  js_def(req, "url", js_mk_cstring(ctx, url), P_ENUMERABLE);
+  js_def(req, "name", A(1).type == JV_STR ? A(1) : js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(req, "module", js_bool(js_to_boolean(A(2))), P_ENUMERABLE);
+  c = js_clone_write(ctx, js_obj_value(req), js_undef());
+  gc_pop_scope();
+  if (!c)
+    return js_undef();
+  wmsg_post(cur_wt, &cur_wt->out, WM_REQUEST, 0, c, 0);
+  return js_number(id);
+}
+
+/* N.childPost(id, data, transfer): the page hands the message on to the worker with that id */
+static js_value wt_n_child_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(1), A(2));
+  (void)t;
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_CHILD_POST, (int)js_to_number(ctx, A(0)), c, 0);
+  return js_undef();
+}
+
+static js_value wt_n_child_terminate(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  wmsg_post(cur_wt, &cur_wt->out, WM_CHILD_TERM, (int)js_to_number(ctx, A(0)), 0, 0);
   return js_undef();
 }
 
@@ -1294,6 +1387,9 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "portPost", wt_n_port_post, 3);
   js_def_native(ctx, n, "portClose", wt_n_port_close, 1);
   js_def_native(ctx, n, "cloneLocal", wt_n_clone_local, 2);
+  js_def_native(ctx, n, "spawn", wt_n_spawn, 3);
+  js_def_native(ctx, n, "childPost", wt_n_child_post, 3);
+  js_def_native(ctx, n, "childTerminate", wt_n_child_terminate, 1);
   js_def_native(ctx, n, "waitReply", wt_n_wait_reply, 1);
   js_def_native(ctx, n, "wsOpen", wt_n_ws_open, 2);
   js_def_native(ctx, n, "wsProtocol", wt_n_ws_protocol, 1);
@@ -1433,7 +1529,9 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
       else if (m->kind == WM_PORT_CLOSE) {
         js_value id = js_number(m->level);
         wt_hook(ctx, "onportclose", &id, 1);
-      } else if (m->clone)
+      } else if (m->kind == WM_CHILD_DATA || m->kind == WM_CHILD_ERROR)
+        wt_dispatch_child(ctx, m);
+      else if (m->clone)
         wt_deliver(ctx, m->clone);
       wmsg_free(m);
       continue;
@@ -1814,6 +1912,9 @@ static js_value request_fetch(js_ctx *ctx, int id, js_value req)
 }
 
 /* Answer one WM_REQUEST from a worker on the page thread */
+static struct wthread *worker_create(js_ctx *ctx, int id, const char *url, const char *name, int module,
+                                     struct wthread *parent, js_object **out, const char **ename, const char **emsg);
+
 static void serve_request(struct wthread *wt, struct wmsg *m)
 {
   js_value req = js_clone_read(g_ctx, m->clone), reply = js_undef(), op;
@@ -1857,6 +1958,14 @@ static void serve_request(struct wthread *wt, struct wmsg *m)
         reply = js_obj_value(o);
       } else
         reply = reply_error(g_ctx, id, "Refused to connect (Content-Security-Policy)");
+    } else if (op.type == JV_STR &&
+               streq(op.u.str->data, "spawn")) { /* a worker starting a worker: no reply, errors go to its parent */
+      js_value u = js_get(g_ctx, req, "url"), n = js_get(g_ctx, req, "name");
+      js_object *child;
+      const char *ename, *emsg;
+      if (u.type != JV_STR || !worker_create(g_ctx, id, u.u.str->data, n.type == JV_STR ? n.u.str->data : "",
+                                             js_to_boolean(js_get(g_ctx, req, "module")), wt, &child, &ename, &emsg))
+        wmsg_post(wt, &wt->in, WM_CHILD_ERROR, id, 0, u.type == JV_STR ? emsg : "Bad worker URL");
     } else
       reply = reply_error(g_ctx, id, "Unknown request");
   }
@@ -1887,6 +1996,16 @@ static struct wthread *worker_of(js_ctx *ctx, js_value w)
     return 0;
   for (i = 0; i < g_nworkers; i++)
     if (g_workers[i]->id == (int)id.u.num)
+      return g_workers[i];
+  return 0;
+}
+
+/* The worker `parent` started with this id, or NULL */
+static struct wthread *child_of(struct wthread *parent, int id)
+{
+  int i;
+  for (i = 0; i < g_nworkers; i++)
+    if (g_workers[i]->parent == parent && g_workers[i]->id == id)
       return g_workers[i];
   return 0;
 }
@@ -2041,6 +2160,9 @@ static bool worker_reap(int i)
   if (!__atomic_load_n(&wt->done, __ATOMIC_ACQUIRE) || !waitpid_nb(wt->tid, &status))
     return false;
   rport_drop_worker(wt);
+  for (int k = 0; k < g_nworkers; k++)
+    if (g_workers[k]->parent == wt)
+      g_workers[k]->parent = 0;
   thread_stack_free(wt->stack);
   while (wt->in.head) {
     struct wmsg *m = wt->in.head;
@@ -2101,9 +2223,26 @@ int js_workers_pump(void)
     js_value w = js_obj_value(g_wobjs[i]);
     if (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) == 1)
       serve_rpc(wt);
+    if (wt->parent && (__atomic_load_n(&wt->parent->done, __ATOMIC_ACQUIRE) ||
+                       __atomic_load_n(&wt->parent->irq.stop, __ATOMIC_ACQUIRE) ||
+                       __atomic_load_n(&wt->parent->closing, __ATOMIC_ACQUIRE)))
+      wthread_stop(wt); /* a worker does not outlive the one that started it */
     for (m = wq_take_all(wt, &wt->out); m; m = next) {
       next = m->next;
-      if (m->kind == WM_PORT || m->kind == WM_PORT_CLOSE) {
+      if (m->kind == WM_CHILD_POST || m->kind == WM_CHILD_TERM) {
+        struct wthread *child = child_of(wt, m->level);
+        if (child && m->kind == WM_CHILD_TERM)
+          wthread_stop(child);
+        else if (child && !__atomic_load_n(&child->irq.stop, __ATOMIC_ACQUIRE) &&
+                 !__atomic_load_n(&child->closing, __ATOMIC_ACQUIRE)) {
+          wmsg_post(child, &child->in, WM_DATA, 0, m->clone, 0);
+          m->clone = 0;
+        }
+      } else if (wt->parent && (m->kind == WM_DATA || m->kind == WM_ERROR)) {
+        wmsg_post(wt->parent, &wt->parent->in, m->kind == WM_DATA ? WM_CHILD_DATA : WM_CHILD_ERROR, wt->id, m->clone,
+                  m->text);
+        m->clone = 0;
+      } else if (m->kind == WM_PORT || m->kind == WM_PORT_CLOSE) {
         int pi = rport_find(m->level);
         if (pi >= 0 && g_rport_wt[pi] == wt && m->kind == WM_PORT) {
           js_value port = js_obj_value(g_rport_objs[pi]), data;
@@ -2183,36 +2322,39 @@ static js_value worker_terminate(js_ctx *ctx, js_value t, js_value *args, int ar
   return js_undef();
 }
 
-static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+/* Starts a worker thread for `url` and the page-side object that tracks it. On failure returns NULL with the
+ * error's name and message. `parent` is the worker that asked for it, if any. */
+static struct wthread *worker_create(js_ctx *ctx, int id, const char *url, const char *name, int module,
+                                     struct wthread *parent, js_object **out, const char **ename, const char **emsg)
 {
-  char url[URL_MAX];
   js_object *w;
-  js_value opts = A(1), nm, ty, wv;
   struct wthread *wt;
   struct purl pu;
   bool inl;
-  (void)thisv;
-  script_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
-  if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
-    return throw_err(ctx, "SecurityError", "Worker script must be same-origin");
-  if (g_nworkers == WORKER_MAX)
-    return throw_err(ctx, "QuotaExceededError", "Too many workers");
+  if (g_nworkers == WORKER_MAX) {
+    *ename = "QuotaExceededError";
+    *emsg = "Too many workers";
+    return 0;
+  }
   wt = (struct wthread *)calloc(1, sizeof *wt);
-  if (!wt)
-    return throw_err(ctx, "Error", "Out of memory");
+  if (!wt) {
+    *ename = "Error";
+    *emsg = "Out of memory";
+    return 0;
+  }
   wt->stack = thread_stack_alloc(WORKER_STACK);
   if (!wt->stack) {
     free(wt);
-    return throw_err(ctx, "Error", "Could not allocate a worker stack");
+    *ename = "Error";
+    *emsg = "Could not allocate a worker stack";
+    return 0;
   }
   wt->stack_lo = (char *)wt->stack - WORKER_STACK;
-  wt->id = ++g_next_wid;
+  wt->id = id;
+  wt->parent = parent;
   snprintf(wt->url, sizeof wt->url, "%s", url);
-  nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
-  ty = opts.type == JV_OBJ ? js_get(ctx, opts, "type") : js_undef();
-  if (nm.type == JV_STR)
-    snprintf(wt->name, sizeof wt->name, "%s", nm.u.str->data);
-  wt->module = ty.type == JV_STR && streq(ty.u.str->data, "module");
+  snprintf(wt->name, sizeof wt->name, "%s", name);
+  wt->module = module;
   inl = starts_ci(url, "blob:") || starts_ci(url, "data:");
   cors_origin(g_page_url_buf, wt->origin, sizeof wt->origin);
   pu.host[0] = 0;
@@ -2225,7 +2367,6 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   wt->src = fetch_source(url);
   gc_push_scope();
   w = (js_object *)gc_keep(js_new_object(ctx, g_worker_proto));
-  wv = js_obj_value(w);
   js_def(w, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "onmessageerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
@@ -2238,12 +2379,34 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
     free(wt->src);
     free(wt);
     gc_pop_scope();
-    return throw_err(ctx, "Error", "Could not start the worker thread");
+    *ename = "Error";
+    *emsg = "Could not start the worker thread";
+    return 0;
   }
   g_workers[g_nworkers] = wt;
   g_wobjs[g_nworkers++] = w;
+  *out = w;
   gc_pop_scope();
-  return wv;
+  return wt;
+}
+
+static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  char url[URL_MAX];
+  js_object *w = 0;
+  js_value opts = A(1), nm, ty;
+  const char *ename, *emsg;
+  (void)thisv;
+  script_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
+  if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
+    return throw_err(ctx, "SecurityError", "Worker script must be same-origin");
+  nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
+  ty = opts.type == JV_OBJ ? js_get(ctx, opts, "type") : js_undef();
+  if (!worker_create(ctx, __atomic_add_fetch(&g_next_wid, 1, __ATOMIC_RELAXED), url,
+                     nm.type == JV_STR ? nm.u.str->data : "", ty.type == JV_STR && streq(ty.u.str->data, "module"), 0,
+                     &w, &ename, &emsg))
+    return throw_err(ctx, ename, emsg);
+  return js_obj_value(w);
 }
 
 void js_worker_setup(js_ctx *ctx, js_object *win)

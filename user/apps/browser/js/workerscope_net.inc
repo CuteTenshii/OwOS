@@ -391,6 +391,40 @@ JS(
   };
   hide(g, "WebSocket", WebSocket);
 
+  /* ---- Worker: workers started from this one; the page relays the messages ---- */
+  var children = {};
+  function Worker(url, options) {
+    var o = options || {};
+    EventTarget.call(this);
+    this.onmessage = null;
+    this.onmessageerror = null;
+    this.onerror = null;
+    hide(this, "@id", N.spawn(String(url), o.name === undefined ? "" : String(o.name), o.type === "module"));
+    children[this["@id"]] = this;
+  }
+  Worker.prototype = Object.create(EventTarget.prototype);
+  hide(Worker.prototype, "constructor", Worker);
+  method(Worker.prototype, "postMessage", function (data, transfer) {
+    if (this["@dead"]) { return; }
+    N.childPost(this["@id"], data, transfer);
+  });
+  method(Worker.prototype, "terminate", function () {
+    if (this["@dead"]) { return; }
+    hide(this, "@dead", true);
+    N.childTerminate(this["@id"]);
+    delete children[this["@id"]];
+  });
+  N.onchild = function (id, type, data, ports) {
+    var w = children[id];
+    if (!w || w["@dead"]) { return; }
+    if (type === "message") {
+      w.dispatchEvent(new g.MessageEvent("message", { data: data, ports: ports, target: w }));
+    } else {
+      w.dispatchEvent(new g.ErrorEvent("error", { message: data, target: w }));
+    }
+  };
+  hide(g, "Worker", Worker);
+
   /* ---- MessageChannel: ports in this worker only ---- */
   function MessagePort() { throw typeError("Illegal constructor"); }
   MessagePort.prototype = Object.create(EventTarget.prototype);

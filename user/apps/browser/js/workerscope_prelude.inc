@@ -228,7 +228,7 @@ JS(
     });
   }
   lazyPart(1, ["URL", "URLSearchParams", "Blob", "File", "FormData", "FileReader", "Headers"]);
-  lazyPart(2, ["Request", "Response", "fetch", "XMLHttpRequest", "WebSocket", "MessagePort", "MessageChannel"]);
+  lazyPart(2, ["Request", "Response", "fetch", "XMLHttpRequest", "WebSocket", "MessagePort", "MessageChannel", "Worker"]);
 
   /* ---- crypto ---- */
   var crypto = {};

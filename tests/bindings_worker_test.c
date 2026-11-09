@@ -428,6 +428,33 @@ static void test_event_ports(void)
              "event.ports');\n");
 }
 
+static void test_nested_workers(void)
+{
+  run_script(
+      "var nres=null, nerr=null, beats=null, ctr=new Int32Array(new SharedArrayBuffer(8));\n"
+      "var inner='onmessage=function(e){ postMessage(e.data*2); };';\n"
+      "var outer='var w=new Worker(URL.createObjectURL(new Blob([\"'+inner+'\"]))); w.onmessage=function(e){ "
+      "postMessage({echo:e.data, ok:e instanceof MessageEvent && e.target===w}); }; "
+      "var b=new Worker(URL.createObjectURL(new Blob([\"throw new Error(String.fromCharCode(98,111,111,109));\"]))); "
+      "b.onerror=function(e){ postMessage({err:e.message, ev:e instanceof ErrorEvent}); }; "
+      "var h=new Worker(URL.createObjectURL(new Blob([\"onmessage=function(e){ var ia=new Int32Array(e.data); "
+      "setInterval(function(){ Atomics.add(ia,0,1); },2); };\"]))); h.postMessage(self.ctrBuf); "
+      "onmessage=function(e){ if (e.data.buf) { self.ctrBuf=e.data.buf; h.postMessage(e.data.buf); } else "
+      "w.postMessage(e.data); };';\n"
+      "var ow=new Worker(URL.createObjectURL(new Blob([outer])));\n"
+      "ow.onmessage=function(e){ if (e.data.echo!==undefined) nres=e.data; else nerr=e.data; };\n"
+      "ow.postMessage({buf:ctr.buffer}); ow.postMessage(21);\n");
+  expect(wait_for("nres!==null && nerr!==null && Atomics.load(ctr,0)>3"));
+  run_script("expect(nres.echo===42 && nres.ok===true, 'a nested worker answers its parent: '+JSON.stringify(nres));\n"
+             "expect(nerr.err.indexOf('boom')>=0 && nerr.ev===true, 'a nested worker error reaches the parent: "
+             "'+JSON.stringify(nerr));\n"
+             "ow.terminate(); var at=Atomics.load(ctr,0);\n");
+  settle();
+  run_script("var after1=Atomics.load(ctr,0);\n");
+  settle();
+  expect(check("Atomics.load(ctr,0)===after1"));
+}
+
 static void test_worker_url_edges(void)
 {
   run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
@@ -647,6 +674,7 @@ int main(void)
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   worker_test("MessageChannel and MessagePort", test_message_channel);
   worker_test("MessageEvent.ports", test_event_ports);
+  worker_test("nested workers", test_nested_workers);
   worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
   worker_test("script and construction errors", test_errors);
 
