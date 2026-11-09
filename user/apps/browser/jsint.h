@@ -85,6 +85,7 @@ void js_idb_setup(js_ctx *ctx, js_object *win);     /* IndexedDB (js_indexeddb.c
 void js_idb_teardown(void);                         /* unroot the page's IDB state  */
 void js_webapi_setup(js_ctx *ctx, js_object *win);  /* performance + Encoding (js_webapi.c) */
 void js_streams_setup(js_ctx *ctx, js_object *win); /* Streams API, lazily compiled (js/streams.c) */
+void js_filedata_setup(js_ctx *ctx, js_object *win); /* FileReader and DataTransfer, lazily compiled (js/filedata.c) */
 void js_webaudio_setup(js_ctx *ctx,
                        js_object *win); /* AudioContext + AudioWorkletNode, lazily compiled (js/webaudio.c) */
 js_value js_audio_thread(js_ctx *ctx);  /* a hidden worker running an AudioWorkletGlobalScope */

@@ -349,7 +349,8 @@ static const char *const k_event_init_keys[] = {
     "relatedTarget", "key",       "code",     "keyCode",   "which",     "charCode",    "repeat",   "location",
     "deltaX",        "deltaY",    "deltaZ",   "deltaMode", "pointerId", "pointerType", "pressure", "isPrimary",
     "data",          "message",   "filename", "lineno",    "colno",     "error",       "origin",   "lastEventId",
-    "source",        "ports",     "oldValue", "newValue",  "url",       "storageArea",
+    "source",        "ports",     "oldValue", "newValue",  "url",       "storageArea", "dataTransfer",
+    "clipboardData",
 };
 
 /* Constructor shared by every Event subclass */

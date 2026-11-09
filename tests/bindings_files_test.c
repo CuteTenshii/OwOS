@@ -163,6 +163,72 @@ static void test_formdata_with_files(void)
       "expect(t.slice(-(b.length+6))==='--'+b+'--\\r\\n', 'closing boundary');\n");
 }
 
+static void test_filereader(void)
+{
+  run_script(
+      "window.fr={};\n"
+      "var seq=[], r=new FileReader();\n"
+      "expect(r.readyState===0 && r.result===null && FileReader.DONE===2 && r instanceof EventTarget, 'initial state');\n"
+      "['loadstart','progress','load','loadend'].forEach(function(t){ r.addEventListener(t,function(e){ "
+      "seq.push(t+':'+e.loaded+'/'+e.total+':'+(e.target===r)+':'+(e instanceof ProgressEvent)); }); });\n"
+      "r.onload=function(e){ fr.onload=r.result; };\n"
+      "r.readAsText(new Blob(['h\\u00e9llo']));\n"
+      "expect(r.readyState===1 && r.result===null && seq.length===1, 'loading: '+seq);\n"
+      "var threw=false; try { r.readAsText(new Blob([])); } catch(e) { threw=e.name==='InvalidStateError'; }\n"
+      "expect(threw, 'busy reader throws');\n"
+      "try { r.readAsText('x'); expect(false,'non-blob'); } catch(e) { expect(e instanceof TypeError,'non-blob'); }\n"
+      "fr.seq=seq; fr.r=r;\n"
+      "var a=new FileReader(), b=new FileReader(), c=new FileReader(), d=new FileReader();\n"
+      "a.onload=function(){ fr.buf=a.result; }; a.readAsArrayBuffer(new Blob([new Uint8Array([1,2,255])]));\n"
+      "b.onload=function(){ fr.bin=b.result; }; b.readAsBinaryString(new Blob([new Uint8Array([104,200])]));\n"
+      "c.onload=function(){ fr.url=c.result; }; c.readAsDataURL(new Blob(['hi'],{type:'text/plain'}));\n"
+      "d.onabort=function(){ fr.abort=d.readyState+':'+d.result; }; d.onload=function(){ fr.aborted=false; };\n"
+      "d.readAsText(new Blob(['x'])); d.abort();\n");
+  for (int i = 0; i < 20; i++)
+    js_timers_pump();
+  run_script(
+      "expect(fr.seq.join()==='loadstart:0/6:true:true,progress:6/6:true:true,load:6/6:true:true,loadend:6/6:true:true',"
+      " 'event order: '+fr.seq);\n"
+      "expect(fr.r.readyState===2 && fr.r.result==='h\\u00e9llo' && fr.onload===fr.r.result, 'text result');\n"
+      "expect(fr.buf instanceof ArrayBuffer && new Uint8Array(fr.buf).join()==='1,2,255', 'arraybuffer');\n"
+      "expect(fr.bin==='h\\u00c8', 'binary string: '+fr.bin);\n"
+      "expect(fr.url==='data:text/plain;base64,aGk=', 'data url: '+fr.url);\n"
+      "expect(fr.abort==='2:null' && fr.aborted===undefined, 'abort: '+fr.abort);\n");
+}
+
+static void test_datatransfer(void)
+{
+  run_script(
+      "var dt=new DataTransfer();\n"
+      "expect(dt.dropEffect==='none' && dt.effectAllowed==='none' && dt.items.length===0 && dt.types.length===0, 'empty');\n"
+      "dt.setData('text/plain','hello'); dt.setData('Text','again'); dt.setData('URL','# c\\nhttp://a.test/x\\nhttp://b.test');\n"
+      "expect(dt.getData('text')==='again' && dt.getData('TEXT/PLAIN')==='again', 'text alias, replaced in place');\n"
+      "expect(dt.getData('url')==='http://a.test/x' && dt.getData('missing')==='', 'url alias, missing');\n"
+      "expect(dt.types.join()==='text/plain,text/uri-list' && Object.isFrozen(dt.types), 'types');\n"
+      "var f=new File(['abc'],'a.txt',{type:'text/plain'});\n"
+      "var it=dt.items.add(f);\n"
+      "expect(it.kind==='file' && it.getAsFile()===f && dt.files.length===1 && dt.files[0]===f, 'add file');\n"
+      "expect(dt.types.join()==='text/plain,text/uri-list,Files' && dt.items.length===3 && dt.items[2]===it, 'Files type');\n"
+      "expect(dt.items[0].kind==='string' && dt.items[0].type==='text/plain', 'string item');\n"
+      "window.got=null; dt.items[0].getAsString(function(s){ window.got=s; });\n"
+      "var threw=false; try { dt.items.add('x','text/plain'); } catch(e) { threw=e.name==='NotSupportedError'; }\n"
+      "expect(threw, 'duplicate type');\n"
+      "dt.items.add('<b>', 'text/html'); expect(dt.getData('text/html')==='<b>', 'add string');\n"
+      "dt.clearData('text'); expect(dt.getData('text')==='' && dt.getData('text/html')==='<b>', 'clearData(format)');\n"
+      "dt.items.remove(0); expect(dt.items.length===2 && dt.items[2]===undefined && dt.items[0].kind==='file', 'remove');\n"
+      "dt.clearData(); expect(dt.types.join()==='Files' && dt.files.length===1, 'clearData keeps files');\n"
+      "dt.items.clear(); expect(dt.items.length===0 && dt.files.length===0 && dt.types.length===0, 'clear');\n"
+      "dt.dropEffect='copy'; dt.dropEffect='bogus'; dt.effectAllowed='copyMove'; dt.effectAllowed='bogus';\n"
+      "expect(dt.dropEffect==='copy' && dt.effectAllowed==='copyMove', 'effects validated');\n"
+      "expect([].concat(Array.from(dt.items)).length===0, 'iterable');\n"
+      "var ev=new DragEvent('drop',{dataTransfer:dt}); expect(ev.dataTransfer===dt, 'DragEvent.dataTransfer');\n"
+      "var ce=new ClipboardEvent('paste',{clipboardData:dt}); expect(ce.clipboardData===dt && ce instanceof Event, 'ClipboardEvent');\n"
+      "var t=0; try { new DataTransferItem(); } catch(e) { t=e instanceof TypeError; } expect(t, 'illegal constructor');\n");
+  for (int i = 0; i < 5; i++)
+    js_timers_pump();
+  run_script("expect(window.got==='again', 'getAsString calls back: '+window.got);\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -174,5 +240,7 @@ int main(void)
   test("input.files lists the chosen files as File objects", test_input_files);
   test("File constructor", test_file_constructor);
   test("FormData carries files and serializes as multipart", test_formdata_with_files);
+  test("FileReader reads Blobs and fires progress events", test_filereader);
+  test("DataTransfer, its items and DragEvent/ClipboardEvent", test_datatransfer);
   return 0;
 }
