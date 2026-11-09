@@ -123,7 +123,7 @@ static js_value textenc_encodeinto(js_ctx *ctx, js_value t, js_value *args, int 
 }
 
 /* --- TextDecoder --- */
-static int decoder_kind(const char *label)
+int text_decoder_kind(const char *label)
 {
   char b[40];
   int i = 0, j;
@@ -144,7 +144,7 @@ static int decoder_kind(const char *label)
   (void)j;
   return DEC_LATIN1; /* everything else */
 }
-static const char *decoder_name(int kind)
+const char *text_decoder_name(int kind)
 {
   switch (kind) {
   case DEC_UTF16LE:
@@ -164,7 +164,7 @@ static js_value textdec_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
   bool fatal = false, ignore = false;
   (void)thisv;
   if (argc > 0 && A(0).type != JV_UNDEF)
-    kind = decoder_kind(arg_str(ctx, A(0)));
+    kind = text_decoder_kind(arg_str(ctx, A(0)));
   if (argc > 1 && A(1).type == JV_OBJ) {
     fatal = js_to_boolean(js_get(ctx, A(1), "fatal"));
     ignore = js_to_boolean(js_get(ctx, A(1), "ignoreBOM"));
@@ -173,24 +173,20 @@ static js_value textdec_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
   gc_push_scope();
   gc_keep(o);
   js_def(o, "@kind", js_number(kind), 0);
-  js_def(o, "encoding", js_mk_cstring(ctx, decoder_name(kind)), P_ENUMERABLE);
+  js_def(o, "encoding", js_mk_cstring(ctx, text_decoder_name(kind)), P_ENUMERABLE);
   js_def(o, "fatal", js_bool(fatal), P_ENUMERABLE);
   js_def(o, "ignoreBOM", js_bool(ignore), P_ENUMERABLE);
   gc_pop_scope();
   return js_obj_value(o);
 }
-static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* Decode the bytes of an ArrayBuffer or view as text of the given DEC_* kind */
+js_value text_decode(js_ctx *ctx, js_value view, int kind, bool ignore, bool fatal)
 {
-  int len = 0, kind, i;
-  bool ignore, fatal;
+  int len = 0, i;
   const unsigned char *in;
   sbuf sb = {0, 0, 0};
   js_value r;
-  (void)argc;
-  in = view_bytes(A(0), &len);
-  kind = js_to_int_sat(ctx, js_get(ctx, t, "@kind"));
-  ignore = js_to_boolean(js_get(ctx, t, "ignoreBOM"));
-  fatal = js_to_boolean(js_get(ctx, t, "fatal"));
+  in = view_bytes(view, &len);
   if (!in)
     return js_mk_cstring(ctx, "");
   if (kind == DEC_UTF8) {
@@ -263,6 +259,13 @@ static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc
   if (sb.b)
     free(sb.b);
   return r;
+}
+
+static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)argc;
+  return text_decode(ctx, A(0), js_to_int_sat(ctx, js_get(ctx, t, "@kind")), js_to_boolean(js_get(ctx, t, "ignoreBOM")),
+                     js_to_boolean(js_get(ctx, t, "fatal")));
 }
 
 /* --- performance --- */

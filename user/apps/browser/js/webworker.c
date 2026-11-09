@@ -10,6 +10,14 @@
 #include "fetchint.h"
 #include "mutex.h"
 
+#define JS(...) #__VA_ARGS__
+
+/* The JavaScript half of the worker global scope; each part is a function called as f(globalThis, N, L) */
+static const char k_events_js[] =
+#include "workerscope_prelude.inc"
+    ;
+static const char *const k_parts[] = {k_events_js};
+
 enum { WM_DATA, WM_ERROR, WM_LOG };
 
 struct wmsg {
@@ -210,12 +218,13 @@ static void wt_keep_arena(struct wthread *wt, js_arena *ar)
 }
 
 /* Parse and run `src` in the worker's global scope (or as a module). A failure leaves its exception pending. */
-static bool wt_eval(js_ctx *ctx, struct wthread *wt, const char *src, const char *label, js_object *module_exports)
+static bool wt_eval(js_ctx *ctx, struct wthread *wt, const char *src, const char *label, js_object *module_exports,
+                    js_value *result)
 {
   js_arena *ar = (js_arena *)malloc(sizeof *ar);
   js_parse_error pe;
   js_node *prog;
-  js_value r;
+  js_value r = js_undef();
   bool ok;
   if (!ar)
     return false;
@@ -230,6 +239,8 @@ static bool wt_eval(js_ctx *ctx, struct wthread *wt, const char *src, const char
   wt_keep_arena(wt, ar);
   js_set_script(ctx, label);
   ok = module_exports ? js_run_module(ctx, prog, module_exports, label) == 0 : js_run(ctx, prog, &r) == 0;
+  if (result)
+    *result = r;
   return ok;
 }
 
@@ -290,7 +301,7 @@ static js_value wt_import_scripts(js_ctx *ctx, js_value t, js_value *args, int a
       free(src);
       return throw_err(ctx, strcmp(err, "cross-origin") ? "TypeError" : "SecurityError", "importScripts failed");
     }
-    wt_eval(ctx, cur_wt, src, cur_wt->url, 0);
+    wt_eval(ctx, cur_wt, src, cur_wt->url, 0, NULL);
     free(src);
   }
   return js_undef();
@@ -308,7 +319,7 @@ static __thread int ntimers, captimers, next_timer_id;
 
 static js_value wt_set_timer(js_ctx *ctx, js_value *args, int argc, bool repeat)
 {
-  js_value store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  js_value store = js_get(ctx, js_obj_value(ctx->global), "@timers");
   double delay = argc > 1 ? js_to_number(ctx, args[1]) : 0;
   struct wtimer *t;
   char key[24];
@@ -355,7 +366,7 @@ static js_value wt_set_interval(js_ctx *ctx, js_value t, js_value *args, int arg
 
 static void timer_remove(js_ctx *ctx, int id)
 {
-  js_value store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  js_value store = js_get(ctx, js_obj_value(ctx->global), "@timers");
   char key[24];
   int i;
   for (i = 0; i < ntimers; i++)
@@ -376,6 +387,25 @@ static js_value wt_clear_timer(js_ctx *ctx, js_value t, js_value *args, int argc
   return js_undef();
 }
 
+static void wt_run_microtasks(js_ctx *ctx)
+{
+  js_value list = js_get(ctx, js_obj_value(ctx->global), "@micro");
+  if (list.type != JV_OBJ)
+    return;
+  while (js_array_len(list.u.obj) && !js_irq_stopped(ctx->irq)) {
+    js_value fn = js_get_index(ctx, list, 0), shift = js_get(ctx, list, "shift");
+    gc_push_scope();
+    if (fn.type == JV_OBJ)
+      gc_keep(fn.u.obj);
+    js_call(ctx, shift, list, 0, 0);
+    if (js_is_callable(fn))
+      js_call(ctx, fn, js_undef(), 0, 0);
+    if (ctx->has_exc)
+      wt_report(ctx);
+    gc_pop_scope();
+  }
+}
+
 /* Run the earliest due timer; false when none is due */
 static bool fire_due_timer(js_ctx *ctx)
 {
@@ -394,7 +424,7 @@ static bool fire_due_timer(js_ctx *ctx)
   id = timers[best].id;
   repeat = timers[best].repeat;
   snprintf(key, sizeof key, "t%d", id);
-  store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  store = js_get(ctx, js_obj_value(ctx->global), "@timers");
   bundle = js_get(ctx, store, key);
   gc_push_scope();
   if (bundle.type == JV_OBJ) {
@@ -412,12 +442,25 @@ static bool fire_due_timer(js_ctx *ctx)
         js_call(ctx, fn, js_obj_value(ctx->global), argv, n > 1 ? (int)(n - 1 > 8 ? 8 : n - 1) : 0);
         if (ctx->has_exc)
           wt_report(ctx);
+        wt_run_microtasks(ctx);
       }
     }
   } else
     timer_remove(ctx, id);
   gc_pop_scope();
   return true;
+}
+
+/* queueMicrotask: callbacks wait in a list and run when the current task ends, before the next message or timer */
+static js_value wt_queue_microtask(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value list = js_get(ctx, js_obj_value(ctx->global), "@micro");
+  (void)t;
+  if (!js_is_callable(A(0)))
+    return js_throw_type(ctx, "queueMicrotask: callback must be a function");
+  if (list.type == JV_OBJ)
+    js_array_push(ctx, list.u.obj, args[0]);
+  return js_undef();
 }
 
 static js_value wt_perf_now(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -436,7 +479,7 @@ static js_value wt_perf_now(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_object *wt_load_module(js_ctx *ctx, const char *spec, void *ud)
 {
   struct wthread *wt = (struct wthread *)ud;
-  js_value cache = js_get(ctx, js_obj_value(ctx->global), "__modules"), hit;
+  js_value cache = js_get(ctx, js_obj_value(ctx->global), "@modules"), hit;
   js_object *exports;
   char *src = 0;
   char url[URL_MAX];
@@ -457,7 +500,7 @@ static js_object *wt_load_module(js_ctx *ctx, const char *spec, void *ud)
   gc_keep(exports);
   if (cache.type == JV_OBJ)
     js_set(ctx, cache, url, js_obj_value(exports));
-  wt_eval(ctx, wt, src, wt->url, exports);
+  wt_eval(ctx, wt, src, wt->url, exports, NULL);
   gc_pop_scope();
   free(src);
   return ctx->has_exc ? NULL : exports;
@@ -481,22 +524,77 @@ static void wt_def_location(js_ctx *ctx, struct wthread *wt)
   gc_pop_scope();
 }
 
-/* Event plumbing the worker script sees: self, EventTarget methods, onmessage and friends */
-static const char wt_prelude[] =
-    "(function(g){\n"
-    "var L={};\n"
-    "g.self=g;\n"
-    "g.onmessage=null;g.onerror=null;g.onmessageerror=null;\n"
-    "g.addEventListener=function(t,f){var a=L[t]||(L[t]=[]);if(a.indexOf(f)<0)a.push(f);};\n"
-    "g.removeEventListener=function(t,f){var a=L[t];if(a){var i=a.indexOf(f);if(i>=0)a.splice(i,1);}};\n"
-    "g.dispatchEvent=function(e){var h=g['on'+e.type];if(typeof h==='function')h.call(g,e);var a=L[e.type];\n"
-    "if(a)a.slice().forEach(function(f){if(typeof f==='function')f.call(g,e);else if(f&&typeof "
-    "f.handleEvent==='function')f.handleEvent(e);});return true;};\n"
-    "g.queueMicrotask=function(f){Promise.resolve().then(f);};\n"
-    "g.navigator={hardwareConcurrency:4,onLine:true,language:'en-US',userAgent:'OwOS'};\n"
-    "Object.defineProperty(g,'__deliver',{value:function(d){g.dispatchEvent({type:'message',data:d,origin:'',"
-    "lastEventId:'',source:null,ports:[],target:g});}});\n"
-    "})(globalThis);\n";
+static js_value wt_n_utf8encode(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value s = js_to_string(ctx, A(0)), r;
+  (void)t;
+  if (s.type != JV_STR)
+    return js_undef();
+  gc_push_scope();
+  gc_keep(s.u.str);
+  r = js_new_typedarray(ctx, TA_U8, s.u.str->len);
+  if (r.type == JV_OBJ)
+    memcpy(((js_arraybuffer *)((js_typedarray *)r.u.obj->host)->buffer->host)->data, s.u.str->data,
+           (unsigned)s.u.str->len);
+  gc_pop_scope();
+  return r;
+}
+
+static js_value wt_n_encoding_name(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value s = js_to_string(ctx, A(0));
+  (void)t;
+  return s.type == JV_STR ? js_mk_cstring(ctx, text_decoder_name(text_decoder_kind(s.u.str->data))) : js_null();
+}
+
+/* N.decode(bytes, encodingName, ignoreBOM, fatal) */
+static js_value wt_n_decode(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value label = js_to_string(ctx, A(1));
+  (void)t;
+  if (label.type != JV_STR)
+    return js_undef();
+  return text_decode(ctx, A(0), text_decoder_kind(label.u.str->data), js_to_boolean(A(2)), js_to_boolean(A(3)));
+}
+
+static js_value wt_n_random_fill(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int len = 0;
+  const unsigned char *p = view_bytes(A(0), &len);
+  (void)ctx;
+  (void)t;
+  if (p && len > 0)
+    rng_bytes((void *)p, len);
+  return js_undef();
+}
+
+/* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
+static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
+{
+  js_object *n, *l;
+  bool ok = true;
+  unsigned i;
+  gc_push_scope();
+  n = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  l = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def_native(ctx, n, "utf8encode", wt_n_utf8encode, 1);
+  js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
+  js_def_native(ctx, n, "decode", wt_n_decode, 4);
+  js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
+  for (i = 0; ok && i < sizeof k_parts / sizeof *k_parts; i++) {
+    js_value fn = js_undef(), args[3];
+    ok = wt_eval(ctx, wt, k_parts[i], wt->url, 0, &fn) && js_is_callable(fn);
+    if (ok) {
+      args[0] = js_obj_value(ctx->global);
+      args[1] = js_obj_value(n);
+      args[2] = js_obj_value(l);
+      js_call(ctx, fn, js_undef(), args, 3);
+      ok = !ctx->has_exc;
+    }
+  }
+  gc_pop_scope();
+  return ok;
+}
 
 static void wt_setup(js_ctx *ctx, struct wthread *wt)
 {
@@ -509,13 +607,15 @@ static void wt_setup(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, g, "setInterval", wt_set_interval, 2);
   js_def_native(ctx, g, "clearTimeout", wt_clear_timer, 1);
   js_def_native(ctx, g, "clearInterval", wt_clear_timer, 1);
+  js_def_native(ctx, g, "queueMicrotask", wt_queue_microtask, 1);
+  js_def(g, "@micro", js_obj_value(js_new_array(ctx, 0)), 0);
   perf = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def_native(ctx, perf, "now", wt_perf_now, 0);
   js_def(g, "performance", js_obj_value(perf), P_WRITABLE | P_CONFIGURABLE);
   store = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(g, "__timers", js_obj_value(store), 0);
+  js_def(g, "@timers", js_obj_value(store), 0);
   store = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(g, "__modules", js_obj_value(store), 0);
+  js_def(g, "@modules", js_obj_value(store), 0);
   wt_def_location(ctx, wt);
   ctx->load_module = wt_load_module;
   ctx->load_module_ud = wt;
@@ -531,11 +631,12 @@ static void wt_deliver(js_ctx *ctx, js_clone *c)
   if (ctx->has_exc)
     wt_report(ctx);
   else {
-    fn = js_get(ctx, js_obj_value(ctx->global), "__deliver");
+    fn = js_get(ctx, js_obj_value(ctx->global), "@deliver");
     ev[0] = data;
     js_call(ctx, fn, js_obj_value(ctx->global), ev, 1);
     if (ctx->has_exc)
       wt_report(ctx);
+    wt_run_microtasks(ctx);
   }
   gc_pop_scope();
 }
@@ -574,7 +675,7 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   ctx->irq = &wt->irq;
   js_set_stack_limit(ctx, wt->stack_lo + WORKER_HEADROOM);
   wt_setup(ctx, wt);
-  if (!wt_eval(ctx, wt, wt_prelude, wt->url, 0)) {
+  if (!wt_run_parts(ctx, wt)) {
     wt_report(ctx);
     return;
   }
@@ -585,8 +686,9 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   gc_push_scope();
   if (wt->module)
     exports = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  if (!wt_eval(ctx, wt, wt->src, wt->url, exports))
+  if (!wt_eval(ctx, wt, wt->src, wt->url, exports, NULL))
     wt_report(ctx);
+  wt_run_microtasks(ctx);
   gc_pop_scope();
   free(wt->src);
   wt->src = 0;

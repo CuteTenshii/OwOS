@@ -177,6 +177,42 @@ static void test_worker_timers(void)
              "expect(ticks.indexOf('early')<ticks.indexOf('late'), 'timers fire in order');\n");
 }
 
+static void test_worker_globals(void)
+{
+  run_script(
+      "var gl=null, gw=new Worker('data:text/javascript,"
+      "var enc=new TextEncoder().encode(\"h\\u00e9\u20ac\"), dec=new TextDecoder().decode(enc), "
+      "fatal=false; try{ new TextDecoder(\"utf-8\",{fatal:true}).decode(new Uint8Array([255])); }catch(e){ fatal=e "
+      "instanceof TypeError; }"
+      "var parts=new TextDecoder(), "
+      "s1=parts.decode(enc.subarray(0,2),{stream:true})+parts.decode(enc.subarray(2),{stream:true});"
+      "var ac=new AbortController(), aborted=0; ac.signal.addEventListener(\"abort\",function(){ aborted++; }); "
+      "ac.abort(); ac.abort();"
+      "var de=new DOMException(\"m\",\"AbortError\"), uu=crypto.randomUUID(), rv=crypto.getRandomValues(new "
+      "Uint8Array(8));"
+      "var ev=new CustomEvent(\"x\",{detail:5}), heard=0; self.addEventListener(\"x\",function(e){ heard+=e.detail; "
+      "},{once:true});"
+      "self.dispatchEvent(ev); self.dispatchEvent(ev);"
+      "var micro=[]; queueMicrotask(function(){ micro.push(1); }); micro.push(0);"
+      "var tgt=new EventTarget(), t2=0; tgt.addEventListener(\"y\",function(){ t2++; }); tgt.dispatchEvent(new "
+      "Event(\"y\"));"
+      "setTimeout(function(){ postMessage({enc:enc.length, dec:dec, fatal:fatal, s1:s1, aborted:aborted, "
+      "reason:ac.signal.reason.name, "
+      "domcode:de.code, uuid:uu.length, rnd:rv.length, heard:heard, micro:micro.join(), t2:t2, "
+      "inst:[de instanceof Error, ev instanceof Event, self===globalThis, typeof WorkerGlobalScope]}); },1);');\n"
+      "gw.onmessage=function(e){ gl=e.data; };\n");
+  expect(wait_for("gl!==null"));
+  run_script(
+      "expect(gl.enc===6 && gl.dec==='h\\u00e9\u20ac', 'TextEncoder and TextDecoder round trip: '+gl.enc+' '+gl.dec);\n"
+      "expect(gl.fatal===true, 'fatal decoding throws TypeError');\n"
+      "expect(gl.s1==='h\\u00e9\u20ac', 'streaming decode across a split character: '+gl.s1);\n"
+      "expect(gl.aborted===1 && gl.reason==='AbortError', 'AbortController aborts once');\n"
+      "expect(gl.domcode===20 && gl.uuid===36 && gl.rnd===8, 'DOMException code, randomUUID, getRandomValues');\n"
+      "expect(gl.heard===5 && gl.micro==='0,1' && gl.t2===1, 'events, once, microtasks, EventTarget: '+gl.heard+' "
+      "'+gl.micro);\n"
+      "expect(gl.inst[0] && gl.inst[1] && gl.inst[2], 'instanceof and self');\n");
+}
+
 static void test_transfer_and_collections(void)
 {
   run_script("var tr=null, tbuf=new ArrayBuffer(16), tv=new Uint8Array(tbuf); tv[3]=5;\n"
@@ -290,6 +326,7 @@ int main(void)
   test("importScripts, location and name", test_import_scripts_and_location);
   test("module workers", test_module_worker);
   test("worker timers", test_worker_timers);
+  test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
   test("transferred buffers and collections", test_transfer_and_collections);
   test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   test("MessageChannel and MessagePort", test_message_channel);

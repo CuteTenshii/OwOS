@@ -23,6 +23,9 @@ extern js_object *g_remotes;      /* rooted array of live RemotePlayback wrapper
 
 /* args[] -> a borrowed C string (coerces via ToString; "" for non-strings) */
 const char *arg_str(js_ctx *ctx, js_value v);
+int text_decoder_kind(const char *label); /* TextDecoder label -> DEC_* kind */
+const char *text_decoder_name(int kind);  /* the canonical encoding name of a kind */
+js_value text_decode(js_ctx *ctx, js_value view, int kind, bool ignore_bom, bool fatal); /* bytes -> string */
 
 /* the DOM node a wrapper object fronts (NULL if not a node wrapper), and the cached wrapper */
 struct dom_node *node_of(js_value v);
