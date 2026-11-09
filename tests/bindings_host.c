@@ -309,21 +309,6 @@ js_value image_ctor(js_ctx *c, js_value t, js_value *a, int n)
   (void)n;
   return js_undef();
 }
-void sw_install(js_ctx *c, js_object *w, const char *u)
-{
-  (void)c;
-  (void)w;
-  (void)u;
-}
-void sw_teardown(void) {}
-int sw_intercept_fetch(js_ctx *c, const char *u, const char *m, js_value *o)
-{
-  (void)c;
-  (void)u;
-  (void)m;
-  (void)o;
-  return 0;
-}
 /* An echo server: ws://.../echo answers every message with itself, close ends the connection */
 struct ws_conn {
   unsigned char *msg[16];

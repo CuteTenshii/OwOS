@@ -2,6 +2,7 @@
 #include <stdbool.h>
 
 #include "features/cors/cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "features/persist/persist.h"
 #include "jsint.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
 
@@ -20,6 +21,8 @@ struct sw_cache {
 };
 static struct sw_cache **g_swc; /* every open Cache, all origins             */
 static int g_swc_n, g_swc_cap, g_swc_nextid = 1;
+static bool g_swc_loading; /* reading a file: the entries it holds are not changes */
+static void sw_cache_dirty(const char *origin);
 
 /* A registration; src is kept so the worker can be re-run without a re-fetch. */
 struct sw_reg {
@@ -163,6 +166,246 @@ static void sw_cache_store(struct sw_cache *c, const char *method, const char *u
   e->body = (unsigned char *)malloc((unsigned)(e->blen ? e->blen : 1));
   if (e->body && e->blen)
     memcpy(e->body, body, (unsigned)e->blen);
+  if (!g_swc_loading)
+    sw_cache_dirty(c->origin);
+}
+
+/* ---- persistence: the caches of one origin are one file, written after they change ---- */
+
+#define SWC_SAVE_MS 500                    /* least gap between two writes */
+static char **g_swc_loaded, **g_swc_dirty; /* origins read from disk / changed since they were written */
+static int g_swc_nloaded, g_swc_ndirty;
+static unsigned g_swc_last_save;
+
+struct wbuf {
+  unsigned char *p;
+  unsigned n, cap;
+  int failed;
+};
+static void wb_put(struct wbuf *b, const void *d, unsigned n)
+{
+  if (b->failed)
+    return;
+  if (b->n + n > b->cap) {
+    unsigned nc = b->cap ? b->cap : 4096;
+    unsigned char *np;
+    while (nc < b->n + n)
+      nc *= 2;
+    np = (unsigned char *)realloc(b->p, nc);
+    if (!np) {
+      b->failed = 1;
+      return;
+    }
+    b->p = np;
+    b->cap = nc;
+  }
+  memcpy(b->p + b->n, d, n);
+  b->n += n;
+}
+static void wb_u32(struct wbuf *b, unsigned v)
+{
+  unsigned char x[4] = {(unsigned char)v, (unsigned char)(v >> 8), (unsigned char)(v >> 16), (unsigned char)(v >> 24)};
+  wb_put(b, x, 4);
+}
+static void wb_str(struct wbuf *b, const char *s)
+{
+  unsigned n = s ? (unsigned)strlen(s) : 0;
+  wb_u32(b, n);
+  wb_put(b, s, n);
+}
+
+struct rbuf {
+  const unsigned char *p;
+  unsigned n, at;
+  int bad;
+};
+static unsigned rb_u32(struct rbuf *r)
+{
+  unsigned v;
+  if (r->bad || r->n - r->at < 4) {
+    r->bad = 1;
+    return 0;
+  }
+  v = r->p[r->at] | (unsigned)r->p[r->at + 1] << 8 | (unsigned)r->p[r->at + 2] << 16 | (unsigned)r->p[r->at + 3] << 24;
+  r->at += 4;
+  return v;
+}
+/* A length-prefixed run of bytes inside the buffer, NUL-terminated copy when `text` */
+static const unsigned char *rb_bytes(struct rbuf *r, unsigned *len)
+{
+  const unsigned char *p;
+  *len = rb_u32(r);
+  if (r->bad || r->n - r->at < *len) {
+    r->bad = 1;
+    *len = 0;
+    return 0;
+  }
+  p = r->p + r->at;
+  r->at += *len;
+  return p;
+}
+static char *rb_str(struct rbuf *r)
+{
+  unsigned n;
+  const unsigned char *p = rb_bytes(r, &n);
+  char *s;
+  if (r->bad)
+    return 0;
+  s = (char *)malloc(n + 1);
+  if (s) {
+    memcpy(s, p, n);
+    s[n] = 0;
+  }
+  return s;
+}
+
+static int sw_origin_listed(char **list, int n, const char *origin)
+{
+  int i;
+  for (i = 0; i < n; i++)
+    if (streq(list[i], origin))
+      return 1;
+  return 0;
+}
+static void sw_origin_add(char ***list, int *n, const char *origin)
+{
+  char **nl = (char **)realloc(*list, (unsigned)(*n + 1) * sizeof **list);
+  if (!nl)
+    return;
+  *list = nl;
+  nl[*n] = strdup(origin);
+  if (nl[*n])
+    (*n)++;
+}
+static void sw_cache_dirty(const char *origin)
+{
+  if (!sw_origin_listed(g_swc_dirty, g_swc_ndirty, origin))
+    sw_origin_add(&g_swc_dirty, &g_swc_ndirty, origin);
+}
+
+/* Reads the origin's file the first time its caches are looked at */
+static void sw_caches_ensure(const char *origin)
+{
+  char path[160];
+  unsigned char *bytes;
+  int len = 0;
+  struct rbuf r;
+  unsigned nc, i;
+  if (sw_origin_listed(g_swc_loaded, g_swc_nloaded, origin))
+    return;
+  sw_origin_add(&g_swc_loaded, &g_swc_nloaded, origin);
+  if (persist_path("cache", origin, path, sizeof path) != 0 || !(bytes = persist_read(path, &len)))
+    return;
+  r.p = bytes;
+  r.n = (unsigned)len;
+  r.at = 0;
+  r.bad = 0;
+  g_swc_loading = true;
+  nc = rb_u32(&r);
+  for (i = 0; i < nc && !r.bad; i++) {
+    char *name = rb_str(&r);
+    unsigned ne = rb_u32(&r), k;
+    struct sw_cache *c = name && !r.bad ? sw_cache_find(origin, name, true) : 0;
+    free(name);
+    for (k = 0; k < ne && !r.bad; k++) {
+      char *method = rb_str(&r), *url = rb_str(&r), *st = rb_str(&r), *ct = rb_str(&r);
+      unsigned status = rb_u32(&r), blen;
+      const unsigned char *body = rb_bytes(&r, &blen);
+      if (c && !r.bad && method && url)
+        sw_cache_store(c, method, url, (int)status, st, ct, (const char *)body, (int)blen);
+      free(method);
+      free(url);
+      free(st);
+      free(ct);
+    }
+  }
+  g_swc_loading = false;
+  free(bytes);
+}
+
+static void sw_caches_save(const char *origin)
+{
+  struct wbuf b = {0, 0, 0, 0};
+  char path[160];
+  unsigned nc = 0;
+  int i, k;
+  if (persist_path("cache", origin, path, sizeof path) != 0)
+    return;
+  for (i = 0; i < g_swc_n; i++)
+    if (g_swc[i] && streq(g_swc[i]->origin, origin))
+      nc++;
+  wb_u32(&b, nc);
+  for (i = 0; i < g_swc_n; i++) {
+    struct sw_cache *c = g_swc[i];
+    if (!c || !streq(c->origin, origin))
+      continue;
+    wb_str(&b, c->name);
+    wb_u32(&b, (unsigned)c->n);
+    for (k = 0; k < c->n; k++) {
+      struct sw_c_entry *e = &c->e[k];
+      wb_str(&b, e->method);
+      wb_str(&b, e->url);
+      wb_str(&b, e->statustext);
+      wb_str(&b, e->ctype);
+      wb_u32(&b, (unsigned)e->status);
+      wb_u32(&b, (unsigned)e->blen);
+      wb_put(&b, e->body, (unsigned)e->blen);
+    }
+  }
+  if (!b.failed)
+    persist_write(path, b.p, (int)b.n);
+  free(b.p);
+}
+
+/* Writes the origins whose caches changed; `force` ignores the gap since the last write */
+static void sw_caches_flush(bool force)
+{
+  int i;
+  if (!g_swc_ndirty || (!force && msec() - g_swc_last_save < SWC_SAVE_MS))
+    return;
+  for (i = 0; i < g_swc_ndirty; i++) {
+    sw_caches_save(g_swc_dirty[i]);
+    free(g_swc_dirty[i]);
+  }
+  free(g_swc_dirty);
+  g_swc_dirty = 0;
+  g_swc_ndirty = 0;
+  g_swc_last_save = msec();
+}
+
+/* The page is going away: what is on disk is the truth, so drop the caches that have a file. The ones of an origin
+ * that cannot persist stay in memory for the next page of this process. */
+static void sw_caches_unload(void)
+{
+  int i, k, keep = 0;
+  char path[160];
+  for (i = 0; i < g_swc_n; i++) {
+    struct sw_cache *c = g_swc[i];
+    if (c && persist_path("cache", c->origin, path, sizeof path) != 0) {
+      g_swc[keep++] = c;
+      continue;
+    }
+    if (!c)
+      continue;
+    for (k = 0; k < c->n; k++)
+      sw_entry_free(&c->e[k]);
+    free(c->e);
+    free(c->origin);
+    free(c->name);
+    free(c);
+  }
+  g_swc_n = keep;
+  for (i = 0; i < g_swc_nloaded; i++)
+    free(g_swc_loaded[i]);
+  free(g_swc_loaded);
+  g_swc_loaded = 0;
+  g_swc_nloaded = 0;
+}
+
+int sw_cache_pump(void)
+{
+  sw_caches_flush(false);
+  return 0;
 }
 
 /* ---- persistent C store: registrations ---- */
@@ -514,6 +757,7 @@ static js_value cache_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
     return sw_resolve(ctx, js_bool(0));
   sw_entry_free(&c->e[i]);
   c->e[i] = c->e[--c->n];
+  sw_cache_dirty(c->origin);
   return sw_resolve(ctx, js_bool(1));
 }
 static js_value cache_keys(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -553,6 +797,9 @@ static js_value caches_open(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
+  if (!sw_cache_find(org, arg_str(ctx, A(0)), false))
+    sw_cache_dirty(org);
   c = sw_cache_find(org, arg_str(ctx, A(0)), true);
   if (!c)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "Error", "caches.open failed"));
@@ -565,6 +812,7 @@ static js_value caches_match(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
   sw_input_url(ctx, A(0), url, sizeof url);
   for (i = 0; i < g_swc_n; i++) {
     struct sw_cache *c = g_swc[i];
@@ -586,6 +834,7 @@ static js_value caches_has(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
   return sw_resolve(ctx, js_bool(sw_cache_find(org, arg_str(ctx, A(0)), false) != 0));
 }
 static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -596,6 +845,7 @@ static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
   name = arg_str(ctx, A(0));
   for (i = 0; i < g_swc_n; i++)
     if (g_swc[i] && streq(g_swc[i]->origin, org) && streq(g_swc[i]->name, name)) {
@@ -608,6 +858,7 @@ static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
       free(c->name);
       free(c);
       g_swc[i] = g_swc[--g_swc_n];
+      sw_cache_dirty(org);
       return sw_resolve(ctx, js_bool(1));
     }
   return sw_resolve(ctx, js_bool(0));
@@ -622,6 +873,7 @@ static js_value caches_keys(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)args;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
   for (i = 0; i < g_swc_n; i++)
@@ -1509,6 +1761,8 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
 /* Drops per-context roots; the persistent store (g_swr/g_swc) survives. */
 void sw_teardown(void)
 {
+  sw_caches_flush(true);
+  sw_caches_unload();
   gc_remove_root((void **)&g_swcontainer_proto);
   gc_remove_root((void **)&g_swreg_proto);
   gc_remove_root((void **)&g_sw_proto);
