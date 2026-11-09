@@ -673,6 +673,40 @@ static void test_resize_observer(void)
   test_box_w = test_box_h = 0;
 }
 
+static void test_rellist(void)
+{
+  run_script(
+      "var l = document.createElement('link');\n"
+      "l.setAttribute('rel', 'stylesheet preload');\n"
+      "expect(l.relList.length === 2 && l.relList[1] === 'preload', 'relList reads rel');\n"
+      "expect(l.relList.contains('preload') && !l.relList.contains('icon'), 'contains');\n"
+      "l.relList.add('icon');\n"
+      "expect(l.getAttribute('rel') === 'stylesheet preload icon', 'add writes rel');\n"
+      "expect(l.getAttribute('class') === null && l.classList.length === 0, 'class untouched');\n"
+      "l.relList.remove('preload');\n"
+      "expect(l.relList.toggle('x') && l.relList.value === 'stylesheet icon x', 'remove and toggle');\n"
+      "l.relList.value = 'alternate';\n"
+      "expect(l.getAttribute('rel') === 'alternate', 'value setter');\n"
+      "function throws(f, name) { try { f(); } catch (e) { return e.name === name; } return false; }\n"
+      "expect(l.rel === 'alternate' && (l.rel = 'icon', l.relList.contains('icon')), 'rel property');\n"
+      "expect(document.createElement('div').rel === undefined, 'rel only on a, area, link, form');\n"
+      "l.relList.value = 'alternate';\n"
+      "expect(throws(function () { l.relList.add(''); }, 'SyntaxError'), 'empty token');\n"
+      "expect(throws(function () { l.relList.add('a b'); }, 'InvalidCharacterError'), 'whitespace token');\n"
+      "expect(throws(function () { l.relList.toggle(''); }, 'SyntaxError'), 'toggle validates');\n"
+      "expect(throws(function () { l.relList.replace('alternate', 'a b'); }, 'InvalidCharacterError'), 'replace "
+      "validates');\n"
+      "l.relList.add('x', '' + 1);\n"
+      "expect(throws(function () { l.relList.add('y', ''); }, 'SyntaxError') && !l.relList.contains('y'), 'add is all "
+      "or nothing');\n"
+      "expect(l.relList.supports('stylesheet') && l.relList.supports('PRELOAD') && !l.relList.supports('bogus'), "
+      "'supports');\n"
+      "expect(throws(function () { l.classList.supports('x'); }, 'TypeError'), 'classList has no supported tokens');\n"
+      "expect(document.createElement('div').relList === undefined, 'relList only on a, area, link, form');\n"
+      "expect(document.createElement('a').relList.length === 0 && document.createElement('form').relList.length === 0, "
+      "'other rel owners');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -703,6 +737,7 @@ int main(void)
   test("TreeWalker, NodeIterator and NodeFilter", test_tree_walker_and_node_iterator);
   test("MutationObserver", test_mutation_observer);
   test("ResizeObserver", test_resize_observer);
+  test("relList reflects the rel attribute", test_rellist);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

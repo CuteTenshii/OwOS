@@ -281,6 +281,7 @@ js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 extern js_object *g_classlist_proto;
+extern js_object *g_rellist_proto;
 extern js_object *g_document_proto;
 extern js_object *g_element_proto;
 extern struct html_iface g_html_ifaces[];

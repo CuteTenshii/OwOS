@@ -15,6 +15,7 @@ js_ctx *g_ctx;
 js_object *g_node_proto; /* Node.prototype (ancestor of element/document) */
 js_object *g_element_proto;
 js_object *g_style_proto;
+js_object *g_rellist_proto;   /* DOMTokenList for element.relList, chains to g_classlist_proto */
 js_object *g_classlist_proto; /* DOMTokenList.prototype (element.classList) */
 js_object *g_url_proto;
 js_object *g_sp_proto;
@@ -469,89 +470,111 @@ static js_value el_set_class(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 
 /* ------------------------------------------------------- classList --------- */
-/* DOMTokenList over the element's class="" attribute */
+/* DOMTokenList over class="" (classList) or rel="" (relList) */
 
-/* the node's current class string, or "" (never NULL) */
+/* the attribute a token list object reflects */
+static const char *cl_attr(js_value t)
+{
+  return t.type == JV_OBJ && t.u.obj->proto == g_rellist_proto ? "rel" : "class";
+}
+
+/* the node's current token string, or "" (never NULL) */
 static const char *cl_class_of(js_value t)
 {
   struct dom_node *n = node_of(t);
-  const char *v = n ? dom_get_attr(n, "class") : 0;
+  const char *v = n ? dom_get_attr(n, cl_attr(t)) : 0;
   return v ? v : "";
 }
 
-/* rebuild `n`'s class attr as the current tokens (deduped) with `tok` appended */
-static void cl_write_add(struct dom_node *n, const char *tok, int tl)
+/* rebuild `n`'s `attr` as the current tokens (deduped) with `tok` appended */
+static void cl_write_add(struct dom_node *n, const char *attr, const char *tok, int tl)
 {
-  char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+  char *classes = strdup(dom_get_attr(n, attr) ? dom_get_attr(n, attr) : "");
   classlist_add(&classes, tok, tl);
-  dom_set_attr(n, "class", classes);
+  dom_set_attr(n, attr, classes);
   free(classes);
 }
 
-/* rebuild `n`'s class attr as the current tokens minus every copy of `tok` */
-static void cl_write_remove(struct dom_node *n, const char *tok, int tl)
+/* rebuild `n`'s `attr` as the current tokens minus every copy of `tok` */
+static void cl_write_remove(struct dom_node *n, const char *attr, const char *tok, int tl)
 {
-  char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+  char *classes = strdup(dom_get_attr(n, attr) ? dom_get_attr(n, attr) : "");
   classlist_remove(&classes, tok, tl);
-  dom_set_attr(n, "class", classes);
+  dom_set_attr(n, attr, classes);
   free(classes);
 }
 
+/* throws SyntaxError for an empty token, InvalidCharacterError for one with whitespace; true if it threw */
+static bool cl_token_invalid(js_ctx *ctx, const char *tok)
+{
+  if (!*tok) {
+    js_throw_error(ctx, ctx->error_proto, "SyntaxError", "the token must not be empty");
+    return true;
+  }
+  for (; *tok; tok++)
+    if (*tok == ' ' || *tok == '\t' || *tok == '\n' || *tok == '\r' || *tok == '\f') {
+      js_throw_error(ctx, ctx->error_proto, "InvalidCharacterError", "the token must not contain whitespace");
+      return true;
+    }
+  return false;
+}
+
+static const char *cl_tok(js_ctx *ctx, js_value v)
+{
+  js_value s = js_to_string(ctx, v);
+  return s.type == JV_STR ? s.u.str->data : "";
+}
+
+/* add (remove=0) or remove every argument; all are validated before any is applied */
+static js_value cl_add_remove(js_ctx *ctx, js_value t, js_value *args, int argc, bool remove)
+{
+  struct dom_node *n = node_of(t);
+  int i;
+  if (!n)
+    return js_undef();
+  for (i = 0; i < argc; i++)
+    if (cl_token_invalid(ctx, cl_tok(ctx, args[i])))
+      return js_undef();
+  for (i = 0; i < argc; i++) {
+    const char *tok = cl_tok(ctx, args[i]);
+    if (remove)
+      cl_write_remove(n, cl_attr(t), tok, (int)strlen(tok));
+    else
+      cl_write_add(n, cl_attr(t), tok, (int)strlen(tok));
+  }
+  return js_undef();
+}
 static js_value cl_add(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *n = node_of(t);
-  int i;
-  if (!n)
-    return js_undef();
-  for (i = 0; i < argc; i++) {
-    js_value s = js_to_string(ctx, args[i]);
-    const char *tok = s.type == JV_STR ? s.u.str->data : "";
-    int tl = (int)strlen(tok);
-    if (tl)
-      cl_write_add(n, tok, tl);
-  }
-  return js_undef();
+  return cl_add_remove(ctx, t, args, argc, false);
 }
-
 static js_value cl_remove(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *n = node_of(t);
-  int i;
-  if (!n)
-    return js_undef();
-  for (i = 0; i < argc; i++) {
-    js_value s = js_to_string(ctx, args[i]);
-    const char *tok = s.type == JV_STR ? s.u.str->data : "";
-    int tl = (int)strlen(tok);
-    if (tl)
-      cl_write_remove(n, tok, tl);
-  }
-  return js_undef();
+  return cl_add_remove(ctx, t, args, argc, true);
 }
 
 /* toggle(token[, force]): with `force` given, force==true adds / false removes */
 static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  js_value s = js_to_string(ctx, A(0));
-  const char *tok = s.type == JV_STR ? s.u.str->data : "";
+  const char *tok = cl_tok(ctx, A(0));
   int tl = (int)strlen(tok), present;
-  if (!n || tl == 0)
+  if (!n || cl_token_invalid(ctx, tok))
     return js_bool(0);
   present = classlist_has(cl_class_of(t), tok, tl);
   if (argc >= 2) {
     bool force = js_to_boolean(args[1]);
     if (force && !present)
-      cl_write_add(n, tok, tl);
+      cl_write_add(n, cl_attr(t), tok, tl);
     else if (!force && present)
-      cl_write_remove(n, tok, tl);
+      cl_write_remove(n, cl_attr(t), tok, tl);
     return js_bool(force);
   }
   if (present) {
-    cl_write_remove(n, tok, tl);
+    cl_write_remove(n, cl_attr(t), tok, tl);
     return js_bool(0);
   }
-  cl_write_add(n, tok, tl);
+  cl_write_add(n, cl_attr(t), tok, tl);
   return js_bool(1);
 }
 
@@ -559,17 +582,18 @@ static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value cl_replace(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  js_value ov = js_to_string(ctx, A(0)), nv = js_to_string(ctx, A(1));
-  const char *oldt = ov.type == JV_STR ? ov.u.str->data : "";
-  const char *newt = nv.type == JV_STR ? nv.u.str->data : "";
-  int ol = (int)strlen(oldt), nl = (int)strlen(newt);
+  const char *oldt = cl_tok(ctx, A(0)), *newt;
   (void)argc;
-  if (!n || ol == 0 || nl == 0)
+  if (!n || cl_token_invalid(ctx, oldt))
+    return js_bool(0);
+  newt = cl_tok(ctx, A(1));
+  if (cl_token_invalid(ctx, newt))
     return js_bool(0);
   {
-    char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+    const char *attr = cl_attr(t);
+    char *classes = strdup(dom_get_attr(n, attr) ? dom_get_attr(n, attr) : "");
     int replaced = classlist_replace(&classes, oldt, newt);
-    dom_set_attr(n, "class", classes);
+    dom_set_attr(n, attr, classes);
     free(classes);
     return js_bool(replaced);
   }
@@ -582,6 +606,22 @@ static js_value cl_contains(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)args;
   (void)argc;
   return js_bool(classlist_has(cl_class_of(t), tok, (int)strlen(tok)));
+}
+
+/* only relList defines supported tokens (the rels the browser acts on) */
+static js_value cl_supports(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  static const char *const known[] = {"stylesheet", "icon", "preload", "preconnect"};
+  const char *tok = cl_tok(ctx, A(0));
+  int i;
+  (void)argc;
+  (void)args;
+  if (t.type != JV_OBJ || t.u.obj->proto != g_rellist_proto)
+    return js_throw_type(ctx, "this token list has no supported tokens");
+  for (i = 0; i < (int)(sizeof known / sizeof *known); i++)
+    if (streq_ci(tok, known[i]))
+      return js_bool(1);
+  return js_bool(0);
 }
 
 static js_value cl_item(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -612,7 +652,7 @@ static js_value cl_set_value(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
   if (n)
-    dom_set_attr(n, "class", arg_str(ctx, A(0)));
+    dom_set_attr(n, cl_attr(t), arg_str(ctx, A(0)));
   return js_undef();
 }
 
@@ -668,19 +708,17 @@ static js_value cl_entries(js_ctx *ctx, js_value t, js_value *a, int n)
   return cl_iter_kind(ctx, t, "entries");
 }
 
-static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int argc)
+static js_value el_token_list(js_ctx *ctx, js_value t, js_object *proto, const char *attr)
 {
   js_object *o;
   struct dom_node *n = node_of(t);
   const char *cur, *b;
   int i, len;
-  (void)args;
-  (void)argc;
   gc_push_scope();
-  o = (js_object *)gc_keep(js_new_object(ctx, g_classlist_proto));
+  o = (js_object *)gc_keep(js_new_object(ctx, proto));
   o->host = n;
   /* Snapshot numeric index properties (classList[0]), the engine has no index-getter hook */
-  cur = n ? dom_get_attr(n, "class") : 0;
+  cur = n ? dom_get_attr(n, attr) : 0;
   if (!cur)
     cur = "";
   for (i = 0; (b = classlist_nth(cur, i, &len)); i++) {
@@ -703,6 +741,44 @@ static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int ar
   }
   gc_pop_scope();
   return js_obj_value(o);
+}
+static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return el_token_list(ctx, t, g_classlist_proto, "class");
+}
+/* a, area, link and form carry rel/relList */
+static bool has_rel(const struct dom_node *n)
+{
+  return n && (!strcmp(n->tag, "a") || !strcmp(n->tag, "area") || !strcmp(n->tag, "link") || !strcmp(n->tag, "form"));
+}
+static js_value el_get_rel(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  const char *v;
+  (void)args;
+  (void)argc;
+  if (!has_rel(n))
+    return js_undef();
+  v = dom_get_attr(n, "rel");
+  return js_mk_cstring(ctx, v ? v : "");
+}
+static js_value el_set_rel(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (has_rel(n))
+    dom_set_attr(n, "rel", arg_str(ctx, A(0)));
+  return js_undef();
+}
+static js_value el_get_rellist(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)args;
+  (void)argc;
+  if (!has_rel(n))
+    return js_undef();
+  return el_token_list(ctx, t, g_rellist_proto, "rel");
 }
 /* .src / .href reflect the attribute resolved to an absolute URL */
 static js_value el_get_url_attr(js_ctx *ctx, js_value t, const char *attr)
@@ -1694,6 +1770,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   g_element_proto = js_new_object(ctx, g_node_proto);
   g_style_proto = js_new_object(ctx, ctx->object_proto);
   g_classlist_proto = js_new_object(ctx, ctx->object_proto);
+  g_rellist_proto = js_new_object(ctx, g_classlist_proto);
   g_url_proto = js_new_object(ctx, ctx->object_proto);
   g_sp_proto = js_new_object(ctx, ctx->object_proto);
   g_formdata_proto = js_new_object(ctx, ctx->object_proto);
@@ -1730,6 +1807,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   gc_add_root((void **)&g_element_proto);
   gc_add_root((void **)&g_style_proto);
   gc_add_root((void **)&g_classlist_proto);
+  gc_add_root((void **)&g_rellist_proto);
   gc_add_root((void **)&g_url_proto);
   gc_add_root((void **)&g_sp_proto);
   gc_add_root((void **)&g_formdata_proto);
@@ -1776,6 +1854,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_classlist_proto, "toggle", cl_toggle, 1);
   def_method(g_classlist_proto, "replace", cl_replace, 2);
   def_method(g_classlist_proto, "contains", cl_contains, 1);
+  def_method(g_classlist_proto, "supports", cl_supports, 1);
   def_method(g_classlist_proto, "item", cl_item, 1);
   def_method(g_classlist_proto, "forEach", cl_foreach, 1);
   def_method(g_classlist_proto, "values", cl_values, 0);
@@ -1796,6 +1875,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(g_element_proto, "nonce", el_get_nonce, el_set_nonce);
   def_acc(g_element_proto, "className", el_get_class, el_set_class);
   def_acc(g_element_proto, "classList", el_get_classlist, 0);
+  def_acc(g_element_proto, "rel", el_get_rel, el_set_rel);
+  def_acc(g_element_proto, "relList", el_get_rellist, 0);
   def_acc(g_element_proto, "textContent", el_get_text, el_set_text);
   def_acc(g_element_proto, "innerText", el_get_text, el_set_text);
   def_acc(g_element_proto, "innerHTML", el_get_html, el_set_html);
