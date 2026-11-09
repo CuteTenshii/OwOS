@@ -1,13 +1,14 @@
 /* archive.c: browse and extract ZIP, TAR, TAR.GZ, TAR.ZST and TAR.BR archives.
  *
  *   archive                  open the window empty
- *   archive <file>           open the window on <file> (how Files launches it)
- *   archive -l <file>        print the entry list to stdout
- *   archive -x <file> <dir>  extract everything into <dir>
+ *   archive FILE             open the window on FILE (how Files launches it)
+ *   archive -l FILE          print the entry list to stdout
+ *   archive -x DIR FILE      extract everything into DIR
  */
 #include "archive.h"
 #include "dialog.h"
 #include "gfx.h"
+#include "opt.h"
 #include "owos.h"
 
 #define MENU_H 18
@@ -403,49 +404,77 @@ static void on_key(int key, int mods)
   reveal(sel);
 }
 
-static int cli(int argc, char **argv)
+static int list_entries(const char *file)
 {
-  if (argc >= 3 && streq(argv[1], "-l")) {
-    struct archive *a = archive_open(argv[2]);
-    if (!a) {
-      printf("archive: %s: not a supported archive, or damaged\n", argv[2]);
-      return 1;
-    }
-    printf("%s, %d entries\n", archive_format(a), archive_count(a));
-    for (int i = 0; i < archive_count(a); i++) {
-      struct arcent e;
-      char sz[24];
-      archive_entry(a, i, &e);
-      size_str(e.size, sz, sizeof sz);
-      printf("  %s%s  %s\n", e.name, e.is_dir ? "/" : "", e.is_dir ? "" : sz);
-    }
-    archive_close(a);
-    return 0;
+  struct archive *a = archive_open(file);
+  if (!a) {
+    printf("archive: %s: not a supported archive, or damaged\n", file);
+    return 1;
   }
-  if (argc >= 4 && streq(argv[1], "-x")) {
-    struct archive *a = archive_open(argv[2]);
-    if (!a) {
-      printf("archive: %s: not a supported archive, or damaged\n", argv[2]);
-      return 1;
-    }
-    int rc = archive_extract_all(a, argv[3]);
-    if (rc < 0)
-      printf("archive: extracting into %s failed partway\n", argv[3]);
-    else
-      printf("extracted %d entries into %s\n", archive_count(a), argv[3]);
-    archive_close(a);
-    return rc < 0 ? 1 : 0;
+  printf("%s, %d entries\n", archive_format(a), archive_count(a));
+  for (int i = 0; i < archive_count(a); i++) {
+    struct arcent e;
+    char sz[24];
+    archive_entry(a, i, &e);
+    size_str(e.size, sz, sizeof sz);
+    printf("  %s%s  %s\n", e.name, e.is_dir ? "/" : "", e.is_dir ? "" : sz);
   }
-  printf("usage: archive [file]\n"
-         "       archive -l <file>        list entries\n"
-         "       archive -x <file> <dir>  extract everything into <dir>\n");
-  return 2;
+  archive_close(a);
+  return 0;
+}
+
+static int extract_entries(const char *file, const char *dir)
+{
+  struct archive *a = archive_open(file);
+  if (!a) {
+    printf("archive: %s: not a supported archive, or damaged\n", file);
+    return 1;
+  }
+  int rc = archive_extract_all(a, dir);
+  if (rc < 0)
+    printf("archive: extracting into %s failed partway\n", dir);
+  else
+    printf("extracted %d entries into %s\n", archive_count(a), dir);
+  archive_close(a);
+  return rc < 0 ? 1 : 0;
 }
 
 int main(int argc, char **argv)
 {
-  if (argc > 1 && argv[1][0] == '-')
-    return cli(argc, argv);
+  static const struct opt opts[] = {
+      {'l', "list", OPT_FLAG, 'l', 0, "print the entries instead of opening a window"},
+      {'x', "extract", OPT_ARG, 'x', "DIR", "extract everything into DIR instead of opening a window"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
+  };
+  const char *file = 0, *dir = 0;
+  int list = 0;
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'l') {
+      list = 1;
+    } else if (o == 'x') {
+      dir = st.arg;
+    } else if (o == 'h') {
+      opt_print_help("archive", "[FILE]", "Browse and extract ZIP and TAR archives.", opts, OPT_N(opts));
+      return 0;
+    } else if (o == OPT_POS && !file) {
+      file = st.arg;
+    } else {
+      printf("archive: unexpected argument %s\n", o == OPT_POS ? st.arg : st.bad);
+      opt_print_usage("archive", "[FILE]", opts, OPT_N(opts));
+      return 2;
+    }
+  }
+  if ((list || dir) && !file) {
+    printf("archive: -l and -x need a FILE\n");
+    opt_print_usage("archive", "[FILE]", opts, OPT_N(opts));
+    return 2;
+  }
+  if (list)
+    return list_entries(file);
+  if (dir)
+    return extract_entries(file, dir);
 
   win_id = win_create(W, H, "Archive");
   if (win_id < 0)
@@ -453,8 +482,8 @@ int main(int argc, char **argv)
   gfx_init(win_fb(), W, H);
   win_resizable(win_id, 1);
   textfield_init(&path_tf, path_buf, sizeof path_buf);
-  if (argc > 1)
-    open_archive(argv[1]);
+  if (file)
+    open_archive(file);
 
   for (;;) {
     struct win_event ev;
