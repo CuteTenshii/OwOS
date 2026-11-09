@@ -300,6 +300,23 @@ static void check_string_append(void)
              0));
 }
 
+static void check_promise_chain_depth(void)
+{
+  expect(run(
+      "var n=0, done=false;\n"
+      "function hop(){ n++; return n<20000 ? Promise.resolve(n).then(hop) : Promise.resolve('end'); }\n"
+      "hop().then(function(v){ done=v; });\n"
+      "expect(done==='end' && n===20000, 'a long chain of settled promises does not exhaust the stack: '+n+' '+done);\n"
+      "var order=[]; Promise.resolve().then(function(){ order.push('a'); }); order.push('sync'); "
+      "Promise.resolve().then(function(){ order.push('b'); });\n"
+      "expect(order.join()==='a,sync,b', 'shallow reactions still run in place: '+order.join());\n"
+      "var arr=[], rs=null, p=new Promise(function(res){ rs=res; }); var chain=p;\n"
+      "for (var i=0;i<5000;i++) { (function(i){ chain=chain.then(function(v){ arr.push(i); return v; }); })(i); }\n"
+      "rs('go'); expect(arr.length===5000 && arr[4999]===4999 && arr[0]===0, 'a pending chain settles in order: "
+      "'+arr.length);\n",
+      0));
+}
+
 static void check_json_parse(void)
 {
   expect(
@@ -600,6 +617,7 @@ int main(void)
   test("Promise.all, allSettled, race and any with pending promises", check_promise_combinators);
   test("typed array set, slice and copy construction", check_typed_array_copy);
   test("long string appends and buffer garbage", check_string_append);
+  test("long promise chains do not recurse without bound", check_promise_chain_depth);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

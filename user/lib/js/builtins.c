@@ -6321,6 +6321,50 @@ static void run_reaction(js_ctx *ctx, int state, js_value value, js_value reacti
   }
   gc_pop_scope();
 }
+/* Reactions run where they are triggered, but each one nests the next: a loop that chains promises which are
+ * already settled would otherwise recurse until the native stack ran out. Past this depth they wait in a queue that
+ * the outermost reaction drains once the stack has unwound. */
+#define PROM_MAX_DEPTH 24
+
+static void react(js_ctx *ctx, int state, js_value value, js_value reaction)
+{
+  if (ctx->prom_depth >= PROM_MAX_DEPTH) {
+    gc_push_scope();
+    KEEP(value);
+    KEEP(reaction);
+    if (!ctx->prom_queue)
+      ctx->prom_queue = js_new_array(ctx, 0);
+    js_array_push(ctx, ctx->prom_queue, js_number(state));
+    js_array_push(ctx, ctx->prom_queue, value);
+    js_array_push(ctx, ctx->prom_queue, reaction);
+    gc_pop_scope();
+    return;
+  }
+  ctx->prom_depth++;
+  run_reaction(ctx, state, value, reaction);
+  ctx->prom_depth--;
+  if (ctx->prom_depth)
+    return;
+  while (ctx->prom_queue && ctx->prom_head < ctx->prom_queue->elen) {
+    js_object *q = ctx->prom_queue;
+    unsigned at = ctx->prom_head;
+    int st = (int)q->elems[at].u.num;
+    js_value v = q->elems[at + 1], r = q->elems[at + 2];
+    ctx->prom_head += 3;
+    gc_push_scope();
+    KEEP(v);
+    KEEP(r);
+    ctx->prom_depth++;
+    run_reaction(ctx, st, v, r);
+    ctx->prom_depth--;
+    gc_pop_scope();
+  }
+  if (ctx->prom_queue) {
+    js_array_set_len(ctx, ctx->prom_queue, 0);
+    ctx->prom_head = 0;
+  }
+}
+
 static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value)
 {
   js_value rs;
@@ -6335,7 +6379,7 @@ static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value)
   if (rs.type == JV_OBJ) {
     unsigned i;
     for (i = 0; i < rs.u.obj->elen; i++)
-      run_reaction(ctx, state, value, rs.u.obj->elems[i]);
+      react(ctx, state, value, rs.u.obj->elems[i]);
   }
   js_def(p, "@r", js_obj_value(js_new_array(ctx, 0)), 0);
   gc_pop_scope();
@@ -6451,7 +6495,7 @@ static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *a, int n)
       if (rs.type == JV_OBJ)
         js_array_push(ctx, rs.u.obj, js_obj_value(reaction));
     } else
-      run_reaction(ctx, st, prom_value(p), js_obj_value(reaction));
+      react(ctx, st, prom_value(p), js_obj_value(reaction));
   }
   gc_pop_scope();
   return js_obj_value(child);

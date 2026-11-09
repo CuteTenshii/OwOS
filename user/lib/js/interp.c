@@ -3877,6 +3877,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   gc_add_root((void **)&ctx->async_generator_proto);
   gc_add_root((void **)&ctx->typedarray_proto);
   gc_add_root((void **)&ctx->arraybuffer_proto);
+  gc_add_root((void **)&ctx->prom_queue);
   gc_add_root((void **)&ctx->sharedarraybuffer_proto);
   gc_add_root((void **)&ctx->dataview_proto);
   {
@@ -3971,6 +3972,7 @@ void js_ctx_free(js_ctx *ctx)
   gc_remove_root((void **)&ctx->async_generator_proto);
   gc_remove_root((void **)&ctx->typedarray_proto);
   gc_remove_root((void **)&ctx->arraybuffer_proto);
+  gc_remove_root((void **)&ctx->prom_queue);
   gc_remove_root((void **)&ctx->sharedarraybuffer_proto);
   gc_remove_root((void **)&ctx->dataview_proto);
   {
