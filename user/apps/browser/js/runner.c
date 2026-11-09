@@ -12,6 +12,27 @@
 
 static js_irq g_page_irq; /* lets the main thread stop a running page script on navigation */
 
+/* Append the source text around a parse error: up to 40 bytes before and 20 after the column */
+static void sb_put_src_context(sbuf *sb, const char *code, int line, int col)
+{
+  const char *s = code;
+  const char *e;
+  int i, n;
+  for (i = 1; i < line && *s; s++)
+    if (*s == '\n')
+      i++;
+  e = s;
+  while (*e && *e != '\n')
+    e++;
+  s += col > 41 ? col - 41 : 0;
+  if (s > e)
+    return;
+  n = (int)(e - s) > 60 ? 60 : (int)(e - s);
+  sb_puts(sb, "\n    near: ");
+  for (i = 0; i < n; i++)
+    sb_putc(sb, s[i] >= ' ' ? s[i] : ' ');
+}
+
 /* What structured clone carries across threads besides plain data: Blobs and OffscreenCanvases */
 static int page_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
@@ -336,7 +357,6 @@ void run_inserted_script(struct dom_node *node)
   }
   js_arena_init(ar);
   prog = js_parse(code, ar, &pe);
-  free(code);
   if (!prog) {
     sbuf sb;
     sb.b = 0;
@@ -345,14 +365,17 @@ void run_inserted_script(struct dom_node *node)
     sb_puts(&sb, "[js] SyntaxError: ");
     sb_puts(&sb, pe.msg ? pe.msg : "parse error");
     sb_put_pos(&sb, pe.line, pe.col);
+    sb_put_src_context(&sb, code, pe.line, pe.col);
     sb_putc(&sb, '\n');
     devtools_console_append(DT_ERROR, sb.b, sb.n);
     if (sb.b)
       free(sb.b);
+    free(code);
     js_arena_free(ar);
     free(ar);
     return;
   }
+  free(code);
   if (!arenas_push(ar)) {
     js_arena_free(ar);
     free(ar);
@@ -605,7 +628,6 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
       }
       js_arena_init(ar);
       prog = js_parse(code, ar, &pe);
-      free(code);
       if (!prog) {
         sbuf sb;
         sb.b = 0;
@@ -618,14 +640,17 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
           sb_puts(&sb, g_cur_script);
           sb_put_pos(&sb, pe.line, pe.col);
         }
+        sb_put_src_context(&sb, code, pe.line, pe.col);
         sb_putc(&sb, '\n');
         devtools_console_append(DT_ERROR, sb.b, sb.n);
         if (sb.b)
           free(sb.b);
+        free(code);
         js_arena_free(ar);
         free(ar);
         continue;
       }
+      free(code);
       if (!arenas_push(ar)) {
         js_arena_free(ar);
         free(ar);

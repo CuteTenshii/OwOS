@@ -275,8 +275,8 @@ int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top); /* fn(arg
 void *thread_stack_alloc(int bytes); /* guarded thread stack (unmapped guard page below); 0 on fail */
 void thread_stack_free(void *top);
 static inline int thread_join(int tid) { return waitpid(tid); }
-
 static inline void thread_exit(void) { exit(0); } /* ends the calling thread only */
+
 /* sbrk returns the PREVIOUS break, or (void *)-1 */
 void *sbrk(int inc);
 void *malloc(unsigned size);
