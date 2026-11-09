@@ -68,11 +68,13 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
     onname[k] = 0;
     js_value h = js_get(g_ctx, js_obj_value(obj), onname);
     if (js_is_callable(h)) {
-      js_value a = ev;
+      js_value a = ev, r;
       js_set_event_script(evty.u.str->data, 0);
-      js_call(g_ctx, h, js_obj_value(obj), &a, 1);
+      r = js_call(g_ctx, h, js_obj_value(obj), &a, 1);
       if (g_ctx->has_exc)
         report_exc_v(g_ctx);
+      else if (streq(evty.u.str->data, "beforeunload") && r.type != JV_UNDEF && r.type != JV_NULL)
+        js_set(g_ctx, ev, "@dp", js_bool(1));
     }
   }
   gc_pop_scope();

@@ -108,6 +108,8 @@ int main(int argc, char **argv)
 
   unsigned last = B->seq - 1;
   int prev_loading = 0;
+  unsigned nav_wait_ms = 0;
+#define NAV_STUCK_MS 1500
   /* Repaint coalescing while a page loads */
   unsigned frame = 0, last_paint_frame = 0;
   const unsigned LOAD_REDRAW_FRAMES = 6; /* ~6*15ms ≈ 90ms → ~10 fps while loading */
@@ -200,6 +202,19 @@ int main(int argc, char **argv)
     if (B->loc_nav) { /* location.assign/replace/reload */
       B->loc_nav = 0;
       navigate(B->loc_url);
+    }
+    if (B->nav_cancel) {
+      B->nav_cancel = 0;
+      nav_cancelled();
+    }
+    /* A navigation the worker hasn't picked up means it is stuck in a script: stop it, beforeunload or not */
+    if (!B->req_pending || B->dlg_req) {
+      nav_wait_ms = 0;
+    } else if (!nav_wait_ms) {
+      nav_wait_ms = msec() | 1;
+    } else if (msec() - nav_wait_ms > NAV_STUCK_MS) {
+      B->abort_load = 1;
+      js_page_interrupt();
     }
     /* window.alert/confirm/prompt */
     if (B->dlg_req && !B->dlg_done) {

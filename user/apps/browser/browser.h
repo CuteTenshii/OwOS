@@ -219,6 +219,7 @@ struct browser {
   int req_pending;
   int loading;
   volatile int abort_load;      /* main -> worker: cancel the in-flight fetch */
+  volatile int nav_cancel;      /* worker -> main: the user stayed on the page, drop the pending navigation */
   volatile int scripts_pending; /* worker: page painted, run its <script>s on the next pass */
   volatile int in_scripts;      /* worker is running the deferred script pass; load_quiesce waits */
 
@@ -353,6 +354,7 @@ void js_page_end(void);       /* reclaim the page ctx  */
 void js_page_interrupt(void); /* any thread: unwind the running page script (cleared when the next ctx starts) */
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
 int js_has_listeners(void); /* any listener registered */
+int js_before_unload(void); /* worker: fire beforeunload; 0 if the user chose to stay */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */

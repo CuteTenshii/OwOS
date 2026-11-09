@@ -136,6 +136,7 @@ bool hist_can_fwd(const struct tab *t);
 void pane_metrics(int *py, int *phh, int *rows);
 void scroll_set(int target);
 void navigate(const char *url);
+void nav_cancelled(void);
 void blur_content_control(void);
 void submit(void);
 void do_reload(void);

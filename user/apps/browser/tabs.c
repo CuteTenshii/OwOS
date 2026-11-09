@@ -204,9 +204,8 @@ void submit(void)
   B->req_url[i] = '\0';
   B->req_method[0] = '\0';
   B->req_body_len = 0; /* GET */
-  if (B->loading || B->in_scripts)
+  if (B->loading)
     B->abort_load = 1; /* the new page supersedes the in-flight load; set before req_pending */
-  js_page_interrupt();
   B->req_pending = 1;
   B->seq++;
 }
@@ -216,6 +215,26 @@ void do_reload(void)
 {
   if (B->pg->cur_url[0])
     navigate(B->pg->cur_url);
+}
+
+/* The user stayed on the page at the beforeunload prompt: undo the address bar and history move */
+void nav_cancelled(void)
+{
+  struct tab *t = &tabs[active_tab];
+  for (int d = 0; d < t->hist_n; d++) {
+    int lo = t->hist_i - d, hi = t->hist_i + d;
+    if (lo >= 0 && streq(t->hist[lo], B->pg->cur_url)) {
+      t->hist_i = lo;
+      break;
+    }
+    if (hi < t->hist_n && streq(t->hist[hi], B->pg->cur_url)) {
+      t->hist_i = hi;
+      break;
+    }
+  }
+  nav_from_history = false;
+  textfield_set(&B->addr_tf, B->pg->cur_url);
+  B->seq++;
 }
 
 /* Stop the in-flight load */

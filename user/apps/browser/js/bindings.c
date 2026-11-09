@@ -1058,7 +1058,7 @@ static void dlg_scopy(char *d, const char *s, int cap)
       d[i] = s[i];
   d[i] = 0;
 }
-static int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int outsz)
+int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int outsz)
 {
   if (B->win_id < 0)
     return 0;

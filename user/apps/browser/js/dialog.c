@@ -321,3 +321,25 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
 }
 
 int js_has_listeners(void) { return g_page_live && g_has_listeners; }
+
+/* Worker thread: fire beforeunload at the live page; 0 when the page asked to stay and the user chose to */
+int js_before_unload(void)
+{
+  js_value ev;
+  int ask;
+  if (!g_page_live || !g_ctx || js_irq_stopped(g_ctx->irq))
+    return 1;
+  gc_push_scope();
+  ev = make_event("beforeunload", 0, 0, js_undef());
+  if (ev.type != JV_OBJ) {
+    gc_pop_scope();
+    return 1;
+  }
+  gc_keep(ev.u.obj);
+  js_set(g_ctx, ev, "bubbles", js_bool(0));
+  js_set(g_ctx, ev, "returnValue", js_mk_cstring(g_ctx, ""));
+  dispatch_from(g_ctx->global, ev);
+  ask = ev_flag(ev, "@dp") || ev_flag(ev, "returnValue");
+  gc_pop_scope();
+  return !ask || worker_dialog(2, "Leave site? Changes you made may not be saved.", 0, 0, 0);
+}

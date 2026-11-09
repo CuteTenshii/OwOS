@@ -270,7 +270,11 @@ void worker_fn(void)
         B->seq++;
       }
     }
-    if (B->req_pending) {
+    if (B->req_pending && !js_before_unload()) {
+      B->req_pending = 0;
+      B->nav_cancel = 1;
+      B->seq++;
+    } else if (B->req_pending) {
       B->req_pending = 0;
       B->abort_load = 0; /* a fresh navigation clears any pending Stop */
       B->pg->doc_title[0] = '\0';

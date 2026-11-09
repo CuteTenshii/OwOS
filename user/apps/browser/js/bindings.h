@@ -60,6 +60,7 @@ js_value dlg_close(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value dlg_get_open(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value dlg_get_rv(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value dlg_request_close(js_ctx *ctx, js_value t, js_value *args, int argc);
+int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int outsz);
 js_value dlg_set_open(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value dlg_set_rv(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value dlg_show(js_ctx *ctx, js_value t, js_value *args, int argc);
