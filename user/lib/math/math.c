@@ -364,10 +364,16 @@ double cos(double x)
   return r;
 }
 
+/* fptan leaves tan(x) in st1 and 1.0 in st0; popping the 1.0 leaves the result in st0, balanced. (sin(x) / cos(x)
+ * does not work: gcc inlines both with their fmod, and the two inline sequences leave the x87 stack out of step.) */
 double tan(double x)
 {
-  double s = sin(x), c = cos(x);
-  return s / c;
+  if (!isfinite(x))
+    return NAN;
+  x = fmod(x, 2.0 * M_PI);
+  double r;
+  __asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(x));
+  return r;
 }
 
 /* fpatan = atan(st1/st0), then pops — balanced. */
