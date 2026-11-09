@@ -1,13 +1,12 @@
 /* edid.h — best-effort monitor EDID reader (real-hardware-only).
  *
- * Recovers the attached monitor's native refresh rate by reading its EDID over
- * DDC2/I2C, for the neofetch splash. The only transport implemented is Intel
- * GMBUS (the I2C controller in 0x8086 integrated graphics), which reaches the
- * DDC pins of an external HDMI/DVI/VGA monitor. Two things it deliberately does
- * NOT handle, because each is a separate per-GPU effort:
- *   - non-Intel GPUs (AMD/NVIDIA have their own I2C/GPIO blocks), and
- *   - an internal laptop eDP panel, whose EDID rides the DisplayPort AUX
- *     channel rather than I2C.
+ * Recovers the attached monitor's native refresh rate by reading its EDID, for
+ * the neofetch splash. Two transports, tried in order, both Intel-only:
+ *   - GMBUS (the I2C controller in 0x8086 integrated graphics), which reaches
+ *     the DDC pins of an external HDMI/DVI/VGA monitor, and
+ *   - the DDI DisplayPort AUX channels A-F (Gen9+ register layout), which carry
+ *     EDID as I2C-over-AUX for external DP and internal eDP panels.
+ * Non-Intel GPUs (AMD/NVIDIA have their own I2C/AUX blocks) are not handled.
  * QEMU's emulated VGA exposes no EDID over GMBUS, so this is a no-op there
  * (edid_refresh_hz() returns 0). Like battery.c it is best-effort: it probes
  * once, fails gracefully, and records edid_error() for on-hardware debugging.

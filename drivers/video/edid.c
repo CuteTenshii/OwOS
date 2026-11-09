@@ -1,6 +1,7 @@
-/* edid.c: read a monitor's EDID over Intel GMBUS and recover its refresh rate (real hardware only). */
+/* edid.c: read a monitor's EDID over Intel GMBUS or the DisplayPort AUX channel (real hardware only). */
 
 #include "edid.h"
+#include "dpaux.h"
 #include "paging.h"
 #include "pci.h"
 #include "timer.h"
@@ -25,6 +26,24 @@
 
 #define EDID_ADDR 0x50 /* DDC EEPROM I2C slave address                      */
 #define EDID_LEN 128   /* one EDID block                                    */
+
+/* DDI AUX channels A-F: control register at 0x64010 + 0x100 * n, then five data dwords (Gen9+ layout). */
+#define AUX_CTL_BASE 0x64010
+#define AUX_CTL_STRIDE 0x100
+#define AUX_PORTS 6
+#define AUX_DATA 0x04
+#define AUX_FIFO 20
+
+#define AUX_SEND_BUSY (1u << 31)
+#define AUX_DONE (1u << 30)
+#define AUX_INTERRUPT (1u << 29)
+#define AUX_TIMEOUT_ERR (1u << 28)
+#define AUX_TIMEOUT_MAX (3u << 26) /* 1600 us */
+#define AUX_RECEIVE_ERR (1u << 25)
+#define AUX_SIZE_SHIFT 20
+#define AUX_SIZE_MASK 0x1Fu
+#define AUX_SYNC_PULSES (31u << 5 | 31u) /* 32 FW and 32 HW sync pulses */
+#define AUX_ATTEMPTS 3
 
 /* GMBUS block offset in BAR0: 0xC5100 on PCH-split parts (Gen5+), 0x5100 on older ones. Try both. */
 static const uint32_t gmbus_bases[] = {0xC5100, 0x5100};
@@ -116,6 +135,49 @@ static int gmbus_read(uint8_t pin, uint8_t addr, uint8_t *buf, int len)
   }
   wr(GMBUS0, 0);
   return 0;
+}
+
+/* Gen9+ AUX CTL programming. A request is up to 20 bytes, packed big-endian into the data dwords. */
+static int aux_xfer(void *ctx, const uint8_t *tx, int txlen, uint8_t *rx, int rxmax)
+{
+  (void)ctx;
+  if (txlen < 1 || txlen > AUX_FIFO)
+    return -1;
+
+  for (int attempt = 0; attempt < AUX_ATTEMPTS; attempt++) {
+    uint32_t start = timer_us();
+    while (rd(0) & AUX_SEND_BUSY)
+      if (timer_us() - start > 10000)
+        return -1;
+
+    for (int i = 0; i < txlen; i += 4) {
+      uint32_t word = 0;
+      for (int b = 0; b < 4; b++)
+        word |= (uint32_t)(i + b < txlen ? tx[i + b] : 0) << (24 - b * 8);
+      wr(AUX_DATA + (uint32_t)i, word);
+    }
+
+    uint32_t flags = AUX_DONE | AUX_INTERRUPT | AUX_TIMEOUT_ERR | AUX_RECEIVE_ERR;
+    wr(0, AUX_SEND_BUSY | flags | AUX_TIMEOUT_MAX | ((uint32_t)txlen << AUX_SIZE_SHIFT) | AUX_SYNC_PULSES);
+
+    uint32_t ctl;
+    start = timer_us();
+    while ((ctl = rd(0)) & AUX_SEND_BUSY)
+      if (timer_us() - start > 10000)
+        return -1;
+    wr(0, ctl | flags);
+
+    if (!(ctl & AUX_DONE) || (ctl & (AUX_TIMEOUT_ERR | AUX_RECEIVE_ERR)))
+      continue;
+
+    int n = (int)((ctl >> AUX_SIZE_SHIFT) & AUX_SIZE_MASK);
+    if (n > rxmax)
+      n = rxmax;
+    for (int i = 0; i < n; i++)
+      rx[i] = (uint8_t)(rd(AUX_DATA + (uint32_t)(i & ~3)) >> (24 - (i & 3) * 8));
+    return n;
+  }
+  return -1;
 }
 
 /* EDID header is 00 FF FF FF FF FF FF 00 and the 128 bytes sum to 0 mod 256. */
@@ -215,6 +277,31 @@ static void parse_identity(const uint8_t *e)
   cached_internal = panel_vendor(cached_mfg);
 }
 
+/* Try each DDI AUX channel for a DisplayPort/eDP sink; the first one with a valid EDID wins. */
+static bool probe_dp_aux(void)
+{
+  uint8_t edid[EDID_LEN];
+  for (uint32_t port = 0; port < AUX_PORTS; port++) {
+    base = AUX_CTL_BASE + port * AUX_CTL_STRIDE;
+    uint8_t caps[3];
+    if (dp_read_dpcd(aux_xfer, 0, 0, caps, sizeof caps) != 0 || !dp_dpcd_valid(caps))
+      continue;
+    if (dp_read_edid(aux_xfer, 0, edid) != 0) {
+      seterr("DP AUX EDID read failed");
+      continue;
+    }
+    if (!edid_valid(edid)) {
+      seterr("bad checksum");
+      continue;
+    }
+    if (parse_preferred(edid) == 0) {
+      parse_identity(edid);
+      return true;
+    }
+  }
+  return false;
+}
+
 static void probe(void)
 {
   probed = true;
@@ -248,8 +335,12 @@ static void probe(void)
       }
     }
   }
+  if (probe_dp_aux()) {
+    err[0] = '\0';
+    return;
+  }
   if (err[0] == '\0')
-    seterr("no EDID (GMBUS NAK)");
+    seterr("no EDID (GMBUS NAK, no DP AUX sink)");
 }
 
 static void ensure(void)
