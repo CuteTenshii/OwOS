@@ -113,7 +113,7 @@ struct js_ctx {
    */
   int (*clone_write_ext)(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
   js_value (*clone_read_ext)(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
-  js_object *prom_queue; /* promise reactions deferred because the stack was already deep (flat triples) */
+  js_object *prom_queue; /* promise reactions deferred because the stack was already deep (flat entries of 5 values) */
   unsigned prom_head, prom_depth;
   void *re_cache;           /* compiled-RegExp cache (builtins.c)         */
   unsigned ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped

@@ -339,6 +339,36 @@ static void check_computed_member_gc(void)
              0));
 }
 
+static void check_promise_objects(void)
+{
+  expect(run("function churn() { var j; for (var i = 0; i < 6000; i++) j = { a: i, b: [i, i] }; return j; }\n"
+             "var p0 = new Promise(function () {});\n"
+             "expect(Object.getOwnPropertyNames(p0).length === 0 && JSON.stringify(p0) === '{}', 'a promise has no "
+             "visible state');\n"
+             "class Sub extends Promise { constructor(ex) { super(ex); this.tag = 'sub'; } }\n"
+             "var s = new Sub(function (r) { r(7); }), got = null;\n"
+             "var t = s.then(function (v) { got = v; });\n"
+             "expect(s instanceof Sub && s instanceof Promise && s.tag === 'sub' && got === 7 && t instanceof Promise, "
+             "'a Promise subclass works');\n"
+             "var res = [], out = [], i;\n"
+             "for (i = 0; i < 200; i++) (function (i) { var p = new Promise(function (r) { res.push(r); });\n"
+             "  p.then(function (v) { out.push('a' + i + v); }); p.then(function (v) { out.push('b' + i); }); "
+             "p.then(function (v) { out.push('c' + i); }); })(i);\n"
+             "churn(); for (i = 0; i < 200; i++) res[i]('!'); res[0]('again');\n"
+             "expect(out.length === 600 && out[0] === 'a0!' && out[1] === 'b0' && out[2] === 'c0' && out[599] === "
+             "'c199', 'reactions on pending promises survive collection and run in order: ' + out.length);\n"
+             "var inner, adopted = null; new Promise(function (r) { r(new Promise(function (rr) { inner = rr; })); "
+             "}).then(function (v) { adopted = v; });\n"
+             "churn(); expect(adopted === null, 'an adopted pending promise holds its follower'); inner('x');\n"
+             "expect(adopted === 'x', 'a promise resolved with a pending promise settles with it: ' + adopted);\n"
+             "var rej = null; new Promise(function (r) { r(Promise.reject(new Error('no'))); }).then(null, function "
+             "(e) { rej = e.message; });\n"
+             "expect(rej === 'no', 'adopting a rejected promise rejects');\n"
+             "var c = null; try { clone(new Promise(function () {})); } catch (e) { c = e.name; }\n"
+             "expect(c !== null, 'a promise cannot be cloned');\n",
+             0));
+}
+
 static void check_promise_chain_depth(void)
 {
   expect(run(
@@ -658,6 +688,7 @@ int main(void)
   test("long string appends and buffer garbage", check_string_append);
   test("string appends in place keep aliases intact", check_string_append_aliasing);
   test("a computed member's object survives its key being evaluated", check_computed_member_gc);
+  test("promise objects: subclasses, reactions and adoption", check_promise_objects);
   test("long promise chains do not recurse without bound", check_promise_chain_depth);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);

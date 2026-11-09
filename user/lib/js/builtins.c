@@ -6272,39 +6272,41 @@ static js_value json_parse(js_ctx *ctx, js_value t, js_value *a, int n)
  * A synchronous-settlement Promise: executors and .then reactions run
  * immediately (a "microtask" is run-now, since there is no event loop yet).
  * That makes await of an already-resolved promise correct; a promise that never
- * settles synchronously (e.g. waiting on a timer) just stays pending. State
- * lives in hidden own properties @s (0 pending/1 fulfilled/2 rejected), @v
- * (value/reason) and @r (a list of pending reactions). Resolver functions carry
- * their target promise in the native closure data (ctx->native_data). */
+ * settles synchronously (e.g. waiting on a timer) just stays pending. A promise
+ * is an OBJ_PROMISE object whose host is a js_promise (state, value, waiting
+ * reactions). Resolver functions carry their target promise in the native
+ * closure data (ctx->native_data). */
 
-static int is_promise(js_value v) { return v.type == JV_OBJ && pmap_find_pub(v.u.obj, "@s") != 0; }
-static int prom_state(js_object *p)
-{
-  pentry *pe = pmap_find_pub(p, "@s");
-  return pe ? (int)pe->value.u.num : 0;
-}
-static js_value prom_value(js_object *p)
-{
-  pentry *pe = pmap_find_pub(p, "@v");
-  return pe ? pe->value : js_undef();
-}
+static int is_promise(js_value v) { return v.type == JV_OBJ && v.u.obj->kind == OBJ_PROMISE; }
+static js_promise *prom_of(js_object *p) { return (js_promise *)p->host; }
+static int prom_state(js_object *p) { return prom_of(p)->state; }
+static js_value prom_value(js_object *p) { return prom_of(p)->value; }
 
 static js_object *new_promise(js_ctx *ctx);
 static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value);
 static void prom_resolve(js_ctx *ctx, js_object *p, js_value v);
 static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 
-static js_object *new_promise(js_ctx *ctx)
+/* A new promise; when `thisv` is a subclass instance that super() is building, that object becomes the promise */
+static js_object *new_promise_on(js_ctx *ctx, js_value thisv)
 {
   js_object *p;
-  gc_push_scope();
-  p = (js_object *)gc_keep(js_new_object(ctx, ctx->promise_proto));
-  js_def(p, "@s", js_number(0), 0);
-  js_def(p, "@v", js_undef(), 0);
-  js_def(p, "@r", js_obj_value(js_new_array(ctx, 0)), 0);
-  gc_pop_scope();
+  js_promise *pr;
+  if (thisv.type == JV_OBJ && thisv.u.obj->kind == OBJ_PLAIN && !thisv.u.obj->host && thisv.u.obj != ctx->global) {
+    js_object *c;
+    for (c = thisv.u.obj->proto; c && c != ctx->promise_proto; c = c->proto)
+      ;
+    p = c ? thisv.u.obj : js_new_object(ctx, ctx->promise_proto);
+  } else
+    p = js_new_object(ctx, ctx->promise_proto);
+  pr = (js_promise *)calloc(1, sizeof *pr);
+  if (!pr)
+    gc_oom();
+  p->kind = OBJ_PROMISE;
+  p->host = pr;
   return p;
 }
+static js_object *new_promise(js_ctx *ctx) { return new_promise_on(ctx, js_undef()); }
 static js_object *resolver(js_ctx *ctx, js_native fn, js_object *p)
 {
   js_object *f = js_new_native(ctx, fn, "", 1);
@@ -6312,67 +6314,80 @@ static js_object *resolver(js_ctx *ctx, js_native fn, js_object *p)
   gc_write_barrier(f);
   return f;
 }
-/* run one stored reaction [onF, onR, childResolve, childReject] */
-static void run_reaction(js_ctx *ctx, int state, js_value value, js_value reaction)
+/* run one reaction: the handler for the outcome (if callable) settles `child`; with no handler the outcome passes on */
+static void run_reaction(js_ctx *ctx, int state, js_value value, js_value onF, js_value onR, js_object *child)
 {
-  js_value onF = js_get_index(ctx, reaction, 0), onR = js_get_index(ctx, reaction, 1);
-  js_value cres = js_get_index(ctx, reaction, 2), crej = js_get_index(ctx, reaction, 3);
   js_value handler = state == 1 ? onF : onR;
   gc_push_scope();
   KEEP(value);
-  KEEP(cres);
-  KEEP(crej);
+  KEEP(onF);
+  KEEP(onR);
+  if (child)
+    gc_keep(child);
   if (js_is_callable(handler)) {
     js_value out = js_call(ctx, handler, js_undef(), &value, 1);
     if (ctx->has_exc) {
       js_value e = ctx->exc;
       ctx->has_exc = 0;
-      if (js_is_callable(crej))
-        js_call(ctx, crej, js_undef(), &e, 1);
-    } else if (js_is_callable(cres))
-      js_call(ctx, cres, js_undef(), &out, 1);
-  } else {
-    js_value next = state == 1 ? cres : crej;
-    if (js_is_callable(next))
-      js_call(ctx, next, js_undef(), &value, 1); /* pass through */
+      if (child) {
+        KEEP(e);
+        prom_settle(ctx, child, 2, e);
+      }
+    } else if (child) {
+      KEEP(out);
+      prom_resolve(ctx, child, out);
+    }
+  } else if (child) {
+    if (state == 1)
+      prom_resolve(ctx, child, value);
+    else
+      prom_settle(ctx, child, 2, value);
   }
   gc_pop_scope();
 }
 /* Reactions run where they are triggered, but each one nests the next: a loop that chains promises which are
  * already settled would otherwise recurse until the native stack ran out. Past this depth they wait in a queue that
- * the outermost reaction drains once the stack has unwound. */
+ * the outermost reaction drains once the stack has unwound (flat entries of PROM_QENT values). */
 #define PROM_MAX_DEPTH 24
+#define PROM_QENT 5
 
-static void react(js_ctx *ctx, int state, js_value value, js_value reaction)
+static void react(js_ctx *ctx, int state, js_value value, js_value onF, js_value onR, js_object *child)
 {
   if (ctx->prom_depth >= PROM_MAX_DEPTH) {
     gc_push_scope();
     KEEP(value);
-    KEEP(reaction);
+    KEEP(onF);
+    KEEP(onR);
+    if (child)
+      gc_keep(child);
     if (!ctx->prom_queue)
       ctx->prom_queue = js_new_array(ctx, 0);
     js_array_push(ctx, ctx->prom_queue, js_number(state));
     js_array_push(ctx, ctx->prom_queue, value);
-    js_array_push(ctx, ctx->prom_queue, reaction);
+    js_array_push(ctx, ctx->prom_queue, onF);
+    js_array_push(ctx, ctx->prom_queue, onR);
+    js_array_push(ctx, ctx->prom_queue, child ? js_obj_value(child) : js_undef());
     gc_pop_scope();
     return;
   }
   ctx->prom_depth++;
-  run_reaction(ctx, state, value, reaction);
+  run_reaction(ctx, state, value, onF, onR, child);
   ctx->prom_depth--;
   if (ctx->prom_depth)
     return;
   while (ctx->prom_queue && ctx->prom_head < ctx->prom_queue->elen) {
     js_object *q = ctx->prom_queue;
-    unsigned at = ctx->prom_head;
-    int st = (int)q->elems[at].u.num;
-    js_value v = q->elems[at + 1], r = q->elems[at + 2];
-    ctx->prom_head += 3;
+    js_value *e = q->elems + ctx->prom_head;
+    int st = (int)e[0].u.num;
+    js_value v = e[1], f = e[2], r = e[3], c = e[4];
+    ctx->prom_head += PROM_QENT;
     gc_push_scope();
     KEEP(v);
+    KEEP(f);
     KEEP(r);
+    KEEP(c);
     ctx->prom_depth++;
-    run_reaction(ctx, st, v, r);
+    run_reaction(ctx, st, v, f, r, c.type == JV_OBJ ? c.u.obj : NULL);
     ctx->prom_depth--;
     gc_pop_scope();
   }
@@ -6382,23 +6397,66 @@ static void react(js_ctx *ctx, int state, js_value value, js_value reaction)
   }
 }
 
+/* Waits for p: a settled promise reacts now, a pending one remembers the reaction. The caller keeps the values. */
+static void prom_subscribe(js_ctx *ctx, js_object *p, js_value onF, js_value onR, js_object *child)
+{
+  js_promise *pr = prom_of(p);
+  js_reaction *r;
+  if (pr->state != 0) {
+    react(ctx, pr->state, pr->value, onF, onR, child);
+    return;
+  }
+  if (pr->n == 0)
+    r = &pr->first;
+  else {
+    if (pr->n - 1 >= pr->cap) {
+      unsigned nc = pr->cap ? pr->cap * 2 : 4;
+      js_reaction *nm = (js_reaction *)realloc(pr->more, nc * sizeof *nm);
+      if (!nm)
+        gc_oom();
+      pr->more = nm;
+      pr->cap = nc;
+    }
+    r = &pr->more[pr->n - 1];
+  }
+  r->on_f = onF;
+  r->on_r = onR;
+  r->child = child;
+  pr->n++;
+  gc_write_barrier(p);
+}
+
 static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value)
 {
-  js_value rs;
-  if (prom_state(p) != 0)
+  js_promise *pr = prom_of(p);
+  js_reaction first, *more;
+  unsigned n, i;
+  if (pr->state != 0)
     return; /* settle once */
   gc_push_scope();
   gc_keep(p);
   KEEP(value);
-  js_def(p, "@s", js_number(state), 0);
-  js_def(p, "@v", value, 0);
-  rs = js_get(ctx, js_obj_value(p), "@r");
-  if (rs.type == JV_OBJ) {
-    unsigned i;
-    for (i = 0; i < rs.u.obj->elen; i++)
-      react(ctx, state, value, rs.u.obj->elems[i]);
+  pr->state = state;
+  pr->value = value;
+  gc_write_barrier(p);
+  n = pr->n;
+  first = pr->first;
+  more = pr->more;
+  pr->n = pr->cap = 0;
+  pr->more = NULL;
+  memset(&pr->first, 0, sizeof pr->first);
+  for (i = 0; i < n; i++) {
+    js_reaction *r = i ? &more[i - 1] : &first;
+    KEEP(r->on_f);
+    KEEP(r->on_r);
+    if (r->child)
+      gc_keep(r->child);
   }
-  js_def(p, "@r", js_obj_value(js_new_array(ctx, 0)), 0);
+  for (i = 0; i < n; i++) {
+    js_reaction *r = i ? &more[i - 1] : &first;
+    react(ctx, state, value, r->on_f, r->on_r, r->child);
+  }
+  free(more);
   gc_pop_scope();
 }
 static js_value prom_res_fn(js_ctx *ctx, js_value t, js_value *a, int n)
@@ -6431,11 +6489,10 @@ static void prom_resolve(js_ctx *ctx, js_object *p, js_value v)
     else if (st == 2)
       prom_settle(ctx, p, 2, prom_value(vp));
     else {
-      js_value a[2];
       gc_push_scope();
-      a[0] = js_obj_value(gc_keep(resolver(ctx, prom_res_fn, p)));
-      a[1] = js_obj_value(gc_keep(resolver(ctx, prom_rej_fn, p)));
-      promise_then(ctx, v, a, 2);
+      gc_keep(p);
+      gc_keep(vp);
+      prom_subscribe(ctx, vp, js_undef(), js_undef(), p); /* no handlers: p follows vp */
       gc_pop_scope();
     }
     return;
@@ -6466,11 +6523,10 @@ static js_value promise_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value exec = ARG(0);
   js_object *p;
-  (void)t;
   if (!js_is_callable(exec))
     return js_throw_type(ctx, "Promise resolver is not a function");
   gc_push_scope();
-  p = (js_object *)gc_keep(new_promise(ctx));
+  p = (js_object *)gc_keep(new_promise_on(ctx, t));
   {
     js_value ea[2];
     ea[0] = js_obj_value(gc_keep(resolver(ctx, prom_res_fn, p)));
@@ -6489,7 +6545,6 @@ static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *a, int n)
 {
   js_object *p, *child;
   js_value onF = ARG(0), onR = ARG(1);
-  int st;
   if (!is_promise(thisv))
     return js_throw_type(ctx, "Promise.prototype.then on non-promise");
   p = thisv.u.obj;
@@ -6498,22 +6553,7 @@ static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *a, int n)
   KEEP(onF);
   KEEP(onR);
   child = (js_object *)gc_keep(new_promise(ctx));
-  {
-    js_object *cres = (js_object *)gc_keep(resolver(ctx, prom_res_fn, child));
-    js_object *crej = (js_object *)gc_keep(resolver(ctx, prom_rej_fn, child));
-    js_object *reaction = (js_object *)gc_keep(js_new_array(ctx, 0));
-    js_array_push(ctx, reaction, onF);
-    js_array_push(ctx, reaction, onR);
-    js_array_push(ctx, reaction, js_obj_value(cres));
-    js_array_push(ctx, reaction, js_obj_value(crej));
-    st = prom_state(p);
-    if (st == 0) {
-      js_value rs = js_get(ctx, thisv, "@r");
-      if (rs.type == JV_OBJ)
-        js_array_push(ctx, rs.u.obj, js_obj_value(reaction));
-    } else
-      react(ctx, st, prom_value(p), js_obj_value(reaction));
-  }
+  prom_subscribe(ctx, p, onF, onR, child);
   gc_pop_scope();
   return js_obj_value(child);
 }
@@ -6675,7 +6715,7 @@ static js_value promise_combinator(js_ctx *ctx, js_value it, int mode)
     KEEP(e);
     handlers[0] = js_obj_value(gc_keep(comb_handler(ctx, result, vals, rem, i, mode, 1)));
     handlers[1] = js_obj_value(gc_keep(comb_handler(ctx, result, vals, rem, i, mode, 0)));
-    promise_then(ctx, e, handlers, 2);
+    prom_subscribe(ctx, e.u.obj, handlers[0], handlers[1], NULL);
     gc_pop_scope();
   }
   gc_pop_scope();
@@ -6703,23 +6743,11 @@ void js_promise_resolve_with(js_ctx *ctx, js_object *p, js_value v) { prom_resol
 /* p.then(onF, onR) for a pending or settled promise p, without the derived promise */
 void js_promise_react(js_ctx *ctx, js_object *p, js_value onF, js_value onR)
 {
-  js_object *reaction;
-  int st = prom_state(p);
   gc_push_scope();
   gc_keep(p);
   KEEP(onF);
   KEEP(onR);
-  reaction = (js_object *)gc_keep(js_new_array(ctx, 0));
-  js_array_push(ctx, reaction, onF);
-  js_array_push(ctx, reaction, onR);
-  js_array_push(ctx, reaction, js_undef());
-  js_array_push(ctx, reaction, js_undef());
-  if (st == 0) {
-    js_value rs = js_get(ctx, js_obj_value(p), "@r");
-    if (rs.type == JV_OBJ)
-      js_array_push(ctx, rs.u.obj, js_obj_value(reaction));
-  } else
-    react(ctx, st, prom_value(p), js_obj_value(reaction));
+  prom_subscribe(ctx, p, onF, onR, NULL);
   gc_pop_scope();
 }
 js_value js_promise_resolved(js_ctx *ctx, js_value v) { return promise_resolve_s(ctx, js_undef(), &v, 1); }
@@ -9590,7 +9618,7 @@ static void clone_value(clone_w *w, js_value v, int depth)
     }
   }
   if (o->kind == OBJ_FUNCTION || o->kind == OBJ_HOST || o->kind == OBJ_PROXY || o->kind == OBJ_GENERATOR ||
-      o->kind == OBJ_SYMBOL || o->kind == OBJ_WASM) {
+      o->kind == OBJ_SYMBOL || o->kind == OBJ_WASM || o->kind == OBJ_PROMISE) {
     clone_fail(w, "The value could not be cloned");
     return;
   }

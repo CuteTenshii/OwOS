@@ -52,7 +52,8 @@ enum {
   OBJ_PROXY,
   OBJ_HOST,      /* embedder object: `host` is freed through js_host_finalizer */
   OBJ_GENERATOR, /* host: js_generator, a coroutine running a generator body */
-  OBJ_WASM       /* host: a WebAssembly object; js_wasm_trace/js_wasm_finalizer own its lifetime */
+  OBJ_WASM,      /* host: a WebAssembly object; js_wasm_trace/js_wasm_finalizer own its lifetime */
+  OBJ_PROMISE    /* host: js_promise */
 };
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1.
@@ -79,6 +80,19 @@ typedef struct {
   js_object *buffer;
   int type, offset, length;
 } js_typedarray;
+
+/* OBJ_PROMISE host: a settled-once value and the reactions waiting for it. A reaction with no handler passes the
+ * outcome on to `child`; a reaction without a child only runs its handlers. */
+typedef struct {
+  js_value on_f, on_r;
+  js_object *child;
+} js_reaction;
+typedef struct {
+  int state; /* 0 pending, 1 fulfilled, 2 rejected */
+  js_value value;
+  unsigned n, cap; /* reactions waiting: `first`, then more[0..n-2] */
+  js_reaction first, *more;
+} js_promise;
 
 /* OBJ_GENERATOR host: the body runs on its own native stack and is switched in
  * and out by next/throw/return (interp.c). */

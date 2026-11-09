@@ -307,6 +307,16 @@ static void trace(void *obj, int kind)
       js_wasm_trace(o);
     if (o->kind == OBJ_HOST && o->host && js_host_trace)
       js_host_trace(o);
+    if (o->kind == OBJ_PROMISE && o->host) {
+      js_promise *pr = (js_promise *)o->host;
+      mark_value(pr->value);
+      for (i = 0; i < pr->n; i++) {
+        js_reaction *r = i ? &pr->more[i - 1] : &pr->first;
+        mark_value(r->on_f);
+        mark_value(r->on_r);
+        gc_mark(r->child);
+      }
+    }
     if (o->kind == OBJ_GENERATOR && o->host) {
       js_generator *g = (js_generator *)o->host;
       gc_mark(g->env);
@@ -370,6 +380,10 @@ static void finalize(void *obj, int kind)
     }
     if (o->kind == OBJ_HOST && o->host && js_host_finalizer)
       js_host_finalizer(o);
+    if (o->kind == OBJ_PROMISE && o->host) {
+      free(((js_promise *)o->host)->more);
+      free(o->host);
+    }
     if (o->kind == OBJ_WASM && o->host && js_wasm_finalizer)
       js_wasm_finalizer(o);
   }
