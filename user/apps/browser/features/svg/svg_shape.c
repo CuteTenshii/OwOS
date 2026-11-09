@@ -11,6 +11,10 @@ int svg_elem_kind(const char *t)
     return K_SWITCH;
   if (streq(t, "use"))
     return K_USE;
+  if (streq(t, "text"))
+    return K_TEXT;
+  if (streq(t, "image"))
+    return K_IMAGE;
   if (streq(t, "rect") || streq(t, "circle") || streq(t, "ellipse") || streq(t, "line") || streq(t, "polyline") ||
       streq(t, "polygon") || streq(t, "path"))
     return K_SHAPE;
@@ -77,7 +81,9 @@ bool svg_build_shape(const struct ctx *cx, const struct dom_node *n, struct path
     add_ellipse(p, scale, svg_attr_len(n, "cx", 0, vw), svg_attr_len(n, "cy", 0, vh), rx, ry);
   } else if (streq(t, "line")) {
     svg_path_move(p, svg_attr_len(n, "x1", 0, vw), svg_attr_len(n, "y1", 0, vh));
+    svg_path_mark(p);
     svg_path_line(p, svg_attr_len(n, "x2", 0, vw), svg_attr_len(n, "y2", 0, vh));
+    svg_path_mark(p);
   } else if (streq(t, "polyline") || streq(t, "polygon")) {
     const char *pts = dom_get_attr(n, "points");
     if (!pts)
@@ -89,6 +95,7 @@ bool svg_build_shape(const struct ctx *cx, const struct dom_node *n, struct path
         svg_path_line(p, x, y);
       else
         svg_path_move(p, x, y);
+      svg_path_mark(p);
     }
     if (streq(t, "polygon"))
       svg_path_close(p);
@@ -97,7 +104,7 @@ bool svg_build_shape(const struct ctx *cx, const struct dom_node *n, struct path
 }
 
 /* Bounding box of an element's geometry in its own user space (for objectBoundingBox units). */
-static void node_bbox(const struct ctx *cx, const struct dom_node *n, struct mat m, struct bb *b, int depth)
+void svg_node_bbox(const struct ctx *cx, const struct dom_node *n, struct mat m, struct bb *b, int depth)
 {
   if (depth > MAX_DEPTH)
     return;
@@ -116,7 +123,7 @@ static void node_bbox(const struct ctx *cx, const struct dom_node *n, struct mat
   } else if (k == K_GROUP || k == K_SVG) {
     for (const struct dom_node *c = n->first_child; c; c = c->next)
       if (c->type == DOM_ELEMENT)
-        node_bbox(cx, c, svg_mat_mul(m, svg_parse_transform(dom_get_attr(c, "transform"))), b, depth + 1);
+        svg_node_bbox(cx, c, svg_mat_mul(m, svg_parse_transform(dom_get_attr(c, "transform"))), b, depth + 1);
   }
 }
 
@@ -168,7 +175,7 @@ unsigned char *svg_make_clip(struct ctx *cx, const struct dom_node *cp, struct m
   const char *u = dom_get_attr(cp, "clippathunits");
   if (u && starts_ci(u, "objectBoundingBox")) {
     struct bb b = {0, 0, 0, 0, false};
-    node_bbox(cx, target, svg_mat_id(), &b, 0);
+    svg_node_bbox(cx, target, svg_mat_id(), &b, 0);
     if (!b.ok) {
       free(mask);
       return 0;
@@ -211,4 +218,66 @@ unsigned char *svg_make_clip(struct ctx *cx, const struct dom_node *cp, struct m
     }
   }
   return mask_and_clip(cx, mask);
+}
+
+/* Luminance (or alpha) mask of a <mask> element, ready to multiply into the active clip. */
+unsigned char *svg_make_mask(struct ctx *cx, const struct dom_node *mk, struct mat m, const struct dom_node *target,
+                             int depth)
+{
+  if (depth > 4 || cx->sub_depth >= 3)
+    return 0;
+  unsigned char *out = mask_new(cx);
+  if (!out)
+    return 0;
+  const char *mu = dom_get_attr(mk, "maskunits"), *cu = dom_get_attr(mk, "maskcontentunits");
+  bool obb = !(mu && starts_ci(mu, "userSpaceOnUse")), cobb = cu && starts_ci(cu, "objectBoundingBox");
+  struct bb b = {0, 0, 0, 0, false};
+  if (obb || cobb) {
+    svg_node_bbox(cx, target, svg_mat_id(), &b, 0);
+    if (!b.ok || b.x1 <= b.x0 || b.y1 <= b.y0)
+      return out; /* nothing to mask against: the element disappears */
+  }
+  float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+  float x = svg_grad_coord(dom_get_attr(mk, "x"), obb ? -0.1f : -0.1f * cx->vw, obb, cx->vw);
+  float y = svg_grad_coord(dom_get_attr(mk, "y"), obb ? -0.1f : -0.1f * cx->vh, obb, cx->vh);
+  float w = svg_grad_coord(dom_get_attr(mk, "width"), obb ? 1.2f : 1.2f * cx->vw, obb, cx->vw);
+  float h = svg_grad_coord(dom_get_attr(mk, "height"), obb ? 1.2f : 1.2f * cx->vh, obb, cx->vh);
+  if (obb) {
+    x = b.x0 + x * bw;
+    y = b.y0 + y * bh;
+    w *= bw;
+    h *= bh;
+  }
+  unsigned *layer = calloc((unsigned)cx->w * (unsigned)cx->h, sizeof *layer);
+  if (!layer || !(w > 0 && h > 0)) {
+    free(layer);
+    return out;
+  }
+  unsigned *saved_buf = cx->buf;
+  unsigned char *saved_clip = cx->clip;
+  cx->buf = layer;
+  cx->clip = 0;
+  cx->sub_depth++;
+  struct style bs;
+  svg_style_base(&bs, 0);
+  svg_resolve_style(cx, mk, &bs);
+  struct mat cm = cobb ? svg_mat_mul(m, (struct mat){bw, 0, 0, bh, b.x0, b.y0}) : m;
+  svg_render_children(cx, mk, cm, &bs, depth + 1, false);
+  cx->sub_depth--;
+  cx->buf = saved_buf;
+
+  char tb[32];
+  bool alpha_only = svg_get_prop(cx, mk, "mask-type", tb, sizeof tb) && starts_ci(tb, "alpha");
+  unsigned char *region = svg_rect_clip(cx, m, x, y, w, h); /* cx->clip is still NULL here */
+  cx->clip = saved_clip;
+  for (int i = 0; i < cx->w * cx->h; i++) {
+    unsigned p = layer[i];
+    unsigned v = alpha_only ? p >> 24 : ((((p >> 16) & 255) * 54 + ((p >> 8) & 255) * 183 + (p & 255) * 19) >> 8);
+    if (v > 255)
+      v = 255;
+    out[i] = region ? (unsigned char)(v * region[i] / 255) : (unsigned char)v;
+  }
+  free(layer);
+  free(region);
+  return mask_and_clip(cx, out);
 }

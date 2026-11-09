@@ -17,38 +17,24 @@ static void draw_shape(struct ctx *cx, const struct dom_node *n, struct mat m, c
   if (st->fill.kind != PAINT_NONE && svg_make_src(cx, &st->fill, st->fill_op, st->color, &bb, m, &s)) {
     svg_path_xform(dp, up, m);
     svg_raster_fill(cx, dp, st->evenodd, &s, 0);
+    svg_src_free(&s);
   }
   if (st->stroke.kind != PAINT_NONE && st->sw > 0 &&
       svg_make_src(cx, &st->stroke, st->stroke_op, st->color, &bb, m, &s)) {
     svg_stroke_build(cx, &cx->tp[2], up, st, scale);
     svg_path_xform(dp, &cx->tp[2], m);
     svg_raster_fill(cx, dp, false, &s, 0);
+    svg_src_free(&s);
   }
-}
-
-static void composite_layer(const struct ctx *cx, unsigned *dst, const unsigned *layer, float opacity)
-{
-  unsigned o = (unsigned)(opacity * 255 + 0.5f);
-  for (int i = 0; i < cx->w * cx->h; i++) {
-    unsigned l = layer[i];
-    if (!l)
-      continue;
-    unsigned a = ((l >> 24) * o + 127) / 255, r = (((l >> 16) & 255) * o + 127) / 255,
-             g = (((l >> 8) & 255) * o + 127) / 255, b = ((l & 255) * o + 127) / 255;
-    unsigned dv = dst[i], ia = 255 - a;
-    unsigned na = a + (((dv >> 24) * ia + 127) / 255);
-    unsigned nr = r + (((dv >> 16 & 255) * ia + 127) / 255), ng = g + (((dv >> 8 & 255) * ia + 127) / 255),
-             nb = b + (((dv & 255) * ia + 127) / 255);
-    if (na > 255)
-      na = 255;
-    dst[i] = (na << 24) | ((nr > na ? na : nr) << 16) | ((ng > na ? na : ng) << 8) | (nb > na ? na : nb);
-  }
+  if (up->nv && (st->marker[0] || st->marker[1] || st->marker[2]) && !streq(n->tag, "rect") &&
+      !streq(n->tag, "circle") && !streq(n->tag, "ellipse"))
+    svg_draw_markers(cx, up, m, st);
 }
 
 static void render_element(struct ctx *cx, const struct dom_node *n, struct mat ctm, const struct style *in, int depth);
 
-static void render_children(struct ctx *cx, const struct dom_node *n, struct mat m, const struct style *st, int depth,
-                            bool first_only)
+void svg_render_children(struct ctx *cx, const struct dom_node *n, struct mat m, const struct style *st, int depth,
+                         bool first_only)
 {
   for (const struct dom_node *c = n->first_child; c; c = c->next) {
     if (c->type != DOM_ELEMENT)
@@ -86,7 +72,7 @@ static void render_viewport(struct ctx *cx, const struct dom_node *n, struct mat
     if (own)
       cx->clip = own;
   }
-  render_children(cx, n, mm, st, depth, false);
+  svg_render_children(cx, n, mm, st, depth, false);
   cx->clip = saved;
   free(own);
   cx->vw = vw;
@@ -120,7 +106,8 @@ static void render_element(struct ctx *cx, const struct dom_node *n, struct mat 
   int k = svg_elem_kind(n->tag);
   if (k == K_NONE || svg_display_none(cx, n))
     return;
-  struct mat m = svg_mat_mul(ctm, svg_parse_transform(dom_get_attr(n, "transform")));
+  char tf[256];
+  struct mat m = svg_mat_mul(ctm, svg_parse_transform(svg_get_prop(cx, n, "transform", tf, sizeof tf) ? tf : 0));
   struct style st = *in;
   svg_resolve_style(cx, n, &st);
   float op = svg_elem_opacity(cx, n);
@@ -136,10 +123,30 @@ static void render_element(struct ctx *cx, const struct dom_node *n, struct mat 
     }
   }
 
+  char mv[128];
+  if (svg_get_prop(cx, n, "mask", mv, sizeof mv) && starts_ci(mv, "url(")) {
+    const struct dom_node *mk = svg_ref_target(cx, mv);
+    if (mk && streq(mk->tag, "mask")) {
+      unsigned char *mm = svg_make_mask(cx, mk, m, n, 0);
+      if (mm) {
+        free(own_clip);
+        own_clip = mm;
+        cx->clip = mm;
+      }
+    }
+  }
+
+  const struct dom_node *filter = 0;
+  if (svg_get_prop(cx, n, "filter", mv, sizeof mv) && starts_ci(mv, "url(")) {
+    filter = svg_ref_target(cx, mv);
+    if (filter && !streq(filter->tag, "filter"))
+      filter = 0;
+  }
+
   unsigned *layer = 0, *prev = cx->buf;
-  if (op < 0.999f) {
+  if (op < 0.999f || filter) {
     bool both = st.fill.kind != PAINT_NONE && st.stroke.kind != PAINT_NONE && st.sw > 0;
-    if ((k != K_SHAPE || both) && cx->nlayers < MAX_LAYERS) {
+    if ((k != K_SHAPE || both || filter) && cx->nlayers < MAX_LAYERS) {
       layer = calloc((unsigned)cx->w * (unsigned)cx->h, sizeof *layer);
       if (layer) {
         cx->layers[cx->nlayers++] = layer;
@@ -154,6 +161,10 @@ static void render_element(struct ctx *cx, const struct dom_node *n, struct mat 
 
   if (k == K_SHAPE) {
     draw_shape(cx, n, m, &st);
+  } else if (k == K_TEXT) {
+    svg_draw_text(cx, n, m, &st);
+  } else if (k == K_IMAGE) {
+    svg_draw_image(cx, n, m, &st);
   } else if (k == K_USE) {
     render_use(cx, n, m, &st, depth);
   } else if (k == K_SVG && depth > 0) {
@@ -161,13 +172,15 @@ static void render_element(struct ctx *cx, const struct dom_node *n, struct mat 
     render_viewport(cx, n, m, &st, x, y, svg_attr_len(n, "width", cx->vw, cx->vw),
                     svg_attr_len(n, "height", cx->vh, cx->vh), depth);
   } else {
-    render_children(cx, n, m, &st, depth, k == K_SWITCH);
+    svg_render_children(cx, n, m, &st, depth, k == K_SWITCH);
   }
 
   if (layer) {
     cx->buf = prev;
     cx->nlayers--;
-    composite_layer(cx, prev, layer, op);
+    if (filter)
+      svg_apply_filter(cx, filter, layer, m, n);
+    svg_composite_layer(cx, prev, layer, op);
     free(layer);
   }
   cx->clip = saved_clip;
@@ -294,12 +307,7 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out, unsigned 
       svg_viewbox_mat(vb, svg_parse_par(dom_get_attr(svg, "preserveaspectratio")), 0, 0, (float)w, (float)h);
 
   struct style base;
-  memset(&base, 0, sizeof base);
-  base.fill = (struct paint){PAINT_COLOR, 0, 255, 0};
-  base.fill_op = base.stroke_op = 1.0f;
-  base.sw = 1.0f;
-  base.miter = 4.0f;
-  base.color = (int)(current_color & 0xFFFFFF);
+  svg_style_base(&base, (int)(current_color & 0xFFFFFF));
   render_element(&cx, svg, ctm, &base, 0);
 
   for (int i = 0; i < w * h; i++) { /* premultiplied -> straight ARGB */

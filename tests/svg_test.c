@@ -1,8 +1,11 @@
 /* Host tests for the SVG rasterizer: shapes, strokes, opacity, gradients, <use>, clip paths, sizing. */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
+#include "css.h"
 #include "features/svg/svg.h"
+#include "font.h"
 #include "test.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define W 20
@@ -153,6 +156,111 @@ static void check_size(void)
   expect(svg_size(d, (int)strlen(d), &w, &h) && w == 96 && h == 16);
 }
 
+static void check_marker(void)
+{
+  render("<svg viewBox='0 0 20 20'><marker id='m' markerWidth='4' markerHeight='4' refX='2' refY='2' orient='auto' "
+         "markerUnits='userSpaceOnUse'><rect width='4' height='4' fill='#ff0000'/></marker>"
+         "<path d='M2 10H10' stroke='none' marker-end='url(#m)'/></svg>");
+  expect_eq(at(11, 10), 0xFFFF0000u);
+  expect_eq(at(3, 10), 0u);
+}
+
+static void check_pattern(void)
+{
+  render("<svg viewBox='0 0 20 20'><pattern id='p' width='4' height='4' patternUnits='userSpaceOnUse'>"
+         "<rect width='2' height='2' fill='#ff0000'/></pattern><rect width='20' height='20' fill='url(#p)'/></svg>");
+  expect_eq(at(1, 1), 0xFFFF0000u);
+  expect_eq(at(3, 3), 0u);
+  expect_eq(at(9, 1), 0xFFFF0000u);
+}
+
+static void check_mask(void)
+{
+  render("<svg viewBox='0 0 20 20'><mask id='m'><rect width='10' height='20' fill='#fff'/></mask>"
+         "<rect width='20' height='20' fill='#00f' mask='url(#m)'/></svg>");
+  expect_eq(at(5, 10), 0xFF0000FFu);
+  expect_eq(at(15, 10), 0u);
+  render("<svg viewBox='0 0 20 20'><mask id='m'><rect width='20' height='20' fill='#808080'/></mask>"
+         "<rect width='20' height='20' fill='#fff' mask='url(#m)'/></svg>");
+  unsigned a = at(10, 10) >> 24;
+  expect(a > 120 && a < 136);
+}
+
+static void check_filter(void)
+{
+  render("<svg viewBox='0 0 20 20'><filter id='f' x='0' y='0' width='1' height='1' filterUnits='objectBoundingBox'>"
+         "<feFlood flood-color='#00ff00'/></filter><rect width='20' height='20' fill='red' filter='url(#f)'/></svg>");
+  expect_eq(at(10, 10), 0xFF00FF00u);
+  render(
+      "<svg viewBox='0 0 20 20'><filter id='f' x='-1' y='-1' width='3' height='3'>"
+      "<feOffset dx='5' dy='0'/></filter><rect x='2' y='5' width='4' height='4' fill='#f00' filter='url(#f)'/></svg>");
+  expect_eq(at(3, 6), 0u);
+  expect_eq(at(8, 6), 0xFFFF0000u);
+  render("<svg viewBox='0 0 20 20'><filter id='f' x='-1' y='-1' width='3' height='3'><feGaussianBlur stdDeviation='2'/>"
+         "</filter><rect x='4' y='4' width='10' height='12' fill='#fff' filter='url(#f)'/></svg>");
+  unsigned edge = at(14, 10) >> 24, mid = at(9, 10) >> 24;
+  expect(mid > 230 && edge > 60 && edge < 200);
+  render("<svg viewBox='0 0 20 20'><filter id='f' color-interpolation-filters='sRGB'>"
+         "<feColorMatrix type='matrix' values='0 0 0 0 0  0 0 0 0 1  0 0 0 0 0  0 0 0 1 0'/></filter>"
+         "<rect width='20' height='20' fill='#ff0000' filter='url(#f)'/></svg>");
+  expect_eq(at(10, 10), 0xFF00FF00u);
+}
+
+static void check_image(void)
+{
+  render("<svg viewBox='0 0 20 20'><image width='20' height='20' href='data:image/png;base64,"
+         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=='/></svg>");
+  expect_eq(at(10, 10), 0xFFFF0000u);
+}
+
+static int first_ink_column(void)
+{
+  for (int x = 0; x < W; x++)
+    for (int y = 0; y < W; y++)
+      if (at(x, y) >> 24)
+        return x;
+  return -1;
+}
+
+static void check_text(void)
+{
+  FILE *fp = fopen("fonts/LiberationSans-Regular.ttf", "rb");
+  expect(fp != 0);
+  if (!fp)
+    return;
+  static unsigned char buf[1 << 20];
+  int n = (int)fread(buf, 1, sizeof buf, fp);
+  fclose(fp);
+  svg_set_fonts(font_load(buf, n), 0);
+  render("<svg viewBox='0 0 20 20'><text x='2' y='16' font-size='16' fill='#fff'>H</text></svg>");
+  int ink = 0;
+  for (int i = 0; i < W * W; i++)
+    ink += (px[i] >> 24) > 0;
+  expect(ink > 20);
+  int start = first_ink_column();
+  expect(start >= 2 && start <= 4);
+  render("<svg viewBox='0 0 20 20'><text x='10' y='16' font-size='16' text-anchor='middle' fill='#fff'>H</text></svg>");
+  expect(first_ink_column() > start + 1);
+}
+
+static void check_transform_units(void)
+{
+  render("<svg viewBox='0 0 20 20'><rect width='5' height='5' fill='#fff' style='transform: translate(10px, 10px)'/>"
+         "<rect width='5' height='5' fill='#f00' transform='translate(10px, 0)'/></svg>");
+  expect_eq(at(2, 2), 0u);
+  expect_eq(at(12, 2), 0xFFFF0000u);
+}
+
+static void check_css_capture(void)
+{
+  struct css_style cs;
+  css_style_reset(&cs);
+  css_apply_inline("stroke-width: 3; fill: url(#g); opacity: .5 !important; margin: 4px", &cs);
+  expect_string(cs.svg_decl, "stroke-width:3;fill:url(#g);opacity:.5;");
+  css_style_reset(&cs);
+  expect_string(cs.svg_decl, "");
+}
+
 int main(void)
 {
   test("fill and anti-aliasing", check_fill_and_aa);
@@ -166,5 +274,13 @@ int main(void)
   test("style sheet and currentColor", check_style_sheet_and_color);
   test("transform and preserveAspectRatio", check_transform_and_par);
   test("intrinsic size", check_size);
+  test("marker", check_marker);
+  test("pattern", check_pattern);
+  test("mask", check_mask);
+  test("filter", check_filter);
+  test("image", check_image);
+  test("text", check_text);
+  test("css transform units", check_transform_units);
+  test("page css svg declarations", check_css_capture);
   return 0;
 }

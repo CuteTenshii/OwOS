@@ -50,6 +50,52 @@ static void add_span(float *acc, float xa, float xb, float wgt)
   acc[ib] += (xb - (float)ib) * wgt;
 }
 
+/* Blend one pixel of coverage `a` (0..255) from source `s`. */
+static void shade(struct ctx *cx, int idx, int x, int y, int a, const struct src *s)
+{
+  if (s->tex || s->grad) {
+    unsigned c =
+        s->tex ? svg_tex_px(s, (float)x + 0.5f, (float)y + 0.5f) : svg_grad_px(s, (float)x + 0.5f, (float)y + 0.5f);
+    put_px(&cx->buf[idx], c & 0xFFFFFF, (unsigned)(a * (int)(c >> 24) / 255 * s->alpha / 255));
+  } else {
+    put_px(&cx->buf[idx], s->rgb, (unsigned)(a * s->alpha / 255));
+  }
+}
+
+/* Blend a coverage bitmap (bw x bh at bx, by) through the active clip. */
+void svg_blend_mask(struct ctx *cx, const unsigned char *cov, int bx, int by, int bw, int bh, const struct src *s)
+{
+  for (int y = by < 0 ? 0 : by; y < by + bh && y < cx->h; y++)
+    for (int x = bx < 0 ? 0 : bx; x < bx + bw && x < cx->w; x++) {
+      int a = cov[(y - by) * bw + (x - bx)];
+      if (!a)
+        continue;
+      int idx = y * cx->w + x;
+      if (cx->clip)
+        a = a * cx->clip[idx] / 255;
+      shade(cx, idx, x, y, a, s);
+    }
+}
+
+void svg_composite_layer(const struct ctx *cx, unsigned *dst, const unsigned *layer, float opacity)
+{
+  unsigned o = (unsigned)(opacity * 255 + 0.5f);
+  for (int i = 0; i < cx->w * cx->h; i++) {
+    unsigned l = layer[i];
+    if (!l)
+      continue;
+    unsigned a = ((l >> 24) * o + 127) / 255, r = (((l >> 16) & 255) * o + 127) / 255,
+             g = (((l >> 8) & 255) * o + 127) / 255, b = ((l & 255) * o + 127) / 255;
+    unsigned dv = dst[i], ia = 255 - a;
+    unsigned na = a + (((dv >> 24) * ia + 127) / 255);
+    unsigned nr = r + (((dv >> 16 & 255) * ia + 127) / 255), ng = g + (((dv >> 8 & 255) * ia + 127) / 255),
+             nb = b + (((dv & 255) * ia + 127) / 255);
+    if (na > 255)
+      na = 255;
+    dst[i] = (na << 24) | ((nr > na ? na : nr) << 16) | ((ng > na ? na : ng) << 8) | (nb > na ? na : nb);
+  }
+}
+
 /* Fill device-space subpaths (implicitly closed). Writes into the canvas, or max-merges into `mout`. */
 void svg_raster_fill(struct ctx *cx, const struct path *p, bool evenodd, const struct src *s, unsigned char *mout)
 {
@@ -151,12 +197,7 @@ void svg_raster_fill(struct ctx *cx, const struct path *p, bool evenodd, const s
       }
       if (clip)
         a = a * clip[idx] / 255;
-      if (!s->grad) {
-        put_px(&cx->buf[idx], s->rgb, (unsigned)(a * s->alpha / 255));
-      } else {
-        unsigned c = svg_grad_px(s, (float)x + 0.5f, (float)y + 0.5f);
-        put_px(&cx->buf[idx], c & 0xFFFFFF, (unsigned)(a * (int)(c >> 24) / 255 * s->alpha / 255));
-      }
+      shade(cx, idx, x, y, a, s);
     }
   }
 }

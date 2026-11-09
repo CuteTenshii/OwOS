@@ -86,6 +86,8 @@ bool svg_parse_len(const char *p, float ref, float *out)
     return false;
   if (*p == '%')
     v = v * ref / 100.0f;
+  else if (starts_ci(p, "rem"))
+    v *= 16.0f;
   else if (starts_ci(p, "em"))
     v *= 16.0f;
   else if (starts_ci(p, "ex"))
@@ -134,7 +136,20 @@ bool svg_parse_viewbox(const char *vb, float out[4])
   return out[2] > 0 && out[3] > 0;
 }
 
-void svg_path_reset(struct path *p) { p->n = p->ns = 0; }
+void svg_path_reset(struct path *p) { p->n = p->ns = p->nv = 0; }
+
+void svg_path_mark(struct path *p)
+{
+  if (p->nv >= p->vcap) {
+    int nc = p->vcap ? p->vcap * 2 : 16;
+    int *nv = realloc(p->vtx, (unsigned)nc * sizeof(int));
+    if (!nv)
+      return;
+    p->vtx = nv;
+    p->vcap = nc;
+  }
+  p->vtx[p->nv++] = p->n - 1;
+}
 
 void svg_path_free(struct path *p)
 {
@@ -142,6 +157,7 @@ void svg_path_free(struct path *p)
   free(p->y);
   free(p->sub);
   free(p->closed);
+  free(p->vtx);
   memset(p, 0, sizeof *p);
 }
 
@@ -484,6 +500,12 @@ void svg_parse_path(struct path *p, float scale, const char *d)
     }
     case 'Z':
       svg_path_close(p);
+      if (p->ns && p->nv < 1 << 20) {
+        int e = p->n;
+        p->n = p->sub[p->ns - 1] + 1; /* the closing vertex is the subpath start */
+        svg_path_mark(p);
+        p->n = e;
+      }
       cx = sx;
       cy = sy;
       prev = 0;
@@ -491,6 +513,8 @@ void svg_parse_path(struct path *p, float scale, const char *d)
     default:
       return;
     }
+    if (c != 'Z')
+      svg_path_mark(p);
     last = c;
   }
 }
@@ -516,8 +540,11 @@ struct mat svg_parse_transform(const char *s)
     p++;
     float arg[6] = {0};
     int na = 0;
-    while (na < 6 && svg_parse_num(&p, end, &arg[na]))
+    while (na < 6 && svg_parse_num(&p, end, &arg[na])) {
       na++;
+      while (p < end && ((*p >= 'a' && *p <= 'z') || *p == '%')) /* CSS units: 10px, 45deg */
+        p++;
+    }
     while (p < end && *p != ')')
       p++;
     if (p < end)

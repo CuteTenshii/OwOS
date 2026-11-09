@@ -292,6 +292,63 @@ static void parse_transition_segment(const char *s, const char *e, struct css_st
   out->trans_mask |= t.mask;
 }
 
+/* Properties an inline <svg> needs verbatim: the page CSS cascades onto its elements and is serialized with them. */
+static const char *const svg_props[] = {
+    "fill",
+    "stroke",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-opacity",
+    "fill-opacity",
+    "fill-rule",
+    "clip-rule",
+    "clip-path",
+    "mask",
+    "filter",
+    "opacity",
+    "color",
+    "display",
+    "visibility",
+    "transform",
+    "stop-color",
+    "stop-opacity",
+    "flood-color",
+    "flood-opacity",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+    "marker",
+    "text-anchor",
+    "dominant-baseline",
+    "paint-order",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "letter-spacing",
+};
+
+static void svg_decl_add(const char *p, const char *pe, const char *val, struct css_style *out)
+{
+  int ol = (int)strlen(out->svg_decl), pl = (int)(pe - p), vl = (int)strlen(val);
+  if (ol + pl + vl + 2 >= CSS_SVG_DECL)
+    return;
+  for (unsigned i = 0; i < sizeof svg_props / sizeof *svg_props; i++) {
+    if ((int)strlen(svg_props[i]) != pl || !eq_ci_n(p, svg_props[i], pl))
+      continue;
+    char *d = out->svg_decl + ol;
+    memcpy(d, p, (unsigned)pl);
+    d[pl] = ':';
+    memcpy(d + pl + 1, val, (unsigned)vl);
+    d[pl + 1 + vl] = ';';
+    d[pl + 2 + vl] = '\0';
+    return;
+  }
+}
+
 static void apply_decl(const char *p, const char *pe, const char *v, const char *ve, struct css_style *out,
                        bool *important)
 {
@@ -326,6 +383,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     }
   }
 
+  svg_decl_add(p, pe, val, out);
   if (span_is(p, pe, "color"))
     out->color = parse_color(val);
   else if (span_is(p, pe, "background-color"))

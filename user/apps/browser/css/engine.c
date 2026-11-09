@@ -259,7 +259,12 @@ static void fold(struct css_style *out, const struct css_style *d)
   if (d->fam[0]) {
     int i = 0;
     for (; d->fam[i] && i < CSS_FAM_STACK - 1; i++)
-      out->fam[i] = d->fam[i];
+      if (d->svg_decl[0]) {
+        int ol = (int)strlen(out->svg_decl), dl = (int)strlen(d->svg_decl);
+        if (ol + dl < CSS_SVG_DECL)
+          memcpy(out->svg_decl + ol, d->svg_decl, (unsigned)dl + 1);
+      }
+    out->fam[i] = d->fam[i];
     out->fam[i] = '\0';
   }
 }

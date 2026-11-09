@@ -245,7 +245,7 @@ const struct dom_node *svg_ref_target(const struct ctx *cx, const char *v)
     return 0;
   h++;
   int len = 0;
-  while (h[len] && h[len] != ')' && h[len] != '"' && h[len] != '\'' && !svg_is_ws(h[len]))
+  while (h[len] && h[len] != ')' && h[len] != '"' && h[len] != '\'' && h[len] != '&' && !svg_is_ws(h[len]))
     len++;
   return find_id(cx, h, len);
 }
@@ -274,7 +274,7 @@ static bool parse_paint(const struct ctx *cx, const char *v, struct paint *p)
   }
   if (starts_ci(v, "url(")) {
     const struct dom_node *g = svg_ref_target(cx, v);
-    if (g && (streq(g->tag, "lineargradient") || streq(g->tag, "radialgradient"))) {
+    if (g && (streq(g->tag, "lineargradient") || streq(g->tag, "radialgradient") || streq(g->tag, "pattern"))) {
       p->kind = PAINT_URL;
       p->ref = g;
       return true;
@@ -373,6 +373,42 @@ void svg_resolve_style(const struct ctx *cx, const struct dom_node *n, struct st
     s->evenodd = starts_ci(b, "evenodd");
   if (svg_get_prop(cx, n, "visibility", b, sizeof b))
     s->hidden = starts_ci(b, "hidden") || starts_ci(b, "collapse");
+  if (svg_get_prop(cx, n, "font-size", b, sizeof b) && svg_parse_len(b, s->font_size, &f)) {
+    const char *u = b;
+    while (*u && ((*u >= '0' && *u <= '9') || *u == '.' || *u == '-' || *u == '+'))
+      u++;
+    if (starts_ci(u, "em"))
+      f = f / 16.0f * s->font_size;
+    if (f > 0)
+      s->font_size = f;
+  }
+  if (svg_get_prop(cx, n, "font-weight", b, sizeof b)) {
+    const char *q = b;
+    s->bold = starts_ci(b, "bold") || (svg_parse_num(&q, b + strlen(b), &f) && f >= 600);
+  }
+  if (svg_get_prop(cx, n, "font-family", b, sizeof b))
+    s->mono = contains_ci(b, "mono") || contains_ci(b, "courier") || contains_ci(b, "consolas");
+  if (svg_get_prop(cx, n, "text-anchor", b, sizeof b))
+    s->anchor = starts_ci(b, "middle") ? 1 : starts_ci(b, "end") ? 2 : 0;
+  if (svg_get_prop(cx, n, "letter-spacing", b, sizeof b) && svg_parse_len(b, s->font_size, &f))
+    s->letter_spacing = f;
+  if (svg_get_prop(cx, n, "marker", b, sizeof b))
+    s->marker[0] = s->marker[1] = s->marker[2] = starts_ci(b, "url(") ? svg_ref_target(cx, b) : 0;
+  static const char *const mk[3] = {"marker-start", "marker-mid", "marker-end"};
+  for (int i = 0; i < 3; i++)
+    if (svg_get_prop(cx, n, mk[i], b, sizeof b))
+      s->marker[i] = starts_ci(b, "url(") ? svg_ref_target(cx, b) : 0;
+}
+
+void svg_style_base(struct style *s, int color)
+{
+  memset(s, 0, sizeof *s);
+  s->fill = (struct paint){PAINT_COLOR, 0, 255, 0};
+  s->fill_op = s->stroke_op = 1.0f;
+  s->sw = 1.0f;
+  s->miter = 4.0f;
+  s->font_size = 16.0f;
+  s->color = color;
 }
 
 float svg_elem_opacity(const struct ctx *cx, const struct dom_node *n)

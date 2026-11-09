@@ -118,6 +118,7 @@ struct css_bg_image {
   char url[CSS_BG_URL]; /* url() target, unresolved ("" = none) */
 };
 
+#define CSS_SVG_DECL 160
 struct css_style {
   int color;
   int bg;
@@ -179,6 +180,8 @@ struct css_style {
   short z_index;           /* stacking order; CSS_Z_AUTO = unset/auto */
   /* SVG paint: -1 unset, -2 none, -3 currentColor, else 0xRRGGBB. */
   int fill, stroke;
+  /* SVG presentation declarations ("name:value;" in cascade order) for the inline-SVG serializer. */
+  char svg_decl[CSS_SVG_DECL];
   /* Animation and transition parameters read by anim.c; -1 = unset (anim_iter -2 unset, -1 infinite). */
   char anim_name[CSS_ANIM_NAME]; /* animation-name (@keyframes), "" = none */
   int anim_dur;                  /* animation-duration ms, -1 unset */

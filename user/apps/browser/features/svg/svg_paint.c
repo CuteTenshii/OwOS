@@ -2,7 +2,7 @@
 #include "features/svg/svg_int.h"
 
 /* Attribute looked up along the xlink:href chain of a gradient. */
-static const char *chain_attr(const struct ctx *cx, const struct dom_node *g, const char *name, bool same_type)
+const char *svg_chain_attr(const struct ctx *cx, const struct dom_node *g, const char *name, bool same_type)
 {
   const char *tag = g->tag;
   for (int hop = 0; g && hop < 8; hop++) {
@@ -14,7 +14,7 @@ static const char *chain_attr(const struct ctx *cx, const struct dom_node *g, co
   return 0;
 }
 
-static float grad_coord(const char *v, float def, bool obb, float ref)
+float svg_grad_coord(const char *v, float def, bool obb, float ref)
 {
   if (!v)
     return def;
@@ -38,14 +38,16 @@ static int collect_stops(const struct ctx *cx, const struct dom_node *g, struct 
         continue;
       char b[64];
       const char *ov = dom_get_attr(c, "offset");
-      float off = ov ? grad_coord(ov, 0, true, 1) : 0;
+      float off = ov ? svg_grad_coord(ov, 0, true, 1) : 0;
       off = off < last ? last : off > 1 ? 1 : off;
       last = off;
       int rgb = 0, alpha = 255, a;
       if (svg_get_prop(cx, c, "stop-color", b, sizeof b)) {
-        if (starts_ci(b, "currentcolor"))
-          rgb = cx->root ? 0 : 0;
-        else {
+        char cb[64];
+        if (starts_ci(b, "currentcolor")) {
+          int ca, cc = svg_get_prop(cx, c, "color", cb, sizeof cb) ? color_parse_a(cb, &ca) : -1;
+          rgb = cc >= 0 ? cc : 0;
+        } else {
           int col = color_parse_a(b, &a);
           if (col >= 0) {
             rgb = col;
@@ -99,7 +101,7 @@ static bool grad_setup(const struct ctx *cx, const struct dom_node *g, const str
     return true;
   }
   bool radial = streq(g->tag, "radialgradient");
-  const char *u = chain_attr(cx, g, "gradientunits", false);
+  const char *u = svg_chain_attr(cx, g, "gradientunits", false);
   bool obb = !(u && starts_ci(u, "userSpaceOnUse"));
   struct mat total = m;
   if (obb) {
@@ -108,31 +110,31 @@ static bool grad_setup(const struct ctx *cx, const struct dom_node *g, const str
     struct mat bm = {bb->x1 - bb->x0, 0, 0, bb->y1 - bb->y0, bb->x0, bb->y0};
     total = svg_mat_mul(total, bm);
   }
-  total = svg_mat_mul(total, svg_parse_transform(chain_attr(cx, g, "gradienttransform", false)));
+  total = svg_mat_mul(total, svg_parse_transform(svg_chain_attr(cx, g, "gradienttransform", false)));
   if (!svg_mat_inv(total, &s->inv))
     return false;
   float vw = obb ? 1 : cx->vw, vh = obb ? 1 : cx->vh, vd = obb ? 1 : (float)sqrt((double)((vw * vw + vh * vh) * 0.5f));
 
-  const char *sp = chain_attr(cx, g, "spreadmethod", false);
+  const char *sp = svg_chain_attr(cx, g, "spreadmethod", false);
   s->spread = sp && starts_ci(sp, "reflect") ? 1 : sp && starts_ci(sp, "repeat") ? 2 : 0;
   s->grad = true;
   s->radial = radial;
   s->alpha = (int)(opacity * 255 + 0.5f);
   if (!radial) {
-    s->x1 = grad_coord(chain_attr(cx, g, "x1", true), 0, obb, vw);
-    s->y1 = grad_coord(chain_attr(cx, g, "y1", true), 0, obb, vh);
-    float x2 = grad_coord(chain_attr(cx, g, "x2", true), vw, obb, vw);
-    float y2 = grad_coord(chain_attr(cx, g, "y2", true), 0, obb, vh);
+    s->x1 = svg_grad_coord(svg_chain_attr(cx, g, "x1", true), 0, obb, vw);
+    s->y1 = svg_grad_coord(svg_chain_attr(cx, g, "y1", true), 0, obb, vh);
+    float x2 = svg_grad_coord(svg_chain_attr(cx, g, "x2", true), vw, obb, vw);
+    float y2 = svg_grad_coord(svg_chain_attr(cx, g, "y2", true), 0, obb, vh);
     s->vx = x2 - s->x1;
     s->vy = y2 - s->y1;
     float l2 = s->vx * s->vx + s->vy * s->vy;
     s->ilen2 = l2 > 0 ? 1.0f / l2 : 0;
   } else {
-    float cxv = grad_coord(chain_attr(cx, g, "cx", true), vw * 0.5f, obb, vw);
-    float cyv = grad_coord(chain_attr(cx, g, "cy", true), vh * 0.5f, obb, vh);
-    float r = grad_coord(chain_attr(cx, g, "r", true), vd * 0.5f, obb, vd);
-    s->fx = grad_coord(chain_attr(cx, g, "fx", true), cxv, obb, vw);
-    s->fy = grad_coord(chain_attr(cx, g, "fy", true), cyv, obb, vh);
+    float cxv = svg_grad_coord(svg_chain_attr(cx, g, "cx", true), vw * 0.5f, obb, vw);
+    float cyv = svg_grad_coord(svg_chain_attr(cx, g, "cy", true), vh * 0.5f, obb, vh);
+    float r = svg_grad_coord(svg_chain_attr(cx, g, "r", true), vd * 0.5f, obb, vd);
+    s->fx = svg_grad_coord(svg_chain_attr(cx, g, "fx", true), cxv, obb, vw);
+    s->fy = svg_grad_coord(svg_chain_attr(cx, g, "fy", true), cyv, obb, vh);
     s->cfx = cxv - s->fx;
     s->cfy = cyv - s->fy;
     float dist = (float)sqrt((double)(s->cfx * s->cfx + s->cfy * s->cfy));
@@ -178,14 +180,63 @@ unsigned svg_grad_px(const struct src *s, float px, float py)
   return s->lut[(int)(t * 255.0f + 0.5f)];
 }
 
-bool svg_make_src(const struct ctx *cx, const struct paint *p, float opacity, int color, const struct bb *bb,
-                  struct mat m, struct src *s)
+bool svg_make_src(struct ctx *cx, const struct paint *p, float opacity, int color, const struct bb *bb, struct mat m,
+                  struct src *s)
 {
-  s->grad = false;
+  s->grad = s->tex = false;
+  s->pix = 0;
   if (p->kind == PAINT_COLOR || p->kind == PAINT_CURRENT) {
     s->rgb = (unsigned)(p->kind == PAINT_COLOR ? p->rgb : color);
     s->alpha = (int)((p->kind == PAINT_COLOR ? p->alpha : 255) * opacity + 0.5f);
     return s->alpha > 0;
   }
-  return p->kind == PAINT_URL && grad_setup(cx, p->ref, bb, m, opacity, s);
+  if (p->kind != PAINT_URL)
+    return false;
+  if (streq(p->ref->tag, "pattern"))
+    return svg_pattern_src(cx, p->ref, bb, m, opacity, color, s);
+  return grad_setup(cx, p->ref, bb, m, opacity, s);
+}
+
+void svg_src_free(struct src *s)
+{
+  free(s->pix);
+  s->pix = 0;
+}
+
+/* Bilinear texel lookup at a device pixel centre; straight ARGB. */
+unsigned svg_tex_px(const struct src *s, float px, float py)
+{
+  float u, v;
+  svg_mat_apply(s->inv, px, py, &u, &v);
+  u -= 0.5f;
+  v -= 0.5f;
+  float fu = (float)floor((double)u), fv = (float)floor((double)v);
+  float tx = u - fu, ty = v - fv;
+  int x0 = (int)fu, y0 = (int)fv;
+  float acc[4] = {0, 0, 0, 0};
+  for (int k = 0; k < 4; k++) {
+    int x = x0 + (k & 1), y = y0 + (k >> 1);
+    float w = ((k & 1) ? tx : 1 - tx) * ((k >> 1) ? ty : 1 - ty);
+    if (s->repeat) {
+      x %= s->tw;
+      y %= s->th;
+      x += x < 0 ? s->tw : 0;
+      y += y < 0 ? s->th : 0;
+    } else {
+      x = x < 0 ? 0 : x >= s->tw ? s->tw - 1 : x;
+      y = y < 0 ? 0 : y >= s->th ? s->th - 1 : y;
+    }
+    unsigned t = s->pix[y * s->tw + x];
+    acc[0] += w * (float)(t >> 24);
+    acc[1] += w * (float)((t >> 16) & 255);
+    acc[2] += w * (float)((t >> 8) & 255);
+    acc[3] += w * (float)(t & 255);
+  }
+  if (acc[0] < 0.5f)
+    return 0;
+  float inv = 255.0f / acc[0];
+  unsigned a = (unsigned)(acc[0] + 0.5f);
+  unsigned r = (unsigned)(acc[1] * inv + 0.5f), g = (unsigned)(acc[2] * inv + 0.5f),
+           b = (unsigned)(acc[3] * inv + 0.5f);
+  return (a << 24) | ((r > 255 ? 255 : r) << 16) | ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
 }

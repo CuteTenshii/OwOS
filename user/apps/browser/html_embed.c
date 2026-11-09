@@ -26,35 +26,58 @@ static void svg_put(struct sbuf *b, const char *s)
   memcpy(b->p + b->n, s, (unsigned)len + 1);
   b->n += len;
 }
-/* Emit ` name="value"` for a baked SVG paint */
-static void svg_put_paint(struct sbuf *b, const char *name, int v)
+/* Attribute text, with the quote that would end it escaped. */
+static void svg_put_attr(struct sbuf *b, const char *v)
 {
-  if (v == -1)
-    return;
-  svg_put(b, " ");
-  svg_put(b, name);
-  svg_put(b, "=\"");
-  if (v == -2)
-    svg_put(b, "none");
-  else if (v == -3)
-    svg_put(b, "currentColor");
-  else {
-    char h[8] = "#";
-    const char *d = "0123456789abcdef";
-    h[1] = d[(v >> 20) & 0xf];
-    h[2] = d[(v >> 16) & 0xf];
-    h[3] = d[(v >> 12) & 0xf];
-    h[4] = d[(v >> 8) & 0xf];
-    h[5] = d[(v >> 4) & 0xf];
-    h[6] = d[v & 0xf];
-    h[7] = '\0';
-    svg_put(b, h);
+  for (; *v; v++) {
+    if (*v == '"')
+      svg_put(b, "&quot;");
+    else {
+      char c[2] = {*v, 0};
+      svg_put(b, c);
+    }
   }
-  svg_put(b, "\"");
 }
+
+/* Properties that do not inherit: an HTML ancestor's value must not reach the <svg>. */
+static bool svg_noninherited(const char *d, int len)
+{
+  static const char *const names[] = {"clip-path", "mask",       "filter",       "opacity",     "display",
+                                      "transform", "stop-color", "stop-opacity", "flood-color", "flood-opacity"};
+  for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
+    if ((int)strlen(names[i]) == len && eq_ci_n(d, names[i], len))
+      return true;
+  return false;
+}
+
+/* Append the declarations of `decl` ("a:b;c:d;") that inherit; `fonts` includes the font properties. */
+static void svg_put_inherited(struct sbuf *b, const char *decl, bool fonts)
+{
+  while (*decl) {
+    const char *colon = strchr(decl, ':'), *semi = strchr(decl, ';');
+    if (!colon || !semi)
+      return;
+    int nl = (int)(colon - decl);
+    bool font = (nl >= 4 && eq_ci_n(decl, "font", 4)) || (nl == 14 && eq_ci_n(decl, "letter-spacing", 14));
+    if (!svg_noninherited(decl, nl) && (fonts || !font)) {
+      char tmp[CSS_SVG_DECL];
+      int n = (int)(semi - decl) + 1;
+      memcpy(tmp, decl, (unsigned)n);
+      tmp[n] = '\0';
+      svg_put_attr(b, tmp);
+    }
+    decl = semi + 1;
+  }
+}
+
 /* Bound the recursion like the DOM walk (WALK_DEPTH_MAX) */
 #define SVG_MAX_DEPTH 256
-static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
+
+/* Serialize a DOM subtree back into SVG/XML text. The page CSS that reaches each element goes out as a style
+ * attribute, so the markup renders on its own exactly as it would loaded as an image. `top` is the <svg> being
+ * embedded: it also receives the properties inherited from its HTML ancestors, and loses the box properties
+ * (opacity, transform, ...) the page applies to it as a whole. */
+static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth, bool top)
 {
   if (depth >= SVG_MAX_DEPTH)
     return;
@@ -65,18 +88,37 @@ static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
   }
   svg_put(b, "<");
   svg_put(b, el->tag);
-  /* Bake the element's cascaded fill/stroke so CSS (e.g */
+  svg_put(b, " style=\"");
+  if (top) {
+    struct dom_node *anc[32];
+    int na = 0;
+    for (struct dom_node *a = el->parent; a && a->type == DOM_ELEMENT && na < 32; a = a->parent)
+      anc[na++] = a;
+    for (int i = na - 1; i >= 0; i--) {
+      struct css_style as;
+      compute_style(anc[i], &as);
+      svg_put_inherited(b, as.svg_decl, false);
+    }
+  }
   {
     struct css_style ecs;
     compute_style(el, &ecs);
-    svg_put_paint(b, "fill", ecs.fill);
-    svg_put_paint(b, "stroke", ecs.stroke);
+    if (top)
+      svg_put_inherited(b, ecs.svg_decl, true);
+    else
+      svg_put_attr(b, ecs.svg_decl);
   }
+  const char *own = dom_get_attr(el, "style");
+  if (own)
+    svg_put_attr(b, own);
+  svg_put(b, "\"");
   for (struct dom_attr *a = el->attrs; a; a = a->next) {
+    if (streq(a->name, "style"))
+      continue;
     svg_put(b, " ");
     svg_put(b, a->name);
     svg_put(b, "=\"");
-    svg_put(b, a->value ? a->value : "");
+    svg_put_attr(b, a->value ? a->value : "");
     svg_put(b, "\"");
   }
   if (!el->first_child) {
@@ -85,10 +127,71 @@ static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
   }
   svg_put(b, ">");
   for (struct dom_node *c = el->first_child; c; c = c->next)
-    svg_serialize(c, b, depth + 1);
+    svg_serialize(c, b, depth + 1, false);
   svg_put(b, "</");
   svg_put(b, el->tag);
   svg_put(b, ">");
+}
+
+static struct dom_node *svg_find_id(struct dom_node *n, const char *id, int len, int depth)
+{
+  if (depth > SVG_MAX_DEPTH)
+    return 0;
+  for (struct dom_node *c = n->first_child; c; c = c->next) {
+    if (c->type != DOM_ELEMENT)
+      continue;
+    const char *v = dom_get_attr(c, "id");
+    if (v && (int)strlen(v) == len && !memcmp(v, id, (unsigned)len))
+      return c;
+    struct dom_node *r = svg_find_id(c, id, len, depth + 1);
+    if (r)
+      return r;
+  }
+  return 0;
+}
+
+static bool svg_defines(const struct sbuf *b, const char *id, int len)
+{
+  for (int i = 0; i + len + 5 <= b->n; i++)
+    if (!memcmp(b->p + i, " id=\"", 5) && !memcmp(b->p + i + 5, id, (unsigned)len) && b->p[i + 5 + len] == '"')
+      return true;
+  return false;
+}
+
+/* Pull in the elements the markup points at (use, gradients, clip paths, markers, ...) that live elsewhere on the
+ * page, as a trailing <defs>, so the serialized document is self-contained. */
+static void svg_add_references(struct sbuf *b)
+{
+  struct dom_node *doc = html_dom_root();
+  static const char tail[] = "</svg>";
+  if (!doc || b->n < (int)sizeof tail - 1 || memcmp(b->p + b->n - (sizeof tail - 1), tail, sizeof tail - 1))
+    return;
+  b->n -= (int)sizeof tail - 1;
+  b->p[b->n] = '\0';
+  svg_put(b, "<defs>");
+  int scan = 0;
+  for (int round = 0; round < 64 && scan < b->n && !b->oom && b->n < (1 << 20); round++) {
+    int end = b->n;
+    for (int i = scan; i + 2 < end; i++) {
+      int s;
+      if (!memcmp(b->p + i, "url(#", 5))
+        s = i + 5;
+      else if (!memcmp(b->p + i, "href=\"#", 7))
+        s = i + 7;
+      else
+        continue;
+      int e = s;
+      while (e < end && b->p[e] != ')' && b->p[e] != '"' && b->p[e] != '\'' && b->p[e] != ' ' && b->p[e] != ';')
+        e++;
+      if (e == s || svg_defines(b, b->p + s, e - s))
+        continue;
+      struct dom_node *t = svg_find_id(doc, b->p + s, e - s, 0);
+      if (t)
+        svg_serialize(t, b, 0, false);
+    }
+    scan = end;
+  }
+  svg_put(b, "</defs></svg>");
 }
 
 struct img_carry g_carry;
@@ -99,7 +202,8 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
     return;
   struct sbuf sb = {0};
-  svg_serialize(el, &sb, 0);
+  svg_serialize(el, &sb, 0, true);
+  svg_add_references(&sb);
   if (sb.oom || sb.n < 5) {
     free(sb.p);
     return;

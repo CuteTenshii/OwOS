@@ -32,6 +32,8 @@ struct path {
   int *sub; /* start index of each subpath */
   unsigned char *closed;
   int ns, scap;
+  int *vtx; /* indices of the points that are path vertices (marker positions) */
+  int nv, vcap;
 };
 
 struct bb {
@@ -87,6 +89,10 @@ struct style {
   float dash_off;
   int color; /* 0xRRGGBB, what currentColor resolves to */
   bool evenodd, hidden;
+  float font_size, letter_spacing;
+  int anchor; /* text-anchor: 0 start, 1 middle, 2 end */
+  bool bold, mono;
+  const struct dom_node *marker[3]; /* marker-start, -mid, -end */
 };
 
 struct ctx {
@@ -108,6 +114,7 @@ struct ctx {
   int nids, idcap;
   float vw, vh; /* viewport in user units, for % lengths */
   int budget, use_depth;
+  int sub_depth; /* nesting of patterns, masks and images */
 };
 
 /* paint sources */
@@ -120,6 +127,9 @@ struct src {
   float x1, y1, vx, vy, ilen2; /* linear */
   float fx, fy, cfx, cfy, ga;  /* radial */
   unsigned lut[256];           /* straight ARGB */
+  bool tex, repeat;            /* texture: pattern tile or image; `inv` maps device pixels to texels */
+  unsigned *pix;               /* premultiplied ARGB texels, owned (see svg_src_free) */
+  int tw, th;
 };
 
 struct stop {
@@ -128,7 +138,7 @@ struct stop {
 };
 
 /* shapes */
-enum { K_NONE, K_GROUP, K_SWITCH, K_SVG, K_USE, K_SHAPE };
+enum { K_NONE, K_GROUP, K_SWITCH, K_SVG, K_USE, K_SHAPE, K_TEXT, K_IMAGE };
 
 /* svg_geom.c */
 struct mat svg_mat_id(void);
@@ -171,11 +181,17 @@ bool svg_display_none(const struct ctx *cx, const struct dom_node *n);
 
 /* svg_paint.c */
 unsigned svg_grad_px(const struct src *s, float px, float py);
-bool svg_make_src(const struct ctx *cx, const struct paint *p, float opacity, int color, const struct bb *bb,
-                  struct mat m, struct src *s);
+bool svg_make_src(struct ctx *cx, const struct paint *p, float opacity, int color, const struct bb *bb, struct mat m,
+                  struct src *s);
+void svg_src_free(struct src *s);
+const char *svg_chain_attr(const struct ctx *cx, const struct dom_node *g, const char *name, bool same_type);
+float svg_grad_coord(const char *v, float def, bool obb, float ref);
+unsigned svg_tex_px(const struct src *s, float px, float py);
 
 /* svg_raster.c */
 void svg_raster_fill(struct ctx *cx, const struct path *p, bool evenodd, const struct src *s, unsigned char *mout);
+void svg_blend_mask(struct ctx *cx, const unsigned char *cov, int bx, int by, int bw, int bh, const struct src *s);
+void svg_composite_layer(const struct ctx *cx, unsigned *dst, const unsigned *layer, float opacity);
 
 /* svg_stroke.c */
 void svg_stroke_build(struct ctx *cx, struct path *out, const struct path *src, const struct style *st, float scale);
@@ -184,9 +200,31 @@ void svg_stroke_build(struct ctx *cx, struct path *out, const struct path *src, 
 int svg_elem_kind(const char *t);
 bool svg_build_shape(const struct ctx *cx, const struct dom_node *n, struct path *p, float scale);
 unsigned char *svg_rect_clip(struct ctx *cx, struct mat m, float x, float y, float w, float h);
+unsigned char *svg_make_mask(struct ctx *cx, const struct dom_node *mk, struct mat m, const struct dom_node *target,
+                             int depth);
+void svg_node_bbox(const struct ctx *cx, const struct dom_node *n, struct mat m, struct bb *b, int depth);
 unsigned char *svg_make_clip(struct ctx *cx, const struct dom_node *cp, struct mat m, const struct dom_node *target,
                              int depth);
 
 /* svg.c */
+void svg_render_children(struct ctx *cx, const struct dom_node *n, struct mat m, const struct style *st, int depth,
+                         bool first_only);
+void svg_style_base(struct style *s, int color);
+
+/* svg_tex.c: pattern paint and <image> */
+bool svg_pattern_src(struct ctx *cx, const struct dom_node *pat, const struct bb *bb, struct mat m, float opacity,
+                     int color, struct src *s);
+void svg_draw_image(struct ctx *cx, const struct dom_node *n, struct mat m, const struct style *st);
+
+/* svg_text.c */
+void svg_draw_text(struct ctx *cx, const struct dom_node *n, struct mat m, const struct style *st);
+
+/* svg_marker.c */
+void svg_draw_markers(struct ctx *cx, const struct path *up, struct mat m, const struct style *st);
+
+/* svg_filter.c */
+bool svg_apply_filter(struct ctx *cx, const struct dom_node *f, unsigned *layer, struct mat m,
+                      const struct dom_node *target);
+void svg_path_mark(struct path *p);
 
 #endif /* OWOS_SVG_INT_H */
