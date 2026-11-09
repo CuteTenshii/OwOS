@@ -432,6 +432,8 @@ int pick_cursor(int mx, int my)
 
   if (tb_menu_open && mx >= tb_menu_x && mx < tb_menu_x + TBM_W && my >= tb_menu_y && my < tb_menu_y + tbm_h())
     return CUR_HAND;
+  if (tray_menu_inside(mx, my))
+    return CUR_HAND;
   int bar_y = screen_h - WM_BAR_H;
   if (my >= bar_y) {
     if (mx >= 0 && mx < START_W)

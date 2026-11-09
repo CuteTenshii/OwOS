@@ -4,6 +4,7 @@
 #include "media.h"
 #include "mediactl.h"
 #include "owos.h"
+#include "tray.h"
 #include <stdbool.h>
 
 /* audio-window geometry */
@@ -315,14 +316,30 @@ static void session_seek(unsigned ms)
   media_seek_ms(g_dec, dur && ms > dur ? dur : ms);
 }
 
+static const struct tray_menu_item player_menu[] = {
+    {"Play / Pause", "mediactl toggle"},
+    {"Next", "mediactl next"},
+    {"Previous", "mediactl prev"},
+    {"Stop", "mediactl stop"},
+};
+
 static void session_sync(void)
 {
   long long now = (long long)msec();
   if (g_state == ST_EMPTY || now < g_sync_at)
     return;
   g_sync_at = now + SESSION_SYNC_MS;
-  if (g_sid < 0 && (g_sid = mediactl_open("Player")) < 0)
-    return;
+  if (g_sid < 0) {
+    if ((g_sid = mediactl_open("Player")) < 0)
+      return;
+    struct tray_icon t = {.pid = getpid(),
+                          .id = "player",
+                          .icon = "multimedia-player",
+                          .action = "mediactl toggle",
+                          .menu = player_menu,
+                          .nmenu = sizeof player_menu / sizeof player_menu[0]};
+    tray_set(&t);
+  }
   struct media_info in = {0};
   strlcpy(in.app, "Player", sizeof in.app);
   strlcpy(in.title, basename_of(g_fn), sizeof in.title);
@@ -577,8 +594,10 @@ int main(int argc, char **argv)
     session_sync();
     while (win_poll(g_win, &ev)) {
       if (ev.type == WEV_CLOSE) {
-        if (g_sid >= 0)
+        if (g_sid >= 0) {
           mediactl_close(g_sid);
+          tray_remove("player");
+        }
         if (audio_live)
           audio_close();
         if (g_asrc)

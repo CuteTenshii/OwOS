@@ -419,6 +419,8 @@ void compose(int mx, int my)
     draw_start_menu();
   if (tb_menu_open)
     draw_tb_menu();
+  if (tray_menu_open)
+    tray_menu_draw();
   for (int i = 0; i < MAXCRASHWIN; i++)
     if (crashwins[i].used)
       draw_crashwin(&crashwins[i]);

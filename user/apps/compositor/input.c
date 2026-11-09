@@ -46,6 +46,14 @@ void handle_input(int mx, int my, int buttons, int dz)
     return;
   }
 
+  if (tray_menu_open) {
+    tray_menu_motion(mx, my);
+    if (dz && tray_menu_inside(mx, my)) {
+      tray_menu_scroll(mx, my, dz);
+      dz = 0;
+    }
+  }
+
   /* Wheel -> focused window under cursor (dropped if a modal blocks it) */
   if (dz) {
     int idx = window_at(mx, my);
@@ -57,6 +65,7 @@ void handle_input(int mx, int my, int buttons, int dz)
 
   /* Right-press */
   if (rdown && !prev_rdown) {
+    tray_menu_close();
     int bar_y = screen_h - WM_BAR_H;
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
     if (my >= bar_y && tray_click(mx, my, true)) {
@@ -104,6 +113,10 @@ void handle_input(int mx, int my, int buttons, int dz)
         prev_down = down;
         return; /* clicks over a crash panel stop here */
       }
+    }
+    if (tray_menu_open && tray_menu_press(mx, my)) {
+      prev_down = down;
+      return;
     }
     if (tb_menu_open) {
       int inside = mx >= tb_menu_x && mx < tb_menu_x + TBM_W && my >= tb_menu_y && my < tb_menu_y + tbm_h();

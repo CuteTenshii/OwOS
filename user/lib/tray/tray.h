@@ -13,13 +13,32 @@
 #define TRAY_ID_MAX 32
 #define TRAY_ICON_MAX 96
 #define TRAY_CMD_MAX 192
+#define TRAY_LABEL_MAX 32
+#define TRAY_MENU_MAX 4096
+
+/* Menu entry flags */
+#define TRAY_ENTRY_CHECKABLE 1 /* shows a check box; the compositor flips CHECKED when it is picked */
+#define TRAY_ENTRY_CHECKED 2
+#define TRAY_ENTRY_DISABLED 4 /* shown dimmed, cannot be picked */
+#define TRAY_ENTRY_HIDDEN 8   /* not shown, together with its submenu */
+#define TRAY_ENTRY_SEPARATOR 16
+
+/* The menu is a flat list in display order. An entry followed by deeper entries opens them as its
+ * submenu; its own command is ignored. */
+struct tray_menu_item {
+  const char *label;
+  const char *command; /* run when picked, or NULL */
+  unsigned flags;      /* TRAY_ENTRY_* */
+  int depth;           /* 0 = top level, 1 = submenu of the nearest shallower entry above, ... */
+};
 
 struct tray_icon {
-  int pid;            /* owner: the icon goes when it exits; 0 = stays until removed */
-  const char *id;     /* unique per app, replaces an existing icon with the same id */
-  const char *icon;   /* PNG path, or a name under /usr/share/icons */
-  const char *action; /* command run on left click, or NULL */
-  const char *menu;   /* command run on right click, or NULL */
+  int pid;                           /* owner: the icon goes when it exits; 0 = stays until removed */
+  const char *id;                    /* unique per app, replaces an existing icon with the same id */
+  const char *icon;                  /* PNG path, or a name under /usr/share/icons */
+  const char *action;                /* command run on left click, or NULL */
+  const struct tray_menu_item *menu; /* right-click popup, or NULL */
+  int nmenu;
 };
 
 int tray_set(const struct tray_icon *t);

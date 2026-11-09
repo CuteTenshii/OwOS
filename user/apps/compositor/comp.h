@@ -283,11 +283,24 @@ const unsigned *icon_lookup(const char *name);
 const unsigned *app_icon(int app);
 const unsigned *window_icon(const struct winrec *w);
 
-/* tray.c */
+/* tray.c, traymenu.c */
+struct tray_entry {
+  char label[32], cmd[192];
+  unsigned char flags, depth;
+};
 extern volatile unsigned tray_gen;
 void tray_start(void);
 void tray_prune(void);
 int tray_draw(int right, int y);
 bool tray_click(int mx, int my, bool right);
+extern bool tray_menu_open;
+bool tray_menu_inside(int mx, int my);
+void tray_menu_draw(void);
+bool tray_menu_press(int mx, int my);
+void tray_menu_open_at(int cx, const char *owner, struct tray_entry *ent, int n);
+void tray_menu_close(void);
+void tray_menu_motion(int mx, int my);
+void tray_menu_scroll(int mx, int my, int dz);
+void tray_menu_toggle(const char *owner, int idx);
 
 #endif /* OWOS_COMP_H */

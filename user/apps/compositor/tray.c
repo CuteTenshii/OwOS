@@ -10,8 +10,9 @@
 struct tray_item {
   char id[TRAY_ID_MAX];
   char icon[TRAY_ICON_MAX];
-  char action[TRAY_CMD_MAX], menu[TRAY_CMD_MAX];
-  int pid;
+  char action[TRAY_CMD_MAX];
+  struct tray_entry *menu;
+  int nmenu, pid;
 };
 
 static struct tray_item items[TRAY_MAX];
@@ -59,8 +60,34 @@ static int find_item(const char *id)
 
 static void item_remove(int i)
 {
+  free(items[i].menu);
   memmove(&items[i], &items[i + 1], (nitems - i - 1) * sizeof items[0]);
   nitems--;
+}
+
+static int read_menu(int ch, struct tray_item *t)
+{
+  unsigned char cnt[2];
+  if (!read_full(ch, cnt, 2))
+    return 0;
+  int n = cnt[0] | cnt[1] << 8;
+  if (n > TRAY_MENU_MAX)
+    return 0;
+  if (n && !(t->menu = malloc(n * sizeof *t->menu)))
+    return 0;
+  for (int i = 0; i < n; i++) {
+    struct tray_entry *e = &t->menu[i];
+    unsigned char fd[2];
+    if (!read_full(ch, fd, 2) || !rd_str(ch, e->label, sizeof e->label) || !rd_str(ch, e->cmd, sizeof e->cmd)) {
+      free(t->menu);
+      t->menu = 0;
+      return 0;
+    }
+    e->flags = fd[0];
+    e->depth = fd[1] > (i ? e[-1].depth + 1 : 0) ? (i ? e[-1].depth + 1 : 0) : fd[1];
+    t->nmenu = i + 1;
+  }
+  return 1;
 }
 
 static void serve(int ch)
@@ -71,7 +98,9 @@ static void serve(int ch)
   struct tray_item t = {0};
   if (op == TRAY_OP_SET) {
     if (!read_full(ch, &t.pid, 4) || !rd_str(ch, t.id, sizeof t.id) || !rd_str(ch, t.icon, sizeof t.icon) ||
-        !rd_str(ch, t.action, sizeof t.action) || !rd_str(ch, t.menu, sizeof t.menu) || !t.id[0])
+        !rd_str(ch, t.action, sizeof t.action) || !t.id[0])
+      return;
+    if (!read_menu(ch, &t))
       return;
   } else if (op == TRAY_OP_REMOVE) {
     if (!rd_str(ch, t.id, sizeof t.id))
@@ -85,10 +114,12 @@ static void serve(int ch)
     if (i >= 0)
       item_remove(i);
   } else if (i >= 0) {
+    free(items[i].menu);
     items[i] = t;
   } else if (nitems < TRAY_MAX) {
     items[nitems++] = t;
-  }
+  } else
+    free(t.menu);
   tray_gen++;
   mutex_unlock(&lock);
   char ack = TRAY_ACK;
@@ -144,29 +175,54 @@ int tray_draw(int right, int y)
   return left;
 }
 
+static void run(char *cmd)
+{
+  char path[TRAY_CMD_MAX + 8];
+  char *arg = 0;
+  for (char *c = cmd; *c; c++)
+    if (*c == ' ') {
+      *c = '\0';
+      arg = c + 1;
+      break;
+    }
+  strcpy(path, cmd[0] == '/' ? "" : "/bin/");
+  strcat(path, cmd);
+  kid_track(spawn(path, arg));
+}
+
+void tray_menu_toggle(const char *owner, int idx)
+{
+  mutex_lock(&lock);
+  int i = find_item(owner);
+  if (i >= 0 && idx < items[i].nmenu && (items[i].menu[idx].flags & TRAY_ENTRY_CHECKABLE)) {
+    items[i].menu[idx].flags ^= TRAY_ENTRY_CHECKED;
+    tray_gen++;
+  }
+  mutex_unlock(&lock);
+}
+
 bool tray_click(int mx, int my, bool right)
 {
   if (my < screen_h - WM_BAR_H)
     return false;
-  char cmd[TRAY_CMD_MAX];
+  char cmd[TRAY_CMD_MAX] = "", id[TRAY_ID_MAX];
+  struct tray_entry *menu = 0;
+  int nmenu = 0, cx = 0;
   mutex_lock(&lock);
   int i = (mx - (tray_x1 - nitems * TRAY_SLOT)) / TRAY_SLOT;
   bool hit = mx < tray_x1 && mx >= tray_x1 - nitems * TRAY_SLOT && i < nitems;
-  if (hit)
-    strcpy(cmd, right ? items[i].menu : items[i].action);
-  mutex_unlock(&lock);
-  if (hit && cmd[0]) {
-    char path[TRAY_CMD_MAX + 8];
-    char *arg = 0;
-    for (char *c = cmd; *c; c++)
-      if (*c == ' ') {
-        *c = '\0';
-        arg = c + 1;
-        break;
-      }
-    strcpy(path, cmd[0] == '/' ? "" : "/bin/");
-    strcat(path, cmd);
-    kid_track(spawn(path, arg));
+  if (hit && !right)
+    strcpy(cmd, items[i].action);
+  if (hit && right && items[i].nmenu && (menu = malloc(items[i].nmenu * sizeof *menu))) {
+    nmenu = items[i].nmenu;
+    memcpy(menu, items[i].menu, nmenu * sizeof *menu);
+    strcpy(id, items[i].id);
+    cx = tray_x1 - (nitems - i) * TRAY_SLOT + TRAY_SLOT / 2;
   }
+  mutex_unlock(&lock);
+  if (menu)
+    tray_menu_open_at(cx, id, menu, nmenu);
+  if (cmd[0])
+    run(cmd);
   return hit;
 }

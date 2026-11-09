@@ -144,6 +144,7 @@ void pw_show(void)
   pw_sel = can_sleep ? PA_SLEEP : PA_RESTART;
   start_open = false;
   tb_menu_open = false;
+  tray_menu_close();
   at_active = false;
 }
 

@@ -106,7 +106,7 @@ int main(void)
   kid_track(spawn("/bin/trayd", 0));
 
   int prev_mx = -9999, prev_my = -9999, prev_cur = -1;
-  bool prev_start = false, prev_tb_menu = false, prev_at_active = false, prev_pw_open = false;
+  bool prev_start = false, prev_tb_menu = false, prev_tray_menu = false, prev_at_active = false, prev_pw_open = false;
   int prev_pw_sel = -1;
   int prev_at_sel = -1;
   int prev_focus = -1, last_sec = -1;
@@ -214,9 +214,10 @@ int main(void)
         full = true;
       prev_at_active = at_active;
       prev_at_sel = at_sel;
-      if (tb_menu_open != prev_tb_menu)
+      if (tb_menu_open != prev_tb_menu || tray_menu_open != prev_tray_menu)
         full = true;
       prev_tb_menu = tb_menu_open;
+      prev_tray_menu = tray_menu_open;
 
       /* moved/resized windows: old ∪ new as one region */
       for (int i = 0; i < nwin; i++) {

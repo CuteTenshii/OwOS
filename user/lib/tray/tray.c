@@ -41,9 +41,18 @@ int tray_set(const struct tray_icon *t)
   if (ch < 0)
     return -1;
   char op = TRAY_OP_SET;
-  return finish(ch, write_full(ch, &op, 1) && write_full(ch, &t->pid, 4) && wr_str(ch, t->id, TRAY_ID_MAX) &&
-                        wr_str(ch, t->icon, TRAY_ICON_MAX) && wr_str(ch, t->action, TRAY_CMD_MAX) &&
-                        wr_str(ch, t->menu, TRAY_CMD_MAX));
+  int nm = !t->menu || t->nmenu < 0 ? 0 : t->nmenu > TRAY_MENU_MAX ? TRAY_MENU_MAX : t->nmenu;
+  unsigned char c[2] = {(unsigned char)nm, (unsigned char)(nm >> 8)};
+  int ok = write_full(ch, &op, 1) && write_full(ch, &t->pid, 4) && wr_str(ch, t->id, TRAY_ID_MAX) &&
+           wr_str(ch, t->icon, TRAY_ICON_MAX) && wr_str(ch, t->action, TRAY_CMD_MAX) && write_full(ch, c, 2);
+  for (int i = 0; ok && i < nm; i++) {
+    const struct tray_menu_item *m = &t->menu[i];
+    unsigned char fd[2] = {(unsigned char)m->flags, (unsigned char)(m->depth < 0     ? 0
+                                                                    : m->depth > 255 ? 255
+                                                                                     : m->depth)};
+    ok = write_full(ch, fd, 2) && wr_str(ch, m->label, TRAY_LABEL_MAX) && wr_str(ch, m->command, TRAY_CMD_MAX);
+  }
+  return finish(ch, ok);
 }
 
 int tray_remove(const char *id)
