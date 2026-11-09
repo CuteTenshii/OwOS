@@ -93,7 +93,7 @@ CRYPTO  := user/lib/crypto/crypto.o user/lib/crypto/ed25519.o   # SHA-1/256/512/
 # socket. Ported from kernel/tls.c; certificates verified with $(PKI) (warn and
 # allow, see tls_verify). Needs $(CRYPTO).
 PKI     := user/lib/pki/bn.o user/lib/pki/rsa.o user/lib/pki/ecdsa.o user/lib/pki/x509.o   # X.509 + RSA/ECDSA verify
-TLS     := user/lib/tls/tls.o user/lib/tls/ech.o $(PKI)
+TLS     := user/lib/tls/tls.o user/lib/tls/certs.o user/lib/tls/ech.o $(PKI)
 # netconn: a TCP-or-TLS byte-stream transport wrapper (SK_TCP socket or $(TLS)
 # conn behind one handle). Used by libcurl HTTP/1.1 + the WebSocket client; needs
 # $(TLS) (+ $(CRYPTO), which TLS needs).

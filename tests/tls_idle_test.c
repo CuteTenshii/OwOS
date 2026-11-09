@@ -6,24 +6,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define net_connect tlst_net_connect
+#define net_dial tlst_net_dial
 #define net_recv tlst_net_recv
 #define net_recv_nb tlst_net_recv_nb
 #define net_send tlst_net_send
 #define net_close tlst_net_close
 #define gettime tlst_gettime
 #define rng_bytes tlst_rng_bytes
-#define resolve tlst_resolve
 #define resolve_ech tlst_resolve_ech
 #define ech_pick_config tlst_ech_pick_config
 #define ech_encode_inner tlst_ech_encode_inner
 #define ech_outer_ext tlst_ech_outer_ext
-#define x509_parse tlst_x509_parse
-#define x509_store_free tlst_x509_store_free
-#define x509_store_load_pem tlst_x509_store_load_pem
 #define x509_strerror tlst_x509_strerror
-#define x509_verify_chain tlst_x509_verify_chain
-#define x509_verify_tls_sig tlst_x509_verify_tls_sig
+#define certs_init tlst_certs_init
+#define certs_take tlst_certs_take
+#define certs_check_sig tlst_certs_check_sig
+#define certs_check_cv tlst_certs_check_cv
+#define certs_fail tlst_certs_fail
 
 struct timeval64 {
   long long tv_sec;
@@ -31,21 +30,20 @@ struct timeval64 {
 };
 int gettime(struct timeval64 *tv);
 void rng_bytes(void *p, int n);
-int net_connect(const char *ip, int port, int proto);
+int net_dial(const char *host, int port, int proto);
 
+#include "certs.h"
 #include "crypto.h"
 #include "ech.h"
 #include "resolve.h"
 #include "test.h"
-#include "x509.h"
 
 int gettime(struct timeval64 *tv) { return tv->tv_sec = 0, -1; }
 void rng_bytes(void *p, int n) { memset(p, 0, (size_t)n); }
-int net_connect(const char *ip, int port, int proto) { return (void)ip, (void)port, (void)proto, -1; }
+int net_dial(const char *host, int port, int proto) { return (void)host, (void)port, (void)proto, -2; }
 int net_recv(int h, void *buf, int max) { return (void)h, (void)buf, (void)max, 0; }
 int net_send(int h, const void *buf, int len) { return (void)h, (void)buf, len; }
 int net_close(int h) { return (void)h, 0; }
-int resolve(const char *host, unsigned char ip[4]) { return (void)host, (void)ip, -1; }
 int resolve_ech(const char *host, int port, unsigned char *out, int max)
 {
   return (void)host, (void)port, (void)out, (void)max, 0;
@@ -63,23 +61,22 @@ uint32_t ech_outer_ext(uint8_t *out, const struct ech_cfg *cfg, const uint8_t en
 {
   return (void)out, (void)cfg, (void)enc, (void)payload_len, 0;
 }
-int x509_parse(struct x509 *c, const uint8_t *der, uint32_t len) { return (void)c, (void)der, (void)len, -1; }
-void x509_store_free(struct x509_store *s) { (void)s; }
-uint32_t x509_store_load_pem(struct x509_store *s, const uint8_t *pem, uint32_t len)
-{
-  return (void)s, (void)pem, (void)len, 0;
-}
 const char *x509_strerror(int err) { return (void)err, ""; }
-int x509_verify_chain(const struct x509_store *store, const struct x509 *certs, uint32_t n, const char *host,
-                      int64_t now)
+void certs_init(struct certs *c) { c->verify = X509_E_UNTRUSTED; }
+void certs_take(struct certs *c, const char *host, const uint8_t *body, uint32_t bl, int tls13)
 {
-  return (void)store, (void)certs, (void)n, (void)host, (void)now, -1;
+  (void)c, (void)host, (void)body, (void)bl, (void)tls13;
 }
-int x509_verify_tls_sig(const struct x509 *leaf, uint16_t scheme, const uint8_t *msg, uint32_t msglen,
-                        const uint8_t *sig, uint32_t siglen)
+void certs_check_sig(struct certs *c, uint16_t scheme, const uint8_t *msg, uint32_t msglen, const uint8_t *sig,
+                     uint32_t siglen)
 {
-  return (void)leaf, (void)scheme, (void)msg, (void)msglen, (void)sig, (void)siglen, -1;
+  (void)c, (void)scheme, (void)msg, (void)msglen, (void)sig, (void)siglen;
 }
+void certs_check_cv(struct certs *c, const uint8_t th[32], const uint8_t *body, uint32_t bl)
+{
+  (void)c, (void)th, (void)body, (void)bl;
+}
+void certs_fail(struct certs *c, int err) { (void)c, (void)err; }
 
 #include "../user/lib/tls/tls.c"
 

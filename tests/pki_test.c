@@ -9,6 +9,18 @@
 #include "../user/lib/pki/ecdsa.c"
 #include "../user/lib/pki/rsa.c"
 #include "../user/lib/pki/x509.c"
+
+struct timeval64 {
+  long long tv_sec;
+  long tv_usec;
+};
+#define gettime certs_test_gettime
+#define readfile certs_test_readfile
+int gettime(struct timeval64 *tv);
+int readfile(const char *path, char *buf, int max);
+#include "../user/lib/tls/certs.c"
+int gettime(struct timeval64 *tv) { return (void)tv, -1; } /* clock unset: the date checks are skipped */
+int readfile(const char *path, char *buf, int max) { return (void)path, (void)buf, (void)max, -1; }
 #include "ecdsa_vectors.h"
 #include "rsa_vectors.h"
 #include "x509_vectors.h"
@@ -390,8 +402,103 @@ static void enforces_name_constraints(void)
   free(s3.certs);
 }
 
+/* A Certificate handshake message holding `n` DER certificates, in the TLS 1.3 or 1.2 layout. */
+static uint32_t cert_message(uint8_t *out, int tls13, struct cert **list, int n)
+{
+  uint32_t o = 0;
+  if (tls13)
+    out[o++] = 0; /* empty certificate_request_context */
+  uint32_t lenpos = o;
+  o += 3;
+  for (int i = 0; i < n; i++) {
+    uint32_t dl = list[i]->x.derlen;
+    out[o++] = (uint8_t)(dl >> 16), out[o++] = (uint8_t)(dl >> 8), out[o++] = (uint8_t)dl;
+    memcpy(out + o, list[i]->der, dl);
+    o += dl;
+    if (tls13)
+      out[o++] = 0, out[o++] = 0; /* no entry extensions */
+  }
+  uint32_t body = o - lenpos - 3;
+  out[lenpos] = (uint8_t)(body >> 16), out[lenpos + 1] = (uint8_t)(body >> 8), out[lenpos + 2] = (uint8_t)body;
+  return o;
+}
+
+static void checks_server_certificates(void)
+{
+  load_all();
+  struct cert *ra[] = {&C_ROOTA}, *rb[] = {&C_ROOTB}, *list[] = {&C_LEAFA1, &C_INTA};
+  struct x509_store A, B;
+  store_of(&A, ra, 1);
+  store_of(&B, rb, 1);
+  static uint8_t msg13[8192], msg12[8192];
+  uint32_t l13 = cert_message(msg13, 1, list, 2), l12 = cert_message(msg12, 0, list, 2);
+
+  static struct certs c;
+  certs_set_roots(&A);
+  certs_init(&c);
+  expect_eq(c.verify, X509_E_UNTRUSTED);
+  certs_take(&c, "example.test", msg13, l13, 1);
+  expect_eq(c.verify, X509_OK);
+  expect(certs_message(&c) == 0);
+  expect_eq(c.nchain, 2);
+  certs_take(&c, "example.test", msg12, l12, 0);
+  expect_eq(c.verify, X509_OK);
+
+  certs_take(&c, "other.test", msg13, l13, 1);
+  expect_eq(c.verify, X509_E_HOSTNAME);
+  expect(certs_message(&c) != 0);
+  certs_take(&c, "example.test", msg13, l13 - 7, 1); /* cut short */
+  expect_eq(c.verify, X509_E_PARSE);
+  certs_take(&c, "example.test", msg13, 0, 1);
+  expect_eq(c.verify, X509_E_PARSE);
+
+  certs_set_roots(&B);
+  certs_take(&c, "example.test", msg13, l13, 1);
+  expect_eq(c.verify, X509_E_UNTRUSTED);
+
+  certs_set_roots(0); /* no bundle on disk (the stub cannot read one) */
+  certs_take(&c, "example.test", msg13, l13, 1);
+  expect_eq(c.verify, X509_E_NO_STORE);
+  free(A.certs);
+  free(B.certs);
+}
+
+static void checks_handshake_signatures(void)
+{
+  load_all();
+  static const uint8_t msg[] = "tls signed content";
+  uint8_t sig[512];
+  uint32_t n = unhex(SIG_RSA_PSS256, sig);
+  struct certs c;
+  memset(&c, 0, sizeof c);
+  c.nchain = 1;
+  c.chain[0] = C_LEAFA1.x;
+  c.verify = X509_OK;
+  certs_check_sig(&c, 0x0804, msg, sizeof msg - 1, sig, n);
+  expect_eq(c.verify, X509_OK);
+  certs_check_sig(&c, 0x0804, msg, sizeof msg - 2, sig, n); /* a different message */
+  expect_eq(c.verify, X509_E_SIG);
+
+  c.verify = X509_E_HOSTNAME; /* the first failure stays */
+  certs_fail(&c, X509_E_SIG);
+  expect_eq(c.verify, X509_E_HOSTNAME);
+  c.nchain = 0; /* no certificate seen: nothing to check against */
+  c.verify = X509_OK;
+  certs_check_sig(&c, 0x0804, msg, sizeof msg - 1, sig, n);
+  expect_eq(c.verify, X509_E_SIG);
+
+  /* CertificateVerify framing: a body whose length field disagrees fails without reaching the signature. */
+  uint8_t th[32] = {0}, body[8] = {0x08, 0x04, 0x00, 0x09, 1, 2, 3, 4};
+  c.nchain = 1;
+  c.verify = X509_OK;
+  certs_check_cv(&c, th, body, sizeof body);
+  expect_eq(c.verify, X509_E_SIG);
+}
+
 int main(void)
 {
+  test("checks server certificates", checks_server_certificates);
+  test("checks handshake signatures", checks_handshake_signatures);
   test("verifies OpenSSL RSA signatures", verifies_openssl_signatures);
   test("rejects tampered signatures and digests", rejects_tampering);
   test("SHA-384", sha384_known_answer);

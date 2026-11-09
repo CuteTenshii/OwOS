@@ -49,6 +49,7 @@ EXTRA_tz          := -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
 EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
 EXTRA_tls_idle    := -Iuser/lib/tls -Iuser/lib/pki
+EXTRA_pki         := -Iuser/lib/tls -Iuser/lib/pki
 EXTRA_resolve     := -Iuser/lib/mdns
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
