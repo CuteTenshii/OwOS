@@ -7613,11 +7613,11 @@ static js_value date_setTime(js_ctx *ctx, js_value t, js_value *a, int n)
   return js_number(v);
 }
 /* setFullYear, setMonth, ... : the native's data is first_field * 8 + max_args over [Y, Mo, D, h, mi, s, ms] */
-static js_value date_set(js_ctx *ctx, js_value t, js_value *a, int n)
+/* Replace the fields from `first` on (order Y, Mo, D, h, mi, s, ms) with the `count` values in `vals` */
+static js_value date_set_fields(js_ctx *ctx, js_value t, int first, int count, const double *vals)
 {
-  int spec = (int)ctx->native_data.u.num, first = spec / 8, max = spec % 8, i;
   double f[7], tv = date_t(ctx, t), v;
-  int c[8];
+  int c[8], i;
   if (tv != tv) {
     if (first != 0)
       return js_number(DATE_NAN);
@@ -7626,14 +7626,33 @@ static js_value date_set(js_ctx *ctx, js_value t, js_value *a, int n)
   date_civil(tv, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
   for (i = 0; i < 7; i++)
     f[i] = c[i];
-  for (i = 0; i < max && i < n; i++)
-    f[first + i] = js_to_number(ctx, a[i]);
-  if (n == 0)
-    f[first] = DATE_NAN;
+  for (i = 0; i < count; i++)
+    f[first + i] = vals[i];
   v = date_make(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
   if (t.type == JV_OBJ)
     js_def(t.u.obj, "@t", js_number(v), 0);
   return js_number(v);
+}
+/* setFullYear, setMonth, ... : the native's data is first_field * 8 + max_args */
+static js_value date_set(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  int spec = (int)ctx->native_data.u.num, first = spec / 8, max = spec % 8, i, count = n < max ? n : max;
+  double vals[4] = {DATE_NAN};
+  for (i = 0; i < count; i++)
+    vals[i] = js_to_number(ctx, a[i]);
+  return date_set_fields(ctx, t, first, count ? count : 1, vals);
+}
+static js_value date_getYear(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value y = date_getFullYear(ctx, t, a, n);
+  return js_number(y.u.num - 1900);
+}
+static js_value date_setYear(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  double y = js_to_number(ctx, n ? a[0] : js_undef());
+  if (y == y && date_trunc(y) >= 0 && date_trunc(y) <= 99)
+    y = 1900 + date_trunc(y);
+  return date_set_fields(ctx, t, 0, 1, &y);
 }
 static void def_date_setter(js_ctx *ctx, const char *name, int first, int max)
 {
@@ -10539,6 +10558,8 @@ void js_setup_builtins(js_ctx *ctx)
   js_def_native(ctx, ctx->date_proto, "toUTCString", date_toutcstring, 0);
   js_def_native(ctx, ctx->date_proto, "toGMTString", date_toutcstring, 0);
   js_def_native(ctx, ctx->date_proto, "setTime", date_setTime, 1);
+  js_def_native(ctx, ctx->date_proto, "getYear", date_getYear, 0);
+  js_def_native(ctx, ctx->date_proto, "setYear", date_setYear, 1);
   {
     static const struct {
       const char *name, *utc_name;
