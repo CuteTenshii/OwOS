@@ -67,6 +67,7 @@ static bool parse_mac(const char *s, unsigned char mac[6])
 }
 
 /* --- DHCP ----------------------------------------------------------------- */
+#define DNS_MAX 3    /* DNS servers kept from option 6 */
 #define DHCP_LEN 300 /* BOOTP fixed area + options we emit */
 
 static unsigned char our_mac[6];
@@ -145,7 +146,7 @@ static int build_frame(const unsigned char *dhcp, int dlen, unsigned char *frame
 
 /* Parse a frame; on a matching OFFER/ACK fill the lease. Returns DHCP type (2/5) or 0. */
 static unsigned char parse_reply(const unsigned char *f, int len, unsigned char yiaddr[4], unsigned char mask[4],
-                                 unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
+                                 unsigned char gw[4], unsigned char dns[DNS_MAX * 4], unsigned char srv[4])
 {
   if (len < 14 + 20 + 8 + 240)
     return 0;
@@ -187,7 +188,7 @@ static unsigned char parse_reply(const unsigned char *f, int len, unsigned char 
     else if (opt == 3 && olen >= 4)
       memcpy(gw, p + i, 4);
     else if (opt == 6 && olen >= 4)
-      memcpy(dns, p + i, 4);
+      memcpy(dns, p + i, olen / 4 > DNS_MAX ? DNS_MAX * 4 : olen / 4 * 4);
     else if (opt == 54 && olen >= 4)
       memcpy(srv, p + i, 4);
     i += olen;
@@ -197,7 +198,7 @@ static unsigned char parse_reply(const unsigned char *f, int len, unsigned char 
 
 /* Send `frame`, poll for a reply of the wanted DHCP type (2/5), retrying. Returns 1 on match. */
 static bool exchange(int fd, const unsigned char *frame, int flen, unsigned char want, unsigned char yiaddr[4],
-                     unsigned char mask[4], unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
+                     unsigned char mask[4], unsigned char gw[4], unsigned char dns[DNS_MAX * 4], unsigned char srv[4])
 {
   unsigned char rx[1514];
   for (int t = 0; t < 8; t++) {
@@ -209,18 +210,18 @@ static bool exchange(int fd, const unsigned char *frame, int flen, unsigned char
       if (n == NET_EINTR)
         return false;
       if (n > 0) {
-        unsigned char yi[4], mk[4], g[4], dn[4], sv[4];
+        unsigned char yi[4], mk[4], g[4], dn[DNS_MAX * 4], sv[4];
         memcpy(yi, yiaddr, 4);
         memcpy(mk, mask, 4);
         memcpy(g, gw, 4);
-        memcpy(dn, dns, 4);
+        memcpy(dn, dns, sizeof dn);
         memcpy(sv, srv, 4);
         unsigned char mt = parse_reply(rx, n, yi, mk, g, dn, sv);
         if (mt == want) {
           memcpy(yiaddr, yi, 4);
           memcpy(mask, mk, 4);
           memcpy(gw, g, 4);
-          memcpy(dns, dn, 4);
+          memcpy(dns, dn, sizeof dn);
           memcpy(srv, sv, 4);
           return true;
         }
@@ -322,7 +323,7 @@ int main(void)
   xid[3] = (unsigned char)(seed >> 8);
 
   unsigned char yiaddr[4] = {0}, mask[4] = {255, 255, 255, 0};
-  unsigned char gw[4] = {0}, dns[4] = {0}, srv[4] = {0};
+  unsigned char gw[4] = {0}, dns[DNS_MAX * 4] = {0}, srv[4] = {0};
   unsigned char dhcp[DHCP_LEN], frame[1514];
 
   /* DISCOVER -> OFFER. */
@@ -347,10 +348,16 @@ int main(void)
     return 1;
   }
 
-  /* Publish the resolver. */
+  /* Publish every DNS server of the lease (nothing if it carried none). */
   char resolv[256];
-  int rl = snprintf(resolv, sizeof resolv, "nameserver %u.%u.%u.%u\n", dns[0], dns[1], dns[2], dns[3]);
-  writefile("/etc/resolv.conf", resolv, rl);
+  int rl = 0;
+  for (int i = 0; i < DNS_MAX; i++) {
+    const unsigned char *d = dns + 4 * i;
+    if (d[0] | d[1] | d[2] | d[3])
+      rl += snprintf(resolv + rl, sizeof resolv - (unsigned)rl, "nameserver %u.%u.%u.%u\n", d[0], d[1], d[2], d[3]);
+  }
+  if (rl)
+    writefile("/etc/resolv.conf", resolv, rl);
 
   log_ip("dhcpcd: ip ", yiaddr);
   log_ip(" gw ", gw);
