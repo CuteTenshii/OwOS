@@ -106,17 +106,32 @@ static void run_program(const char *path, char **argv, int argc, bool background
 {
   oflush();
   int quiet[2] = {-1, -1}; /* a background job reads end of file instead of the keyboard */
+  int out[2] = {-1, -1};   /* the program's stdout, when the shell is redirecting it */
   struct spawn_opts o = {.path = path, .argv = argv, .argc = argc, .flags = SPAWN_STDIO, .stdio = {0, 1, 2}};
   if (background && pipe(quiet) == 0)
     o.stdio[0] = quiet[0];
+  if (out_capturing() && pipe(out) == 0)
+    o.stdio[1] = out[1];
   int pid = spawn_ex(&o);
+  if (out[1] >= 0)
+    close(out[1]);
   if (quiet[0] >= 0) {
     close(quiet[0]);
     close(quiet[1]);
   }
   if (pid < 0) {
+    if (out[0] >= 0)
+      close(out[0]);
     err(pid == -EACCES ? "permission denied: " : "failed to launch ", path);
     return;
+  }
+  if (out[0] >= 0) {
+    char buf[512];
+    int n;
+    tty_set_fg(1, pid);
+    while ((n = read(out[0], buf, sizeof buf)) > 0)
+      out_capture_put(buf, (unsigned)n);
+    close(out[0]);
   }
   if (background)
     job_add(pid, current_line);
@@ -133,7 +148,7 @@ void run_other(int argc, char **argv, bool background)
     err(argv[0], ": command not found");
 }
 
-void bi_jobs(void)
+void bi_jobs(int, char **)
 {
   for (int i = 0; i < njobs; i++) {
     tputc('[');

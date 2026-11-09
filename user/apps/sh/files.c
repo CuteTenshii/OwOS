@@ -249,7 +249,7 @@ int cat_proc(const char *name)
   return 1;
 }
 
-void bi_uptime(void)
+void bi_uptime(int, char **)
 {
   if (readfile("/proc/uptime", iobuf, sizeof iobuf) < 0) {
     err("uptime: unavailable", 0);
@@ -579,4 +579,36 @@ void bi_grep(int argc, char **argv)
     }
     i++;
   }
+}
+
+/* Run argv with its output written to path (appended when append is set) */
+void run_redirected(int argc, char **argv, const char *path, bool append)
+{
+  char full[256];
+  abspath(path, full);
+  struct statinfo st;
+  char *old = 0;
+  int oldlen = 0;
+  if (append && stat(full, &st) == 0 && !st.is_dir && st.size) {
+    old = malloc(st.size);
+    oldlen = old ? readfile(full, old, (int)st.size) : -1;
+    if (oldlen < 0) {
+      free(old);
+      err("cannot read ", path);
+      return;
+    }
+  }
+  out_capture_begin();
+  run_argv(argc, argv);
+  unsigned len;
+  const char *text = out_capture_end(&len);
+  char *all = malloc(oldlen + len + 1);
+  if (all) {
+    memcpy(all, old, (unsigned)oldlen);
+    memcpy(all + oldlen, text, len);
+    if (writefile(full, all, oldlen + (int)len) != 0)
+      err("sh: cannot write ", path);
+  }
+  free(all);
+  free(old);
 }

@@ -572,7 +572,7 @@ void cmd_usermod(int argc, char **argv)
 }
 
 /* users: list every account */
-void cmd_users(void)
+void cmd_users(int, char **)
 {
   load_passwd();
   for (char *line = pbuf; *line;) {
@@ -724,7 +724,7 @@ void cmd_login(int argc, char **argv)
   do_login(argv[1], argc >= 3 ? argv[2] : 0);
 }
 
-void bi_whoami(void)
+void bi_whoami(int, char **)
 {
   tputs(username);
   tputc('\n');

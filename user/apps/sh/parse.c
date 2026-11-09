@@ -69,91 +69,150 @@ static bool expand_var(struct word *w, const char *text, int *i)
   return !value || word_put(w, value, (unsigned)strlen(value));
 }
 
-/* Split a command line into words (whitespace-separated; '', "" and \ quote; $NAME, ${NAME} and $? expand
- * outside single quotes) and run it. A line of NAME=value words only sets environment variables. */
-void run_line(const char *text)
+/* A parsed command line */
+struct command {
+  char **argv;
+  int argc;
+  char *target; /* the file `>` or `>>` sends the output to */
+  bool append, background;
+};
+
+static void command_free(struct command *c)
 {
-  unsigned len = (unsigned)strlen(text);
-  char **argv = malloc((len / 2 + 2) * sizeof *argv);
-  int argc = 0;
-  if (!argv)
-    return;
+  for (int i = 0; i < c->argc; i++)
+    free(c->argv[i]);
+  free(c->argv);
+  free(c->target);
+}
+
+/* Finish the word in w: it names the redirect target when one is pending, else it is the next argument */
+static void end_word(struct word *w, struct command *c, bool *want_target)
+{
+  char *s = w->s ? w->s : strdup_empty();
+  if (*want_target) {
+    free(c->target);
+    c->target = s;
+    *want_target = false;
+  } else {
+    c->argv[c->argc++] = s;
+  }
+  w->s = 0;
+  w->len = w->cap = 0;
+}
+
+/* Split a command line into words (whitespace-separated; '', "" and \ quote; $NAME, ${NAME} and $? expand
+ * outside single quotes), a trailing & and a `> file` or `>> file`. False, after reporting, when it is malformed. */
+static bool parse_command(const char *text, struct command *c)
+{
+  *c = (struct command){0};
+  c->argv = malloc((strlen(text) / 2 + 2) * sizeof *c->argv);
+  if (!c->argv)
+    return false;
   struct word w = {0, 0, 0};
-  bool in_word = false, ok = true, background = false;
+  bool in_word = false, ok = true, want_target = false;
   char quote = 0;
-  current_line = text;
   for (int i = 0; text[i] && ok;) {
-    char c = text[i++];
-    if (c == '#' && !quote && !in_word) /* a comment runs to the end of the line */
+    char ch = text[i++];
+    if (ch == '#' && !quote && !in_word) /* a comment runs to the end of the line */
       break;
-    if (c == '&' && !quote) { /* a trailing & runs the command in the background */
+    if (ch == '&' && !quote) {
       int k = i;
       while (text[k] == ' ' || text[k] == '\t')
         k++;
-      background = !text[k];
-      if (background) {
+      c->background = !text[k];
+      if (c->background) {
         if (in_word) {
-          argv[argc++] = w.s ? w.s : strdup_empty();
-          w.s = 0;
-          w.len = w.cap = 0;
+          end_word(&w, c, &want_target);
           in_word = false;
         }
         break;
       }
     }
     if (quote == '\'') {
-      if (c == '\'')
+      if (ch == '\'')
         quote = 0;
       else
-        ok = word_put(&w, &c, 1);
-    } else if (c == '\\' && text[i]) {
+        ok = word_put(&w, &ch, 1);
+    } else if (ch == '\\' && text[i]) {
       in_word = true;
       ok = word_put(&w, &text[i++], 1);
-    } else if (c == '\'' || c == '"') {
+    } else if (ch == '\'' || ch == '"') {
       in_word = true;
       if (!quote)
-        quote = c;
-      else if (quote == c)
+        quote = ch;
+      else if (quote == ch)
         quote = 0;
       else
-        ok = word_put(&w, &c, 1);
-    } else if (c == '$') {
+        ok = word_put(&w, &ch, 1);
+    } else if (ch == '$') {
       in_word = true;
       ok = expand_var(&w, text, &i);
-    } else if ((c == ' ' || c == '\t') && !quote) {
+    } else if ((ch == ' ' || ch == '\t') && !quote) {
       if (in_word) {
-        argv[argc++] = w.s ? w.s : strdup_empty();
-        w.s = 0;
-        w.len = w.cap = 0;
+        end_word(&w, c, &want_target);
         in_word = false;
       }
+    } else if (ch == '>' && !quote) {
+      if (in_word) {
+        end_word(&w, c, &want_target);
+        in_word = false;
+      }
+      if (want_target) {
+        err("sh: syntax error near '>'", 0);
+        ok = false;
+      }
+      c->append = text[i] == '>';
+      i += c->append;
+      want_target = true;
     } else {
       in_word = true;
-      ok = word_put(&w, &c, 1);
+      ok = word_put(&w, &ch, 1);
     }
   }
   if (in_word && ok)
-    argv[argc++] = w.s ? w.s : strdup_empty();
+    end_word(&w, c, &want_target);
   else
     free(w.s);
-  argv[argc] = 0;
-  bool assignments = argc > 0;
-  for (int i = 0; i < argc; i++)
-    assignments = assignments && is_assignment(argv[i]);
-  if (assignments) {
-    for (int i = 0; i < argc; i++)
-      set_assignment(argv[i]);
-  } else if (argc && ok && background) {
-    if (is_builtin(argv[0]))
-      err(argv[0], ": a builtin cannot run in the background");
-    else
-      run_other(argc, argv, true);
-  } else if (argc && ok) {
-    run_argv(argc, argv);
+  c->argv[c->argc] = 0;
+  if (ok && want_target) {
+    err("sh: syntax error: missing file after '>'", 0);
+    ok = false;
   }
-  for (int i = 0; i < argc; i++)
-    free(argv[i]);
-  free(argv);
+  if (ok && c->target && (c->background || !c->argc)) {
+    err(c->background ? "sh: cannot redirect a background job" : "sh: missing command before '>'", 0);
+    ok = false;
+  }
+  return ok;
+}
+
+/* Run a parsed command. A line of NAME=value words only sets environment variables. */
+static void run_command(const struct command *c)
+{
+  bool assignments = true;
+  for (int i = 0; i < c->argc; i++)
+    assignments = assignments && is_assignment(c->argv[i]);
+  if (assignments) {
+    for (int i = 0; i < c->argc; i++)
+      set_assignment(c->argv[i]);
+  } else if (c->background) {
+    if (is_builtin(c->argv[0]))
+      err(c->argv[0], ": a builtin cannot run in the background");
+    else
+      run_other(c->argc, c->argv, true);
+  } else if (c->target) {
+    run_redirected(c->argc, c->argv, c->target, c->append);
+  } else {
+    run_argv(c->argc, c->argv);
+  }
+}
+
+void run_line(const char *text)
+{
+  struct command c;
+  current_line = text;
+  if (parse_command(text, &c) && c.argc)
+    run_command(&c);
+  command_free(&c);
 }
 
 /* Run the commands in a file, one per line; false when it cannot be read */

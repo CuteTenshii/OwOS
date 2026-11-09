@@ -19,6 +19,10 @@
 
 /* out.c */
 void oflush(void);
+bool out_capturing(void);
+void out_capture_begin(void);
+void out_capture_put(const char *p, unsigned n);
+const char *out_capture_end(unsigned *len);
 void tputc(char c);
 void tputs(const char *s);
 void tdec(unsigned v);
@@ -47,7 +51,7 @@ extern int last_bg_pid; /* for $! */
 void bg_service(void);
 extern const char *current_line;
 void run_other(int argc, char **argv, bool background);
-void bi_jobs(void);
+void bi_jobs(int argc, char **argv);
 void bi_fg(int argc, char **argv);
 void bi_wait(int argc, char **argv);
 void bi_kill(int argc, char **argv);
@@ -59,7 +63,7 @@ void bi_cp(int argc, char **argv);
 void bi_stat(int argc, char **argv);
 void bi_umask(int argc, char **argv);
 int cat_proc(const char *name);
-void bi_uptime(void);
+void bi_uptime(int argc, char **argv);
 void bi_which(int argc, char **argv);
 void bi_loadkeys(int argc, char **argv);
 void bi_clip(int argc, char **argv);
@@ -71,6 +75,7 @@ void do_compress(int argc, char **argv, const char *suffix, const char *cmd,
 void do_decompress(int argc, char **argv, const char *suffix, const char *cmd,
                    int (*dec)(const uint8_t *, uint32_t, uint8_t *, uint32_t), int (*orig)(const uint8_t *, uint32_t));
 void bi_grep(int argc, char **argv);
+void run_redirected(int argc, char **argv, const char *path, bool append);
 
 /* accounts.c */
 void cmd_useradd(int argc, char **argv);
@@ -79,13 +84,13 @@ void cmd_passwd(int argc, char **argv);
 void cmd_groupadd(int argc, char **argv);
 void cmd_groupdel(int argc, char **argv);
 void cmd_usermod(int argc, char **argv);
-void cmd_users(void);
+void cmd_users(int argc, char **argv);
 void cmd_groups(int argc, char **argv);
 void cmd_id(int argc, char **argv);
 void do_login(const char *name, const char *pass);
 void cmd_su(int argc, char **argv);
 void cmd_login(int argc, char **argv);
-void bi_whoami(void);
+void bi_whoami(int argc, char **argv);
 void bi_hostname(int argc, char **argv);
 
 /* parse.c */
