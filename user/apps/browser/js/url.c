@@ -44,7 +44,7 @@ static int hexval(int c)
   return -1;
 }
 /* percent-decode [s, s+len) into a fresh malloc'd string; '+' -> space */
-static char *url_decode(const char *s, int len)
+char *form_decode(const char *s, int len)
 {
   char *out = (char *)malloc((unsigned)(len > 0 ? len : 0) + 1);
   int i, j = 0;
@@ -70,7 +70,7 @@ static int sp_unreserved(int c)
          c == '.' || c == '~' || c == '*';
 }
 /* application/x-www-form-urlencoded component encoding (space -> '+') */
-static void sb_put_form(sbuf *s, const char *t)
+void sb_put_form(sbuf *s, const char *t)
 {
   static const char *hex = "0123456789ABCDEF";
   for (; *t; t++) {
@@ -85,6 +85,259 @@ static void sb_put_form(sbuf *s, const char *t)
       sb_putc(s, hex[c & 15]);
     }
   }
+}
+
+/* ---- URL parsing for workers: the components of an absolute URL, resolved against an optional base ---- */
+
+static char *url_rchr(const char *s, char c)
+{
+  const char *last = 0;
+  for (; *s; s++)
+    if (*s == c)
+      last = s;
+  return (char *)last;
+}
+
+static bool url_has_scheme(const char *s)
+{
+  if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z')))
+    return false;
+  for (s++; *s; s++) {
+    if (*s == ':')
+      return true;
+    if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '+' || *s == '.' ||
+          *s == '-'))
+      return false;
+  }
+  return false;
+}
+
+/* the default port of a special scheme, "" for file:, NULL for any other scheme */
+static const char *url_default_port(const char *protocol)
+{
+  static const struct {
+    const char *scheme, *port;
+  } table[] = {{"http:", "80"}, {"https:", "443"}, {"ftp:", "21"}, {"ws:", "80"}, {"wss:", "443"}, {"file:", ""}};
+  for (unsigned i = 0; i < sizeof table / sizeof *table; i++)
+    if (streq(protocol, table[i].scheme))
+      return table[i].port;
+  return 0;
+}
+
+/* Percent-encode every byte outside the printable ASCII range and the ones `extra` lists */
+static void url_escape(char *dst, int cap, const char *src, const char *extra)
+{
+  static const char hx[] = "0123456789ABCDEF";
+  int n = 0;
+  for (; *src && n < cap - 4; src++) {
+    unsigned char c = (unsigned char)*src;
+    if (c < 33 || c > 126 || strchr(extra, c)) {
+      dst[n++] = '%';
+      dst[n++] = hx[c >> 4];
+      dst[n++] = hx[c & 15];
+    } else
+      dst[n++] = (char)c;
+  }
+  dst[n] = 0;
+}
+
+static void url_lower(char *s)
+{
+  for (; *s; s++)
+    if (*s >= 'A' && *s <= 'Z')
+      *s = (char)(*s + 32);
+}
+
+static bool url_parse_absolute(const char *input, struct url_parts *r)
+{
+  char buf[URL_MAX], *rest, *hash, *query, *colon, *slash, *auth, *at;
+  const char *dp;
+  unsigned n = (unsigned)strlen(input);
+  if (n >= sizeof buf)
+    return false;
+  memcpy(buf, input, n + 1);
+  memset(r, 0, sizeof *r);
+  hash = strchr(buf, '#');
+  if (hash) {
+    char tmp[URL_MAX];
+    url_escape(tmp, sizeof tmp, hash, "\"<>`");
+    snprintf(r->hash, sizeof r->hash, "%s", strcmp(tmp, "#") ? tmp : "");
+    *hash = 0;
+  }
+  query = strchr(buf, '?');
+  if (query) {
+    char tmp[URL_MAX];
+    url_escape(tmp, sizeof tmp, query, "\"<>#'");
+    snprintf(r->search, sizeof r->search, "%s", strcmp(tmp, "?") ? tmp : "");
+    *query = 0;
+  }
+  colon = strchr(buf, ':');
+  if (!colon || colon == buf || colon - buf >= (long)sizeof r->protocol - 1)
+    return false;
+  memcpy(r->protocol, buf, (unsigned)(colon - buf) + 1);
+  url_lower(r->protocol);
+  rest = colon + 1;
+  dp = url_default_port(r->protocol);
+  if (rest[0] == '/' && rest[1] == '/') {
+    rest += 2;
+    slash = strchr(rest, '/');
+    snprintf(r->pathname, sizeof r->pathname, "%s", slash ? slash : "");
+    if (slash)
+      *slash = 0;
+    auth = rest;
+    at = url_rchr(auth, '@');
+    if (at) {
+      char *pw = auth;
+      while (pw < at && *pw != ':')
+        pw++;
+      if (pw == at)
+        pw = 0;
+      *at = 0;
+      if (pw) {
+        *pw = 0;
+        snprintf(r->password, sizeof r->password, "%s", pw + 1);
+      }
+      snprintf(r->username, sizeof r->username, "%s", auth);
+      auth = at + 1;
+    }
+    if (auth[0] == '[') {
+      char *end = strchr(auth, ']');
+      if (end) {
+        if (end[1] == ':')
+          snprintf(r->port, sizeof r->port, "%s", end + 2);
+        end[1] = 0;
+      }
+    } else if ((colon = url_rchr(auth, ':'))) {
+      snprintf(r->port, sizeof r->port, "%s", colon + 1);
+      *colon = 0;
+    }
+    snprintf(r->hostname, sizeof r->hostname, "%s", auth);
+    url_lower(r->hostname);
+    if (dp && r->port[0] && streq(r->port, dp))
+      r->port[0] = 0;
+    if (!r->pathname[0] && dp)
+      strcpy(r->pathname, "/");
+  } else {
+    snprintf(r->pathname, sizeof r->pathname, "%s", rest);
+    r->opaque = true;
+  }
+  if (!r->opaque) {
+    char tmp[URL_MAX];
+    url_escape(tmp, sizeof tmp, r->pathname, "\"<>`{}?#");
+    snprintf(r->pathname, sizeof r->pathname, "%s", tmp);
+  }
+  return true;
+}
+
+/* RFC 3986 dot-segment removal, in place */
+static void url_remove_dots(char *path)
+{
+  char *seg[256], *p = path, *out[256];
+  int nseg = 0, nout = 0, i;
+  char result[URL_MAX];
+  unsigned at = 0;
+  for (;;) {
+    char *slash = strchr(p, '/');
+    if (nseg == 256)
+      return;
+    seg[nseg++] = p;
+    if (!slash)
+      break;
+    *slash = 0;
+    p = slash + 1;
+  }
+  for (i = 0; i < nseg; i++) {
+    bool last = i == nseg - 1;
+    if (streq(seg[i], "..")) {
+      if (nout > 1)
+        nout--;
+      if (last)
+        out[nout++] = (char *)"";
+    } else if (streq(seg[i], ".")) {
+      if (last)
+        out[nout++] = (char *)"";
+    } else
+      out[nout++] = seg[i];
+  }
+  for (i = 0; i < nout; i++) {
+    unsigned l = (unsigned)strlen(out[i]);
+    if (at + l + 2 >= sizeof result)
+      return;
+    if (i)
+      result[at++] = '/';
+    memcpy(result + at, out[i], l);
+    at += l;
+  }
+  result[at] = 0;
+  strcpy(path, result);
+}
+
+/* `input` resolved against `base_href` (NULL: it must be absolute); false for an invalid URL */
+bool url_parse(const char *input, const char *base_href, struct url_parts *out)
+{
+  struct url_parts base;
+  char ref[URL_MAX], abs[URL_MAX], path[URL_MAX], tail_buf[URL_MAX], *cut, *hash, *q;
+  const char *tail = tail_buf, *query = "";
+  unsigned len;
+  while (*input == ' ' || *input == '\t' || *input == '\n' || *input == '\r')
+    input++;
+  len = (unsigned)strlen(input);
+  while (len && (input[len - 1] == ' ' || input[len - 1] == '\t' || input[len - 1] == '\n' || input[len - 1] == '\r'))
+    len--;
+  if (len >= sizeof ref)
+    return false;
+  memcpy(ref, input, len);
+  ref[len] = 0;
+  if (url_has_scheme(ref))
+    return url_parse_absolute(ref, out);
+  if (!base_href || !url_parse_absolute(base_href, &base))
+    return false;
+  if (ref[0] == '/' && ref[1] == '/') {
+    snprintf(abs, sizeof abs, "%s%s", base.protocol, ref);
+    return url_parse_absolute(abs, out);
+  }
+  hash = strchr(ref, '#');
+  snprintf(tail_buf, sizeof tail_buf, "%s", hash ? hash : "");
+  cut = ref;
+  {
+    char saved = hash ? *hash : 0;
+    if (hash)
+      *hash = 0;
+    q = strchr(cut, '?');
+    if (q)
+      query = q;
+    snprintf(path, sizeof path, "%.*s", q ? (int)(q - cut) : (int)strlen(cut), cut);
+    if (base.opaque) {
+      bool ok = ref[0] == 0 && tail[0] == '#';
+      if (hash)
+        *hash = saved;
+      if (!ok)
+        return false;
+      snprintf(abs, sizeof abs, "%s%s%s%s", base.protocol, base.pathname, base.search, tail);
+      return url_parse_absolute(abs, out);
+    }
+    {
+      char root[URL_MAX + 600];
+      snprintf(root, sizeof root, "%s//%s%s%s%s%s%s%s", base.protocol, base.username, base.password[0] ? ":" : "",
+               base.password, base.username[0] || base.password[0] ? "@" : "", base.hostname, base.port[0] ? ":" : "",
+               base.port);
+      if (!path[0]) {
+        snprintf(abs, sizeof abs, "%s%s%s%s", root, base.pathname, !query[0] && !cut[0] ? base.search : query, tail);
+      } else {
+        if (path[0] != '/') {
+          char merged[URL_MAX];
+          char *ls = url_rchr(base.pathname, '/');
+          snprintf(merged, sizeof merged, "%.*s%s", ls ? (int)(ls - base.pathname) + 1 : 0, base.pathname, path);
+          snprintf(path, sizeof path, "%s", merged);
+        }
+        url_remove_dots(path);
+        snprintf(abs, sizeof abs, "%s%s%s%s", root, path, query, tail);
+      }
+    }
+    if (hash)
+      *hash = saved;
+  }
+  return url_parse_absolute(abs, out);
 }
 
 static js_object *sp_arr(js_ctx *ctx, js_value t, const char *key)
@@ -112,8 +365,8 @@ js_value make_search_params(js_ctx *ctx, const char *query)
     while (eq < amp && *eq != '=')
       eq++;
     if (amp > p) {
-      char *k = url_decode(p, (int)(eq - p));
-      char *v = url_decode(eq < amp ? eq + 1 : amp, eq < amp ? (int)(amp - eq - 1) : 0);
+      char *k = form_decode(p, (int)(eq - p));
+      char *v = form_decode(eq < amp ? eq + 1 : amp, eq < amp ? (int)(amp - eq - 1) : 0);
       if (k) {
         js_array_push(ctx, ka, js_mk_cstring(ctx, k));
         free(k);

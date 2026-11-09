@@ -220,6 +220,19 @@ JS(
   });
   L.loadStreams = loadStreams;
 
+  /* ---- the rest of the platform is compiled on first use ---- */
+  function lazyPart(part, names) {
+    names.forEach(function (name) {
+      def(g, name, {
+        get: function () { N.loadPart(part); return g[name]; },
+        set: function (v) { def(g, name, { value: v, writable: true, configurable: true, enumerable: false }); },
+        configurable: true
+      });
+    });
+  }
+  lazyPart(1, ["URL", "URLSearchParams", "Blob", "File", "FormData", "FileReader", "Headers"]);
+  lazyPart(2, ["Request", "Response", "fetch", "XMLHttpRequest", "WebSocket", "MessagePort", "MessageChannel"]);
+
   /* ---- crypto ---- */
   var crypto = {};
   crypto.getRandomValues = function (view) {

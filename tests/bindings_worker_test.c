@@ -401,6 +401,31 @@ static void test_ports_cross(void)
       "ch.port1.close();\n");
 }
 
+static void test_worker_url_edges(void)
+{
+  run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
+             "URL(a,b).href; } catch(e) { return \"ERR\"; } }"
+             "r.push(U(\"http://[::1]:8080/p\"), U(\"HTTP://EXAMPLE.com:80/A b/%41?q=\\u00e9 x#f g\"), "
+             "U(\"mailto:a@b.c?subject=hi\"), U(\"data:text/plain,hi\"),"
+             "U(\"https://h\"), U(\"/a/../b/./c/..\",\"http://h/x/y\"), U(\"../../..\",\"http://h/a/b/c/d\"), "
+             "U(\"x\"), U(\"\"), "
+             "U(\"//h2/p\",\"https://h/\"), U(\"file:///etc/passwd\"), U(\"http://u:p@h/\"), U(\"  "
+             "http://trim.example/ \"), U(\"y\",\"data:text/plain,hi\"));"
+             "var u=new URL(\"https://e.com/p\"); u.port=\"8443\"; u.hash=\"x\"; u.search=\"a=b\"; u.pathname=\"/q "
+             "r\"; u.hostname=\"Z.com\"; r.push(u.href);"
+             "postMessage(r);');\n"
+             "uw.onmessage=function(e){ ue=e.data; };\n");
+  expect(wait_for("ue!==null"));
+  run_script(
+      "var "
+      "want=['http://[::1]:8080/p','http://example.com/A%20b/"
+      "%41?q=%C3%A9%20x#f%20g','mailto:a@b.c?subject=hi','data:text/plain,hi','https://h/',"
+      "'http://h/b/','http://h/','ERR','ERR','https://h2/p','file:///etc/passwd','http://u:p@h/','http://trim.example/"
+      "','ERR',"
+      "'https://z.com:8443/q%20r?a=b#x'];\n"
+      "for (var i=0;i<want.length;i++) expect(ue[i]===want[i], 'URL case '+i+': got '+ue[i]+' want '+want[i]);\n");
+}
+
 static void test_blob_crosses(void)
 {
   run_script("var bl=null, bw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data; "
@@ -551,6 +576,7 @@ int main(void)
   worker_test("worker streams", test_worker_streams);
   worker_test("performance marks, error events, FileReader", test_worker_misc_apis);
   worker_test("MessagePorts move between page and worker", test_ports_cross);
+  worker_test("URL edge cases", test_worker_url_edges);
   worker_test("Blobs cross between page and worker", test_blob_crosses);
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);

@@ -7969,6 +7969,13 @@ static js_typedarray *as_ta(js_value t)
 {
   return (t.type == JV_OBJ && t.u.obj->kind == OBJ_TYPEDARRAY) ? (js_typedarray *)t.u.obj->host : 0;
 }
+/* the first byte of a view, or NULL when its buffer is gone */
+static unsigned char *ta_bytes(const js_typedarray *ta)
+{
+  const js_arraybuffer *ab = (const js_arraybuffer *)ta->buffer->host;
+  return ab && ab->data ? ab->data + ta->offset : 0;
+}
+
 static int clamp_idx(int i, int len)
 {
   if (i < 0)
@@ -8025,9 +8032,15 @@ static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n)
       js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(len, es)));
       view = new_view(ctx, type, buf, 0, len);
       if (view.type == JV_OBJ) {
+        js_typedarray *from = as_ta(arg);
         gc_keep(view.u.obj);
-        for (i = 0; i < len; i++)
-          ta_set(ctx, view.u.obj, (unsigned)i, js_get_index(ctx, arg, (unsigned)i));
+        if (from && from->type == type && len > 0) {
+          unsigned char *src_bytes = ta_bytes(from), *dst_bytes = ta_bytes(as_ta(view));
+          if (src_bytes && dst_bytes)
+            memcpy(dst_bytes, src_bytes, (unsigned)len * (unsigned)es);
+        } else
+          for (i = 0; i < len; i++)
+            ta_set(ctx, view.u.obj, (unsigned)i, js_get_index(ctx, arg, (unsigned)i));
       }
     }
     gc_pop_scope();
@@ -8103,7 +8116,15 @@ static js_value tap_set(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   len = ta_src_len(ctx, src);
   if (off < 0)
-    off = 0;
+    return js_throw_range(ctx, "offset is out of bounds");
+  if ((long long)off + len > ta_length(ta))
+    return js_throw_range(ctx, "source is too large");
+  if (src.type == JV_OBJ && src.u.obj->kind == OBJ_TYPEDARRAY && as_ta(src)->type == ta->type && len > 0) {
+    unsigned char *to = ta_bytes(ta), *from = ta_bytes(as_ta(src)); /* same element type: a straight copy */
+    if (to && from)
+      memmove(to + off * ta_elem_size(ta->type), from, (unsigned)len * (unsigned)ta_elem_size(ta->type));
+    return js_undef();
+  }
   for (i = 0; i < len && !ctx->has_exc; i++)
     ta_set(ctx, t.u.obj, (unsigned)off + (unsigned)i, js_get_index(ctx, src, (unsigned)i));
   return js_undef();
@@ -8140,9 +8161,13 @@ static js_value tap_slice(js_ctx *ctx, js_value t, js_value *a, int n)
     js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(m, es)));
     view = new_view(ctx, ta->type, buf, 0, m);
     if (view.type == JV_OBJ) {
+      unsigned char *to = ta_bytes(as_ta(view)), *from = ta_bytes(ta);
       gc_keep(view.u.obj);
-      for (i = 0; i < m; i++)
-        ta_set(ctx, view.u.obj, (unsigned)i, ta_get(ctx, t.u.obj, (unsigned)(b + i)));
+      if (to && from && m > 0)
+        memcpy(to, from + b * es, (unsigned)m * (unsigned)es);
+      else
+        for (i = 0; i < m; i++)
+          ta_set(ctx, view.u.obj, (unsigned)i, ta_get(ctx, t.u.obj, (unsigned)(b + i)));
     }
   }
   gc_pop_scope();

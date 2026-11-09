@@ -5,6 +5,7 @@
  * (fetching scripts, the devtools console) is done on the page thread: the worker asks over a one-slot RPC and
  * waits for the answer. */
 
+#include "base64.h"
 #include "bindings.h"
 #include "canvasjs.h"
 #include "features/cors/cors.h"
@@ -78,6 +79,11 @@ static js_object *g_wobjs[WORKER_MAX];
 static int g_nworkers;
 
 static __thread struct wthread *cur_wt;
+
+/* The parts of the JavaScript scope run so far: the core always, URL/Blob/... and fetch/WebSocket/... on first use */
+static __thread unsigned parts_loaded;
+enum { PART_WEB = 1, PART_NET = 2 };
+static bool wt_load_parts(js_ctx *ctx, unsigned upto);
 
 /* Port ids are unique across the page and every worker */
 static unsigned g_next_port_id;
@@ -561,11 +567,14 @@ static js_object *wt_load_module(js_ctx *ctx, const char *spec, void *ud)
 /* A worker's Blob (or File) crosses by its bytes and type */
 static int wt_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
-  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "Blob"),
-           proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef(), data, type;
+  js_value ctor, proto, data, type;
   js_object *p;
   const unsigned char *src;
   int n = 0;
+  if (parts_loaded <= PART_WEB) /* no Blob can exist yet */
+    return 0;
+  ctor = js_get(ctx, js_obj_value(ctx->global), "Blob");
+  proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef();
   if (proto.type != JV_OBJ)
     return 0;
   for (p = v.u.obj->proto; p && p != proto.u.obj; p = p->proto)
@@ -588,11 +597,14 @@ static int wt_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char 
 /* A MessagePort of this worker moving to the page: N.portTransfer tells the script side to route its peer */
 static int wt_clone_write_port(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len)
 {
-  js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"),
-           ctor = js_get(ctx, js_obj_value(ctx->global), "MessagePort"),
-           proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef(), fn, r;
+  js_value n, ctor, proto, fn, r;
   js_object *p;
   int rid;
+  if (parts_loaded <= PART_NET) /* no MessagePort can exist yet */
+    return 0;
+  n = js_get(ctx, js_obj_value(ctx->global), "@N");
+  ctor = js_get(ctx, js_obj_value(ctx->global), "MessagePort");
+  proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef();
   if (proto.type != JV_OBJ || n.type != JV_OBJ)
     return 0;
   for (p = v.u.obj->proto; p && p != proto.u.obj; p = p->proto)
@@ -626,8 +638,11 @@ static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char
   if (streq(kind, "ocanvas"))
     return canvas_clone_read(ctx, kind, bytes, len);
   if (streq(kind, "port")) { /* a port arrives: the script side builds it */
-    js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"),
-             fn = n.type == JV_OBJ ? js_get(ctx, n, "portReceive") : js_undef(), id;
+    js_value n, fn, id;
+    if (!wt_load_parts(ctx, PART_NET))
+      return js_undef();
+    n = js_get(ctx, js_obj_value(ctx->global), "@N");
+    fn = n.type == JV_OBJ ? js_get(ctx, n, "portReceive") : js_undef();
     if (!js_is_callable(fn) || len != (int)sizeof(int))
       return js_undef();
     memcpy(&len, bytes, sizeof len);
@@ -711,6 +726,123 @@ static js_value wt_n_random_fill(js_ctx *ctx, js_value t, js_value *args, int ar
   if (p && len > 0)
     rng_bytes((void *)p, len);
   return js_undef();
+}
+
+/* N.urlParse(input, base): the URL's components as an object, or null for an invalid URL */
+static js_value wt_n_url_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value in = js_to_string(ctx, A(0)), base = A(1).type == JV_UNDEF ? js_undef() : js_to_string(ctx, A(1)), v;
+  struct url_parts u;
+  js_object *o;
+  (void)t;
+  if (in.type != JV_STR || !url_parse(in.u.str->data, base.type == JV_STR ? base.u.str->data : 0, &u))
+    return js_null();
+  gc_push_scope();
+  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(o, "protocol", js_mk_cstring(ctx, u.protocol), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "username", js_mk_cstring(ctx, u.username), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "password", js_mk_cstring(ctx, u.password), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hostname", js_mk_cstring(ctx, u.hostname), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "port", js_mk_cstring(ctx, u.port), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "pathname", js_mk_cstring(ctx, u.pathname), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "search", js_mk_cstring(ctx, u.search), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hash", js_mk_cstring(ctx, u.hash), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "opaque", js_bool(u.opaque), P_ENUMERABLE | P_WRITABLE);
+  v = js_obj_value(o);
+  gc_pop_scope();
+  return v;
+}
+
+/* N.queryParse("a=1&b=2"): [[name, value], ...] */
+static js_value wt_n_query_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value q = js_to_string(ctx, A(0)), list;
+  const char *p;
+  (void)t;
+  if (q.type != JV_STR)
+    return js_undef();
+  p = q.u.str->data;
+  if (*p == '?')
+    p++;
+  gc_push_scope();
+  gc_keep(q.u.str);
+  list = js_obj_value(gc_keep(js_new_array(ctx, 0)));
+  while (*p) {
+    const char *amp = strchr(p, '&'), *end = amp ? amp : p + strlen(p), *eq = p;
+    while (eq < end && *eq != '=')
+      eq++;
+    if (end > p) {
+      char *k = form_decode(p, (int)(eq - p)),
+           *v = form_decode(eq < end ? eq + 1 : end, eq < end ? (int)(end - eq - 1) : 0);
+      js_object *pair = js_new_array(ctx, 0);
+      gc_push_scope();
+      gc_keep(pair);
+      js_array_push(ctx, pair, js_mk_cstring(ctx, k ? k : ""));
+      js_array_push(ctx, pair, js_mk_cstring(ctx, v ? v : ""));
+      js_array_push(ctx, list.u.obj, js_obj_value(pair));
+      gc_pop_scope();
+      free(k);
+      free(v);
+    }
+    p = amp ? amp + 1 : end;
+  }
+  gc_pop_scope();
+  return list;
+}
+
+/* N.queryString([[name, value], ...]): application/x-www-form-urlencoded */
+static js_value wt_n_query_string(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  sbuf sb = {0, 0, 0};
+  unsigned i, n = A(0).type == JV_OBJ ? js_array_len(A(0).u.obj) : 0;
+  js_value r;
+  (void)t;
+  for (i = 0; i < n; i++) {
+    js_value pair = js_get_index(ctx, A(0), i), k = js_to_string(ctx, js_get_index(ctx, pair, 0)),
+             v = js_to_string(ctx, js_get_index(ctx, pair, 1));
+    if (i)
+      sb_putc(&sb, '&');
+    sb_put_form(&sb, k.type == JV_STR ? k.u.str->data : "");
+    sb_putc(&sb, '=');
+    sb_put_form(&sb, v.type == JV_STR ? v.u.str->data : "");
+  }
+  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
+}
+
+/* N.base64(bytes) */
+static js_value wt_n_base64(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int len = 0;
+  const unsigned char *p = view_bytes(A(0), &len);
+  char *out;
+  js_value r;
+  (void)t;
+  out = (char *)malloc((unsigned)base64_encoded_len(len) + 1);
+  if (!out)
+    return js_throw_range(ctx, "out of memory");
+  base64_encode(p ? p : (const unsigned char *)"", p ? len : 0, out);
+  r = js_mk_cstring(ctx, out);
+  free(out);
+  return r;
+}
+
+/* N.binaryString(bytes): one character per byte, U+0000 to U+00FF */
+static js_value wt_n_binary_string(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int len = 0, i;
+  const unsigned char *p = view_bytes(A(0), &len);
+  sbuf sb = {0, 0, 0};
+  js_value r;
+  (void)t;
+  for (i = 0; p && i < len; i++) {
+    char tmp[4];
+    sb_putn(&sb, tmp, utf8_encode(p[i], tmp));
+  }
+  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
 }
 
 /* N.createObjectURL(bytes, type, origin): a blob: URL for the page-wide blob store, which fetch() can read */
@@ -990,19 +1122,54 @@ static js_value wt_n_port_close(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_undef();
 }
 
-/* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
+/* Run parts up to and including `upto`; false (exception pending) if one fails */
+static bool wt_load_parts(js_ctx *ctx, unsigned upto)
+{
+  js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"), l = js_get(ctx, js_obj_value(ctx->global), "@L");
+  bool ok = true;
+  while (ok && parts_loaded <= upto && parts_loaded < sizeof k_parts / sizeof *k_parts) {
+    js_value fn = js_undef(), args[3];
+    unsigned i = parts_loaded++;
+    ok = wt_eval(ctx, cur_wt, k_parts[i], cur_wt->url, 0, &fn) && js_is_callable(fn);
+    if (ok) {
+      args[0] = js_obj_value(ctx->global);
+      args[1] = n;
+      args[2] = l;
+      js_call(ctx, fn, js_undef(), args, 3);
+      ok = !ctx->has_exc;
+    }
+  }
+  return ok;
+}
+
+static js_value wt_n_load_part(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  wt_load_parts(ctx, (unsigned)js_to_int_sat(ctx, A(0)));
+  return js_undef();
+}
+
+/* Set up N and L, then run the core part; false (exception pending) if it fails */
 static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
 {
   js_object *n, *l;
-  bool ok = true;
-  unsigned i;
+  bool ok;
+  (void)wt;
+  parts_loaded = 0;
   gc_push_scope();
   n = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   l = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(ctx->global, "@L", js_obj_value(l), 0);
+  js_def_native(ctx, n, "loadPart", wt_n_load_part, 1);
   js_def_native(ctx, n, "utf8encode", wt_n_utf8encode, 1);
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
+  js_def_native(ctx, n, "urlParse", wt_n_url_parse, 2);
+  js_def_native(ctx, n, "queryParse", wt_n_query_parse, 1);
+  js_def_native(ctx, n, "queryString", wt_n_query_string, 1);
+  js_def_native(ctx, n, "base64", wt_n_base64, 1);
+  js_def_native(ctx, n, "binaryString", wt_n_binary_string, 1);
   js_def_native(ctx, n, "request", wt_n_request, 1);
   js_def_native(ctx, n, "streams", wt_n_streams, 0);
   js_def_native(ctx, n, "newPortId", wt_n_new_port_id, 0);
@@ -1016,17 +1183,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def(ctx->global, "@N", js_obj_value(n), 0);
   js_def_native(ctx, n, "createObjectURL", wt_n_create_object_url, 3);
   js_def_native(ctx, n, "revokeObjectURL", wt_n_revoke_object_url, 1);
-  for (i = 0; ok && i < sizeof k_parts / sizeof *k_parts; i++) {
-    js_value fn = js_undef(), args[3];
-    ok = wt_eval(ctx, wt, k_parts[i], wt->url, 0, &fn) && js_is_callable(fn);
-    if (ok) {
-      args[0] = js_obj_value(ctx->global);
-      args[1] = js_obj_value(n);
-      args[2] = js_obj_value(l);
-      js_call(ctx, fn, js_undef(), args, 3);
-      ok = !ctx->has_exc;
-    }
-  }
+  ok = wt_load_parts(ctx, 0);
   gc_pop_scope();
   return ok;
 }

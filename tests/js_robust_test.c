@@ -268,6 +268,26 @@ static void check_promise_combinators(void)
              0));
 }
 
+static void check_typed_array_copy(void)
+{
+  expect(run(
+      "var t=function(f){ try{ f() }catch(e){ return e.name } };\n"
+      "var a=new Uint8Array([1,2,3,4,5]), b=new Uint8Array(8); b.set(a,2);\n"
+      "expect(b.join()==='0,0,1,2,3,4,5,0', 'set copies at an offset: '+b.join());\n"
+      "b.set(b.subarray(2,6),0); expect(b.join()==='1,2,3,4,3,4,5,0', 'set handles overlap: '+b.join());\n"
+      "var f=new Float32Array(3); f.set(new Uint8Array([7,8,9])); expect(f.join()==='7,8,9', 'set converts between "
+      "types');\n"
+      "var i16=new Int16Array(2); i16.set([300,-2]); expect(i16.join()==='300,-2', 'set from an array');\n"
+      "expect(t(function(){ new Uint8Array(2).set(a) })==='RangeError' && t(function(){ new Uint8Array(4).set([1],4) "
+      "})==='RangeError' && "
+      "t(function(){ new Uint8Array(4).set([1],-1) })==='RangeError', 'set past the end throws');\n"
+      "var s=a.slice(1,4); s[0]=99; expect(s.join()==='99,3,4' && a[1]===2, 'slice copies');\n"
+      "var c=new Uint16Array(new Uint16Array([1,500,65535])); expect(c.join()==='1,500,65535', 'copy construction');\n"
+      "var u8=new Uint8ClampedArray(new Float64Array([300,-5,1.5])); expect(u8.join()==='255,0,2', 'conversion on copy "
+      "construction: '+u8.join());\n",
+      0));
+}
+
 static void check_json_parse(void)
 {
   expect(
@@ -566,6 +586,7 @@ int main(void)
   test("SharedArrayBuffer and Atomics", check_atomics);
   test("structured clone across heaps", check_structured_clone);
   test("Promise.all, allSettled, race and any with pending promises", check_promise_combinators);
+  test("typed array set, slice and copy construction", check_typed_array_copy);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

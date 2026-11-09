@@ -23,36 +23,17 @@ JS(
   function badPath(c) { return c === 34 || c === 60 || c === 62 || c === 96 || c === 123 || c === 125 || c === 63 || c === 35; }
   function badQuery(c) { return c === 34 || c === 60 || c === 62 || c === 35 || c === 39; }
   function badFragment(c) { return c === 34 || c === 60 || c === 62 || c === 96; }
-  function formEncode(s) {
-    var e = encodeURIComponent(String(s)).split("%20").join("+");
-    e = e.split("!").join("%21").split("~").join("%7E").split("(").join("%28").split(")").join("%29").split(QUOTE).join("%27");
-    return e;
-  }
-  function formDecode(s) {
-    s = s.split("+").join(" ");
-    try { return decodeURIComponent(s); } catch (e) { return s; }
-  }
 
   /* ---- URLSearchParams ---- */
-  function parseQuery(q) {
-    var list = [], parts, i, p, eq;
-    if (q.charAt(0) === "?") { q = q.slice(1); }
-    if (!q) { return list; }
-    parts = q.split("&");
-    for (i = 0; i < parts.length; i++) {
-      p = parts[i];
-      if (!p) { continue; }
-      eq = p.indexOf("=");
-      list.push(eq < 0 ? [formDecode(p), ""] : [formDecode(p.slice(0, eq)), formDecode(p.slice(eq + 1))]);
-    }
-    return list;
+  function appendAll(list, pairs) {
+    for (var i = 0; i < pairs.length; i++) { list.push(pairs[i]); }
   }
   function URLSearchParams(init) {
     var list = [], k;
     hide(this, "@list", list);
     hide(this, "@url", null);
     if (init === undefined || init === null) { return; }
-    if (typeof init === "string") { list.push.apply(list, parseQuery(init)); }
+    if (typeof init === "string") { appendAll(list, N.queryParse(init)); }
     else if (init instanceof URLSearchParams) { init["@list"].forEach(function (p) { list.push([p[0], p[1]]); }); }
     else if (typeof init === "object" && typeof init[Symbol.iterator] === "function") {
       for (var pair of init) {
@@ -61,7 +42,7 @@ JS(
       }
     } else if (typeof init === "object") {
       for (k in init) { list.push([k, String(init[k])]); }
-    } else { list.push.apply(list, parseQuery(String(init))); }
+    } else { appendAll(list, N.queryParse(String(init))); }
   }
   function touch(sp) { if (sp["@url"]) { sp["@url"]["@sync"](sp.toString()); } }
   method(URLSearchParams.prototype, "append", function (k, v) { this["@list"].push([String(k), String(v)]); touch(this); });
@@ -108,56 +89,13 @@ JS(
   method(URLSearchParams.prototype, "entries", function () { return this["@list"].map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); });
   hide(URLSearchParams.prototype, Symbol.iterator, URLSearchParams.prototype.entries);
   method(URLSearchParams.prototype, "toString", function () {
-    return this["@list"].map(function (p) { return formEncode(p[0]) + "=" + formEncode(p[1]); }).join("&");
+    return N.queryString(this["@list"]);
   });
   def(URLSearchParams.prototype, "size", { get: function () { return this["@list"].length; }, configurable: true });
   hide(g, "URLSearchParams", URLSearchParams);
 
   /* ---- URL ---- */
   var SPECIAL = { "http:": "80", "https:": "443", "ftp:": "21", "ws:": "80", "wss:": "443", "file:": "" };
-  function parseAbsolute(s) {
-    var r = { protocol: "", username: "", password: "", hostname: "", port: "", pathname: "", search: "", hash: "", opaque: false };
-    var i = s.indexOf("#"), rest, auth, at, colon, end, slash;
-    if (i >= 0) { r.hash = s.slice(i); s = s.slice(0, i); }
-    i = s.indexOf("?");
-    if (i >= 0) { r.search = s.slice(i); s = s.slice(0, i); }
-    i = s.indexOf(":");
-    if (i < 1) { return null; }
-    r.protocol = s.slice(0, i + 1).toLowerCase();
-    rest = s.slice(i + 1);
-    if (rest.slice(0, 2) === "//") {
-      rest = rest.slice(2);
-      slash = rest.indexOf("/");
-      auth = slash < 0 ? rest : rest.slice(0, slash);
-      r.pathname = slash < 0 ? "" : rest.slice(slash);
-      at = auth.lastIndexOf("@");
-      if (at >= 0) {
-        var ui = auth.slice(0, at);
-        auth = auth.slice(at + 1);
-        colon = ui.indexOf(":");
-        r.username = colon < 0 ? ui : ui.slice(0, colon);
-        r.password = colon < 0 ? "" : ui.slice(colon + 1);
-      }
-      if (auth.charAt(0) === "[") {
-        end = auth.indexOf("]");
-        r.hostname = auth.slice(0, end + 1).toLowerCase();
-        if (auth.charAt(end + 1) === ":") { r.port = auth.slice(end + 2); }
-      } else {
-        colon = auth.lastIndexOf(":");
-        if (colon >= 0) { r.port = auth.slice(colon + 1); auth = auth.slice(0, colon); }
-        r.hostname = auth.toLowerCase();
-      }
-      if (r.port !== "" && SPECIAL[r.protocol] === r.port) { r.port = ""; }
-      if (r.pathname === "" && SPECIAL[r.protocol] !== undefined) { r.pathname = "/"; }
-    } else {
-      r.pathname = rest;
-      r.opaque = true;
-    }
-    if (!r.opaque) { r.pathname = escapeWith(r.pathname, badPath).split("%25").join("%25"); }
-    r.search = r.search === "?" ? "" : escapeWith(r.search, badQuery);
-    r.hash = r.hash === "#" ? "" : escapeWith(r.hash, badFragment);
-    return r;
-  }
   function serialize(r) {
     var s = r.protocol;
     if (!r.opaque) {
@@ -167,59 +105,9 @@ JS(
     }
     return s + r.pathname + r.search + r.hash;
   }
-  function removeDots(path) {
-    var segs = path.split("/"), out = [], i, seg, last;
-    for (i = 0; i < segs.length; i++) {
-      seg = segs[i];
-      last = i === segs.length - 1;
-      if (seg === "..") { if (out.length > 1) { out.pop(); } if (last) { out.push(""); } }
-      else if (seg === ".") { if (last) { out.push(""); } }
-      else { out.push(seg); }
-    }
-    return out.join("/");
-  }
-  function hasScheme(s) {
-    var i, c;
-    if (!/^[A-Za-z]/.test(s)) { return false; }
-    for (i = 1; i < s.length; i++) {
-      c = s.charAt(i);
-      if (c === ":") { return true; }
-      if (!/[A-Za-z0-9+.-]/.test(c)) { return false; }
-    }
-    return false;
-  }
-  /* RFC 3986 reference resolution; returns an absolute URL string or null */
-  function resolveRef(ref, base) {
-    var cut, tail = "", path, q, h, root;
-    ref = ref.trim();
-    if (hasScheme(ref)) { return ref; }
-    if (!base) { return null; }
-    if (ref.slice(0, 2) === "//") { return base.protocol + ref; }
-    h = ref.indexOf("#");
-    cut = h < 0 ? ref : ref.slice(0, h);
-    tail = h < 0 ? "" : ref.slice(h);
-    q = cut.indexOf("?");
-    path = q < 0 ? cut : cut.slice(0, q);
-    q = q < 0 ? "" : cut.slice(cut.indexOf("?"));
-    if (base.opaque) { return ref.charAt(0) === "#" ? serialize(base).split("#")[0] + ref : null; }
-    root = base.protocol + "//" + (base.username || base.password ? base.username + (base.password ? ":" + base.password : "") + "@" : "") + base.hostname + (base.port ? ":" + base.port : "");
-    if (path === "") {
-      return root + base.pathname + (q === "" && cut === "" ? base.search : q) + tail;
-    }
-    if (path.charAt(0) !== "/") {
-      path = base.pathname.slice(0, base.pathname.lastIndexOf("/") + 1) + path;
-    }
-    return root + removeDots(path) + q + tail;
-  }
   function URL(url, base) {
     if (arguments.length === 0) { throw typeError("Failed to construct URL: 1 argument required"); }
-    var r = null, b = null;
-    if (base !== undefined) {
-      b = parseAbsolute(String(base instanceof URL ? base.href : base));
-      if (!b) { throw typeError("Failed to construct URL: Invalid base URL"); }
-    }
-    var abs = resolveRef(String(url), b);
-    r = abs ? parseAbsolute(abs) : null;
+    var r = N.urlParse(String(url), base === undefined ? undefined : String(base instanceof URL ? base.href : base));
     if (!r) { throw typeError("Failed to construct URL: Invalid URL"); }
     hide(this, "@r", r);
     hide(this, "@sp", null);
@@ -236,7 +124,8 @@ JS(
   function simple(name) {
     urlProp(name, function () { return this["@r"][name]; }, function (v) { this["@r"][name] = String(v); });
   }
-  ["username", "password", "hostname"].forEach(simple);
+  ["username", "password"].forEach(simple);
+  urlProp("hostname", function () { return this["@r"].hostname; }, function (v) { this["@r"].hostname = String(v).toLowerCase(); });
   urlProp("protocol", function () { return this["@r"].protocol; }, function (v) {
     v = String(v);
     this["@r"].protocol = (v.charAt(v.length - 1) === ":" ? v : v + ":").toLowerCase();
@@ -257,14 +146,14 @@ JS(
   urlProp("search", function () { return this["@r"].search; }, function (v) {
     v = String(v);
     this["@r"].search = v === "" || v === "?" ? "" : escapeWith(v.charAt(0) === "?" ? v : "?" + v, badQuery);
-    if (this["@sp"]) { this["@sp"]["@list"].splice(0, this["@sp"]["@list"].length, ...parseQuery(this["@r"].search)); }
+    if (this["@sp"]) { this["@sp"]["@list"].splice(0, this["@sp"]["@list"].length, ...N.queryParse(this["@r"].search)); }
   });
   urlProp("hash", function () { return this["@r"].hash; }, function (v) {
     v = String(v);
     this["@r"].hash = v === "" || v === "#" ? "" : escapeWith(v.charAt(0) === "#" ? v : "#" + v, badFragment);
   });
   urlProp("href", function () { return serialize(this["@r"]); }, function (v) {
-    var r = parseAbsolute(String(v));
+    var r = N.urlParse(String(v));
     if (!r) { throw typeError("Invalid URL"); }
     this["@r"] = r;
   });
@@ -372,14 +261,10 @@ JS(
   method(FileReader.prototype, "readAsText", function (blob, enc) { frRead(this, blob, function (b) { return N.decode(b, enc === undefined ? "utf-8" : String(enc), false, false); }); });
   method(FileReader.prototype, "readAsArrayBuffer", function (blob) { frRead(this, blob, function (b) { return b.slice().buffer; }); });
   method(FileReader.prototype, "readAsBinaryString", function (blob) {
-    frRead(this, blob, function (b) { var s = "", i; for (i = 0; i < b.length; i++) { s += String.fromCharCode(b[i]); } return s; });
+    frRead(this, blob, function (b) { return N.binaryString(b); });
   });
   method(FileReader.prototype, "readAsDataURL", function (blob) {
-    frRead(this, blob, function (b) {
-      var s = "", i;
-      for (i = 0; i < b.length; i++) { s += String.fromCharCode(b[i]); }
-      return "data:" + (blob.type || "application/octet-stream") + ";base64," + btoa(s);
-    });
+    frRead(this, blob, function (b) { return "data:" + (blob.type || "application/octet-stream") + ";base64," + N.base64(b); });
   });
   method(FileReader.prototype, "abort", function () {
     if (this.readyState !== 1) { return; }
@@ -482,7 +367,6 @@ JS(
   });
   hide(Headers.prototype, Symbol.iterator, Headers.prototype.entries);
   hide(g, "Headers", Headers);
-  L.formEncode = formEncode;
   L.concat = concat;
   L.partBytes = partBytes;
   L.Blob = Blob;
