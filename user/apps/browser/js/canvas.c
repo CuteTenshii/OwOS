@@ -991,7 +991,7 @@ static js_value imagedata_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   if (argc >= 2 && args[0].type == JV_OBJ && args[0].u.obj->kind == OBJ_TYPEDARRAY) {
     js_typedarray *ta = args[0].u.obj->host;
     js_arraybuffer *ab = ta->buffer->host;
-    int len = ta->length;
+    int len = ta_length(ta);
     w = js_to_int_sat(ctx, args[1]);
     if (w <= 0 || len % (w * 4))
       return index_size_error(ctx, "The input data length is not a multiple of (4 * width).");

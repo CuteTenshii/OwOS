@@ -58,7 +58,7 @@ const unsigned char *view_bytes(js_value v, int *len)
     if (!ta->buffer || !ta->buffer->host)
       return 0;
     ab = (js_arraybuffer *)ta->buffer->host;
-    *len = ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
+    *len = ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
     return ab->data + ta->offset;
   }
   return 0;
@@ -104,7 +104,7 @@ static js_value textenc_encodeinto(js_ctx *ctx, js_value t, js_value *args, int 
     if (ta->buffer && ta->buffer->host) {
       js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host;
       out = ab->data + ta->offset;
-      cap = ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
+      cap = ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
     }
   }
   n = (s.type == JV_STR) ? s.u.str->len : 0;

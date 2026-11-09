@@ -256,7 +256,7 @@ static const char *wt_fetch(struct wthread *wt, const char *base, const char *sp
 
 static js_value wt_post(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_clone *c = js_clone_write(ctx, A(0));
+  js_clone *c = js_clone_write(ctx, A(0), A(1));
   (void)t;
   if (c)
     wmsg_post(cur_wt, &cur_wt->out, WM_DATA, 0, c, 0);
@@ -843,7 +843,7 @@ static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_clone *c;
   if (!wt || __atomic_load_n(&wt->irq.stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&wt->closing, __ATOMIC_ACQUIRE))
     return js_undef();
-  c = js_clone_write(ctx, A(0));
+  c = js_clone_write(ctx, A(0), A(1));
   if (c)
     wmsg_post(wt, &wt->in, WM_DATA, 0, c, 0);
   return js_undef();

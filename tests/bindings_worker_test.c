@@ -177,6 +177,20 @@ static void test_worker_timers(void)
              "expect(ticks.indexOf('early')<ticks.indexOf('late'), 'timers fire in order');\n");
 }
 
+static void test_transfer_and_collections(void)
+{
+  run_script("var tr=null, tbuf=new ArrayBuffer(16), tv=new Uint8Array(tbuf); tv[3]=5;\n"
+             "var tw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data.buf, v=new Uint8Array(b);"
+             "v[4]=7; postMessage({buf:b, sum:v[3]+v[4], keys:Array.from(e.data.m.keys()), has:e.data.s.has(\"q\"), "
+             "re:e.data.re.test(\"AB\")}, [b]); };');\n"
+             "tw.onmessage=function(e){ tr=e.data; };\n"
+             "tw.postMessage({buf:tbuf, m:new Map([[1,2],[\"k\",3]]), s:new Set([\"q\"]), re:/ab/i}, [tbuf]);\n"
+             "expect(tbuf.byteLength===0 && tv.length===0, 'the page buffer is detached by the transfer');\n");
+  expect(wait_for("tr!==null"));
+  run_script("expect(tr.buf.byteLength===16 && tr.sum===12, 'the worker saw the bytes and sent them back: '+tr.sum);\n"
+             "expect(tr.keys.join()==='1,k' && tr.has===true && tr.re===true, 'Map, Set and RegExp arrive');\n");
+}
+
 static void test_shared_memory(void)
 {
   run_script("var sab=new SharedArrayBuffer(16), ia=new Int32Array(sab), sdone=false, woke=null,\n"
@@ -276,6 +290,7 @@ int main(void)
   test("importScripts, location and name", test_import_scripts_and_location);
   test("module workers", test_module_worker);
   test("worker timers", test_worker_timers);
+  test("transferred buffers and collections", test_transfer_and_collections);
   test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   test("MessageChannel and MessagePort", test_message_channel);
   test("ErrorEvent and MessageEvent", test_event_interfaces);

@@ -155,9 +155,11 @@ static inline int js_irq_stopped(const js_irq *irq) { return irq && __atomic_loa
 
 /* Structured clone across heaps: js_clone_write flattens a value into pointer-free bytes (a SharedArrayBuffer
  * store is retained, not copied), js_clone_read rebuilds it in any context, js_clone_free drops the bytes and
- * the store references. Write returns NULL with a DataCloneError pending for functions and host objects. */
+ * the store references. Write returns NULL with a DataCloneError pending for functions and host objects.
+ * `transfer` is postMessage's transfer list (an array, {transfer: array} or undefined): the ArrayBuffers in it
+ * are moved, not copied, and detached in the sender once the message is written. */
 typedef struct js_clone js_clone;
-js_clone *js_clone_write(js_ctx *ctx, js_value v);
+js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer);
 js_value js_clone_read(js_ctx *ctx, const js_clone *c);
 void js_clone_free(js_clone *c);
 

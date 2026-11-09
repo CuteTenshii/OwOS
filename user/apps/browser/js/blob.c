@@ -27,7 +27,7 @@ static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v)
     if (o->kind == OBJ_TYPEDARRAY && o->host) {
       js_typedarray *ta = (js_typedarray *)o->host;
       js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host;
-      sb_putn(sb, (const char *)ab->data + ta->offset, ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type));
+      sb_putn(sb, (const char *)ab->data + ta->offset, ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type));
       return;
     }
   }
@@ -207,7 +207,7 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
     if (o->kind == OBJ_TYPEDARRAY && o->host) {
       js_typedarray *ta = (js_typedarray *)o->host;
       js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host;
-      *len = ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
+      *len = ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
       return (const char *)ab->data + ta->offset;
     }
     if (o->proto == g_sp_proto) {

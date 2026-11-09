@@ -809,7 +809,7 @@ js_value ta_get(js_ctx *ctx, js_object *view, unsigned idx)
   js_typedarray *ta = (js_typedarray *)view->host;
   js_arraybuffer *ab;
   unsigned char *p;
-  if (!ta || ta->type < 0 || idx >= (unsigned)ta->length)
+  if (!ta || ta->type < 0 || idx >= (unsigned)ta_length(ta))
     return js_undef();
   ab = (js_arraybuffer *)ta->buffer->host;
   p = ab->data + ta->offset + idx * (unsigned)ta_elem_size(ta->type);
@@ -869,7 +869,7 @@ void ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v)
   js_typedarray *ta = (js_typedarray *)view->host;
   js_arraybuffer *ab;
   unsigned char *p;
-  if (!ta || ta->type < 0 || idx >= (unsigned)ta->length)
+  if (!ta || ta->type < 0 || idx >= (unsigned)ta_length(ta))
     return;
   ab = (js_arraybuffer *)ta->buffer->host;
   p = ab->data + ta->offset + idx * (unsigned)ta_elem_size(ta->type);

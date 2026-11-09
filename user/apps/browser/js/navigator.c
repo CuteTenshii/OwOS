@@ -191,7 +191,7 @@ js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int arg
   if (!ta || ta->type < 0 || ta->type == TA_F32 || ta->type == TA_F64 || ta->type == TA_F16)
     return js_make_error(ctx, ctx->type_error_proto, "TypeMismatchError",
                          "getRandomValues requires an integer-typed TypedArray");
-  nbytes = ta->length * ta_elem_size(ta->type);
+  nbytes = ta_length(ta) * ta_elem_size(ta->type);
   if (nbytes > 65536)
     return js_make_error(ctx, ctx->error_proto, "QuotaExceededError",
                          "getRandomValues can only generate a maximum of 65536 bytes");

@@ -29,10 +29,10 @@ static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int arg
 
 static int can_block; /* run() lets Atomics.wait block */
 
-/* clone(v): v through js_clone_write and js_clone_read, as a message between two threads would be */
+/* clone(v, transfer): v through js_clone_write and js_clone_read, as a message between two threads would be */
 static js_value test_clone(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
-  js_clone *c = argc > 0 ? js_clone_write(ctx, args[0]) : NULL;
+  js_clone *c = argc > 0 ? js_clone_write(ctx, args[0], argc > 1 ? args[1] : js_undef()) : NULL;
   js_value v;
   (void)thisv;
   if (!c)
@@ -213,6 +213,29 @@ static void check_structured_clone(void)
       "expect(t(function(){ clone(function(){}) })==='DataCloneError' && t(function(){ clone({f:Symbol()}) "
       "})==='DataCloneError', "
       "'functions and symbols throw DataCloneError');\n"
+      "var mp=new Map([[1,'a'],['k',{z:[1]}]]); mp.set(mp,'self'); var mc=clone(mp);\n"
+      "expect(mc instanceof Map && mc!==mp && mc.size===3 && mc.get(1)==='a' && mc.get('k').z[0]===1 && "
+      "mc.get(mc)==='self', "
+      "'Map, including a key that is the map itself');\n"
+      "var st=new Set([1,'two',{three:3}]), sc2=clone(st); expect(sc2 instanceof Set && sc2.size===3 && "
+      "sc2.has('two'), 'Set');\n"
+      "var rc=clone(/a(b+)c/gi); expect(rc instanceof RegExp && rc.source==='a(b+)c' && rc.flags==='gi' && "
+      "rc.test('xABBc'), "
+      "'RegExp');\n"
+      "var ab2=new ArrayBuffer(8), v8=new Uint8Array(ab2); v8[0]=9; var dv2=new DataView(ab2);\n"
+      "var moved=clone({b:ab2,v:v8},[ab2]);\n"
+      "expect(ab2.byteLength===0 && v8.length===0 && v8[0]===undefined && v8.byteLength===0, 'transfer detaches the "
+      "sender');\n"
+      "v8.fill(1); v8.reverse(); expect(v8.join()==='' && t(function(){ dv2.getUint8(0) })==='RangeError', 'detached "
+      "views stay safe');\n"
+      "expect(moved.b.byteLength===8 && moved.v[0]===9 && moved.v.buffer===moved.b, 'the receiver gets the bytes, "
+      "views included');\n"
+      "var keep=new ArrayBuffer(4); clone(keep,[]); clone(keep,{transfer:[]}); expect(keep.byteLength===4, 'no "
+      "transfer, no detach');\n"
+      "var mv2=new ArrayBuffer(4), r2=clone([mv2],{transfer:[mv2]}); expect(mv2.byteLength===0 && "
+      "r2[0].byteLength===4, 'options form');\n"
+      "var bad=new ArrayBuffer(4); t(function(){ clone([bad,function(){}],[bad]) }); expect(bad.byteLength===4, 'a "
+      "failed write detaches nothing');\n"
       "var big=[]; for (var i=0;i<1000;i++) big.push({i:i,s:'v'+i}); var bc=clone(big);\n"
       "expect(bc.length===1000 && bc[999].s==='v999', 'large arrays');\n",
       0));

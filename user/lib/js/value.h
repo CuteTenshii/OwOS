@@ -261,6 +261,16 @@ void js_array_set_len(js_ctx *ctx, js_object *arr, unsigned len);
 
 /* typed-array element access (the backing-byte read/write behind ta[i]) */
 int ta_elem_size(int type);
+/* A view's element count now: a view over a buffer that was transferred away (detached) or is shorter than the
+ * view was made for reads as shorter, down to empty. */
+static inline int ta_length(const js_typedarray *ta)
+{
+  const js_arraybuffer *ab = (const js_arraybuffer *)ta->buffer->host;
+  int avail = ab ? (ab->byteLength - ta->offset) / (ta->type >= 0 ? ta_elem_size(ta->type) : 1) : 0;
+  if (avail < 0)
+    avail = 0;
+  return ta->length < avail ? ta->length : avail;
+}
 js_value ta_get(js_ctx *ctx, js_object *view, unsigned idx); /* number, BigInt, or undefined */
 void ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v);
 

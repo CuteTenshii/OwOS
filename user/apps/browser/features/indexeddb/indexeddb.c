@@ -213,7 +213,7 @@ static js_value idb_clone(js_ctx *ctx, js_value v, int depth)
         ctor = js_get(ctx, js_obj_value(ctx->global), idb_ta_name(ta->type));
         argv[0] = buf;
         argv[1] = js_number(ta->offset);
-        argv[2] = js_number(ta->length);
+        argv[2] = js_number(ta_length(ta));
         out = js_construct(ctx, ctor, argv, 3);
       }
     } else if (o->kind == OBJ_ARRAY) {

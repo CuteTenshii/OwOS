@@ -1501,7 +1501,7 @@ static js_value array_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
   res = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   if (ta && ta->type < 0)
     ta = NULL;
-  if ((!arr && !ta) || i >= (arr ? (int)arr->elen : ta->length)) {
+  if ((!arr && !ta) || i >= (arr ? (int)arr->elen : ta_length(ta))) {
     js_def(res, "value", js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
     js_def(res, "done", js_bool(1), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
@@ -7936,7 +7936,7 @@ static int ta_src_len(js_ctx *ctx, js_value src)
     js_object *o = src.u.obj;
     if (o->kind == OBJ_TYPEDARRAY) {
       js_typedarray *t = (js_typedarray *)o->host;
-      return t ? t->length : 0;
+      return t ? ta_length(t) : 0;
     }
     if (o->kind == OBJ_ARRAY)
       return (int)o->elen;
@@ -8016,7 +8016,7 @@ static js_value tap_length(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)ctx;
   (void)a;
   (void)n;
-  return js_number(ta ? ta->length : 0);
+  return js_number(ta ? ta_length(ta) : 0);
 }
 static js_value tap_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -8024,7 +8024,7 @@ static js_value tap_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)ctx;
   (void)a;
   (void)n;
-  return js_number(ta ? ta->length * ta_elem_size(ta->type) : 0);
+  return js_number(ta ? ta_length(ta) * ta_elem_size(ta->type) : 0);
 }
 static js_value tap_byteoffset(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -8063,7 +8063,7 @@ static js_value tap_subarray(js_ctx *ctx, js_value t, js_value *a, int n)
   int len, b, e;
   if (!ta)
     return js_undef();
-  len = ta->length;
+  len = ta_length(ta);
   b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[0]), len) : 0;
   e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : len;
   if (e < b)
@@ -8077,7 +8077,7 @@ static js_value tap_slice(js_ctx *ctx, js_value t, js_value *a, int n)
   js_value view;
   if (!ta)
     return js_undef();
-  len = ta->length;
+  len = ta_length(ta);
   es = ta_elem_size(ta->type);
   b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[0]), len) : 0;
   e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : len;
@@ -8104,7 +8104,7 @@ static js_value tap_fill(js_ctx *ctx, js_value t, js_value *a, int n)
   int len, s, e;
   if (!ta)
     return t;
-  len = ta->length;
+  len = ta_length(ta);
   s = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : 0;
   e = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[2]), len) : len;
   for (; s < e && !ctx->has_exc; s++)
@@ -8118,8 +8118,8 @@ static js_value tap_indexof(js_ctx *ctx, js_value t, js_value *a, int n)
   int i, from;
   if (!ta)
     return js_number(-1);
-  from = n > 1 ? clamp_idx(js_to_int_sat(ctx, a[1]), ta->length) : 0;
-  for (i = from; i < ta->length; i++)
+  from = n > 1 ? clamp_idx(js_to_int_sat(ctx, a[1]), ta_length(ta)) : 0;
+  for (i = from; i < ta_length(ta); i++)
     if (js_strict_eq(ta_get(ctx, t.u.obj, (unsigned)i), v))
       return js_number(i);
   return js_number(-1);
@@ -8150,7 +8150,7 @@ static js_value tap_join(js_ctx *ctx, js_value t, js_value *a, int n)
   if (sv.type == JV_STR)
     KEEP(sv);
   if (ta)
-    for (i = 0; i < ta->length; i++) {
+    for (i = 0; i < ta_length(ta); i++) {
       js_value e;
       if (i)
         sb_put(&sb, sep, seplen);
@@ -8177,7 +8177,7 @@ static js_value tap_foreach(js_ctx *ctx, js_value t, js_value *a, int n)
   int i;
   if (!ta || !js_is_callable(cb))
     return js_undef();
-  for (i = 0; i < ta->length; i++) {
+  for (i = 0; i < ta_length(ta); i++) {
     js_value ar[3];
     ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
     ar[1] = js_number(i);
@@ -8197,11 +8197,11 @@ static js_value tap_map(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   gc_push_scope();
   {
-    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(ta->length, ta_elem_size(ta->type))));
-    view = new_view(ctx, ta->type, buf, 0, ta->length);
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(ta_length(ta), ta_elem_size(ta->type))));
+    view = new_view(ctx, ta->type, buf, 0, ta_length(ta));
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
-      for (i = 0; i < ta->length; i++) {
+      for (i = 0; i < ta_length(ta); i++) {
         js_value ar[3], r;
         ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
         ar[1] = js_number(i);
@@ -8226,12 +8226,12 @@ static js_value tap_reduce(js_ctx *ctx, js_value t, js_value *a, int n)
   if (n > 1)
     acc = a[1];
   else {
-    if (ta->length == 0)
+    if (ta_length(ta) == 0)
       return js_throw_type(ctx, "Reduce of empty array with no initial value");
     acc = ta_get(ctx, t.u.obj, 0);
     i = 1;
   }
-  for (; i < ta->length; i++) {
+  for (; i < ta_length(ta); i++) {
     js_value ar[4];
     gc_push_scope();
     KEEP(acc);
@@ -8257,7 +8257,7 @@ static js_value tap_scan(js_ctx *ctx, js_value t, js_value *a, int n, int mode)
     return js_undef();
   if (!js_is_callable(cb))
     return js_throw_type(ctx, "callback is not a function");
-  for (i = rev ? ta->length - 1 : 0; rev ? i >= 0 : i < ta->length; i += rev ? -1 : 1) {
+  for (i = rev ? ta_length(ta) - 1 : 0; rev ? i >= 0 : i < ta_length(ta); i += rev ? -1 : 1) {
     js_value ar[3], r;
     ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
     ar[1] = js_number(i);
@@ -8311,7 +8311,7 @@ static js_object *ta_to_array(js_ctx *ctx, js_value t)
   js_typedarray *ta = as_ta(t);
   js_object *out = (js_object *)gc_keep(js_new_array(ctx, 0));
   int i;
-  for (i = 0; ta && i < ta->length; i++)
+  for (i = 0; ta && i < ta_length(ta); i++)
     js_array_push(ctx, out, ta_get(ctx, t.u.obj, (unsigned)i));
   return out;
 }
@@ -8327,7 +8327,7 @@ static js_value tap_filter(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_throw_type(ctx, "callback is not a function");
   gc_push_scope();
   kept = (js_object *)gc_keep(js_new_array(ctx, 0));
-  for (i = 0; i < ta->length; i++) {
+  for (i = 0; i < ta_length(ta); i++) {
     js_value ar[3], r;
     ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
     ar[1] = js_number(i);
@@ -8350,11 +8350,11 @@ static js_value tap_lastindexof(js_ctx *ctx, js_value t, js_value *a, int n)
   int i;
   if (!ta)
     return js_number(-1);
-  i = n > 1 ? js_to_int_sat(ctx, a[1]) : ta->length - 1;
+  i = n > 1 ? js_to_int_sat(ctx, a[1]) : ta_length(ta) - 1;
   if (i < 0)
-    i += ta->length;
-  if (i >= ta->length)
-    i = ta->length - 1;
+    i += ta_length(ta);
+  if (i >= ta_length(ta))
+    i = ta_length(ta) - 1;
   for (; i >= 0; i--)
     if (js_strict_eq(ta_get(ctx, t.u.obj, (unsigned)i), v))
       return js_number(i);
@@ -8367,8 +8367,8 @@ static js_value tap_at(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!ta)
     return js_undef();
   if (i < 0)
-    i += ta->length;
-  if (i < 0 || i >= ta->length)
+    i += ta_length(ta);
+  if (i < 0 || i >= ta_length(ta))
     return js_undef();
   return ta_get(ctx, t.u.obj, (unsigned)i);
 }
@@ -8378,13 +8378,13 @@ static js_value tap_reverse(js_ctx *ctx, js_value t, js_value *a, int n)
   int i;
   (void)a;
   (void)n;
-  for (i = 0; ta && i < ta->length / 2; i++) {
-    js_value x = ta_get(ctx, t.u.obj, (unsigned)i), y = ta_get(ctx, t.u.obj, (unsigned)(ta->length - 1 - i));
+  for (i = 0; ta && i < ta_length(ta) / 2; i++) {
+    js_value x = ta_get(ctx, t.u.obj, (unsigned)i), y = ta_get(ctx, t.u.obj, (unsigned)(ta_length(ta) - 1 - i));
     gc_push_scope();
     KEEP(x);
     KEEP(y);
     ta_set(ctx, t.u.obj, (unsigned)i, y);
-    ta_set(ctx, t.u.obj, (unsigned)(ta->length - 1 - i), x);
+    ta_set(ctx, t.u.obj, (unsigned)(ta_length(ta) - 1 - i), x);
     gc_pop_scope();
   }
   return t;
@@ -8430,7 +8430,7 @@ static js_value tap_sort(js_ctx *ctx, js_value t, js_value *a, int n)
   KEEP(cmp);
   tmp = ta_to_array(ctx, t);
   sort_values(ctx, tmp, cmp);
-  for (i = 0; i < ta->length && !ctx->has_exc; i++)
+  for (i = 0; i < ta_length(ta) && !ctx->has_exc; i++)
     ta_set(ctx, t.u.obj, (unsigned)i, tmp->elems[i]);
   gc_pop_scope();
   return t;
@@ -8485,8 +8485,8 @@ static js_value tap_with(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!ta)
     return js_undef();
   if (i < 0)
-    i += ta->length;
-  if (i < 0 || i >= ta->length)
+    i += ta_length(ta);
+  if (i < 0 || i >= ta_length(ta))
     return js_throw_range(ctx, "Invalid typed array index");
   gc_push_scope();
   KEEP(t);
@@ -8506,11 +8506,11 @@ static js_value tap_reduceright(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   if (!js_is_callable(cb))
     return js_throw_type(ctx, "callback is not a function");
-  i = ta->length - 1;
+  i = ta_length(ta) - 1;
   if (n > 1)
     acc = a[1];
   else {
-    if (ta->length == 0)
+    if (ta_length(ta) == 0)
       return js_throw_type(ctx, "Reduce of empty array with no initial value");
     acc = ta_get(ctx, t.u.obj, (unsigned)i--);
   }
@@ -8536,7 +8536,7 @@ static js_value tap_copywithin(js_ctx *ctx, js_value t, js_value *a, int n)
   js_object *tmp;
   if (!ta)
     return t;
-  len = ta->length;
+  len = ta_length(ta);
   to = clamp_idx(n > 0 ? js_to_int_sat(ctx, a[0]) : 0, len);
   from = clamp_idx(n > 1 ? js_to_int_sat(ctx, a[1]) : 0, len);
   end = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[2]), len) : len;
@@ -8692,7 +8692,7 @@ static js_object *atomics_target(js_ctx *ctx, js_value *a, int n, int wait, unsi
   }
   if (d != d)
     d = 0;
-  if (d < 0 || d >= ta->length) {
+  if (d < 0 || d >= ta_length(ta)) {
     js_throw_range(ctx, "Atomics index out of range");
     return 0;
   }
@@ -9098,7 +9098,7 @@ static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type)
     return js_undef();
   off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 1) && js_to_boolean(a[1]);
-  if (off < 0 || off > ta->length - es)
+  if (off < 0 || off > ta_length(ta) - es)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
   ab = (js_arraybuffer *)ta->buffer->host;
   memcpy(tmp, ab->data + ta->offset + off, (unsigned)es);
@@ -9116,7 +9116,7 @@ static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type)
     return js_undef();
   off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 2) && js_to_boolean(a[2]);
-  if (off < 0 || off > ta->length - es)
+  if (off < 0 || off > ta_length(ta) - es)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
   ab = (js_arraybuffer *)ta->buffer->host;
   if (!dv_encode(ctx, type, n > 1 ? a[1] : js_undef(), tmp))
@@ -9160,7 +9160,7 @@ static js_value dv_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)ctx;
   (void)a;
   (void)n;
-  return js_number(ta ? ta->length : 0);
+  return js_number(ta ? ta_length(ta) : 0);
 }
 static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -9185,9 +9185,9 @@ static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 /* ------------------------------------------------------- structured clone across heaps -- *
  * js_clone_write flattens a value into bytes that hold no pointers into the sender's heap, so a message can
  * be read back (js_clone_read) in another thread's context. Plain objects, arrays, primitives, BigInts,
- * Dates, Errors, ArrayBuffers and typed-array views are copied; a SharedArrayBuffer store is shared. Objects
- * get back-references, so cycles and shared structure survive. Functions, symbols and host objects throw
- * DataCloneError. */
+ * Dates, RegExps, Maps, Sets, Errors, ArrayBuffers and typed-array views are copied; a SharedArrayBuffer store is
+ * shared. Objects get back-references, so cycles and shared structure survive. Functions, symbols and host objects
+ * throw DataCloneError. */
 enum {
   CL_UNDEF,
   CL_NULL,
@@ -9203,7 +9203,11 @@ enum {
   CL_ERROR,
   CL_ABUF,
   CL_SAB,
-  CL_VIEW
+  CL_VIEW,
+  CL_MAP,
+  CL_SET,
+  CL_REGEXP,
+  CL_ABUF_MOVE
 };
 #define CLONE_DEPTH 200
 
@@ -9216,6 +9220,8 @@ struct js_clone {
   int len, cap;
   clone_sab *sabs;
   int nsabs;
+  clone_sab *moved; /* transferred ArrayBuffers: their bytes now belong to the message */
+  int nmoved;
 };
 typedef struct {
   js_ctx *ctx;
@@ -9223,6 +9229,10 @@ typedef struct {
   js_object **seen;
   int nseen, capseen;
   int failed;
+  js_object **xfer; /* the transfer list's ArrayBuffers */
+  int nxfer;
+  js_arraybuffer **moves; /* those actually written, in order of appearance */
+  int nmoves;
 } clone_w;
 
 static int clone_put(clone_w *w, const void *p, int n)
@@ -9287,6 +9297,15 @@ static int clone_note(clone_w *w, js_object *o)
   return 1;
 }
 static int clone_key_ok(const pentry *pe) { return (pe->flags & P_ENUMERABLE) && pe->key[0] != '\x01'; }
+
+static int clone_transferred(const clone_w *w, const js_object *o)
+{
+  int i;
+  for (i = 0; i < w->nxfer; i++)
+    if (w->xfer[i] == o)
+      return 1;
+  return 0;
+}
 
 static void clone_value(clone_w *w, js_value v, int depth)
 {
@@ -9356,6 +9375,16 @@ static void clone_value(clone_w *w, js_value v, int depth)
       ns[w->c->nsabs].len = ab->byteLength;
       clone_tag(w, CL_SAB);
       clone_u32(w, (unsigned)w->c->nsabs++);
+    } else if (clone_transferred(w, o)) {
+      js_arraybuffer **nm = (js_arraybuffer **)realloc(w->moves, (unsigned)(w->nmoves + 1) * sizeof *nm);
+      if (!nm) {
+        w->failed = 1;
+        return;
+      }
+      w->moves = nm;
+      nm[w->nmoves] = ab;
+      clone_tag(w, CL_ABUF_MOVE);
+      clone_u32(w, (unsigned)w->nmoves++);
     } else {
       clone_tag(w, CL_ABUF);
       clone_str(w, (const char *)ab->data, ab->byteLength);
@@ -9367,7 +9396,7 @@ static void clone_value(clone_w *w, js_value v, int depth)
     clone_tag(w, CL_VIEW);
     clone_u32(w, (unsigned)ta->type);
     clone_u32(w, (unsigned)ta->offset);
-    clone_u32(w, (unsigned)ta->length);
+    clone_u32(w, (unsigned)ta_length(ta));
     clone_value(w, js_obj_value(ta->buffer), depth + 1);
     return;
   }
@@ -9375,6 +9404,13 @@ static void clone_value(clone_w *w, js_value v, int depth)
     js_value t = js_get(ctx, v, "@t");
     clone_tag(w, CL_DATE);
     clone_put(w, &t.u.num, 8);
+    return;
+  }
+  if (o->proto == ctx->regexp_proto) {
+    js_value src = js_to_string(ctx, js_get(ctx, v, "source")), flags = js_to_string(ctx, js_get(ctx, v, "flags"));
+    clone_tag(w, CL_REGEXP);
+    clone_str(w, src.u.str->data, src.u.str->len);
+    clone_str(w, flags.u.str->data, flags.u.str->len);
     return;
   }
   if (o->kind == OBJ_ERROR) {
@@ -9386,7 +9422,18 @@ static void clone_value(clone_w *w, js_value v, int depth)
   }
   gc_push_scope();
   gc_keep(o);
-  if (o->kind == OBJ_ARRAY) {
+  if (o->proto == ctx->map_proto || o->proto == ctx->set_proto) {
+    int is_map = o->proto == ctx->map_proto;
+    js_object *keys = coll_keys(ctx, v), *vals = is_map ? coll_vals(ctx, v) : 0;
+    unsigned e, n = keys ? keys->elen : 0;
+    clone_tag(w, is_map ? CL_MAP : CL_SET);
+    clone_u32(w, n);
+    for (e = 0; e < n && !w->failed; e++) {
+      clone_value(w, e < keys->elen ? keys->elems[e] : js_undef(), depth + 1);
+      if (is_map)
+        clone_value(w, vals && e < vals->elen ? vals->elems[e] : js_undef(), depth + 1);
+    }
+  } else if (o->kind == OBJ_ARRAY) {
     unsigned e, n = o->elen;
     clone_tag(w, CL_ARRAY);
     clone_u32(w, n);
@@ -9416,18 +9463,47 @@ static void clone_value(clone_w *w, js_value v, int depth)
   gc_pop_scope();
 }
 
-js_clone *js_clone_write(js_ctx *ctx, js_value v)
+js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer)
 {
-  clone_w w = {ctx, 0, 0, 0, 0, 0};
+  clone_w w = {ctx, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  unsigned i, n;
   w.c = (js_clone *)calloc(1, sizeof *w.c);
   if (!w.c)
     return NULL;
+  if (transfer.type == JV_OBJ && transfer.u.obj->kind != OBJ_ARRAY) {
+    js_value list = js_get(ctx, transfer, "transfer"); /* postMessage(v, {transfer: [...]}) */
+    transfer = list;
+  }
+  if (transfer.type == JV_OBJ && transfer.u.obj->kind == OBJ_ARRAY) {
+    n = transfer.u.obj->elen;
+    w.xfer = (js_object **)malloc((n ? n : 1) * sizeof *w.xfer);
+    for (i = 0; w.xfer && i < n; i++) {
+      js_value item = transfer.u.obj->elems[i];
+      if (item.type == JV_OBJ && item.u.obj->kind == OBJ_ARRAYBUFFER && !((js_arraybuffer *)item.u.obj->host)->shared)
+        w.xfer[w.nxfer++] = item.u.obj;
+    }
+  }
   clone_value(&w, v, 0);
   free(w.seen);
+  free(w.xfer);
+  if (!w.failed && w.nmoves) {
+    w.c->moved = (clone_sab *)malloc((unsigned)w.nmoves * sizeof *w.c->moved);
+    if (!w.c->moved)
+      w.failed = 1;
+  }
   if (w.failed) {
+    free(w.moves);
     js_clone_free(w.c);
     return NULL;
   }
+  for (i = 0; i < (unsigned)w.nmoves; i++) { /* now commit: the sender's buffers become detached */
+    w.c->moved[i].data = w.moves[i]->data;
+    w.c->moved[i].len = w.moves[i]->byteLength;
+    w.moves[i]->data = NULL;
+    w.moves[i]->byteLength = 0;
+  }
+  w.c->nmoved = w.nmoves;
+  free(w.moves);
   return w.c;
 }
 
@@ -9438,6 +9514,9 @@ void js_clone_free(js_clone *c)
     return;
   for (i = 0; i < c->nsabs; i++)
     js_sab_release(c->sabs[i].data);
+  for (i = 0; i < c->nmoved; i++)
+    free(c->moved[i].data);
+  free(c->moved);
   free(c->sabs);
   free(c->buf);
   free(c);
@@ -9588,6 +9667,53 @@ static js_value clone_read_value(clone_r *r, int depth)
     gc_pop_scope();
     return js_obj_value(o);
   }
+  case CL_MAP:
+  case CL_SET: {
+    unsigned n = clone_get_u32(r), e;
+    js_object *coll;
+    gc_push_scope();
+    coll = (js_object *)gc_keep(make_coll(ctx, tag == CL_MAP ? ctx->map_proto : ctx->set_proto, tag == CL_MAP));
+    clone_made(r, coll);
+    for (e = 0; e < n && !r->failed; e++) {
+      js_value args[2];
+      args[0] = clone_read_value(r, depth + 1);
+      gc_push_scope();
+      if (args[0].type == JV_OBJ)
+        gc_keep(args[0].u.obj);
+      if (tag == CL_MAP) {
+        args[1] = clone_read_value(r, depth + 1);
+        if (args[1].type == JV_OBJ)
+          gc_keep(args[1].u.obj);
+        map_set(ctx, js_obj_value(coll), args, 2);
+      } else
+        set_add(ctx, js_obj_value(coll), args, 1);
+      gc_pop_scope();
+    }
+    gc_pop_scope();
+    return js_obj_value(coll);
+  }
+  case CL_REGEXP: {
+    int sl, fl;
+    const unsigned char *sp = clone_get_bytes(r, &sl), *fp = clone_get_bytes(r, &fl);
+    char flags[16];
+    js_value src, re;
+    if (!sp || !fp || fl >= (int)sizeof flags) {
+      r->failed = 1;
+      return js_undef();
+    }
+    memcpy(flags, fp, (unsigned)fl);
+    flags[fl] = 0;
+    gc_push_scope();
+    src = js_mk_string(ctx, (const char *)sp, sl);
+    gc_keep(src.u.str);
+    re = js_make_regexp(ctx, src.u.str->data, flags);
+    if (re.type == JV_OBJ) {
+      gc_keep(re.u.obj);
+      clone_made(r, re.u.obj);
+    }
+    gc_pop_scope();
+    return re;
+  }
   case CL_DATE: {
     double ms = 0;
     js_object *o;
@@ -9644,6 +9770,20 @@ static js_value clone_read_value(clone_r *r, int depth)
       memcpy(((js_arraybuffer *)o->host)->data, p, (unsigned)len);
     clone_made(r, o);
     gc_pop_scope();
+    return js_obj_value(o);
+  }
+  case CL_ABUF_MOVE: {
+    unsigned i = clone_get_u32(r);
+    clone_sab *mv;
+    js_object *o;
+    if (i >= (unsigned)r->c->nmoved || !r->c->moved[i].data) {
+      r->failed = 1;
+      return js_undef();
+    }
+    mv = &r->c->moved[i];
+    o = buffer_object(ctx, ctx->arraybuffer_proto, mv->data, mv->len, 0);
+    mv->data = NULL; /* the buffer owns the bytes now; a message is read once */
+    clone_made(r, o);
     return js_obj_value(o);
   }
   case CL_SAB: {
