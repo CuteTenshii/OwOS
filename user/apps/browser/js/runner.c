@@ -528,6 +528,8 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
     js_def_native(g_ctx, g_ctx->global, "eval", dyncode_blocked, 1);
     js_def_native(g_ctx, g_ctx->global, "Function", dyncode_blocked, 1);
   }
+  if (B->pg->csp && !csp_allows_wasm_eval(B->pg->csp))
+    js_wasm_block(g_ctx);
 
   int inline_n = 0;
   /* Two ordered passes: pass 0 = classic + async (document order) */

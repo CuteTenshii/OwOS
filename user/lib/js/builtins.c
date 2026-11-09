@@ -7940,6 +7940,7 @@ static js_object *buffer_object(js_ctx *ctx, js_object *proto, unsigned char *da
   ab->data = data;
   ab->byteLength = data ? n : 0;
   ab->shared = shared;
+  ab->owner = NULL;
   if (!data) /* too big for the heap */
     js_throw_range(ctx, "Array buffer allocation failed");
   gc_set_external(o, (unsigned)ab->byteLength); /* the bytes are malloc'd, outside the collector */
@@ -7965,6 +7966,25 @@ js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length)
   if (o->host && data && byte_length > 0)
     memcpy(((js_arraybuffer *)o->host)->data, data, (unsigned)byte_length);
   return js_obj_value(o);
+}
+js_value js_arraybuffer_external(js_ctx *ctx, unsigned char *data, int byte_length, js_object *owner)
+{
+  js_object *o;
+  gc_push_scope();
+  gc_keep(owner);
+  o = buffer_object(ctx, ctx->arraybuffer_proto, data, byte_length, 0);
+  if (o->host)
+    ((js_arraybuffer *)o->host)->owner = owner;
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+void js_arraybuffer_detach(js_object *buf)
+{
+  js_arraybuffer *ab = (js_arraybuffer *)buf->host;
+  if (buf->kind == OBJ_ARRAYBUFFER && ab && ab->owner) {
+    ab->data = NULL;
+    ab->byteLength = 0;
+  }
 }
 js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length)
 {
@@ -9496,7 +9516,7 @@ static void clone_value(clone_w *w, js_value v, int depth)
     }
   }
   if (o->kind == OBJ_FUNCTION || o->kind == OBJ_HOST || o->kind == OBJ_PROXY || o->kind == OBJ_GENERATOR ||
-      o->kind == OBJ_SYMBOL) {
+      o->kind == OBJ_SYMBOL || o->kind == OBJ_WASM) {
     clone_fail(w, "The value could not be cloned");
     return;
   }
@@ -9620,7 +9640,8 @@ js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer)
     w.xfer = (js_object **)malloc((n ? n : 1) * sizeof *w.xfer);
     for (i = 0; w.xfer && i < n; i++) {
       js_value item = transfer.u.obj->elems[i];
-      if (item.type == JV_OBJ && item.u.obj->kind == OBJ_ARRAYBUFFER && !((js_arraybuffer *)item.u.obj->host)->shared)
+      if (item.type == JV_OBJ && item.u.obj->kind == OBJ_ARRAYBUFFER && !((js_arraybuffer *)item.u.obj->host)->shared &&
+          !((js_arraybuffer *)item.u.obj->host)->owner)
         w.xfer[w.nxfer++] = item.u.obj;
     }
   }
@@ -11604,5 +11625,6 @@ void js_setup_builtins(js_ctx *ctx)
 
   setup_intl(ctx);
   js_setup_generators(ctx);
+  js_setup_wasm(ctx);
   gc_pop_scope();
 }

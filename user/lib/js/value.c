@@ -289,6 +289,10 @@ static void trace(void *obj, int kind)
     }
     if (o->kind == OBJ_TYPEDARRAY && o->host)
       gc_mark(((js_typedarray *)o->host)->buffer);
+    if (o->kind == OBJ_ARRAYBUFFER && o->host)
+      gc_mark(((js_arraybuffer *)o->host)->owner);
+    if (o->kind == OBJ_WASM && o->host && js_wasm_trace)
+      js_wasm_trace(o);
     if (o->kind == OBJ_GENERATOR && o->host) {
       js_generator *g = (js_generator *)o->host;
       gc_mark(g->env);
@@ -299,6 +303,8 @@ static void trace(void *obj, int kind)
 }
 
 void (*js_host_finalizer)(js_object *o);
+void (*js_wasm_trace)(js_object *o);
+void (*js_wasm_finalizer)(js_object *o);
 
 static void finalize(void *obj, int kind)
 {
@@ -322,7 +328,7 @@ static void finalize(void *obj, int kind)
       bi_free((bigint *)o->host);
     if (o->kind == OBJ_ARRAYBUFFER && o->host) {
       js_arraybuffer *ab = (js_arraybuffer *)o->host;
-      if (ab->data) {
+      if (ab->data && !ab->owner) {
         if (ab->shared)
           js_sab_release(ab->data);
         else
@@ -343,6 +349,8 @@ static void finalize(void *obj, int kind)
     }
     if (o->kind == OBJ_HOST && o->host && js_host_finalizer)
       js_host_finalizer(o);
+    if (o->kind == OBJ_WASM && o->host && js_wasm_finalizer)
+      js_wasm_finalizer(o);
   }
 }
 

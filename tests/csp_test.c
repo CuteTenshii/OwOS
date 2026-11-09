@@ -64,6 +64,35 @@ static void check_multiple_policies(void)
 /* No CSP / empty policy => allowed. */
 static void check_empty_policy(void) { expect(script_ok("", cf, page, 0, 1)); }
 
+/* WebAssembly needs 'wasm-unsafe-eval' or 'unsafe-eval' once a script policy exists. */
+static void check_wasm_eval(void)
+{
+  const char *ok[] = {"", "script-src 'self' 'wasm-unsafe-eval'", "script-src 'unsafe-eval'",
+                      "default-src 'wasm-unsafe-eval'"};
+  const char *no[] = {"script-src 'self'", "default-src 'self'"};
+  for (unsigned i = 0; i < sizeof ok / sizeof *ok; i++) {
+    csp *c = csp_new();
+    csp_add(c, ok[i]);
+    expect(csp_allows_wasm_eval(c));
+    csp_free(c);
+  }
+  for (unsigned i = 0; i < sizeof no / sizeof *no; i++) {
+    csp *c = csp_new();
+    csp_add(c, no[i]);
+    expect(!csp_allows_wasm_eval(c));
+    csp_free(c);
+  }
+  csp *c = csp_new();
+  csp_add(c, "script-src 'wasm-unsafe-eval'");
+  expect(!csp_allows_eval(c));
+  csp_free(c);
+  c = csp_new();
+  csp_add(c, "script-src 'self' 'wasm-unsafe-eval'");
+  csp_add(c, "script-src 'self'");
+  expect(!csp_allows_wasm_eval(c));
+  csp_free(c);
+}
+
 int main(void)
 {
   test("nonce authorization", check_nonce);
@@ -71,5 +100,6 @@ int main(void)
   test("host-source authorization", check_host_source);
   test("multiple policies", check_multiple_policies);
   test("empty policy", check_empty_policy);
+  test("wasm-unsafe-eval", check_wasm_eval);
   return 0;
 }

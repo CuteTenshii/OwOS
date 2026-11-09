@@ -50,8 +50,9 @@ enum {
   OBJ_TYPEDARRAY,
   OBJ_BIGINT,
   OBJ_PROXY,
-  OBJ_HOST,     /* embedder object: `host` is freed through js_host_finalizer */
-  OBJ_GENERATOR /* host: js_generator, a coroutine running a generator body */
+  OBJ_HOST,      /* embedder object: `host` is freed through js_host_finalizer */
+  OBJ_GENERATOR, /* host: js_generator, a coroutine running a generator body */
+  OBJ_WASM       /* host: a WebAssembly object; js_wasm_trace/js_wasm_finalizer own its lifetime */
 };
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1.
@@ -65,7 +66,8 @@ enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64, TA_
 typedef struct {
   unsigned char *data;
   int byteLength;
-  int shared; /* SharedArrayBuffer */
+  int shared;       /* SharedArrayBuffer */
+  js_object *owner; /* non-NULL: `data` belongs to this object, which the buffer keeps alive and does not free */
 } js_arraybuffer;
 
 /* SharedArrayBuffer bytes are refcounted so several heaps (threads) can hold the same store. The count lives
@@ -99,6 +101,10 @@ typedef struct js_generator {
 
 /* Called when an OBJ_HOST object is collected; release o->host here. */
 extern void (*js_host_finalizer)(js_object *o);
+
+/* OBJ_WASM objects: trace marks the GC objects `o->host` refers to (gc_mark), finalize releases it */
+extern void (*js_wasm_trace)(js_object *o);
+extern void (*js_wasm_finalizer)(js_object *o);
 
 /* property entry flags */
 enum { P_ENUMERABLE = 1, P_WRITABLE = 2, P_CONFIGURABLE = 4, P_ACCESSOR = 8 };

@@ -173,6 +173,16 @@ void js_clone_free(js_clone *c);
 /* A fresh ArrayBuffer holding a copy of `data` (zeroed when NULL) */
 js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length);
 
+/* An ArrayBuffer over bytes that `owner` keeps; the buffer keeps `owner` alive and never frees the bytes.
+ * js_arraybuffer_detach empties such a buffer once the bytes moved or went away. */
+js_value js_arraybuffer_external(js_ctx *ctx, unsigned char *data, int byte_length, js_object *owner);
+void js_arraybuffer_detach(js_object *buf);
+
+/* The WebAssembly global (wasm_js.c), set up with the other builtins */
+void js_setup_wasm(js_ctx *ctx);
+/* Make compiling and instantiating WebAssembly fail with a CompileError (a Content-Security-Policy refusal) */
+void js_wasm_block(js_ctx *ctx);
+
 /* A SharedArrayBuffer object in ctx over an existing store, which it retains. Lets one thread hand a buffer to
  * another thread's context: retain on the sending side, wrap in the receiver, then release. */
 js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length);

@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png webp gif imganim canvas2d mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar
+ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png webp gif imganim canvas2d mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -153,7 +153,8 @@ GC      := user/lib/gc/gc.o
 # $(LIBGCC). Class evaluation, RegExp matching, async/modules come next.
 JS      := user/lib/js/lexer.o user/lib/js/parser.o user/lib/js/ast.o \
            user/lib/js/value.o user/lib/js/interp.o user/lib/js/builtins.o \
-           user/lib/js/bigint.o
+           user/lib/js/bigint.o user/lib/js/wasm_js.o \
+           user/lib/wasm/wasm.o user/lib/wasm/wasm_run.o user/lib/wasm/wasm_simd.o
 # brotli: from-scratch RFC 7932 codec (HTTP `br` content-coding). decode needs the
 # 122 KiB static dictionary blob (objcopy of dictionary.bin -> the path-derived
 # symbol decode.c externs); encode is standalone. Links with $(LIBGCC).

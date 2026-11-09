@@ -38,6 +38,7 @@ int csp_check_script_el(const csp *c, const char *abs_url, const char *page_url,
 int csp_check_inline(const csp *c, int type, const char *nonce, const unsigned char *body, int len, char *reason,
                      int rcap);
 
-int csp_allows_eval(const csp *c); /* is dynamic code generation permitted? */
+int csp_allows_eval(const csp *c);      /* is dynamic code generation permitted? */
+int csp_allows_wasm_eval(const csp *c); /* may WebAssembly be compiled? */
 
 #endif /* OWOS_BROWSER_CSP_H */

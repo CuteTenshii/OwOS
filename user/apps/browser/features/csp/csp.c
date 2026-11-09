@@ -714,7 +714,8 @@ int csp_check_inline(const csp *c, int type, const char *nonce, const unsigned c
   return 1;
 }
 
-int csp_allows_eval(const csp *c)
+/* Does every policy's script directive list `kw` (or `alt`)? */
+static int allows_keyword(const csp *c, const char *kw, const char *alt)
 {
   if (!c || csp_empty(c))
     return 1;
@@ -725,7 +726,7 @@ int csp_allows_eval(const csp *c)
     const char *p = val, *ts, *te;
     bool seen = false;
     while ((p = tok_next(p, &ts, &te)) != 0) {
-      if (tok_is(ts, te, "'unsafe-eval'"))
+      if (tok_is(ts, te, kw) || (alt && tok_is(ts, te, alt)))
         seen = true;
       p = te;
     }
@@ -734,3 +735,7 @@ int csp_allows_eval(const csp *c)
   }
   return 1;
 }
+
+int csp_allows_eval(const csp *c) { return allows_keyword(c, "'unsafe-eval'", 0); }
+
+int csp_allows_wasm_eval(const csp *c) { return allows_keyword(c, "'wasm-unsafe-eval'", "'unsafe-eval'"); }
