@@ -334,6 +334,30 @@ static void test_worker_network(void)
       "expect(net.mc==='1:1', 'MessageChannel inside a worker: '+net.mc);\n");
 }
 
+static void test_worker_streams(void)
+{
+  run_script("var st=null, sw=new Worker('data:text/javascript,"
+             "var out={}, done=[]; var rs=new ReadableStream({start:function(c){ c.enqueue(new Uint8Array([104,105])); "
+             "c.enqueue(new Uint8Array([33])); c.close(); }});"
+             "done.push(new Response(rs).text().then(function(t){ out.fromStream=t; }));"
+             "done.push(new Blob([\"streamed\"]).stream().getReader().read().then(function(r){ out.blob=new "
+             "TextDecoder().decode(r.value); }));"
+             "var tr=new TransformStream({transform:function(chunk,c){ c.enqueue(chunk.toUpperCase()); }}), "
+             "w=tr.writable.getWriter(); w.write(\"abc\"); w.close();"
+             "done.push(tr.readable.getReader().read().then(function(r){ out.transform=r.value; }));"
+             "done.push(fetch(\"data:text/plain,body\").then(function(r){ return r.body.getReader().read(); "
+             "}).then(function(r){ out.body=new TextDecoder().decode(r.value); }));"
+             "Promise.all(done).then(function(){ out.stream=typeof ReadableStream; postMessage(out); },function(e){ "
+             "postMessage({fail:String(e)}); });');\n"
+             "sw.onmessage=function(e){ st=e.data; }; sw.onerror=function(e){ st={fail:e.message}; };\n");
+  expect(wait_for("st!==null"));
+  run_script("expect(st.fail===undefined, 'no failure: '+st.fail);\n"
+             "expect(st.fromStream==='hi!', 'a Response built from a ReadableStream reads back: '+st.fromStream);\n"
+             "expect(st.blob==='streamed' && st.transform==='ABC' && st.body==='body', 'Blob.stream, TransformStream, "
+             "Response.body: '+JSON.stringify(st));\n"
+             "expect(st.stream==='function', 'the stream classes are globals');\n");
+}
+
 static void test_blob_crosses(void)
 {
   run_script("var bl=null, bw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data; "
@@ -481,6 +505,7 @@ int main(void)
   worker_test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
   worker_test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
   worker_test("worker network: fetch, XMLHttpRequest, WebSocket, MessageChannel", test_worker_network);
+  worker_test("worker streams", test_worker_streams);
   worker_test("Blobs cross between page and worker", test_blob_crosses);
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);

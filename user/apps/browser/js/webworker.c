@@ -865,6 +865,21 @@ static void wt_dispatch_reply(js_ctx *ctx, js_clone *c)
   gc_pop_scope();
 }
 
+/* N.streams(): the Streams classes, compiled on first use (see the lazy globals in workerscope_prelude.inc) */
+static js_value wt_n_streams(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_arena *ar = 0;
+  js_value exports = js_streams_run(ctx, &ar);
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (ar)
+    wt_keep_arena(cur_wt, ar);
+  if (exports.type != JV_OBJ && !ctx->has_exc)
+    return js_throw_type(ctx, "Streams are unavailable");
+  return exports;
+}
+
 /* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
 static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
 {
@@ -879,6 +894,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
   js_def_native(ctx, n, "request", wt_n_request, 1);
+  js_def_native(ctx, n, "streams", wt_n_streams, 0);
   js_def_native(ctx, n, "waitReply", wt_n_wait_reply, 1);
   js_def_native(ctx, n, "wsOpen", wt_n_ws_open, 2);
   js_def_native(ctx, n, "wsProtocol", wt_n_ws_protocol, 1);

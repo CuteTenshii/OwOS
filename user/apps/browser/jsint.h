@@ -78,10 +78,11 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc); /* window
 void emit_event(js_object *w, const char *type, js_value data);        /* fire a plain Event on w */
 
 /* ---- subsystem setup entry points --------------------------------------- */
-void js_idb_setup(js_ctx *ctx, js_object *win);     /* IndexedDB (js_indexeddb.c) */
-void js_idb_teardown(void);                         /* unroot the page's IDB state  */
-void js_webapi_setup(js_ctx *ctx, js_object *win);  /* performance + Encoding (js_webapi.c) */
-void js_streams_setup(js_ctx *ctx, js_object *win); /* Streams API, lazily compiled (js/streams.c) */
+void js_idb_setup(js_ctx *ctx, js_object *win);         /* IndexedDB (js_indexeddb.c) */
+void js_idb_teardown(void);                             /* unroot the page's IDB state  */
+void js_webapi_setup(js_ctx *ctx, js_object *win);      /* performance + Encoding (js_webapi.c) */
+void js_streams_setup(js_ctx *ctx, js_object *win);     /* Streams API, lazily compiled (js/streams.c) */
+js_value js_streams_run(js_ctx *ctx, js_arena **arena); /* the Streams classes as an exports object, for any context */
 enum { CONSUME_BUFFER, CONSUME_TEXT, CONSUME_BLOB, CONSUME_JSON };
 /* A Response body init as raw bytes in a string. A ReadableStream is returned through *stream instead; ctype is
  * overwritten for Blob, BufferSource and stream bodies. */

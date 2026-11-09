@@ -318,6 +318,7 @@ JS(
   method(Blob.prototype, "arrayBuffer", function () { return Promise.resolve(this["@bytes"].slice().buffer); });
   method(Blob.prototype, "bytes", function () { return Promise.resolve(this["@bytes"].slice()); });
   method(Blob.prototype, "text", function () { return Promise.resolve(N.decode(this["@bytes"], "utf-8", false, false)); });
+  method(Blob.prototype, "stream", function () { return L.loadStreams().bytesStream(this["@bytes"].slice()); });
   method(Blob.prototype, "toString", function () { return "[object Blob]"; });
   hide(g, "Blob", Blob);
   function File(parts, name, opts) {

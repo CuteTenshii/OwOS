@@ -182,6 +182,31 @@ JS(
   });
   hide(g, "TextDecoder", TextDecoder);
 
+  /* ---- Streams: the classes are compiled the first time one is used ---- */
+  var STREAM_NAMES = ["ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WritableStream",
+    "WritableStreamDefaultWriter", "WritableStreamDefaultController", "TransformStream", "TransformStreamDefaultController",
+    "CountQueuingStrategy", "ByteLengthQueuingStrategy", "CompressionStream", "DecompressionStream", "TextEncoderStream", "TextDecoderStream"];
+  var streamExports = null, streamsLoading = false;
+  function loadStreams() {
+    if (!streamExports && !streamsLoading) {
+      streamsLoading = true;
+      try { streamExports = N.streams(); } finally { streamsLoading = false; }
+    }
+    return streamExports;
+  }
+  STREAM_NAMES.forEach(function (name) {
+    def(g, name, {
+      get: function () {
+        var ex = loadStreams(), v = ex ? ex[name] : undefined;
+        if (ex) { def(g, name, { value: v, writable: true, configurable: true, enumerable: false }); }
+        return v;
+      },
+      set: function (v) { def(g, name, { value: v, writable: true, configurable: true, enumerable: false }); },
+      configurable: true
+    });
+  });
+  L.loadStreams = loadStreams;
+
   /* ---- crypto ---- */
   var crypto = {};
   crypto.getRandomValues = function (view) {

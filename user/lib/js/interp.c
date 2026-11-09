@@ -3784,6 +3784,7 @@ int js_run(js_ctx *ctx, js_node *program, js_value *result)
 {
   completion c;
   int i;
+  js_env *caller_env = ctx->cur_env; /* a native may run a script from inside a function, which must keep its scope */
   ctx->cur_env = ctx->global_env;
   for (i = 0; i < program->u.list.count; i++)
     hoist_vars(ctx, ctx->global_env, program->u.list.items[i]);
@@ -3791,6 +3792,7 @@ int js_run(js_ctx *ctx, js_node *program, js_value *result)
     hoist_block_funcs(ctx, ctx->global_env, program->u.list.items[i]);
   hoist_functions(ctx, program->u.list.items, program->u.list.count);
   c = exec_list(ctx, program->u.list.items, program->u.list.count);
+  ctx->cur_env = caller_env;
   if (ctx->has_exc)
     return -1;
   if (result)

@@ -38,6 +38,7 @@ JS(
   }
   function extractBody(b) {
     if (b === null || b === undefined) { return { bytes: null, type: null }; }
+    if (typeof b === "object" && typeof b.getReader === "function") { return { bytes: null, type: null, stream: b }; }
     if (typeof b === "string") { return { bytes: N.utf8encode(b), type: "text/plain;charset=UTF-8" }; }
     if (b instanceof URLSearchParams) { return { bytes: N.utf8encode(b.toString()), type: "application/x-www-form-urlencoded;charset=UTF-8" }; }
     if (b instanceof Blob) { return { bytes: b["@bytes"].slice(), type: b.type || null }; }
@@ -45,10 +46,27 @@ JS(
     if (b instanceof ArrayBuffer || ArrayBuffer.isView(b)) { return { bytes: new Uint8Array(L.bytesOf(b)).slice(), type: null }; }
     return { bytes: N.utf8encode(String(b)), type: "text/plain;charset=UTF-8" };
   }
+  function readAll(stream) {
+    var reader = stream.getReader(), chunks = [];
+    return (function pump() {
+      return reader.read().then(function (r) {
+        if (r.done) { return L.concat(chunks); }
+        chunks.push(ArrayBuffer.isView(r.value) ? new Uint8Array(r.value.buffer, r.value.byteOffset, r.value.byteLength) : N.utf8encode(String(r.value)));
+        return pump();
+      });
+    })();
+  }
   function consume(self) {
     if (self["@used"]) { return Promise.reject(typeError("Body has already been consumed")); }
     self["@used"] = true;
+    if (self["@source"]) { return readAll(self["@source"]); }
     return Promise.resolve(self["@body"] || new Uint8Array(0));
+  }
+  function bodyStream(self, always) {
+    if (self["@source"]) { return self["@source"]; }
+    if (!self["@body"] && !always) { return null; }
+    if (!self["@stream"]) { hide(self, "@stream", L.loadStreams().bytesStream((self["@body"] || new Uint8Array(0)).slice())); }
+    return self["@stream"];
   }
   function bodyMixin(proto) {
     method(proto, "arrayBuffer", function () { return consume(this).then(function (b) { return b.slice().buffer; }); });
@@ -93,6 +111,7 @@ JS(
     if (body === null && src && !src["@used"]) { hide(this, "@body", src["@body"]); }
     else {
       b = extractBody(body);
+      if (b.stream) { throw typeError("Request bodies cannot be streams"); }
       hide(this, "@body", b.bytes);
       if (b.type && !this.headers.has("content-type")) { this.headers.set("content-type", b.type); }
     }
@@ -103,7 +122,7 @@ JS(
     if (this["@used"]) { throw typeError("Cannot clone a Request whose body is used"); }
     return new Request(this);
   });
-  def(Request.prototype, "body", { get: function () { return null; }, configurable: true });
+  def(Request.prototype, "body", { get: function () { return bodyStream(this, false); }, configurable: true });
   hide(g, "Request", Request);
 
   /* ---- Response ---- */
@@ -113,6 +132,7 @@ JS(
     if (status < 200 || status > 599) { throw new RangeError("The status provided (" + status + ") is outside the range [200, 599]."); }
     hide(this, "@used", false);
     hide(this, "@body", b.bytes);
+    hide(this, "@source", b.stream || null);
     this.status = status;
     this.statusText = init.statusText === undefined ? "" : String(init.statusText);
     this.headers = new Headers(init.headers);
@@ -125,12 +145,12 @@ JS(
   bodyMixin(Response.prototype);
   method(Response.prototype, "clone", function () {
     if (this["@used"]) { throw typeError("Cannot clone a Response whose body is used"); }
-    var r = new Response(this["@body"] ? this["@body"].slice() : null, { status: this.status, statusText: this.statusText, headers: this.headers });
+    var r = new Response(this["@source"] ? this["@source"].tee()[1] : this["@body"] ? this["@body"].slice() : null, { status: this.status, statusText: this.statusText, headers: this.headers });
     r.url = this.url;
     r.type = this.type;
     return r;
   });
-  def(Response.prototype, "body", { get: function () { return null; }, configurable: true });
+  def(Response.prototype, "body", { get: function () { return bodyStream(this, true); }, configurable: true });
   Response.error = function () { var r = new Response(null, { status: 200 }); r.status = 0; r.ok = false; r.type = "error"; return r; };
   Response.redirect = function (url, status) {
     var r = new Response(null, { status: 200, headers: { location: new g.URL(String(url), g.location.href).href } });

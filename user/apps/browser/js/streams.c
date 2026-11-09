@@ -216,45 +216,54 @@ static js_value streams_codec(js_ctx *ctx, js_value t, js_value *args, int argc)
 
 /* ---- lazy installation -------------------------------------------------- */
 
+/* Run the prelude in ctx: its exports (the stream classes and the helpers), or undefined with the exception left
+ * pending. The parsed program goes to *arena, which the caller keeps for as long as the classes live. */
+js_value js_streams_run(js_ctx *ctx, js_arena **arena)
+{
+  js_node *prog;
+  js_parse_error pe;
+  js_value fn, codec, exports = js_undef();
+  *arena = malloc(sizeof **arena);
+  if (!*arena)
+    return js_undef();
+  js_arena_init(*arena);
+  prog = js_parse(k_streams_js, *arena, &pe);
+  if (!prog) {
+    js_arena_free(*arena);
+    free(*arena);
+    *arena = 0;
+    return js_undef();
+  }
+  gc_push_scope();
+  if (js_run(ctx, prog, &fn) == 0) {
+    if (fn.type == JV_OBJ)
+      gc_keep(fn.u.obj);
+    codec = js_obj_value(js_new_native(ctx, streams_codec, "codec", 3));
+    gc_keep(codec.u.obj);
+    exports = js_call(ctx, fn, js_undef(), &codec, 1);
+  }
+  gc_pop_scope();
+  return ctx->has_exc ? js_undef() : exports;
+}
+
 /* Compile and run the prelude once, then replace the placeholder accessors with the real constructors */
 static int streams_load(js_ctx *ctx)
 {
   js_arena *ar;
-  js_node *prog;
-  js_parse_error pe;
-  js_value fn, codec, exports;
+  js_value exports;
   unsigned i;
   if (g_load_state != LOAD_NONE)
     return g_load_state == LOAD_OK;
   g_load_state = LOAD_RUNNING;
-  ar = malloc(sizeof *ar);
-  if (!ar)
-    goto fail;
-  js_arena_init(ar);
-  prog = js_parse(k_streams_js, ar, &pe);
-  if (!prog || !arenas_push(ar)) {
-    js_arena_free(ar);
-    free(ar);
-    goto fail;
+  exports = js_streams_run(ctx, &ar);
+  if (exports.type != JV_OBJ || !arenas_push(ar)) {
+    if (ctx->has_exc)
+      report_exc(ctx);
+    g_load_state = LOAD_FAILED;
+    return 0;
   }
   gc_push_scope();
-  if (js_run(ctx, prog, &fn) != 0) {
-    report_exc(ctx);
-    gc_pop_scope();
-    goto fail;
-  }
-  if (fn.type == JV_OBJ)
-    gc_keep(fn.u.obj);
-  codec = js_obj_value(js_new_native(ctx, streams_codec, "codec", 3));
-  gc_keep(codec.u.obj);
-  exports = js_call(ctx, fn, js_undef(), &codec, 1);
-  if (ctx->has_exc) {
-    report_exc(ctx);
-    gc_pop_scope();
-    goto fail;
-  }
-  if (exports.type == JV_OBJ)
-    gc_keep(exports.u.obj);
+  gc_keep(exports.u.obj);
   for (i = 0; i < sizeof k_globals / sizeof k_globals[0]; i++)
     js_def(ctx->global, k_globals[i], js_get(ctx, exports, k_globals[i]), P_WRITABLE | P_CONFIGURABLE);
   for (i = 0; i < sizeof k_helpers / sizeof k_helpers[0]; i++) {
@@ -265,9 +274,6 @@ static int streams_load(js_ctx *ctx)
   gc_pop_scope();
   g_load_state = LOAD_OK;
   return 1;
-fail:
-  g_load_state = LOAD_FAILED;
-  return 0;
 }
 
 static js_value lazy_get(js_ctx *ctx, js_value t, js_value *args, int argc)
