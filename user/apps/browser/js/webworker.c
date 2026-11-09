@@ -1184,8 +1184,10 @@ static js_value parse_header_block(js_ctx *ctx, const char *hdr)
   gc_push_scope();
   gc_keep(list);
   while (*p && (eol = strchr(p, '\n'))) {
-    const char *colon = memchr(p, ':', (size_t)(eol - p)), *vs, *ve = eol;
-    if (colon && p != hdr && colon > p && p[0] != '\r') {
+    const char *colon = p, *vs, *ve = eol;
+    while (colon < eol && *colon != ':')
+      colon++;
+    if (colon < eol && p != hdr && colon > p && p[0] != '\r') {
       char name[128];
       int nl = (int)(colon - p);
       js_object *pair;
