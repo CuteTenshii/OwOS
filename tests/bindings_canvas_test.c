@@ -267,19 +267,17 @@ static void test_offscreen_transfer(void)
   expect(canvas_by_id("xfer")->c->w == 8);
 }
 
+/* Workers run on their own threads and heaps, and a canvas lives in the page's, so it cannot be transferred
+ * yet: posting one fails cleanly instead of handing the worker a dead object. */
 static void test_offscreen_in_worker(void)
 {
   run_script(
       "var cv=document.createElement('canvas'); cv.id='wk'; cv.width=5; cv.height=2; document.body.appendChild(cv);\n"
-      "var w=new Worker('data:text/javascript,onmessage=function(e){ var c=e.data.canvas.getContext(\"2d\"); "
-      "c.fillStyle=\"#0f0\"; c.fillRect(0,0,5,2); var o=new OffscreenCanvas(2,2); "
-      "postMessage(o.width+\"x\"+e.data.canvas.height); };'); window.reply=null;\n"
-      "w.onmessage=function(e){ window.reply=e.data };\n"
-      "var off=cv.transferControlToOffscreen(); w.postMessage({canvas:off},[off]);\n");
-  for (int i = 0; i < 20; i++)
-    js_workers_pump();
-  run_script("expect(window.reply==='2x2', 'worker reply: '+window.reply);\n");
-  expect(pixel("wk", 4, 1)[1] == 255);
+      "var w=new Worker('data:text/javascript,onmessage=function(e){ postMessage(1); };');\n"
+      "var off=cv.transferControlToOffscreen(), err='';\n"
+      "try{ w.postMessage({canvas:off},[off]); }catch(e){ err=e.name; }\n"
+      "expect(err==='DataCloneError', 'an OffscreenCanvas cannot be posted to a worker thread: '+err);\n"
+      "w.terminate();\n");
 }
 
 static void test_composite_shadow_clip(void)

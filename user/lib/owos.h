@@ -275,6 +275,7 @@ void *thread_stack_alloc(int bytes); /* guarded thread stack (unmapped guard pag
 void thread_stack_free(void *top);
 static inline int thread_join(int tid) { return waitpid(tid); }
 
+static inline void thread_exit(void) { exit(0); } /* ends the calling thread only */
 /* sbrk returns the PREVIOUS break, or (void *)-1 */
 void *sbrk(int inc);
 void *malloc(unsigned size);

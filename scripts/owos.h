@@ -8,6 +8,7 @@
 #define OWOS_HOST_TEST_SHIM_H
 
 #include "../user/lib/ascii.h"
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -140,6 +141,14 @@ static inline int utf8_decode(const char *s, const char *end, unsigned *cp)
 
 unsigned msec(void);
 long long now_ms(void);
+
+/* Threads: host tests map them onto pthreads (tests/bindings_host.c). */
+int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top);
+void *thread_stack_alloc(int bytes);
+void thread_stack_free(void *top);
+int waitpid_nb(int pid, int *status);
+void msleep(unsigned ms);
+static inline void thread_exit(void) { pthread_exit(0); }
 
 /* Guest network + CSPRNG decls the freestanding net libs (stun.c, resolve.c)
  * pull from the real owos.h. Host tests exercise only the wire codecs, so the

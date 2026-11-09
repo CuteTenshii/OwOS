@@ -1,8 +1,10 @@
 /* Host stand-ins for the OS services user/apps/browser/js/bindings.c calls. */
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <malloc/malloc.h>
 #define usable_size(p) malloc_size(p)
@@ -29,18 +31,113 @@ void *poison_realloc(void *ptr, unsigned long size)
 }
 int BW = 1024, BH = 768;
 
+/* A futex over one condition variable: every wake is a broadcast, which futex callers already tolerate */
+static pthread_mutex_t fx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fxc = PTHREAD_COND_INITIALIZER;
+
 bool futex_wait(unsigned *addr, unsigned expected, unsigned ms)
 {
-  (void)addr;
-  (void)expected;
-  (void)ms;
-  return true;
+  bool timed_out = false;
+  pthread_mutex_lock(&fx);
+  if (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == expected) {
+    if (ms) {
+      struct timespec t;
+      clock_gettime(CLOCK_REALTIME, &t);
+      t.tv_sec += ms / 1000;
+      t.tv_nsec += (long)(ms % 1000) * 1000000;
+      if (t.tv_nsec >= 1000000000L) {
+        t.tv_sec++;
+        t.tv_nsec -= 1000000000L;
+      }
+      timed_out = pthread_cond_timedwait(&fxc, &fx, &t) != 0;
+    } else {
+      pthread_cond_wait(&fxc, &fx);
+    }
+  }
+  pthread_mutex_unlock(&fx);
+  return timed_out;
 }
 int futex_wake(unsigned *addr, int n)
 {
   (void)addr;
   (void)n;
+  pthread_mutex_lock(&fx);
+  pthread_cond_broadcast(&fxc);
+  pthread_mutex_unlock(&fx);
   return 0;
+}
+
+/* Threads run on malloc'd stacks so the engine's stack limit means what it does in the guest */
+#define HOST_THREADS 64
+static struct {
+  pthread_t th;
+  char *base;
+  void *top;
+  void (*fn)(void *);
+  void *arg;
+  int used, done;
+} hthreads[HOST_THREADS];
+
+void *thread_stack_alloc(int bytes)
+{
+  int i;
+  for (i = 0; i < HOST_THREADS; i++)
+    if (!hthreads[i].base) {
+      hthreads[i].base = malloc((size_t)bytes);
+      hthreads[i].top = hthreads[i].base ? hthreads[i].base + bytes : 0;
+      return hthreads[i].top;
+    }
+  return 0;
+}
+
+void thread_stack_free(void *top)
+{
+  int i;
+  for (i = 0; i < HOST_THREADS; i++)
+    if (hthreads[i].top == top) {
+      free(hthreads[i].base);
+      memset(&hthreads[i], 0, sizeof hthreads[i]);
+    }
+}
+
+static void host_thread_done(void *p) { __atomic_store_n(&((typeof(hthreads[0]) *)p)->done, 1, __ATOMIC_RELEASE); }
+
+static void *host_thread_main(void *p)
+{
+  pthread_cleanup_push(host_thread_done, p);
+  ((typeof(hthreads[0]) *)p)->fn(((typeof(hthreads[0]) *)p)->arg);
+  pthread_cleanup_pop(1);
+  return 0;
+}
+
+int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top)
+{
+  int i;
+  for (i = 0; i < HOST_THREADS; i++)
+    if (hthreads[i].top == stack_top && !hthreads[i].used) {
+      pthread_attr_t attr;
+      size_t size = (size_t)((char *)hthreads[i].top - hthreads[i].base);
+      hthreads[i].fn = fn;
+      hthreads[i].arg = arg;
+      hthreads[i].used = 1;
+      pthread_attr_init(&attr);
+      pthread_attr_setstack(&attr, hthreads[i].base, size);
+      if (pthread_create(&hthreads[i].th, &attr, host_thread_main, &hthreads[i]) != 0)
+        return -1;
+      return i + 1;
+    }
+  return -1;
+}
+
+int waitpid_nb(int pid, int *status)
+{
+  if (pid < 1 || pid > HOST_THREADS || !hthreads[pid - 1].used ||
+      !__atomic_load_n(&hthreads[pid - 1].done, __ATOMIC_ACQUIRE))
+    return 0;
+  pthread_join(hthreads[pid - 1].th, 0);
+  hthreads[pid - 1].used = 0;
+  *status = 0;
+  return 1;
 }
 long long fake_now_ms;
 
@@ -168,9 +265,13 @@ void js_idb_teardown(void) {}
 unsigned msec(void)
 {
   static unsigned clock = 1000;
-  return clock += 5;
+  return __atomic_add_fetch(&clock, 5, __ATOMIC_RELAXED);
 }
-void msleep(unsigned ms) { (void)ms; }
+void msleep(unsigned ms)
+{
+  struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
+  nanosleep(&t, 0);
+}
 long long now_ms(void) { return 1720000000000LL + fake_now_ms; }
 unsigned long rtc_epoch(void) { return 1720000000UL; }
 void rng_bytes(void *b, unsigned long n)

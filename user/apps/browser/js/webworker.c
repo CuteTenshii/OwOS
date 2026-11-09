@@ -1,21 +1,64 @@
-/* Dedicated Workers. The worker script runs in the page's single JS context inside its own scope object bound
- * as `self`; postMessage in both directions goes through a queue drained by js_workers_pump. */
+/* Dedicated Workers on OS threads. Each worker is a thread with its own GC heap and js_ctx; it shares no
+ * object with the page. Messages cross as structured clones (js_clone_*) through mutex-guarded queues: the
+ * page drains its side in js_workers_pump, the worker sleeps on a futex until something arrives or a timer
+ * is due. A SharedArrayBuffer crosses by sharing its refcounted store. Everything that touches page state
+ * (fetching scripts, the devtools console) is done on the page thread: the worker asks over a one-slot RPC and
+ * waits for the answer. */
 
 #include "bindings.h"
 #include "features/cors/cors.h"
 #include "fetchint.h"
+#include "mutex.h"
 
-enum { WQ_TO_WORKER, WQ_TO_PAGE, WQ_ERROR, WQ_TO_PORT };
+enum { WM_DATA, WM_ERROR, WM_LOG };
+
+struct wmsg {
+  struct wmsg *next;
+  int kind;
+  int level; /* WM_LOG: JS_LOG_* */
+  js_clone *clone;
+  char *text;
+};
+struct wq {
+  struct wmsg *head, *tail;
+};
+
+#define WORKER_MAX 16               /* thread stacks come from 32 shared slots */
+#define WORKER_STACK (240 * 1024)   /* at most 63 pages per guarded thread stack */
+#define WORKER_HEADROOM (40 * 1024) /* below this the engine throws instead of recursing */
+
+struct wthread {
+  int id;
+  int tid;
+  void *stack;
+  char *stack_lo;
+  mutex_t lock; /* guards both queues */
+  struct wq in, out;
+  unsigned seq; /* bumped whenever the worker has something new to look at */
+  int stop;     /* the page (or the worker itself) wants it to end */
+  int done;     /* the thread has finished running JS */
+  unsigned rpc; /* 0 idle, 1 the worker is waiting for the page, 2 answered */
+  char rpc_base[URL_MAX], rpc_spec[URL_MAX], rpc_url[URL_MAX];
+  char *rpc_src;
+  const char *rpc_err;
+  char *src; /* the main script, NULL when it could not be fetched */
+  int module;
+  char url[URL_MAX], origin[URL_MAX], pathname[URL_MAX], host[256], name[128];
+  int tls;
+  js_arena **arenas; /* parsed scripts, kept for the thread's lifetime */
+  int narenas;
+};
 
 static js_object *g_worker_proto; /* Worker.prototype */
-static js_object *g_wscope_proto; /* DedicatedWorkerGlobalScope.prototype (`self`) */
-static js_object *g_wq;           /* flat queue of (worker, kind, data) triples */
+static js_object *g_wq;           /* MessagePort traffic: flat (port, data) pairs, drained by the pump */
 static int g_next_wid;
 
-/* Module workers run against a scope env holding their globals; kept rooted for the page's lifetime */
-#define WENV_MAX 32
-static js_env *g_wenvs[WENV_MAX];
-static int g_nwenvs;
+/* Live workers and their page-side objects, index for index; the objects are GC roots */
+static struct wthread *g_workers[WORKER_MAX];
+static js_object *g_wobjs[WORKER_MAX];
+static int g_nworkers;
+
+static __thread struct wthread *cur_wt;
 
 static js_value throw_err(js_ctx *ctx, const char *name, const char *msg)
 {
@@ -32,156 +75,543 @@ static void script_url(const char *base, const char *spec, char *out, int cap)
     resolve_url(base, spec, out, cap);
 }
 
-static js_value wclone(js_ctx *ctx, js_value v)
+/* ------------------------------------------------------- queues ------------ */
+
+static void wmsg_free(struct wmsg *m)
 {
-  js_value f = js_get(ctx, js_obj_value(ctx->global), "structuredClone"), r;
-  if (v.type != JV_OBJ || !js_is_callable(f))
-    return v;
-  r = js_call(ctx, f, js_undef(), &v, 1);
-  return ctx->has_exc ? v : r;
+  js_clone_free(m->clone);
+  free(m->text);
+  free(m);
 }
 
-static void wq_push(js_value w, int kind, js_value data)
+static void wq_put(struct wthread *wt, struct wq *q, struct wmsg *m)
 {
+  m->next = 0;
+  mutex_lock(&wt->lock);
+  if (q->tail)
+    q->tail->next = m;
+  else
+    q->head = m;
+  q->tail = m;
+  mutex_unlock(&wt->lock);
+}
+
+static struct wmsg *wq_take_all(struct wthread *wt, struct wq *q)
+{
+  struct wmsg *m;
+  mutex_lock(&wt->lock);
+  m = q->head;
+  q->head = q->tail = 0;
+  mutex_unlock(&wt->lock);
+  return m;
+}
+
+/* One message, or NULL; *seq is the wake counter read in the same critical section, so sleeping on it
+ * cannot miss a message that arrives afterwards. */
+static struct wmsg *wq_take_one(struct wthread *wt, struct wq *q, unsigned *seq)
+{
+  struct wmsg *m;
+  mutex_lock(&wt->lock);
+  m = q->head;
+  if (m) {
+    q->head = m->next;
+    if (!q->head)
+      q->tail = 0;
+  }
+  *seq = __atomic_load_n(&wt->seq, __ATOMIC_ACQUIRE);
+  mutex_unlock(&wt->lock);
+  return m;
+}
+
+static void wthread_wake(struct wthread *wt)
+{
+  __atomic_fetch_add(&wt->seq, 1, __ATOMIC_ACQ_REL);
+  futex_wake(&wt->seq, 1);
+}
+
+static void wmsg_post(struct wthread *wt, struct wq *q, int kind, int level, js_clone *clone, const char *text)
+{
+  struct wmsg *m = (struct wmsg *)calloc(1, sizeof *m);
+  if (!m) {
+    js_clone_free(clone);
+    return;
+  }
+  m->kind = kind;
+  m->level = level;
+  m->clone = clone;
+  if (text) {
+    int n = (int)strlen(text);
+    m->text = (char *)malloc((unsigned)n + 1);
+    if (m->text)
+      memcpy(m->text, text, (unsigned)n + 1);
+  }
+  wq_put(wt, q, m);
+  if (q == &wt->in)
+    wthread_wake(wt);
+}
+
+/* ------------------------------------------------------- worker thread ------ */
+
+/* console.* from a worker goes to the page's devtools console through the out queue */
+static void wt_print(js_ctx *ctx, int level, const char *s, int len)
+{
+  char text[1024];
+  (void)ctx;
+  if (len >= (int)sizeof text)
+    len = (int)sizeof text - 1;
+  memcpy(text, s, (unsigned)len);
+  text[len] = 0;
+  wmsg_post(cur_wt, &cur_wt->out, WM_LOG, level, 0, text);
+}
+
+/* Send the pending exception to the page as an error event and clear it */
+static void wt_report(js_ctx *ctx)
+{
+  js_value e = ctx->exc, text;
+  ctx->has_exc = 0;
+  ctx->exc_root = 0;
   gc_push_scope();
-  gc_keep(w.u.obj);
-  if (data.type == JV_OBJ)
-    gc_keep(data.u.obj);
-  js_array_push(g_ctx, g_wq, w);
-  js_array_push(g_ctx, g_wq, js_number(kind));
-  js_array_push(g_ctx, g_wq, data);
+  if (e.type == JV_OBJ) {
+    js_value m = js_get(ctx, e, "message");
+    gc_keep(e.u.obj);
+    if (m.type == JV_STR)
+      e = m;
+  }
+  text = js_to_string(ctx, e);
+  if (ctx->has_exc) {
+    ctx->has_exc = 0;
+    ctx->exc_root = 0;
+  } else if (text.type == JV_STR)
+    wmsg_post(cur_wt, &cur_wt->out, WM_ERROR, 0, 0, text.u.str->data);
   gc_pop_scope();
 }
 
-/* `onmessage = fn` inside the worker script assigns a wrapper local; mirror it onto the scope */
-static void sync_onmessage(js_ctx *ctx, js_value scope)
+static void wt_keep_arena(struct wthread *wt, js_arena *ar)
 {
-  js_value get = js_get(ctx, scope, "__getom"), envi = js_get(ctx, scope, "@envi"), cur = js_undef();
-  if (envi.type == JV_NUM) {
-    pentry *pe = js_env_lookup(g_wenvs[(int)envi.u.num], "onmessage");
-    if (pe)
-      cur = pe->value;
-  } else if (js_is_callable(get)) {
-    cur = js_call(ctx, get, js_undef(), 0, 0);
-    if (ctx->has_exc) {
-      report_exc(ctx);
+  js_arena **na = (js_arena **)realloc(wt->arenas, (unsigned)(wt->narenas + 1) * sizeof *na);
+  if (!na) {
+    return; /* the AST then lives until the thread is torn down by exit */
+  }
+  wt->arenas = na;
+  na[wt->narenas++] = ar;
+}
+
+/* Parse and run `src` in the worker's global scope (or as a module). A failure leaves its exception pending. */
+static bool wt_eval(js_ctx *ctx, struct wthread *wt, const char *src, const char *label, js_object *module_exports)
+{
+  js_arena *ar = (js_arena *)malloc(sizeof *ar);
+  js_parse_error pe;
+  js_node *prog;
+  js_value r;
+  bool ok;
+  if (!ar)
+    return false;
+  js_arena_init(ar);
+  prog = js_parse(src, ar, &pe);
+  if (!prog) {
+    js_arena_free(ar);
+    free(ar);
+    throw_err(ctx, "SyntaxError", pe.msg ? pe.msg : "syntax error");
+    return false;
+  }
+  wt_keep_arena(wt, ar);
+  js_set_script(ctx, label);
+  ok = module_exports ? js_run_module(ctx, prog, module_exports, label) == 0 : js_run(ctx, prog, &r) == 0;
+  return ok;
+}
+
+/* Ask the page thread to resolve `spec` against `base` and fetch it. On success *src is malloc'd and
+ * wt->rpc_url holds the resolved URL; otherwise the error text is returned. */
+static const char *wt_fetch(struct wthread *wt, const char *base, const char *spec, char **src)
+{
+  const char *err;
+  snprintf(wt->rpc_base, sizeof wt->rpc_base, "%s", base);
+  snprintf(wt->rpc_spec, sizeof wt->rpc_spec, "%s", spec);
+  __atomic_store_n(&wt->rpc, 1, __ATOMIC_RELEASE);
+  while (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) == 1 && !__atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE))
+    futex_wait(&wt->rpc, 1, 50);
+  if (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) != 2) {
+    __atomic_store_n(&wt->rpc, 0, __ATOMIC_RELEASE);
+    return "worker is closing";
+  }
+  *src = wt->rpc_src;
+  err = wt->rpc_err;
+  wt->rpc_src = 0;
+  __atomic_store_n(&wt->rpc, 0, __ATOMIC_RELEASE);
+  return err;
+}
+
+static js_value wt_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(0));
+  (void)t;
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_DATA, 0, c, 0);
+  return js_undef();
+}
+
+static js_value wt_close(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  __atomic_store_n(&cur_wt->stop, 1, __ATOMIC_RELEASE);
+  return js_undef();
+}
+
+static js_value wt_import_scripts(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int i;
+  (void)t;
+  for (i = 0; i < argc && !ctx->has_exc; i++) {
+    js_value s = js_to_string(ctx, args[i]);
+    char spec[URL_MAX];
+    char *src = 0;
+    const char *err;
+    if (s.type != JV_STR)
+      break;
+    snprintf(spec, sizeof spec, "%s", s.u.str->data);
+    err = wt_fetch(cur_wt, cur_wt->url, spec, &src);
+    if (err) {
+      free(src);
+      return throw_err(ctx, strcmp(err, "cross-origin") ? "TypeError" : "SecurityError", "importScripts failed");
+    }
+    wt_eval(ctx, cur_wt, src, cur_wt->url, 0);
+    free(src);
+  }
+  return js_undef();
+}
+
+/* Timers: the table is plain C; each callback and its arguments sit in the hidden global __timers as an array
+ * under "t<id>", which keeps them alive. */
+struct wtimer {
+  int id;
+  unsigned due, period;
+  bool repeat;
+};
+static __thread struct wtimer *timers;
+static __thread int ntimers, captimers, next_timer_id;
+
+static js_value wt_set_timer(js_ctx *ctx, js_value *args, int argc, bool repeat)
+{
+  js_value store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  double delay = argc > 1 ? js_to_number(ctx, args[1]) : 0;
+  struct wtimer *t;
+  char key[24];
+  int k;
+  if (!js_is_callable(A(0)) || store.type != JV_OBJ)
+    return js_number(0);
+  if (ntimers == captimers) {
+    int nc = captimers ? captimers * 2 : 16;
+    struct wtimer *nt = (struct wtimer *)realloc(timers, (unsigned)nc * sizeof *nt);
+    if (!nt)
+      return js_number(0);
+    timers = nt;
+    captimers = nc;
+  }
+  t = &timers[ntimers++];
+  t->id = ++next_timer_id;
+  t->period = delay != delay || delay < 1 ? (repeat ? 1 : 0) : (unsigned)delay;
+  t->due = msec() + t->period;
+  t->repeat = repeat;
+  snprintf(key, sizeof key, "t%d", t->id);
+  gc_push_scope();
+  {
+    js_object *bundle = (js_object *)gc_keep(js_new_array(ctx, 0));
+    js_array_push(ctx, bundle, args[0]);
+    for (k = 2; k < argc; k++)
+      js_array_push(ctx, bundle, args[k]);
+    js_set(ctx, store, key, js_obj_value(bundle));
+  }
+  gc_pop_scope();
+  return js_number(t->id);
+}
+
+static js_value wt_set_timeout(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  return wt_set_timer(ctx, args, argc, false);
+}
+
+static js_value wt_set_interval(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  return wt_set_timer(ctx, args, argc, true);
+}
+
+static void timer_remove(js_ctx *ctx, int id)
+{
+  js_value store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  char key[24];
+  int i;
+  for (i = 0; i < ntimers; i++)
+    if (timers[i].id == id) {
+      timers[i] = timers[--ntimers];
+      snprintf(key, sizeof key, "t%d", id);
+      if (store.type == JV_OBJ)
+        js_set(ctx, store, key, js_undef());
       return;
     }
-  }
-  if (js_is_callable(cur) && !js_strict_eq(cur, js_get(ctx, scope, "@lom"))) {
-    js_set(ctx, scope, "onmessage", cur);
-    js_set(ctx, scope, "@lom", cur);
-  }
 }
 
-static int worker_id(js_ctx *ctx, js_value w)
+static js_value wt_clear_timer(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value id = w.type == JV_OBJ ? js_get(ctx, w, "@id") : js_undef();
-  return id.type == JV_NUM ? (int)id.u.num : 0;
+  (void)t;
+  if (argc > 0 && args[0].type == JV_NUM)
+    timer_remove(ctx, (int)args[0].u.num);
+  return js_undef();
 }
 
-static void wq_deliver(js_value w, int kind, js_value data)
+/* Run the earliest due timer; false when none is due */
+static bool fire_due_timer(js_ctx *ctx)
 {
-  js_value target, ev;
-  if (w.type != JV_OBJ || js_to_boolean(js_get(g_ctx, w, "@dead")) ||
-      ((kind == WQ_TO_WORKER || kind == WQ_TO_PORT) && js_to_boolean(js_get(g_ctx, w, "@closed"))))
-    return;
+  unsigned now = msec();
+  int best = -1, i;
+  js_value store, bundle, argv[8];
+  char key[24];
+  unsigned n, k;
+  int id;
+  bool repeat;
+  for (i = 0; i < ntimers; i++)
+    if ((int)(timers[i].due - now) <= 0 && (best < 0 || (int)(timers[i].due - timers[best].due) < 0))
+      best = i;
+  if (best < 0)
+    return false;
+  id = timers[best].id;
+  repeat = timers[best].repeat;
+  snprintf(key, sizeof key, "t%d", id);
+  store = js_get(ctx, js_obj_value(ctx->global), "__timers");
+  bundle = js_get(ctx, store, key);
   gc_push_scope();
-  gc_keep(w.u.obj);
+  if (bundle.type == JV_OBJ) {
+    gc_keep(bundle.u.obj);
+    n = js_array_len(bundle.u.obj);
+    for (k = 1; k < n && k <= 8; k++)
+      argv[k - 1] = js_get_index(ctx, bundle, k);
+    if (repeat)
+      timers[best].due = now + timers[best].period;
+    else
+      timer_remove(ctx, id);
+    {
+      js_value fn = js_get_index(ctx, bundle, 0);
+      if (js_is_callable(fn)) {
+        js_call(ctx, fn, js_obj_value(ctx->global), argv, n > 1 ? (int)(n - 1 > 8 ? 8 : n - 1) : 0);
+        if (ctx->has_exc)
+          wt_report(ctx);
+      }
+    }
+  } else
+    timer_remove(ctx, id);
+  gc_pop_scope();
+  return true;
+}
+
+static js_value wt_perf_now(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  static __thread unsigned origin;
+  unsigned now = msec();
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (!origin)
+    origin = now;
+  return js_number((double)(now - origin));
+}
+
+static js_object *wt_load_module(js_ctx *ctx, const char *spec, void *ud)
+{
+  struct wthread *wt = (struct wthread *)ud;
+  js_value cache = js_get(ctx, js_obj_value(ctx->global), "__modules"), hit;
+  js_object *exports;
+  char *src = 0;
+  char url[URL_MAX];
+  const char *err = wt_fetch(wt, ctx->cur_module_url ? ctx->cur_module_url : wt->url, spec, &src);
+  if (err) {
+    free(src);
+    throw_err(ctx, "TypeError", "module load failed");
+    return NULL;
+  }
+  snprintf(url, sizeof url, "%s", wt->rpc_url);
+  hit = cache.type == JV_OBJ ? js_get(ctx, cache, url) : js_undef();
+  if (hit.type == JV_OBJ) {
+    free(src);
+    return hit.u.obj;
+  }
+  exports = js_new_object(ctx, ctx->object_proto);
+  gc_push_scope();
+  gc_keep(exports);
+  if (cache.type == JV_OBJ)
+    js_set(ctx, cache, url, js_obj_value(exports));
+  wt_eval(ctx, wt, src, wt->url, exports);
+  gc_pop_scope();
+  free(src);
+  return ctx->has_exc ? NULL : exports;
+}
+
+static void wt_def_location(js_ctx *ctx, struct wthread *wt)
+{
+  js_object *loc;
+  gc_push_scope();
+  loc = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(loc, "href", js_mk_cstring(ctx, wt->url), P_ENUMERABLE);
+  js_def(loc, "origin", js_mk_cstring(ctx, wt->origin), P_ENUMERABLE);
+  js_def(loc, "pathname", js_mk_cstring(ctx, wt->pathname), P_ENUMERABLE);
+  js_def(loc, "protocol", js_mk_cstring(ctx, wt->tls ? "https:" : "http:"), P_ENUMERABLE);
+  js_def(loc, "host", js_mk_cstring(ctx, wt->host), P_ENUMERABLE);
+  js_def(loc, "hostname", js_mk_cstring(ctx, wt->host), P_ENUMERABLE);
+  js_def(loc, "search", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(loc, "hash", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(ctx->global, "location", js_obj_value(loc), P_WRITABLE | P_ENUMERABLE);
+  js_def(ctx->global, "name", js_mk_cstring(ctx, wt->name), P_WRITABLE | P_ENUMERABLE);
+  gc_pop_scope();
+}
+
+/* Event plumbing the worker script sees: self, EventTarget methods, onmessage and friends */
+static const char wt_prelude[] =
+    "(function(g){\n"
+    "var L={};\n"
+    "g.self=g;\n"
+    "g.onmessage=null;g.onerror=null;g.onmessageerror=null;\n"
+    "g.addEventListener=function(t,f){var a=L[t]||(L[t]=[]);if(a.indexOf(f)<0)a.push(f);};\n"
+    "g.removeEventListener=function(t,f){var a=L[t];if(a){var i=a.indexOf(f);if(i>=0)a.splice(i,1);}};\n"
+    "g.dispatchEvent=function(e){var h=g['on'+e.type];if(typeof h==='function')h.call(g,e);var a=L[e.type];\n"
+    "if(a)a.slice().forEach(function(f){if(typeof f==='function')f.call(g,e);else if(f&&typeof "
+    "f.handleEvent==='function')f.handleEvent(e);});return true;};\n"
+    "g.queueMicrotask=function(f){Promise.resolve().then(f);};\n"
+    "g.navigator={hardwareConcurrency:4,onLine:true,language:'en-US',userAgent:'OwOS'};\n"
+    "Object.defineProperty(g,'__deliver',{value:function(d){g.dispatchEvent({type:'message',data:d,origin:'',"
+    "lastEventId:'',source:null,ports:[],target:g});}});\n"
+    "})(globalThis);\n";
+
+static void wt_setup(js_ctx *ctx, struct wthread *wt)
+{
+  js_object *g = ctx->global, *perf, *store;
+  gc_push_scope();
+  js_def_native(ctx, g, "postMessage", wt_post, 1);
+  js_def_native(ctx, g, "close", wt_close, 0);
+  js_def_native(ctx, g, "importScripts", wt_import_scripts, 1);
+  js_def_native(ctx, g, "setTimeout", wt_set_timeout, 2);
+  js_def_native(ctx, g, "setInterval", wt_set_interval, 2);
+  js_def_native(ctx, g, "clearTimeout", wt_clear_timer, 1);
+  js_def_native(ctx, g, "clearInterval", wt_clear_timer, 1);
+  perf = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def_native(ctx, perf, "now", wt_perf_now, 0);
+  js_def(g, "performance", js_obj_value(perf), P_WRITABLE | P_CONFIGURABLE);
+  store = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(g, "__timers", js_obj_value(store), 0);
+  store = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(g, "__modules", js_obj_value(store), 0);
+  wt_def_location(ctx, wt);
+  ctx->load_module = wt_load_module;
+  ctx->load_module_ud = wt;
+  gc_pop_scope();
+}
+
+static void wt_deliver(js_ctx *ctx, js_clone *c)
+{
+  js_value data = js_clone_read(ctx, c), fn, ev[1];
+  gc_push_scope();
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
-  target = kind == WQ_TO_WORKER ? js_get(g_ctx, w, "@scope") : w;
-  if (target.type == JV_OBJ) {
-    gc_keep(target.u.obj);
-    if (kind == WQ_TO_WORKER)
-      sync_onmessage(g_ctx, target);
-    if (kind == WQ_ERROR) {
-      ev = make_event("error", 0, 0, js_undef());
-      if (ev.type == JV_OBJ) {
-        gc_keep(ev.u.obj);
-        event_adopt_iface(ev, "ErrorEvent");
-        js_def(ev.u.obj, "message", data, P_WRITABLE | P_ENUMERABLE);
-        js_def(ev.u.obj, "filename", js_get(g_ctx, w, "@url"), P_WRITABLE | P_ENUMERABLE);
-        js_def(ev.u.obj, "lineno", js_number(0), P_WRITABLE | P_ENUMERABLE);
-        js_def(ev.u.obj, "colno", js_number(0), P_WRITABLE | P_ENUMERABLE);
-        js_def(ev.u.obj, "error", js_null(), P_WRITABLE | P_ENUMERABLE);
-      }
-    } else
-      ev = make_message_event(data);
-    if (ev.type == JV_OBJ) {
-      gc_keep(ev.u.obj);
-      js_set(g_ctx, ev, "target", target);
-      g_timer_owner = kind == WQ_TO_WORKER ? worker_id(g_ctx, w) : 0;
-      ev_fire_on(target.u.obj, ev, 0);
-      g_timer_owner = 0;
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else {
+    fn = js_get(ctx, js_obj_value(ctx->global), "__deliver");
+    ev[0] = data;
+    js_call(ctx, fn, js_obj_value(ctx->global), ev, 1);
+    if (ctx->has_exc)
+      wt_report(ctx);
+  }
+  gc_pop_scope();
+}
+
+static void wt_loop(js_ctx *ctx, struct wthread *wt)
+{
+  while (!__atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE)) {
+    unsigned seen, wait = 0;
+    struct wmsg *m = wq_take_one(wt, &wt->in, &seen);
+    int i;
+    if (m) {
+      if (m->clone)
+        wt_deliver(ctx, m->clone);
+      wmsg_free(m);
+      continue;
     }
+    if (fire_due_timer(ctx))
+      continue;
+    if (ntimers) { /* sleep until the nearest timer; futex time 0 means forever */
+      unsigned now = msec();
+      int best = (int)(timers[0].due - now);
+      for (i = 1; i < ntimers; i++)
+        if ((int)(timers[i].due - now) < best)
+          best = (int)(timers[i].due - now);
+      wait = best < 1 ? 1 : (unsigned)best;
+    }
+    futex_wait(&wt->seq, seen, wait);
   }
-  gc_pop_scope();
 }
 
-int js_workers_pump(void)
+static void wt_run(js_ctx *ctx, struct wthread *wt)
 {
-  js_object *old;
-  unsigned n, i;
-  if (!g_wq || !g_ctx || !g_page_live || !js_array_len(g_wq))
-    return 0;
+  js_object *exports = 0;
+  ctx->now_ms = now_ms;
+  ctx->can_block = 1;
+  js_set_stack_limit(ctx, wt->stack_lo + WORKER_HEADROOM);
+  wt_setup(ctx, wt);
+  if (!wt_eval(ctx, wt, wt_prelude, wt->url, 0)) {
+    wt_report(ctx);
+    return;
+  }
+  if (!wt->src) {
+    wmsg_post(wt, &wt->out, WM_ERROR, 0, 0, "Failed to load worker script");
+    return;
+  }
   gc_push_scope();
-  old = (js_object *)gc_keep(g_wq);
-  g_wq = js_new_array(g_ctx, 0);
-  n = js_array_len(old);
-  for (i = 0; i + 2 < n; i += 3) {
-    js_value w = js_get_index(g_ctx, js_obj_value(old), i);
-    js_value k = js_get_index(g_ctx, js_obj_value(old), i + 1);
-    js_value d = js_get_index(g_ctx, js_obj_value(old), i + 2);
-    wq_deliver(w, (int)k.u.num, d);
-  }
+  if (wt->module)
+    exports = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  if (!wt_eval(ctx, wt, wt->src, wt->url, exports))
+    wt_report(ctx);
   gc_pop_scope();
-  return (int)(n / 3);
+  free(wt->src);
+  wt->src = 0;
+  wt_loop(ctx, wt);
 }
 
-void js_port_enqueue(js_value port, js_value data) { wq_push(port, WQ_TO_PORT, data); }
-
-static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+static void worker_main(void *arg)
 {
-  (void)argc;
-  if (t.type == JV_OBJ && !js_to_boolean(js_get(ctx, t, "@dead")) && !js_to_boolean(js_get(ctx, t, "@closed")))
-    wq_push(t, WQ_TO_WORKER, wclone(ctx, A(0)));
-  return js_undef();
-}
-
-static js_value worker_terminate(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  (void)args;
-  (void)argc;
-  if (t.type == JV_OBJ) {
-    js_set(ctx, t, "@dead", js_bool(1));
-    timers_drop_owner(worker_id(ctx, t));
+  struct wthread *wt = (struct wthread *)arg;
+  gc_heap *heap = gc_heap_new();
+  js_ctx *ctx;
+  int i;
+  cur_wt = wt;
+  if (heap) {
+    gc_heap_attach(heap);
+    ctx = js_ctx_new(wt_print);
+    if (ctx) {
+      wt_run(ctx, wt);
+      js_ctx_free(ctx);
+    }
+    gc_heap_detach();
+    gc_heap_free(heap);
   }
-  return js_undef();
-}
-
-static js_value scope_post(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value w;
-  (void)argc;
-  w = t.type == JV_OBJ ? js_get(ctx, t, "@worker") : js_undef();
-  if (w.type == JV_OBJ && !js_to_boolean(js_get(ctx, w, "@dead")))
-    wq_push(w, WQ_TO_PAGE, wclone(ctx, A(0)));
-  return js_undef();
-}
-
-static js_value scope_close(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value w;
-  (void)args;
-  (void)argc;
-  w = t.type == JV_OBJ ? js_get(ctx, t, "@worker") : js_undef();
-  if (w.type == JV_OBJ) {
-    js_set(ctx, w, "@closed", js_bool(1));
-    timers_drop_owner(worker_id(ctx, w));
+  for (i = 0; i < wt->narenas; i++) {
+    js_arena_free(wt->arenas[i]);
+    free(wt->arenas[i]);
   }
-  return js_undef();
+  free(wt->arenas);
+  wt->arenas = 0;
+  free(wt->src);
+  wt->src = 0;
+  free(timers);
+  timers = 0;
+  ntimers = captimers = 0;
+  __atomic_store_n(&wt->done, 1, __ATOMIC_RELEASE);
+  thread_exit();
 }
+
+/* ------------------------------------------------------- page side ----------- */
 
 /* The script's bytes as a NUL-terminated string, or NULL */
 static char *fetch_source(const char *url)
@@ -215,203 +645,232 @@ static char *fetch_source(const char *url)
   return src;
 }
 
-static js_value scope_import_scripts(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* Answer a worker's script request on its behalf */
+static void serve_rpc(struct wthread *wt)
 {
-  js_value loc = t.type == JV_OBJ ? js_get(ctx, t, "location") : js_undef();
-  js_value href = loc.type == JV_OBJ ? js_get(ctx, loc, "href") : js_undef();
-  js_value gself = js_get(ctx, js_obj_value(ctx->global), "self"), ret = js_undef();
+  char *src = 0;
+  const char *err = 0;
+  script_url(wt->rpc_base, wt->rpc_spec, wt->rpc_url, sizeof wt->rpc_url);
+  if (!starts_ci(wt->rpc_url, "blob:") && !starts_ci(wt->rpc_url, "data:") &&
+      !cors_same_origin(g_page_url_buf, wt->rpc_url))
+    err = "cross-origin";
+  else if (!(src = fetch_source(wt->rpc_url)))
+    err = "fetch failed";
+  wt->rpc_src = src;
+  wt->rpc_err = err;
+  __atomic_store_n(&wt->rpc, 2, __ATOMIC_RELEASE);
+  futex_wake(&wt->rpc, 1);
+}
+
+static struct wthread *worker_of(js_ctx *ctx, js_value w)
+{
+  js_value id = w.type == JV_OBJ ? js_get(ctx, w, "@id") : js_undef();
   int i;
-  js_set(ctx, js_obj_value(ctx->global), "self", t); /* imported code sees the worker as `self` */
-  for (i = 0; i < argc && !ctx->has_exc; i++) {
-    char url[URL_MAX];
-    char *code;
-    js_arena *ar;
-    js_node *prog;
-    js_parse_error pe;
-    js_value r;
-    script_url(href.type == JV_STR ? href.u.str->data : g_page_url_buf, arg_str(ctx, args[i]), url, sizeof url);
-    if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url)) {
-      ret = throw_err(ctx, "SecurityError", "importScripts: cross-origin");
-      break;
-    }
-    code = fetch_source(url);
-    if (!code) {
-      ret = js_throw_type(ctx, "importScripts failed");
-      break;
-    }
-    ar = (js_arena *)malloc(sizeof *ar);
-    if (!ar) {
-      free(code);
-      break;
-    }
-    js_arena_init(ar);
-    prog = js_parse(code, ar, &pe);
-    free(code);
-    if (!prog || !arenas_push(ar)) {
-      js_arena_free(ar);
-      free(ar);
-      ret = throw_err(ctx, "SyntaxError", "importScripts: parse error");
-      break;
-    }
-    js_set_cur_script(url);
-    js_run(ctx, prog, &r); /* a pending exception propagates to the caller */
-  }
-  js_set(ctx, js_obj_value(ctx->global), "self", gself);
-  return ret;
-}
-
-static char *wrap_source(const char *src)
-{
-  static const char pre[] = "(function(self){"
-                            "var onmessage=null,onerror=null,onmessageerror=null,name=self.name,location=self."
-                            "location;"
-                            "self.__getom=function(){return onmessage;};"
-                            "function postMessage(){return self.postMessage.apply(self,arguments);}"
-                            "function close(){return self.close();}"
-                            "function importScripts(){return self.importScripts.apply(self,arguments);}"
-                            "function addEventListener(){return self.addEventListener.apply(self,arguments);}"
-                            "function removeEventListener(){return self.removeEventListener.apply(self,arguments);}"
-                            "function dispatchEvent(e){return self.dispatchEvent(e);}\n";
-  static const char post[] = "\n;})";
-  int pl = (int)sizeof pre - 1, sl = (int)strlen(src), ql = (int)sizeof post - 1;
-  char *w = (char *)malloc((unsigned)(pl + sl + ql) + 1);
-  if (!w)
+  if (id.type != JV_NUM)
     return 0;
-  memcpy(w, pre, (unsigned)pl);
-  memcpy(w + pl, src, (unsigned)sl);
-  memcpy(w + pl + sl, post, (unsigned)ql);
-  w[pl + sl + ql] = 0;
-  return w;
+  for (i = 0; i < g_nworkers; i++)
+    if (g_workers[i]->id == (int)id.u.num)
+      return g_workers[i];
+  return 0;
 }
 
-/* Run the worker script with `scope` as self. False if it failed to parse or threw. */
-static bool run_in_scope(js_ctx *ctx, js_object *scope, const char *src, const char *label)
+static void worker_fire(js_value w, struct wmsg *m)
 {
-  char *w = wrap_source(src);
-  js_arena *ar;
-  js_node *prog;
-  js_parse_error pe;
-  js_value fn, a;
-  bool ok = false;
-  if (!w)
-    return false;
-  ar = (js_arena *)malloc(sizeof *ar);
-  if (!ar) {
-    free(w);
-    return false;
-  }
-  js_arena_init(ar);
-  prog = js_parse(w, ar, &pe);
-  free(w);
-  if (!prog || !arenas_push(ar)) {
-    js_arena_free(ar);
-    free(ar);
-    return false;
-  }
-  js_set_cur_script(label);
+  js_value ev;
   gc_push_scope();
-  if (js_run(ctx, prog, &fn) == 0 && js_is_callable(fn)) {
-    gc_keep(fn.u.obj);
-    a = js_obj_value(scope);
-    js_call(ctx, fn, a, &a, 1);
-    ok = !ctx->has_exc;
+  gc_keep(w.u.obj);
+  if (m->kind == WM_ERROR) {
+    ev = make_event("error", 0, 0, js_undef());
+    if (ev.type == JV_OBJ) {
+      gc_keep(ev.u.obj);
+      event_adopt_iface(ev, "ErrorEvent");
+      js_def(ev.u.obj, "message", js_mk_cstring(g_ctx, m->text ? m->text : ""), P_WRITABLE | P_ENUMERABLE);
+      js_def(ev.u.obj, "filename", js_get(g_ctx, w, "@url"), P_WRITABLE | P_ENUMERABLE);
+      js_def(ev.u.obj, "lineno", js_number(0), P_WRITABLE | P_ENUMERABLE);
+      js_def(ev.u.obj, "colno", js_number(0), P_WRITABLE | P_ENUMERABLE);
+      js_def(ev.u.obj, "error", js_null(), P_WRITABLE | P_ENUMERABLE);
+    }
+  } else {
+    js_value data = js_clone_read(g_ctx, m->clone);
+    if (g_ctx->has_exc) {
+      g_ctx->has_exc = 0;
+      g_ctx->exc_root = 0;
+      gc_pop_scope();
+      return;
+    }
+    if (data.type == JV_OBJ)
+      gc_keep(data.u.obj);
+    ev = make_message_event(data);
   }
-  if (!ok && ctx->has_exc)
-    report_exc(ctx);
+  if (ev.type == JV_OBJ) {
+    gc_keep(ev.u.obj);
+    js_set(g_ctx, ev, "target", w);
+    ev_fire_on(w.u.obj, ev, 0);
+  }
   gc_pop_scope();
-  return ok;
 }
 
-static js_value bound(js_ctx *ctx, js_value scope, const char *name)
+/* Free a finished worker once its thread has been joined */
+static bool worker_reap(int i)
 {
-  js_value fn = js_get(ctx, scope, name), bind = js_get(ctx, fn, "bind");
-  return js_call(ctx, bind, fn, &scope, 1);
-}
-
-/* Run a module worker: its globals live in an env spliced under the module scope, so bare
- * `postMessage` and `onmessage = f` reach this worker instead of the window. */
-static bool run_module_in_scope(js_ctx *ctx, js_object *scope, const char *src, const char *url)
-{
-  static const char *const fns[] = {"postMessage",         "close",        "importScripts", "addEventListener",
-                                    "removeEventListener", "dispatchEvent"};
-  js_arena *ar;
-  js_node *prog;
-  js_parse_error pe;
-  js_object *exports;
-  js_env *env, *saved;
-  js_value sv = js_obj_value(scope);
-  unsigned i;
-  bool ok;
-  if (g_nwenvs == WENV_MAX)
+  struct wthread *wt = g_workers[i];
+  int status;
+  if (!__atomic_load_n(&wt->done, __ATOMIC_ACQUIRE) || !waitpid_nb(wt->tid, &status))
     return false;
-  ar = (js_arena *)malloc(sizeof *ar);
-  if (!ar)
-    return false;
-  js_arena_init(ar);
-  prog = js_parse(src, ar, &pe);
-  if (!prog || !arenas_push(ar)) {
-    js_arena_free(ar);
-    free(ar);
-    return false;
+  thread_stack_free(wt->stack);
+  while (wt->in.head) {
+    struct wmsg *m = wt->in.head;
+    wt->in.head = m->next;
+    wmsg_free(m);
   }
+  free(wt->rpc_src);
+  free(wt);
+  g_workers[i] = g_workers[g_nworkers - 1];
+  g_wobjs[i] = g_wobjs[g_nworkers - 1];
+  g_wobjs[g_nworkers - 1] = 0;
+  g_nworkers--;
+  return true;
+}
+
+static void wq_deliver_port(js_value port, js_value data)
+{
+  js_value ev;
+  if (port.type != JV_OBJ || js_to_boolean(js_get(g_ctx, port, "@dead")) ||
+      js_to_boolean(js_get(g_ctx, port, "@closed")))
+    return;
   gc_push_scope();
-  env = (js_env *)gc_keep(js_new_env(ctx, ctx->global_env, 1));
-  g_wenvs[g_nwenvs] = env;
-  js_set(ctx, sv, "@envi", js_number(g_nwenvs++));
-  js_env_define(env, "self", sv, P_WRITABLE);
-  js_env_define(env, "name", js_get(ctx, sv, "name"), P_WRITABLE);
-  js_env_define(env, "location", js_get(ctx, sv, "location"), P_WRITABLE);
-  js_env_define(env, "onmessage", js_null(), P_WRITABLE);
-  js_env_define(env, "onerror", js_null(), P_WRITABLE);
-  js_env_define(env, "onmessageerror", js_null(), P_WRITABLE);
-  for (i = 0; i < sizeof fns / sizeof *fns; i++)
-    js_env_define(env, fns[i], bound(ctx, sv, fns[i]), P_WRITABLE);
-  exports = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  saved = ctx->global_env;
-  ctx->global_env = env;
-  js_set_cur_script(url);
-  ok = js_run_module(ctx, prog, exports, url) == 0;
-  ctx->global_env = saved;
-  if (!ok)
-    report_exc(ctx);
+  gc_keep(port.u.obj);
+  if (data.type == JV_OBJ)
+    gc_keep(data.u.obj);
+  ev = make_message_event(data);
+  if (ev.type == JV_OBJ) {
+    gc_keep(ev.u.obj);
+    js_set(g_ctx, ev, "target", port);
+    ev_fire_on(port.u.obj, ev, 0);
+  }
   gc_pop_scope();
-  return ok;
 }
 
-static void def_location(js_ctx *ctx, js_object *scope, const char *url)
+int js_workers_pump(void)
 {
-  js_object *loc = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  char org[URL_MAX];
-  struct purl pu;
-  bool inl = starts_ci(url, "blob:") || starts_ci(url, "data:");
-  cors_origin(g_page_url_buf, org, sizeof org);
-  pu.host[0] = 0;
-  pu.path[0] = 0;
-  pu.tls = 0;
-  parse_url(inl ? g_page_url_buf : url, &pu);
-  js_def(loc, "href", js_mk_cstring(ctx, url), P_ENUMERABLE);
-  js_def(loc, "origin", js_mk_cstring(ctx, org), P_ENUMERABLE);
-  js_def(loc, "pathname", js_mk_cstring(ctx, pu.path), P_ENUMERABLE);
-  js_def(loc, "protocol", js_mk_cstring(ctx, pu.tls ? "https:" : "http:"), P_ENUMERABLE);
-  js_def(loc, "host", js_mk_cstring(ctx, pu.host), P_ENUMERABLE);
-  js_def(loc, "hostname", js_mk_cstring(ctx, pu.host), P_ENUMERABLE);
-  js_def(loc, "search", js_mk_cstring(ctx, ""), P_ENUMERABLE);
-  js_def(loc, "hash", js_mk_cstring(ctx, ""), P_ENUMERABLE);
-  js_def(scope, "location", js_obj_value(loc), P_ENUMERABLE);
+  int delivered = 0, i;
+  if (!g_ctx || !g_page_live)
+    return 0;
+  if (g_wq && js_array_len(g_wq)) {
+    js_object *old;
+    unsigned n, k;
+    gc_push_scope();
+    old = (js_object *)gc_keep(g_wq);
+    g_wq = js_new_array(g_ctx, 0);
+    n = js_array_len(old);
+    for (k = 0; k + 1 < n; k += 2)
+      wq_deliver_port(js_get_index(g_ctx, js_obj_value(old), k), js_get_index(g_ctx, js_obj_value(old), k + 1));
+    gc_pop_scope();
+    delivered += (int)(n / 2);
+  }
+  for (i = 0; i < g_nworkers; i++) {
+    struct wthread *wt = g_workers[i];
+    struct wmsg *m, *next;
+    js_value w = js_obj_value(g_wobjs[i]);
+    if (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) == 1)
+      serve_rpc(wt);
+    for (m = wq_take_all(wt, &wt->out); m; m = next) {
+      next = m->next;
+      if (m->kind == WM_LOG)
+        devtools_console_append(m->level == JS_LOG_ERROR  ? DT_ERROR
+                                : m->level == JS_LOG_WARN ? DT_WARN
+                                                          : DT_LOG,
+                                m->text ? m->text : "", m->text ? (int)strlen(m->text) : 0);
+      else if (!js_to_boolean(js_get(g_ctx, w, "@dead")))
+        worker_fire(w, m);
+      delivered++;
+      wmsg_free(m);
+    }
+  }
+  for (i = 0; i < g_nworkers;)
+    if (!worker_reap(i))
+      i++;
+  return delivered;
+}
+
+void js_port_enqueue(js_value port, js_value data)
+{
+  gc_push_scope();
+  gc_keep(port.u.obj);
+  if (data.type == JV_OBJ)
+    gc_keep(data.u.obj);
+  js_array_push(g_ctx, g_wq, port);
+  js_array_push(g_ctx, g_wq, data);
+  gc_pop_scope();
+}
+
+static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct wthread *wt = worker_of(ctx, t);
+  js_clone *c;
+  if (!wt || __atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE))
+    return js_undef();
+  c = js_clone_write(ctx, A(0));
+  if (c)
+    wmsg_post(wt, &wt->in, WM_DATA, 0, c, 0);
+  return js_undef();
+}
+
+static js_value worker_terminate(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct wthread *wt = worker_of(ctx, t);
+  (void)args;
+  (void)argc;
+  if (t.type == JV_OBJ)
+    js_set(ctx, t, "@dead", js_bool(1));
+  if (wt) {
+    __atomic_store_n(&wt->stop, 1, __ATOMIC_RELEASE);
+    wthread_wake(wt);
+    futex_wake(&wt->rpc, 1);
+  }
+  return js_undef();
 }
 
 static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   char url[URL_MAX];
-  char *src;
-  js_object *w, *scope;
+  js_object *w;
   js_value opts = A(1), nm, ty, wv;
-  bool module, ok;
-  int prev_owner;
+  struct wthread *wt;
+  struct purl pu;
+  bool inl;
   (void)thisv;
   script_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
   if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
     return throw_err(ctx, "SecurityError", "Worker script must be same-origin");
+  if (g_nworkers == WORKER_MAX)
+    return throw_err(ctx, "QuotaExceededError", "Too many workers");
+  wt = (struct wthread *)calloc(1, sizeof *wt);
+  if (!wt)
+    return throw_err(ctx, "Error", "Out of memory");
+  wt->stack = thread_stack_alloc(WORKER_STACK);
+  if (!wt->stack) {
+    free(wt);
+    return throw_err(ctx, "Error", "Could not allocate a worker stack");
+  }
+  wt->stack_lo = (char *)wt->stack - WORKER_STACK;
+  wt->id = ++g_next_wid;
+  snprintf(wt->url, sizeof wt->url, "%s", url);
+  nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
+  ty = opts.type == JV_OBJ ? js_get(ctx, opts, "type") : js_undef();
+  if (nm.type == JV_STR)
+    snprintf(wt->name, sizeof wt->name, "%s", nm.u.str->data);
+  wt->module = ty.type == JV_STR && streq(ty.u.str->data, "module");
+  inl = starts_ci(url, "blob:") || starts_ci(url, "data:");
+  cors_origin(g_page_url_buf, wt->origin, sizeof wt->origin);
+  pu.host[0] = 0;
+  pu.path[0] = 0;
+  pu.tls = 0;
+  parse_url(inl ? g_page_url_buf : url, &pu);
+  snprintf(wt->pathname, sizeof wt->pathname, "%s", pu.path);
+  snprintf(wt->host, sizeof wt->host, "%s", pu.host);
+  wt->tls = pu.tls;
+  wt->src = fetch_source(url);
   gc_push_scope();
   w = (js_object *)gc_keep(js_new_object(ctx, g_worker_proto));
   wv = js_obj_value(w);
@@ -420,30 +879,17 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   js_def(w, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "@dead", js_bool(0), P_WRITABLE);
   js_def(w, "@url", js_mk_cstring(ctx, url), 0);
-  js_def(w, "@id", js_number(++g_next_wid), 0);
-  scope = (js_object *)gc_keep(js_new_object(ctx, g_wscope_proto));
-  nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
-  ty = opts.type == JV_OBJ ? js_get(ctx, opts, "type") : js_undef();
-  module = ty.type == JV_STR && streq(ty.u.str->data, "module");
-  js_def(scope, "self", js_obj_value(scope), P_WRITABLE | P_ENUMERABLE);
-  js_def(scope, "name", nm.type == JV_STR ? nm : js_mk_cstring(ctx, ""), P_ENUMERABLE);
-  js_def(scope, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
-  js_def(scope, "onmessageerror", js_null(), P_WRITABLE | P_ENUMERABLE);
-  js_def(scope, "@worker", wv, P_WRITABLE);
-  js_def(w, "@scope", js_obj_value(scope), P_WRITABLE);
-  def_location(ctx, scope, url);
-  src = fetch_source(url);
-  if (!src) {
-    wq_push(wv, WQ_ERROR, js_mk_cstring(ctx, "Failed to load worker script"));
-  } else {
-    prev_owner = g_timer_owner;
-    g_timer_owner = g_next_wid;
-    ok = module ? run_module_in_scope(ctx, scope, src, url) : run_in_scope(ctx, scope, src, url);
-    g_timer_owner = prev_owner;
-    if (!ok)
-      wq_push(wv, WQ_ERROR, js_mk_cstring(ctx, "Uncaught error in worker script"));
-    free(src);
+  js_def(w, "@id", js_number(wt->id), 0);
+  wt->tid = thread_create_arg(worker_main, wt, wt->stack);
+  if (wt->tid < 0) {
+    thread_stack_free(wt->stack);
+    free(wt->src);
+    free(wt);
+    gc_pop_scope();
+    return throw_err(ctx, "Error", "Could not start the worker thread");
   }
+  g_workers[g_nworkers] = wt;
+  g_wobjs[g_nworkers++] = w;
   gc_pop_scope();
   return wv;
 }
@@ -452,25 +898,17 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
 {
   js_object *ctor;
   g_worker_proto = js_new_object(ctx, ctx->object_proto);
-  g_wscope_proto = js_new_object(ctx, ctx->object_proto);
   g_wq = js_new_array(ctx, 0);
   gc_add_root((void **)&g_worker_proto);
-  gc_add_root((void **)&g_wscope_proto);
   gc_add_root((void **)&g_wq);
-  g_nwenvs = 0;
-  gc_add_root_range((void **)g_wenvs, &g_nwenvs);
+  g_nworkers = 0;
+  gc_add_root_range((void **)g_wobjs, &g_nworkers);
   js_msgchannel_setup(ctx, win);
   def_method(g_worker_proto, "postMessage", worker_post, 1);
   def_method(g_worker_proto, "terminate", worker_terminate, 0);
   def_method(g_worker_proto, "addEventListener", el_add_listener, 3);
   def_method(g_worker_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_worker_proto, "dispatchEvent", el_dispatch, 1);
-  def_method(g_wscope_proto, "postMessage", scope_post, 1);
-  def_method(g_wscope_proto, "close", scope_close, 0);
-  def_method(g_wscope_proto, "importScripts", scope_import_scripts, 1);
-  def_method(g_wscope_proto, "addEventListener", el_add_listener, 3);
-  def_method(g_wscope_proto, "removeEventListener", el_remove_listener, 3);
-  def_method(g_wscope_proto, "dispatchEvent", el_dispatch, 1);
   ctor = js_new_native(ctx, worker_ctor, "Worker", 1);
   gc_push_scope();
   gc_keep(ctor);
@@ -480,13 +918,26 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
   gc_pop_scope();
 }
 
+/* Stop every worker and join what finishes in time. A thread stuck in a long script is left behind. */
 void js_worker_teardown(void)
 {
+  int i, waited;
+  for (i = 0; i < g_nworkers; i++) {
+    __atomic_store_n(&g_workers[i]->stop, 1, __ATOMIC_RELEASE);
+    wthread_wake(g_workers[i]);
+    futex_wake(&g_workers[i]->rpc, 1);
+  }
+  for (waited = 0; g_nworkers && waited < 1000; waited += 5) {
+    for (i = 0; i < g_nworkers;)
+      if (!worker_reap(i))
+        i++;
+    if (g_nworkers)
+      msleep(5);
+  }
+  g_nworkers = 0;
   js_msgchannel_teardown();
   gc_remove_root((void **)&g_worker_proto);
-  gc_remove_root((void **)&g_wscope_proto);
   gc_remove_root((void **)&g_wq);
-  gc_remove_root_range((void **)g_wenvs);
-  g_nwenvs = 0;
-  g_worker_proto = g_wscope_proto = g_wq = 0;
+  gc_remove_root_range((void **)g_wobjs);
+  g_worker_proto = g_wq = 0;
 }
