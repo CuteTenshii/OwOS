@@ -209,8 +209,8 @@ static bool xf_func(const char *name, char arg[][40], int n, struct xf *x)
       parse_angle(arg[0], strcmp(name, "skewy") ? &ax : &ay);
     if (n > 1)
       parse_angle(arg[1], &ay);
-    x->c = ax ? sin(ax * 0.017453292519943295) / cos(ax * 0.017453292519943295) : 0;
-    x->b = ay ? sin(ay * 0.017453292519943295) / cos(ay * 0.017453292519943295) : 0;
+    x->c = tan(ax * 0.017453292519943295);
+    x->b = tan(ay * 0.017453292519943295);
     return true;
   }
   if (!strcmp(name, "matrix") && n >= 6) {
