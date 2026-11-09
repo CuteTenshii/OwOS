@@ -106,6 +106,7 @@ struct js_ctx {
                              * names the script that armed it. Not owned; the
                              * embedder keeps the storage valid (js_set_script). */
   unsigned rng;             /* Math.random state                             */
+  void *re_cache;           /* compiled-RegExp cache (builtins.c)         */
   unsigned ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped
                              * by direct eval, which can inject a binding into an
                              * existing scope and so invalidate cached slots     */
@@ -141,6 +142,7 @@ void js_ctx_free(js_ctx *ctx);
  * script overflows the stack into neighbouring memory. NULL disables the check.
  */
 void js_set_stack_limit(js_ctx *ctx, void *low_limit);
+void js_regex_cache_free(js_ctx *ctx); /* drop the context's compiled-RegExp cache */
 
 /* Run a parsed program. Returns 0 on normal completion (the last expression
  * value, if any, in *result when non-NULL); returns -1 if an exception escaped

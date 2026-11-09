@@ -3043,12 +3043,10 @@ static void *coro_prepare(char *stack, void (*entry)(void))
   return sp;
 }
 
-static js_generator *gen_boot;
-
 /* The first switch into a generator lands here; it never returns. */
 static void gen_entry(void)
 {
-  js_generator *g = gen_boot;
+  js_generator *g = gc_heap_slots()[JS_SLOT_GEN_BOOT];
   js_ctx *ctx = g->ctx;
   js_node *body = g->node->u.func.body;
   js_value result = js_undef();
@@ -3124,7 +3122,7 @@ static js_value gen_resume(js_ctx *ctx, js_generator *g, int mode, js_value v, i
   ctx->cur_gen = g;
   js_set_stack_limit(ctx, g->stack + GEN_STACK_HEADROOM);
   g->state = GEN_RUNNING;
-  gen_boot = g;
+  gc_heap_slots()[JS_SLOT_GEN_BOOT] = g;
   coro_switch(&g->caller_sp, g->sp);
   js_set_stack_limit(ctx, saved_limit);
   ctx->cur_gen = prev;
@@ -3939,6 +3937,7 @@ void js_ctx_free(js_ctx *ctx)
    * reachable the whole JS heap (object headers + their malloc'd internals via
    * the finalizer) is reclaimed. This matters when the embedder creates a fresh
    * context per use (e.g. the browser, once per page) over the shared GC. */
+  js_regex_cache_free(ctx);
   gc_remove_root((void **)&ctx->global);
   gc_remove_root((void **)&ctx->global_env);
   gc_remove_root((void **)&ctx->cur_env);

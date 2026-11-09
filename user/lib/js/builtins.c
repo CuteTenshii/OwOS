@@ -3166,11 +3166,11 @@ static int re_word(int c)
 }
 
 /* Lowest native SP the regex compiler/matcher may recurse to; set per call from the context. */
-static const char *re_floor;
 static int re_deep(void)
 {
   char probe;
-  return re_floor && &probe < re_floor;
+  const char *floor = gc_heap_slots()[JS_SLOT_REGEX_FLOOR];
+  return floor && &probe < floor;
 }
 
 /* Add the code points lo..hi to a class: below 128 as bits, the rest as a range */
@@ -4215,12 +4215,28 @@ static int re_is_regexp(js_ctx *ctx, js_value v) { return v.type == JV_OBJ && v.
 
 /* Compile the source+flags of a RegExp object; *caps_n = 2*(groups+1). */
 #define RE_CACHE_N 16
-static struct {
-  char *src;
-  int len;
-  reprog *prog;
-} re_cache[RE_CACHE_N];
-static int re_cache_next;
+typedef struct {
+  struct {
+    char *src;
+    int len;
+    reprog *prog;
+  } e[RE_CACHE_N];
+  int next;
+} re_cache_t;
+
+void js_regex_cache_free(js_ctx *ctx)
+{
+  re_cache_t *c = ctx->re_cache;
+  int i;
+  if (!c)
+    return;
+  for (i = 0; i < RE_CACHE_N; i++) {
+    re_free(c->e[i].prog);
+    free(c->e[i].src);
+  }
+  free(c);
+  ctx->re_cache = NULL;
+}
 
 /* Compile the source+flags carried by a RegExp object; *caps_n = 2*(groups+1).
  */
@@ -4230,22 +4246,26 @@ static reprog *re_compile_obj(js_ctx *ctx, js_value rx, int *caps_n)
   reprog *p = NULL;
   const char *s = src.type == JV_STR ? src.u.str->data : "";
   int len = src.type == JV_STR ? src.u.str->len : 0, i;
-  re_floor = ctx->stack_limit;
-  for (i = 0; i < RE_CACHE_N && !p; i++)
-    if (re_cache[i].prog && re_cache[i].len == len && memcmp_(re_cache[i].src, s, len) == 0) {
-      p = re_cache[i].prog;
+  re_cache_t *cache;
+  gc_heap_slots()[JS_SLOT_REGEX_FLOOR] = ctx->stack_limit;
+  if (!ctx->re_cache)
+    ctx->re_cache = calloc(1, sizeof(re_cache_t));
+  cache = ctx->re_cache;
+  for (i = 0; cache && i < RE_CACHE_N && !p; i++)
+    if (cache->e[i].prog && cache->e[i].len == len && memcmp_(cache->e[i].src, s, len) == 0) {
+      p = cache->e[i].prog;
       p->refs++;
     }
   if (!p && (p = re_compile(s, len))) {
-    char *key = (char *)malloc((unsigned)len + 1);
+    char *key = cache ? (char *)malloc((unsigned)len + 1) : NULL;
     if (key) {
-      i = re_cache_next++ % RE_CACHE_N;
-      re_free(re_cache[i].prog);
-      free(re_cache[i].src);
+      i = cache->next++ % RE_CACHE_N;
+      re_free(cache->e[i].prog);
+      free(cache->e[i].src);
       memcpy(key, s, (unsigned)len);
-      re_cache[i].src = key;
-      re_cache[i].len = len;
-      re_cache[i].prog = p;
+      cache->e[i].src = key;
+      cache->e[i].len = len;
+      cache->e[i].prog = p;
       p->refs++;
     }
   }

@@ -49,48 +49,166 @@ typedef struct gc_obj {
 #define NURSERY_CAP (8u * 1024u * 1024u) /* largest nursery budget          */
 #define MIN_MAJOR (4u * 1024u * 1024u)   /* old-gen size that forces a major */
 
-static gc_obj *young; /* freshly allocated                    */
-static gc_obj *old;   /* survived >= 1 collection             */
-static unsigned young_bytes, old_bytes;
-static unsigned alloc_since;
-static unsigned threshold = MIN_THRESHOLD;   /* nursery budget before a GC  */
-static unsigned major_threshold = MIN_MAJOR; /* old_bytes that forces major */
-static int force_major;                      /* set when a barrier couldn't remember */
-static int rescan_kind = -1;                 /* kind scanned wholesale when old      */
-static int collecting_minor;                 /* gc_mark skips old objects while set  */
-static gc_tracer tracer;
-static gc_finalizer finalizer;
-static gc_stats_t stats;
-
-/* roots: addresses of pointer variables. */
-static void ***roots;
-static int nroots, caproots;
-/* root ranges: a base array plus a live count. */
 struct range {
   void **base;
   int *count;
 };
-static struct range *ranges;
-static int nranges, capranges;
-/* handle scopes: pinned local pointers, with per-scope saved high-water marks.
- */
-static void **handles;
-static int nhandles, caphandles;
-static int *scopes;
-static int nscopes, capscopes;
-static int lost_scopes; /* pushes that hit OOM: their pops must not close an outer scope */
-/* grey worklist. */
-static void **grey;
-static int grey_sp, grey_cap, grey_overflow;
-/* remembered set: old objects that hold an old->young pointer. */
-static gc_obj **remset;
-static int remset_n, remset_cap;
-/* old objects of the rescan kind, scanned wholesale each minor. */
-static gc_obj **rescan;
-static int rescan_n, rescan_cap;
+
+/* One collector instance: everything a thread's contexts share. */
+struct gc_heap {
+  gc_obj *young; /* freshly allocated                    */
+  gc_obj *old;   /* survived >= 1 collection             */
+  unsigned young_bytes, old_bytes;
+  unsigned alloc_since;
+  unsigned threshold;       /* nursery budget before a GC  */
+  unsigned major_threshold; /* old_bytes that forces major */
+  int force_major;          /* set when a barrier couldn't remember */
+  int rescan_kind;          /* kind scanned wholesale when old      */
+  int collecting_minor;     /* gc_mark skips old objects while set  */
+  gc_tracer tracer;
+  gc_finalizer finalizer;
+  gc_stats_t stats;
+  /* roots: addresses of pointer variables. */
+  void ***roots;
+  int nroots, caproots;
+  /* root ranges: a base array plus a live count. */
+  struct range *ranges;
+  int nranges, capranges;
+  /* handle scopes: pinned local pointers, with per-scope saved high-water marks. */
+  void **handles;
+  int nhandles, caphandles;
+  int *scopes;
+  int nscopes, capscopes;
+  int lost_scopes; /* pushes that hit OOM: their pops must not close an outer scope */
+  /* grey worklist. */
+  void **grey;
+  int grey_sp, grey_cap, grey_overflow;
+  /* remembered set: old objects that hold an old->young pointer. */
+  gc_obj **remset;
+  int remset_n, remset_cap;
+  /* old objects of the rescan kind, scanned wholesale each minor. */
+  gc_obj **rescan;
+  int rescan_n, rescan_cap;
+  void *slots[GC_HEAP_SLOTS];
+};
 
 static inline gc_obj *hdr(void *payload) { return (gc_obj *)payload - 1; }
 static inline void *body(gc_obj *o) { return (void *)(o + 1); }
+
+/* The heap of the calling thread. A thread that never attaches one uses main_heap, so single-threaded
+ * embedders see the old global collector. Hosted test builds use real TLS; OwOS has none, so an attached
+ * heap is found by the stack range of the calling thread. */
+static gc_heap main_heap = {.threshold = MIN_THRESHOLD, .major_threshold = MIN_MAJOR, .rescan_kind = -1};
+
+#ifdef OWOS_HOST_TEST_SHIM_H
+static __thread gc_heap *thread_heap;
+
+static inline gc_heap *cur_heap(void) { return thread_heap ? thread_heap : &main_heap; }
+
+int gc_heap_attach(gc_heap *h, void *stack_lo, void *stack_hi)
+{
+  (void)stack_lo;
+  (void)stack_hi;
+  thread_heap = h;
+  return 0;
+}
+
+void gc_heap_detach(void) { thread_heap = 0; }
+#else
+#include "mutex.h"
+
+#define MAX_ATTACHED 32
+static struct {
+  char *lo, *hi;
+  gc_heap *heap;
+} attached[MAX_ATTACHED];
+static int nslots; /* slots in use or once used; 0 until the first attach */
+static mutex_t attach_lock = MUTEX_INIT;
+
+static gc_heap *cur_heap(void)
+{
+  int n = __atomic_load_n(&nslots, __ATOMIC_ACQUIRE);
+  if (n) {
+    char *sp = __builtin_frame_address(0);
+    for (int i = 0; i < n; i++) {
+      gc_heap *h = __atomic_load_n(&attached[i].heap, __ATOMIC_ACQUIRE);
+      if (h && sp >= attached[i].lo && sp < attached[i].hi)
+        return h;
+    }
+  }
+  return &main_heap;
+}
+
+int gc_heap_attach(gc_heap *h, void *stack_lo, void *stack_hi)
+{
+  int slot = -1;
+  mutex_lock(&attach_lock);
+  for (int i = 0; i < MAX_ATTACHED && slot < 0; i++)
+    if (!attached[i].heap)
+      slot = i;
+  if (slot >= 0) {
+    attached[slot].lo = stack_lo;
+    attached[slot].hi = stack_hi;
+    __atomic_store_n(&attached[slot].heap, h, __ATOMIC_RELEASE);
+    if (slot >= nslots)
+      __atomic_store_n(&nslots, slot + 1, __ATOMIC_RELEASE);
+  }
+  mutex_unlock(&attach_lock);
+  return slot < 0 ? -1 : 0;
+}
+
+void gc_heap_detach(void)
+{
+  char *sp = __builtin_frame_address(0);
+  mutex_lock(&attach_lock);
+  for (int i = 0; i < nslots; i++)
+    if (attached[i].heap && sp >= attached[i].lo && sp < attached[i].hi)
+      __atomic_store_n(&attached[i].heap, 0, __ATOMIC_RELEASE);
+  mutex_unlock(&attach_lock);
+}
+#endif
+
+gc_heap *gc_heap_new(void)
+{
+  gc_heap *h = malloc(sizeof *h);
+  if (h) {
+    memset(h, 0, sizeof *h);
+    h->threshold = MIN_THRESHOLD;
+    h->major_threshold = MIN_MAJOR;
+    h->rescan_kind = -1;
+  }
+  return h;
+}
+
+void gc_heap_free(gc_heap *h)
+{
+  for (gc_obj *list = h->young; list;) {
+    gc_obj *next = list->next;
+    if (h->finalizer)
+      h->finalizer(body(list), list->kind);
+    free(list);
+    list = next;
+  }
+  for (gc_obj *list = h->old; list;) {
+    gc_obj *next = list->next;
+    if (h->finalizer)
+      h->finalizer(body(list), list->kind);
+    free(list);
+    list = next;
+  }
+  free(h->roots);
+  free(h->ranges);
+  free(h->handles);
+  free(h->scopes);
+  free(h->grey);
+  free(h->remset);
+  free(h->rescan);
+  free(h);
+}
+
+int gc_ready(void) { return cur_heap()->tracer != 0; }
+
+void **gc_heap_slots(void) { return cur_heap()->slots; }
 
 /* Grow a void* array to hold one more; returns 0 on OOM (caller copes). */
 static int grow(void ***a, int *cap, int need)
@@ -114,92 +232,95 @@ void gc_oom(void) { raise(6); /* SIGABRT: crash handler drops the page */ }
 
 void gc_init(gc_tracer trace, gc_finalizer finalize)
 {
-  tracer = trace;
-  finalizer = finalize;
-  young = old = 0;
-  young_bytes = old_bytes = alloc_since = 0;
-  threshold = MIN_THRESHOLD;
-  major_threshold = MIN_MAJOR;
-  force_major = 0;
-  collecting_minor = 0;
-  nroots = nranges = nhandles = nscopes = lost_scopes = 0;
-  grey_sp = 0;
-  remset_n = rescan_n = 0;
+  gc_heap *H = cur_heap();
+  H->tracer = trace;
+  H->finalizer = finalize;
+  H->young = H->old = 0;
+  H->young_bytes = H->old_bytes = H->alloc_since = 0;
+  H->threshold = MIN_THRESHOLD;
+  H->major_threshold = MIN_MAJOR;
+  H->force_major = 0;
+  H->collecting_minor = 0;
+  H->nroots = H->nranges = H->nhandles = H->nscopes = H->lost_scopes = 0;
+  H->grey_sp = 0;
+  H->remset_n = H->rescan_n = 0;
 }
 
-void gc_set_rescan_kind(int kind) { rescan_kind = kind; }
+void gc_set_rescan_kind(int kind) { cur_heap()->rescan_kind = kind; }
 
 /* ------------------------------------------------------------------ marking */
-void gc_mark(void *p)
+static void mark(gc_heap *H, void *p)
 {
   if (!p)
     return;
   gc_obj *h = hdr(p);
-  if (collecting_minor && h->gen == GEN_OLD)
+  if (H->collecting_minor && h->gen == GEN_OLD)
     return; /* old is assumed live  */
   if (h->mark != WHITE)
     return; /* already grey or black */
   h->mark = GREY;
-  if (grey_sp < grey_cap) {
-    grey[grey_sp++] = p;
+  if (H->grey_sp < H->grey_cap) {
+    H->grey[H->grey_sp++] = p;
     return;
   }
-  if (grow((void ***)&grey, &grey_cap, grey_sp + 1))
-    grey[grey_sp++] = p;
+  if (grow((void ***)&H->grey, &H->grey_cap, H->grey_sp + 1))
+    H->grey[H->grey_sp++] = p;
   else
-    grey_overflow = 1; /* rescan pass will find it              */
+    H->grey_overflow = 1; /* rescan pass will find it              */
 }
 
-static void mark_roots(void)
+void gc_mark(void *p) { mark(cur_heap(), p); }
+
+static void mark_roots(gc_heap *H)
 {
-  for (int i = 0; i < nroots; i++)
-    gc_mark(*roots[i]);
-  for (int i = 0; i < nranges; i++) {
-    int n = *ranges[i].count;
+  for (int i = 0; i < H->nroots; i++)
+    mark(H, *H->roots[i]);
+  for (int i = 0; i < H->nranges; i++) {
+    int n = *H->ranges[i].count;
     for (int j = 0; j < n; j++)
-      gc_mark(ranges[i].base[j]);
+      mark(H, H->ranges[i].base[j]);
   }
-  for (int i = 0; i < nhandles; i++)
-    gc_mark(handles[i]);
+  for (int i = 0; i < H->nhandles; i++)
+    mark(H, H->handles[i]);
 }
 
 /* Drain the grey worklist, tracing each object. `full` selects the fallback
  * rescan list: only the young list can hold grey objects during a minor. */
-static void drain(int full)
+static void drain(gc_heap *H, int full)
 {
   for (;;) {
-    while (grey_sp > 0) {
-      void *o = grey[--grey_sp];
+    while (H->grey_sp > 0) {
+      void *o = H->grey[--H->grey_sp];
       gc_obj *h = hdr(o);
       if (h->mark == BLACK)
         continue;
       h->mark = BLACK;
 #ifdef GC_PROFILE
-      stats.marked++;
+      H->stats.marked++;
 #endif
-      if (tracer)
-        tracer(o, h->kind);
+      if (H->tracer)
+        H->tracer(o, h->kind);
     }
-    if (!grey_overflow)
+    if (!H->grey_overflow)
       return;
     /* Worklist couldn't hold everything: sweep for stranded grey objects,
      * blacken and trace them. Marks only move white->grey->black, so repeated
      * passes make monotonic progress and terminate. */
-    grey_overflow = 0;
+    H->grey_overflow = 0;
     int found = 0;
     for (int pass = 0; pass < 2; pass++) {
-      gc_obj *list = pass == 0 ? young : old;
+      gc_obj *list = pass == 0 ? H->young : H->old;
       if (pass == 1 && !full)
         break; /* old holds no grey during a minor */
       for (gc_obj *o = list; o; o = o->next)
         if (o->mark == GREY) {
           o->mark = BLACK;
-          if (tracer)
-            tracer(body(o), o->kind);
+          if (H->tracer)
+            H->tracer(body(o), o->kind);
           found = 1;
         }
     }
-    if (!found && grey_sp == 0)
+    if (!found && H->grey_sp == 0)
       return;
   }
 }
@@ -207,23 +328,23 @@ static void drain(int full)
 /* Sweep one generation list: free the white objects, and run `on_survivor` for
  * each survivor (resetting its mark). Returns bytes freed and advances *pbytes.
  */
-static unsigned sweep(gc_obj **list, unsigned *pbytes, void (*on_survivor)(gc_obj *))
+static unsigned sweep(gc_heap *H, gc_obj **list, unsigned *pbytes, void (*on_survivor)(gc_obj *))
 {
   unsigned freed = 0;
   gc_obj **pp = list;
   while (*pp) {
     gc_obj *o = *pp;
 #ifdef GC_PROFILE
-    stats.swept++;
+    H->stats.swept++;
 #endif
     if (o->mark == WHITE) {
       *pp = o->next;
-      if (finalizer)
-        finalizer(body(o), o->kind);
+      if (H->finalizer)
+        H->finalizer(body(o), o->kind);
       *pbytes -= o->size;
       freed += o->size;
 #ifdef GC_PROFILE
-      stats.freed++;
+      H->stats.freed++;
 #endif
       free(o);
     } else {
@@ -235,222 +356,224 @@ static unsigned sweep(gc_obj **list, unsigned *pbytes, void (*on_survivor)(gc_ob
   return freed;
 }
 
-static void note_rescan(gc_obj *o)
+static void note_rescan(gc_heap *H, gc_obj *o)
 {
-  if (o->kind == rescan_kind && grow((void ***)&rescan, &rescan_cap, rescan_n + 1))
-    rescan[rescan_n++] = o;
+  if (o->kind == H->rescan_kind && grow((void ***)&H->rescan, &H->rescan_cap, H->rescan_n + 1))
+    H->rescan[H->rescan_n++] = o;
 }
 
 /* A minor sweep unlinks each young survivor and promotes it to the old list. */
 static void promote_survivor(gc_obj *o) { (void)o; /* handled inline in gc_minor: promotion needs to relink lists */ }
 
-static void set_threshold(void)
+static void set_threshold(gc_heap *H)
 {
-  unsigned want = old_bytes;
+  unsigned want = H->old_bytes;
   if (want < MIN_THRESHOLD)
     want = MIN_THRESHOLD;
   if (want > NURSERY_CAP)
     want = NURSERY_CAP;
-  threshold = want;
-  alloc_since = 0;
+  H->threshold = want;
+  H->alloc_since = 0;
 }
 
-static void clear_remset(void)
+static void clear_remset(gc_heap *H)
 {
-  for (int i = 0; i < remset_n; i++)
-    remset[i]->rem = 0;
-  remset_n = 0;
+  for (int i = 0; i < H->remset_n; i++)
+    H->remset[i]->rem = 0;
+  H->remset_n = 0;
 }
 
 /* ---------------------------------------------------------------- minor GC */
-static void gc_minor(void)
+static void gc_minor(gc_heap *H)
 {
-  stats.collections++;
-  stats.minors++;
+  H->stats.collections++;
+  H->stats.minors++;
 #ifdef GC_PROFILE
   double t0 = gc_now_ms();
 #endif
-  collecting_minor = 1;
-  grey_sp = 0;
-  grey_overflow = 0;
+  H->collecting_minor = 1;
+  H->grey_sp = 0;
+  H->grey_overflow = 0;
 
-  mark_roots();
+  mark_roots(H);
   /* old->young edges: the remembered set, plus every old rescan-kind object. */
-  for (int i = 0; i < remset_n; i++)
-    if (tracer)
-      tracer(body(remset[i]), remset[i]->kind);
-  for (int i = 0; i < rescan_n; i++)
-    if (tracer)
-      tracer(body(rescan[i]), rescan[i]->kind);
-  drain(0);
+  for (int i = 0; i < H->remset_n; i++)
+    if (H->tracer)
+      H->tracer(body(H->remset[i]), H->remset[i]->kind);
+  for (int i = 0; i < H->rescan_n; i++)
+    if (H->tracer)
+      H->tracer(body(H->rescan[i]), H->rescan[i]->kind);
+  drain(H, 0);
 
   /* Sweep the young list: free the dead, promote survivors to old. */
   {
-    gc_obj **pp = &young;
+    gc_obj **pp = &H->young;
     while (*pp) {
       gc_obj *o = *pp;
 #ifdef GC_PROFILE
-      stats.swept++;
+      H->stats.swept++;
 #endif
       if (o->mark == WHITE) {
         *pp = o->next;
-        if (finalizer)
-          finalizer(body(o), o->kind);
-        young_bytes -= o->size;
+        if (H->finalizer)
+          H->finalizer(body(o), o->kind);
+        H->young_bytes -= o->size;
 #ifdef GC_PROFILE
-        stats.freed++;
+        H->stats.freed++;
 #endif
         free(o);
       } else {
         o->mark = WHITE;
         o->gen = GEN_OLD;
-        young_bytes -= o->size;
-        old_bytes += o->size;
+        H->young_bytes -= o->size;
+        H->old_bytes += o->size;
         *pp = o->next; /* unlink from young                    */
-        o->next = old;
-        old = o; /* prepend to old                       */
-        note_rescan(o);
+        o->next = H->old;
+        H->old = o; /* prepend to old                       */
+        note_rescan(H, o);
       }
     }
   }
 
-  clear_remset(); /* every remembered old->young is now old->old       */
-  collecting_minor = 0;
-  set_threshold();
+  clear_remset(H); /* every remembered old->young is now old->old       */
+  H->collecting_minor = 0;
+  set_threshold(H);
 #ifdef GC_PROFILE
   {
     double _d = gc_now_ms() - t0;
-    stats.ms += _d;
-    if (_d > stats.max_ms)
-      stats.max_ms = _d;
+    H->stats.ms += _d;
+    if (_d > H->stats.max_ms)
+      H->stats.max_ms = _d;
   }
 #endif
 }
 
 /* ---------------------------------------------------------------- major GC */
-static unsigned gc_major(void)
+static unsigned gc_major(gc_heap *H)
 {
-  stats.collections++;
-  stats.majors++;
+  H->stats.collections++;
+  H->stats.majors++;
 #ifdef GC_PROFILE
   double t0 = gc_now_ms();
 #endif
-  collecting_minor = 0;
-  grey_sp = 0;
-  grey_overflow = 0;
+  H->collecting_minor = 0;
+  H->grey_sp = 0;
+  H->grey_overflow = 0;
 
-  mark_roots();
-  drain(1);
+  mark_roots(H);
+  drain(H, 1);
 
   /* Sweep old first (survivors keep their generation), then young (survivors
    * promote to old). Rebuild the rescan list from the surviving old objects. */
-  unsigned freed = sweep(&old, &old_bytes, promote_survivor);
+  unsigned freed = sweep(H, &H->old, &H->old_bytes, promote_survivor);
   {
-    gc_obj **pp = &young;
+    gc_obj **pp = &H->young;
     while (*pp) {
       gc_obj *o = *pp;
 #ifdef GC_PROFILE
-      stats.swept++;
+      H->stats.swept++;
 #endif
       if (o->mark == WHITE) {
         *pp = o->next;
-        if (finalizer)
-          finalizer(body(o), o->kind);
-        young_bytes -= o->size;
+        if (H->finalizer)
+          H->finalizer(body(o), o->kind);
+        H->young_bytes -= o->size;
         freed += o->size;
 #ifdef GC_PROFILE
-        stats.freed++;
+        H->stats.freed++;
 #endif
         free(o);
       } else {
         o->mark = WHITE;
         o->gen = GEN_OLD;
-        young_bytes -= o->size;
-        old_bytes += o->size;
+        H->young_bytes -= o->size;
+        H->old_bytes += o->size;
         *pp = o->next;
-        o->next = old;
-        old = o;
+        o->next = H->old;
+        H->old = o;
       }
     }
   }
 
   /* Rebuild the rescan list and clear stale remembered-set flags: both are
    * repopulated by promotion and the barrier from here on. */
-  rescan_n = 0;
-  for (gc_obj *o = old; o; o = o->next) {
+  H->rescan_n = 0;
+  for (gc_obj *o = H->old; o; o = o->next) {
     o->rem = 0;
-    note_rescan(o);
+    note_rescan(H, o);
   }
-  remset_n = 0;
+  H->remset_n = 0;
 
-  force_major = 0;
-  major_threshold = old_bytes * 2;
-  if (major_threshold < MIN_MAJOR)
-    major_threshold = MIN_MAJOR;
-  set_threshold();
+  H->force_major = 0;
+  H->major_threshold = H->old_bytes * 2;
+  if (H->major_threshold < MIN_MAJOR)
+    H->major_threshold = MIN_MAJOR;
+  set_threshold(H);
 #ifdef GC_PROFILE
   {
     double _d = gc_now_ms() - t0;
-    stats.ms += _d;
-    if (_d > stats.max_ms)
-      stats.max_ms = _d;
+    H->stats.ms += _d;
+    if (_d > H->stats.max_ms)
+      H->stats.max_ms = _d;
   }
 #endif
   return freed;
 }
 
 /* Public: force a full reclamation. */
-unsigned gc_collect(void) { return gc_major(); }
+unsigned gc_collect(void) { return gc_major(cur_heap()); }
 
 /* Choose a collection when the nursery budget is spent. */
-static void gc_step(void)
+static void gc_step(gc_heap *H)
 {
-  if (force_major || old_bytes > major_threshold)
-    gc_major();
+  if (H->force_major || H->old_bytes > H->major_threshold)
+    gc_major(H);
   else
-    gc_minor();
+    gc_minor(H);
 }
 
 /* ------------------------------------------------------------ write barrier */
 void gc_write_barrier(void *container)
 {
+  gc_heap *H = cur_heap();
   if (!container)
     return;
   gc_obj *h = hdr(container);
   if (h->gen != GEN_OLD || h->rem)
     return;
-  if (h->kind == rescan_kind)
+  if (h->kind == H->rescan_kind)
     return; /* scanned wholesale; no need to log */
-  if (grow((void ***)&remset, &remset_cap, remset_n + 1)) {
+  if (grow((void ***)&H->remset, &H->remset_cap, H->remset_n + 1)) {
     h->rem = 1;
-    remset[remset_n++] = h;
+    H->remset[H->remset_n++] = h;
   } else {
-    force_major = 1; /* can't remember this edge: next GC must be a major */
+    H->force_major = 1; /* can't remember this edge: next GC must be a major */
   }
 }
 
 /* --------------------------------------------------------------- allocation */
 void *gc_alloc(unsigned size, int kind)
 {
+  gc_heap *H = cur_heap();
 #ifdef GC_TORTURE
   /* Collect on every allocation, forcing a major periodically. Every object is
    * then one allocation from reclamation, so a missing write barrier or rooting
    * bug surfaces immediately as a use-after-free (run under AddressSanitizer).
    */
-  if (tracer) {
+  if (H->tracer) {
     static unsigned tc;
     if ((++tc & 63) == 0)
-      force_major = 1;
-    gc_step();
+      H->force_major = 1;
+    gc_step(H);
   }
 #else
-  if (alloc_since + size > threshold)
-    gc_step();
+  if (H->alloc_since + size > H->threshold)
+    gc_step(H);
 #endif
 
   gc_obj *o = malloc(sizeof(gc_obj) + size);
   if (!o) {
-    gc_major();
+    gc_major(H);
     o = malloc(sizeof(gc_obj) + size);
     if (!o) {
       gc_oom();
@@ -463,51 +586,55 @@ void *gc_alloc(unsigned size, int kind)
   o->kind = (unsigned char)kind;
   o->mark = WHITE;
   o->gen = GEN_YOUNG;
-  o->next = young;
-  young = o;
+  o->next = H->young;
+  H->young = o;
 
-  young_bytes += size;
-  alloc_since += size;
+  H->young_bytes += size;
+  H->alloc_since += size;
   return body(o);
 }
 
 /* -------------------------------------------------------------------- roots */
 void gc_add_root(void **slot)
 {
-  if (!grow((void ***)&roots, &caproots, nroots + 1))
+  gc_heap *H = cur_heap();
+  if (!grow((void ***)&H->roots, &H->caproots, H->nroots + 1))
     return;
-  roots[nroots++] = slot;
+  H->roots[H->nroots++] = slot;
 }
 
 void gc_remove_root(void **slot)
 {
-  for (int i = 0; i < nroots; i++)
-    if (roots[i] == slot) {
-      roots[i] = roots[--nroots];
+  gc_heap *H = cur_heap();
+  for (int i = 0; i < H->nroots; i++)
+    if (H->roots[i] == slot) {
+      H->roots[i] = H->roots[--H->nroots];
       return;
     }
 }
 
 void gc_add_root_range(void **base, int *count)
 {
-  if (nranges == capranges) {
-    int nc = capranges ? capranges * 2 : 8;
-    struct range *nr = realloc(ranges, (unsigned)nc * sizeof(struct range));
+  gc_heap *H = cur_heap();
+  if (H->nranges == H->capranges) {
+    int nc = H->capranges ? H->capranges * 2 : 8;
+    struct range *nr = realloc(H->ranges, (unsigned)nc * sizeof(struct range));
     if (!nr)
       return;
-    ranges = nr;
-    capranges = nc;
+    H->ranges = nr;
+    H->capranges = nc;
   }
-  ranges[nranges].base = base;
-  ranges[nranges].count = count;
-  nranges++;
+  H->ranges[H->nranges].base = base;
+  H->ranges[H->nranges].count = count;
+  H->nranges++;
 }
 
 void gc_remove_root_range(void **base)
 {
-  for (int i = 0; i < nranges; i++)
-    if (ranges[i].base == base) {
-      ranges[i] = ranges[--nranges];
+  gc_heap *H = cur_heap();
+  for (int i = 0; i < H->nranges; i++)
+    if (H->ranges[i].base == base) {
+      H->ranges[i] = H->ranges[--H->nranges];
       return;
     }
 }
@@ -515,60 +642,66 @@ void gc_remove_root_range(void **base)
 /* ------------------------------------------------------------ handle scopes */
 void gc_push_scope(void)
 {
-  if (!grow((void ***)&scopes, &capscopes, nscopes + 1)) {
-    lost_scopes++;
+  gc_heap *H = cur_heap();
+  if (!grow((void ***)&H->scopes, &H->capscopes, H->nscopes + 1)) {
+    H->lost_scopes++;
     return;
   }
-  scopes[nscopes++] = nhandles;
+  H->scopes[H->nscopes++] = H->nhandles;
 }
 
 void gc_pop_scope(void)
 {
-  if (lost_scopes > 0)
-    lost_scopes--;
-  else if (nscopes > 0)
-    nhandles = scopes[--nscopes];
+  gc_heap *H = cur_heap();
+  if (H->lost_scopes > 0)
+    H->lost_scopes--;
+  else if (H->nscopes > 0)
+    H->nhandles = H->scopes[--H->nscopes];
 }
 
 void *gc_keep(void *obj)
 {
-  if (grow((void ***)&handles, &caphandles, nhandles + 1))
-    handles[nhandles++] = obj;
+  gc_heap *H = cur_heap();
+  if (grow((void ***)&H->handles, &H->caphandles, H->nhandles + 1))
+    H->handles[H->nhandles++] = obj;
   return obj;
 }
 
 void gc_scope_pos(int *nh, int *ns)
 {
-  *nh = nhandles;
-  *ns = nscopes;
+  gc_heap *H = cur_heap();
+  *nh = H->nhandles;
+  *ns = H->nscopes;
 }
 
 void gc_scope_take(int nh, int ns, gc_stash *st)
 {
-  st->nh = nhandles - nh;
-  st->ns = nscopes - ns;
+  gc_heap *H = cur_heap();
+  st->nh = H->nhandles - nh;
+  st->ns = H->nscopes - ns;
   st->h = st->nh ? malloc((unsigned)st->nh * sizeof *st->h) : NULL;
   st->s = st->ns ? malloc((unsigned)st->ns * sizeof *st->s) : NULL;
   if ((st->nh && !st->h) || (st->ns && !st->s))
     gc_oom();
   for (int i = 0; i < st->nh; i++)
-    st->h[i] = handles[nh + i];
+    st->h[i] = H->handles[nh + i];
   for (int i = 0; i < st->ns; i++)
-    st->s[i] = scopes[ns + i] - nh;
-  nhandles = nh;
-  nscopes = ns;
+    st->s[i] = H->scopes[ns + i] - nh;
+  H->nhandles = nh;
+  H->nscopes = ns;
 }
 
 void gc_scope_put(gc_stash *st)
 {
-  int base = nhandles;
-  if (!grow((void ***)&handles, &caphandles, nhandles + st->nh) ||
-      !grow((void ***)&scopes, &capscopes, nscopes + st->ns))
+  gc_heap *H = cur_heap();
+  int base = H->nhandles;
+  if (!grow((void ***)&H->handles, &H->caphandles, H->nhandles + st->nh) ||
+      !grow((void ***)&H->scopes, &H->capscopes, H->nscopes + st->ns))
     gc_oom();
   for (int i = 0; i < st->nh; i++)
-    handles[nhandles++] = st->h[i];
+    H->handles[H->nhandles++] = st->h[i];
   for (int i = 0; i < st->ns; i++)
-    scopes[nscopes++] = st->s[i] + base;
+    H->scopes[H->nscopes++] = st->s[i] + base;
   gc_scope_drop(st);
 }
 
@@ -588,10 +721,14 @@ void gc_scope_drop(gc_stash *st)
 }
 
 /* --------------------------------------------------------------------- misc */
-unsigned gc_bytes(void) { return young_bytes + old_bytes; }
+unsigned gc_bytes(void)
+{
+  gc_heap *H = cur_heap();
+  return H->young_bytes + H->old_bytes;
+}
 void gc_get_stats(gc_stats_t *out)
 {
   if (out)
-    *out = stats;
+    *out = cur_heap()->stats;
 }
-void gc_set_threshold(unsigned bytes) { threshold = bytes ? bytes : MIN_THRESHOLD; }
+void gc_set_threshold(unsigned bytes) { cur_heap()->threshold = bytes ? bytes : MIN_THRESHOLD; }

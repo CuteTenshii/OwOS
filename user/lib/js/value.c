@@ -348,16 +348,12 @@ static void finalize(void *obj, int kind)
 
 void js_gc_setup(void)
 {
-  /* One shared GC heap underlies every js_ctx. An embedder may keep several
-   * contexts live at once (the browser holds one per tab, all coexisting, each
-   * rooting its own world) — so initialize the heap exactly once. A later
-   * js_ctx_new must not re-init it, or it would wipe the other contexts' roots
-   * and objects. js_ctx_free drops a context's roots and collects, draining its
-   * objects from the shared heap. */
-  static int inited = 0;
-  if (inited)
+  /* Every js_ctx on a thread shares that thread's GC heap (the browser holds one context per tab, all
+   * coexisting, each rooting its own world), so initialize it once: a later js_ctx_new must not re-init
+   * it, or it would wipe the other contexts' roots and objects. js_ctx_free drops a context's roots and
+   * collects, draining its objects from the heap. */
+  if (gc_ready())
     return;
-  inited = 1;
   gc_init(trace, finalize);
   gc_set_rescan_kind(GCK_ARRAY);
 }
@@ -1559,9 +1555,10 @@ int js_strict_eq(js_value a, js_value b)
 
 /* ------------------------------------------------------- symbols ---------- */
 
+static unsigned symbol_counter;
+
 js_value js_mk_symbol(js_ctx *ctx, const char *desc)
 {
-  static unsigned counter = 0;
   js_object *o;
   js_value v;
   char *ks;
@@ -1576,7 +1573,7 @@ js_value js_mk_symbol(js_ctx *ctx, const char *desc)
     gc_oom();
   ks[0] = 1;
   ks[1] = 's';
-  n = u64toa((unsigned long long)counter++, ks + 2, 36);
+  n = u64toa((unsigned long long)__atomic_fetch_add(&symbol_counter, 1, __ATOMIC_RELAXED), ks + 2, 36);
   ks[2 + n] = 0;
   o->host = ks;
   js_def(o, "@desc", desc ? js_mk_cstring(ctx, desc) : js_undef(), 0);
