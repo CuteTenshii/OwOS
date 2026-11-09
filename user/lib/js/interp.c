@@ -786,9 +786,14 @@ static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r)
 static js_value access_ex(js_ctx *ctx, js_value objv, js_node *m, char *keyout, int cap)
 {
   if (m->u.member.computed) {
-    js_value k = evaluate(ctx, m->u.member.prop);
-    if (ctx->has_exc)
+    js_value k, out;
+    gc_push_scope();
+    KEEP(objv); /* the key expression may collect */
+    k = evaluate(ctx, m->u.member.prop);
+    if (ctx->has_exc) {
+      gc_pop_scope();
       return js_undef();
+    }
     if (k.type == JV_NUM) {
       double d = k.u.num;
       if (d >= 0 && d == floor(d) && d < 4294967296.0) {
@@ -796,16 +801,15 @@ static js_value access_ex(js_ctx *ctx, js_value objv, js_node *m, char *keyout, 
           u64toa((unsigned)d, keyout, 10);
         else if (keyout && cap > 0)
           keyout[0] = '\0';
-        return js_get_index(ctx, objv, (unsigned)d);
+        out = js_get_index(ctx, objv, (unsigned)d);
+        gc_pop_scope();
+        return out;
       }
     }
-    gc_push_scope();
-    KEEP(objv);
     KEEP(k);
     {
       js_value hold;
       const char *key = to_prop_key(ctx, k, &hold);
-      js_value out;
       if (ctx->has_exc) {
         gc_pop_scope();
         return js_undef();

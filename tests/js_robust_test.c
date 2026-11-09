@@ -330,6 +330,15 @@ static void check_string_append_aliasing(void)
           0));
 }
 
+static void check_computed_member_gc(void)
+{
+  expect(run("function churn() { var j; for (var i = 0; i < 4000; i++) j = { a: i, b: [i, i] }; return 1; }\n"
+             "var bad = 0; for (var k = 0; k < 60; k++) { var v = [{ x: 1 }, { x: 2 }, { x: 3 }][churn()]; if (!v || "
+             "v.x !== 2) bad++; }\n"
+             "expect(bad === 0, 'an array literal survives collection while its index is evaluated: ' + bad);\n",
+             0));
+}
+
 static void check_promise_chain_depth(void)
 {
   expect(run(
@@ -648,6 +657,7 @@ int main(void)
   test("typed array set, slice and copy construction", check_typed_array_copy);
   test("long string appends and buffer garbage", check_string_append);
   test("string appends in place keep aliases intact", check_string_append_aliasing);
+  test("a computed member's object survives its key being evaluated", check_computed_member_gc);
   test("long promise chains do not recurse without bound", check_promise_chain_depth);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
