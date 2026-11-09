@@ -933,6 +933,15 @@ int hda_output_count(void)
   return n;
 }
 
+/* EDID describes one monitor, so it can only name an output when no other digital sink is attached. */
+static bool sole_digital_sink(void)
+{
+  int n = 0;
+  for (int i = 0; i < n_outs; i++)
+    n += (outs[i].pincap & PINCAP_DIGITAL) && out_present(&outs[i]);
+  return n == 1;
+}
+
 int hda_output_name(int i, char *out, int max)
 {
   int r = present ? visible_to_real(i) : -1;
@@ -949,6 +958,18 @@ int hda_output_name(int i, char *out, int max)
     s = names[kind][ord < 4 ? ord : 3];
   }
   int k = 0;
+  char mon[48];
+  edid_model(mon, (int)sizeof mon);
+  if (kind != KIND_ANALOG && mon[0] && sole_digital_sink()) {
+    const char *tag = kind == KIND_HDMI ? " (HDMI)" : " (DP)";
+    int tl = kind == KIND_HDMI ? 7 : 5;
+    for (; mon[k] && k < max - 1 - tl; k++)
+      out[k] = mon[k];
+    for (int t = 0; t < tl && k < max - 1; t++)
+      out[k++] = tag[t];
+    out[k] = 0;
+    return 1;
+  }
   for (; s[k] && k < max - 1; k++)
     out[k] = s[k];
   out[k] = 0;
