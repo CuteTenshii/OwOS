@@ -7,15 +7,27 @@ static struct lbox *g_pool;
 static int g_n, g_cap;
 static int g_cur = -1; /* index of the currently open box, -1 = none */
 
+static void exts_free(void)
+{
+  for (int i = 0; i < g_n; i++) {
+    free(g_pool[i].ext);
+    g_pool[i].ext = 0;
+  }
+}
+
 void layout_reset(void)
 {
+  browser_buf_lock(); /* the painter dereferences box extras under this lock */
+  exts_free();
   g_n = 0;
   g_cur = -1;
+  browser_buf_unlock();
 }
 
 void layout_free(void)
 {
   browser_buf_lock();
+  exts_free();
   free(g_pool);
   g_pool = 0;
   g_n = g_cap = 0;
@@ -57,6 +69,46 @@ static struct ledge edge4(const short v[4])
   return e;
 }
 
+/* The rarely-set properties of `cs`, or NULL when it sets none of them. */
+static struct lext *ext_new(const struct css_style *cs)
+{
+  bool tr = cs->has_tr == 1, flt = cs->flt_bright >= 0, clip = cs->clip_kind > CSS_CLIP_NONE;
+  if (cs->n_areas <= 0 && !cs->area[0] && !tr && !flt && !clip && !cs->backdrop_set)
+    return 0;
+  struct lext *x = calloc(1, sizeof *x);
+  if (!x)
+    return 0;
+  if (cs->n_areas > 0) {
+    x->n_areas = cs->n_areas;
+    memcpy(x->areas, cs->areas, (unsigned)cs->n_areas * sizeof *x->areas);
+  }
+  for (int i = 0; cs->area[i] && i < CSS_AREA_NAME - 1; i++)
+    x->area[i] = cs->area[i];
+  x->backdrop = cs->backdrop;
+  x->backdrop_set = (unsigned char)cs->backdrop_set;
+  if (tr) {
+    x->tr_x = cs->tr_x;
+    x->tr_y = cs->tr_y;
+    x->tr_xp = cs->tr_xp;
+    x->tr_yp = cs->tr_yp;
+  }
+  x->flt_bright = 1000;
+  x->flt_opacity = 100;
+  if (flt) {
+    x->flt_bright = cs->flt_bright;
+    x->flt_gray = cs->flt_gray;
+    x->flt_invert = cs->flt_invert;
+    x->flt_opacity = cs->flt_opacity;
+  }
+  if (clip) {
+    x->clip_kind = cs->clip_kind;
+    x->clip_n = cs->clip_n;
+    memcpy(x->clip_v, cs->clip_v, (unsigned)cs->clip_n * sizeof *x->clip_v);
+    memcpy(x->clip_unit, cs->clip_unit, (unsigned)cs->clip_n);
+  }
+  return x;
+}
+
 void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
 {
   int i = box_alloc();
@@ -71,6 +123,12 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->col_span = (signed char)(cs->col_span > 0 ? cs->col_span : 1);
   b->row_span = (signed char)(cs->row_span > 0 ? cs->row_span : 1);
   b->justify_items = cs->justify_items;
+  b->col_start = (short)(cs->col_start > 0 ? cs->col_start : 0);
+  b->row_start = (short)(cs->row_start > 0 ? cs->row_start : 0);
+  b->align_self = cs->align_self;
+  b->aspect = cs->aspect > 0 ? cs->aspect : 0;
+  b->hidden = (unsigned char)(cs->visibility == 0);
+  b->ext = ext_new(cs);
   if (cs->n_cols > 0)
     for (int i = 0; i < cs->n_cols && i < CSS_GRID_MAX; i++)
       b->cols_t[i] = cs->grid_cols[i];

@@ -301,7 +301,16 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
     pc->a = span_is(ns, ne, "where"); /* :where() carries zero specificity */
     return true;
   }
-  return true; /* dynamic state / :has() / unsupported -> PC_NEVER */
+  if (span_is(ns, ne, "hover") || span_is(ns, ne, "active") || span_is(ns, ne, "focus") ||
+      span_is(ns, ne, "focus-visible") || span_is(ns, ne, "focus-within")) {
+    pc->kind = span_is(ns, ne, "hover")          ? PC_HOVER
+               : span_is(ns, ne, "active")       ? PC_ACTIVE
+               : span_is(ns, ne, "focus-within") ? PC_FOCUS_WITHIN
+                                                 : PC_FOCUS;
+    g_state_used = true;
+    return true;
+  }
+  return true; /* :has() / unsupported -> PC_NEVER */
 }
 
 static void add_pseudo_class(struct sel_step *st, const char *ns, const char *ne, const char *as, const char *ae)
@@ -446,6 +455,10 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
         st->pseudo_el = PE_BEFORE;
       else if (span_is(ns, ne, "after"))
         st->pseudo_el = PE_AFTER;
+      else if (dbl && (span_is(ns, ne, "selection") || span_is(ns, ne, "-moz-selection")))
+        st->pseudo_el = PE_SELECTION;
+      else if (dbl && span_is(ns, ne, "backdrop"))
+        st->pseudo_el = PE_BACKDROP;
       else if (dbl && span_is(ns, ne, "slotted") && as) {
         st->pseudo_el = PE_SLOTTED;
         st->pe_list = parse_sel_list(as, ae);
@@ -740,6 +753,15 @@ static bool attr_value_match(const struct pseudo *pc, const char *v)
   return false;
 }
 
+/* True when `n` is `from` or one of its flat-tree ancestors. */
+static bool in_chain(const struct dom_node *from, const struct dom_node *n)
+{
+  for (const struct dom_node *m = from; m; m = dom_flat_parent(m))
+    if (m == n)
+      return true;
+  return false;
+}
+
 static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
 {
   switch (pc->kind) {
@@ -808,6 +830,14 @@ static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
       return true;
     return attr_value_match(pc, v);
   }
+  case PC_HOVER:
+    return in_chain(g_state_hover, n);
+  case PC_ACTIVE:
+    return in_chain(g_state_active, n);
+  case PC_FOCUS:
+    return n == g_state_focus;
+  case PC_FOCUS_WITHIN:
+    return in_chain(g_state_focus, n);
   case PC_NOT_LIST:
     for (int i = 0; i < pc->list->n; i++)
       if (selector_match(&pc->list->sels[i], n))

@@ -357,6 +357,8 @@ static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned d
 
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 {
+  if (im->hidden)
+    return;
   /* Draw with the exact geometry the row was reserved with (line_x/line_w), not the full pane */
   const struct ltab *t = &g_fr->lt;
   int row = im->start_row;
@@ -373,34 +375,48 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
     return;
   int y0 = py + t->y[row] - B->pg->scroll;
   int ry0 = y0 < ct ? ct - y0 : 0, ry1 = y0 + dh > cb ? cb - y0 : dh;
-  unsigned lo, hi;
-  if (ry1 <= ry0 || !clip_cols(x0, (unsigned)dw, &lo, &hi))
+  if (ry1 <= ry0)
+    return;
+  int fw = dw, fh = dh, ox = 0, oy = 0;
+  if (im->fit && im->iw && im->ih)
+    ru_fit_rect(im->fit, im->iw, im->ih, dw, dh, &fw, &fh, &ox, &oy);
+  /* columns of the fitted image that land inside the box and the window */
+  int lo_i = -ox > -(x0 + ox) ? -ox : -(x0 + ox), hi_i = dw - ox < BW - (x0 + ox) ? dw - ox : BW - (x0 + ox);
+  unsigned lo = (unsigned)(lo_i < 0 ? 0 : lo_i), hi = (unsigned)(hi_i > fw ? fw : hi_i);
+  if (hi_i <= lo_i || hi <= lo)
     return;
   unsigned *fb = browser_surface();
+  if (ry0 < oy)
+    ry0 = oy;
+  if (ry1 > oy + fh)
+    ry1 = oy + fh;
 
   /* SVGs and animated frames live raw in img_pool */
   if (im->is_argb) {
     if (im->uid)
       animimg_seen(im->uid);
     const unsigned char *src = B->img_pool + im->coff;
-    const unsigned *xm = xmap_get((unsigned)dw, im->iw);
+    const unsigned *xm = xmap_get((unsigned)fw, im->iw);
     for (int ry = ry0; ry < ry1; ry++) {
-      const unsigned char *srow = src + (unsigned long)((unsigned)ry * im->ih / (unsigned)dh) * im->iw * 4;
-      ru_blit_row_rgba(fb + (unsigned long)(y0 + ry) * BW + x0, srow, xm, (unsigned)dw, im->iw, lo, hi);
+      const unsigned char *srow = src + (unsigned long)((unsigned)(ry - oy) * im->ih / (unsigned)fh) * im->iw * 4;
+      ru_blit_row_rgba(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, im->iw, lo, hi);
     }
     return;
   }
-  const struct ru_img *c = imgc_get(im, (unsigned)dw, (unsigned)dh);
+  const struct ru_img *c = imgc_get(im, (unsigned)fw, (unsigned)fh);
   if (c) {
-    const unsigned *xm = c->cw == (unsigned)dw ? 0 : xmap_get((unsigned)dw, c->cw);
+    const unsigned *xm = c->cw == (unsigned)fw ? 0 : xmap_get((unsigned)fw, c->cw);
     for (int ry = ry0; ry < ry1; ry++) {
-      const unsigned *srow = c->px + (unsigned long)((unsigned)ry * c->ch / (unsigned)dh) * c->cw;
-      ru_blit_row_words(fb + (unsigned long)(y0 + ry) * BW + x0, srow, xm, (unsigned)dw, c->cw, c->opaque, lo, hi);
+      const unsigned *srow = c->px + (unsigned long)((unsigned)(ry - oy) * c->ch / (unsigned)fh) * c->cw;
+      ru_blit_row_words(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, c->cw, c->opaque, lo, hi);
     }
     return;
   }
-  /* Fallback (too large to hold / decode failed): stream it once. */
-  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), lo, hi};
+  /* Fallback (too large to hold / decode failed): stream it once, filling the box. */
+  unsigned flo, fhi;
+  if (!clip_cols(x0, (unsigned)dw, &flo, &fhi))
+    return;
+  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), flo, fhi};
   struct poolrd r = {0, im->coff, im->clen};
   png_decode(poolrd_get, &r, inl_row, &v, 0, 0);
 }
@@ -408,6 +424,8 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 /* A placeholder box for an image that couldn't be fetched/decoded. */
 void draw_alt_box(struct inl_img *im, int py, int ct, int cb)
 {
+  if (im->hidden)
+    return;
   int y0 = py + g_fr->lt.y[im->start_row] - B->pg->scroll;
   if (y0 + LINE_H <= ct || y0 >= cb)
     return; /* keep it in-pane    */

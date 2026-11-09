@@ -28,8 +28,8 @@ static void draw_hover_status(void)
   gfx_ui_text(6, by + 3, shown, 0xe8eaee);
 }
 
-/* Darken the pane rect behind a modal dialog */
-static void dim_rect(int x, int y, int w, int h, int ct, int cb)
+/* Shade the pane rect behind a modal dialog with `argb` (0xAARRGGBB) */
+static void dim_rect(int x, int y, int w, int h, int ct, int cb, unsigned argb)
 {
   unsigned *fb = browser_surface();
   if (y < ct) {
@@ -38,11 +38,14 @@ static void dim_rect(int x, int y, int w, int h, int ct, int cb)
   }
   if (y + h > cb)
     h = cb - y;
+  unsigned a = argb >> 24, ia = 255 - a;
+  unsigned sr = ((argb >> 16) & 0xff) * a, sg = ((argb >> 8) & 0xff) * a, sb = (argb & 0xff) * a;
   for (int yy = y; yy < y + h; yy++)
     for (int xx = x; xx < x + w; xx++) {
       unsigned p = fb[(unsigned long)yy * BW + xx];
-      fb[(unsigned long)yy * BW + xx] =
-          ((((p & 0xff00ff) * 102) >> 8) & 0xff00ff) | ((((p & 0xff00) * 102) >> 8) & 0xff00);
+      unsigned r = (sr + ((p >> 16) & 0xff) * ia) / 255, g = (sg + ((p >> 8) & 0xff) * ia) / 255,
+               b = (sb + (p & 0xff) * ia) / 255;
+      fb[(unsigned long)yy * BW + xx] = (r << 16) | (g << 8) | b;
     }
 }
 
@@ -53,7 +56,7 @@ static void paint_overlays(int py, int pw, int ct, int cb)
   int n, order[OVL_MAX], pane_y, phh, rows;
   if (!o->n_ov)
     return;
-  layout_pool(&n);
+  const struct lbox *bx = layout_pool(&n);
   if (n != o->n_geo)
     return;
   pane_metrics(&pane_y, &phh, &rows);
@@ -61,8 +64,10 @@ static void paint_overlays(int py, int pw, int ct, int cb)
   for (int q = 0; q < o->n_ov; q++) {
     const struct lovl *ov = &o->ov[order[q]];
     int h, top = overlay_place(ov, phh, &h);
-    if (ov->modal)
-      dim_rect(0, py, pw, phh, ct, cb);
+    if (ov->modal) {
+      const struct lext *x = bx[ov->box].ext;
+      dim_rect(0, py, pw, phh, ct, cb, x && x->backdrop_set ? x->backdrop : 0x99000000u);
+    }
     paint_overlay_boxes(ov, py, pw, ct, cb, top, h);
     int shift = py + top - o->geo[ov->box].y;
     const struct ltab *t = &o->ovlt;

@@ -151,10 +151,41 @@ static bool overlay_hit(int mx, int my, int py, int phh, int *off)
   return modal;
 }
 
+/* CSS cursor (CSS_CUR_AUTO = unset) and whether user-select:none covers the last pane_hit */
+static int hit_cursor = CSS_CUR_AUTO;
+static bool hit_noselect;
+
+/* Innermost explicit cursor, user-select and pointer-events at text offset `off`; call under browser_buf_lock. */
+static void regions_at(int off, int *cursor, int *usel, int *pev)
+{
+  *cursor = CSS_CUR_AUTO;
+  *usel = *pev = -1;
+  bool c = false, u = false, p = false;
+  for (int i = 0; i < B->pg->nregs && !(c && u && p); i++) {
+    const struct pregion *r = &B->pg->regs[i];
+    if (off < r->start || off >= r->end)
+      continue;
+    if (!c && r->cursor >= 0) {
+      *cursor = r->cursor;
+      c = true;
+    }
+    if (!u && r->usel >= 0) {
+      *usel = r->usel;
+      u = true;
+    }
+    if (!p && r->pev >= 0) {
+      *pev = r->pev;
+      p = true;
+    }
+  }
+}
+
 /* Resolve a content-pane hit at client coords (mx,my) */
 static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
 {
   *off = -1;
+  hit_cursor = CSS_CUR_AUTO;
+  hit_noselect = false;
   if (cap)
     url[0] = '\0';
   if (newtab)
@@ -184,6 +215,15 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
         *off = im->text_pos;
         break;
       }
+    }
+  }
+  if (*off >= 0) {
+    int usel, pev;
+    regions_at(*off, &hit_cursor, &usel, &pev);
+    hit_noselect = usel == 0;
+    if (pev == 0) { /* pointer-events:none: the pointer sees nothing here */
+      *off = -1;
+      hit_cursor = CSS_CUR_AUTO;
     }
   }
   if (*off >= 0) {
@@ -263,10 +303,21 @@ static void pane_linecol(int mx, int my, int *line, int *col)
 }
 
 /* Alpha-blend a translucent selection highlight over the frame buffer rect, clipped to the rows */
-void sel_hl_rect(int x, int y, int w, int h, int ct, int cb)
+/* Selection tint at text offset `off`: the page's ::selection background there, else the default blue. */
+unsigned sel_color_at(int off)
+{
+  for (int i = 0; i < B->pg->nregs; i++) {
+    const struct pregion *r = &B->pg->regs[i];
+    if (r->sel >= 0 && off >= r->start && off < r->end)
+      return (unsigned)r->sel;
+  }
+  return 0x3366cc;
+}
+
+void sel_hl_rect(int x, int y, int w, int h, int ct, int cb, unsigned rgb)
 {
   unsigned *fb = browser_surface();
-  const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a; /* ~43% blue */
+  const unsigned sr = (rgb >> 16) & 0xff, sg = (rgb >> 8) & 0xff, sb = rgb & 0xff, a = 110, ia = 255 - a;
   for (int yy = y; yy < y + h; yy++) {
     if (yy < ct || yy >= cb || yy < 0 || yy >= BH)
       continue;
@@ -415,6 +466,19 @@ void drag_field(struct textfield *tf, int mx, int my, int x, int y, int w, int h
   }
 }
 
+/* Report the pointer to the worker when the page has :hover/:active rules and the target changed */
+static void post_pointer(int off, int down)
+{
+  static int last_off = -2, last_down;
+  if (!B->ptr_live || (off == last_off && down == last_down))
+    return;
+  last_off = off;
+  last_down = down;
+  B->ptr_off = off;
+  B->ptr_down = down;
+  B->ptr_pending = 1;
+}
+
 void handle_click(int mx, int my)
 {
   drag_tf = 0;
@@ -527,6 +591,7 @@ void handle_click(int mx, int my)
     char res[URL_MAX];
     int off, nt = 0;
     pane_hit(mx, my, &off, res, sizeof res, &nt);
+    post_pointer(off, 1);
     /* A press clears any previous selection. */
     if (gfx_sel_has(&g_sel)) {
       gfx_sel_clear(&g_sel);
@@ -558,6 +623,8 @@ void handle_click(int mx, int my)
       return;
     }
     /* Plain text (no link): begin a selection; a following drag extends it. */
+    if (hit_noselect)
+      return;
     int line, col;
     pane_linecol(mx, my, &line, &col);
     gfx_sel_start(&g_sel, line, col);
@@ -589,11 +656,13 @@ static int cursor_for(int mx, int my, const char *link)
   /* Crashed tab */
   if (tabs[active_tab].crashed)
     return in_rect(mx, my, &crash_reload_rect) ? WIN_CURSOR_HAND : WIN_CURSOR_ARROW;
+  if (hit_cursor != CSS_CUR_AUTO)
+    return hit_cursor; /* the CSS_CUR_* order is WIN_CURSOR_* */
   return link[0] ? WIN_CURSOR_HAND : WIN_CURSOR_TEXT;
 }
 
-/* Pointer moved over the content pane with no button held */
-void handle_move(int mx, int my)
+/* Pointer moved over the content pane; `down` = the button is held (a drag the page didn't consume) */
+static void pointer_moved(int mx, int my, int down)
 {
   char url[URL_MAX];
   int off;
@@ -605,6 +674,8 @@ void handle_move(int mx, int my)
   } /* pointer left the window: clear */
   else
     pane_hit(mx, my, &off, url, sizeof url, 0);
+
+  post_pointer(off, down);
 
   /* Feed the inspect-element picker the page offset under the cursor */
   if (devtools_picking())
@@ -622,6 +693,9 @@ void handle_move(int mx, int my)
   hover_rows(&y0, &y1);
   damage_rows(y0, y1);
 }
+
+/* Pointer moved over the content pane with no button held */
+void handle_move(int mx, int my) { pointer_moved(mx, my, 0); }
 
 /* Left-button drag in the content pane (WEV_DRAG) */
 void handle_drag(int mx, int my)
@@ -643,7 +717,7 @@ void handle_drag(int mx, int my)
       damage_lines(lo, hi);
     return;
   }
-  handle_move(mx, my);
+  pointer_moved(mx, my, 1);
 }
 
 /* Copy the current text selection to the clipboard */

@@ -293,6 +293,25 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
       f.kind = MF_SCHEME_DARK;
     else if (span_eq_trim(vs, ve, "light"))
       f.kind = MF_SCHEME_LIGHT;
+  } else if (span_is(ns, nend, "hover") || span_is(ns, nend, "any-hover")) { /* a mouse is the pointer */
+    if (vs >= ve || span_eq_trim(vs, ve, "hover"))
+      f.kind = MF_TRUE;
+  } else if (span_is(ns, nend, "pointer") || span_is(ns, nend, "any-pointer")) {
+    if (vs >= ve || span_eq_trim(vs, ve, "fine"))
+      f.kind = MF_TRUE;
+  } else if (span_is(ns, nend, "prefers-reduced-motion") || span_is(ns, nend, "prefers-contrast") ||
+             span_is(ns, nend, "prefers-reduced-transparency")) {
+    if (span_eq_trim(vs, ve, "no-preference"))
+      f.kind = MF_TRUE;
+  } else if (span_is(ns, nend, "scripting")) {
+    if (span_eq_trim(vs, ve, "enabled"))
+      f.kind = MF_TRUE;
+  } else if (span_is(ns, nend, "update")) {
+    if (span_eq_trim(vs, ve, "fast"))
+      f.kind = MF_TRUE;
+  } else if (span_is(ns, nend, "display-mode")) {
+    if (span_eq_trim(vs, ve, "browser"))
+      f.kind = MF_TRUE;
   }
   if ((f.kind == MF_MIN_W || f.kind == MF_MAX_W || f.kind == MF_W || f.kind == MF_MIN_H || f.kind == MF_MAX_H ||
        f.kind == MF_H) &&
@@ -390,6 +409,8 @@ static bool feature_matches(const struct media_feature *f)
     return true; /* the browser renders a light theme */
   case MF_SCHEME_DARK:
     return false;
+  case MF_TRUE:
+    return true;
   default:
     return false; /* MF_UNKNOWN / unsupported feature */
   }
@@ -430,6 +451,7 @@ css_sheet *css_new(void)
   s->keyframes = 0;
   s->medias = 0;
   s->has_pseudo_el = false;
+  s->has_selection = false;
   s->cur_base = 0;
   for (int i = 0; i < CSS_NBUCK; i++) {
     s->id_b[i] = s->cls_b[i] = s->tag_b[i] = 0;
@@ -759,7 +781,9 @@ static void sheet_push(css_sheet *sh, struct selector *sel, const struct css_sty
   r->important = important;
   if (sel->step[sel->n - 1].pseudo_el == PE_BEFORE || sel->step[sel->n - 1].pseudo_el == PE_AFTER)
     sh->has_pseudo_el = true; /* a ::before/::after rule exists in this sheet */
-  r->visit = 0;               /* the index (ensure_index) files it by key */
+  if (sel->step[sel->n - 1].pseudo_el == PE_SELECTION)
+    sh->has_selection = true;
+  r->visit = 0; /* the index (ensure_index) files it by key */
   r->vc = 0;
   r->vc_serial = 0;
   r->raw = copy_collapsed(dec_s, dec_e);
@@ -813,6 +837,90 @@ static const char *skip_atrule(const char *p, const char *end)
 }
 
 /* Parse rules in [p,end) under media query *mq; a nested @media replaces only an unconditional outer one. */
+/* ---- @supports ---- */
+
+/* A declaration counts as supported when the engine's parse of it changes the style. */
+static bool supports_decl(const char *s, const char *e)
+{
+  char buf[256];
+  int n = (int)(e - s) < (int)sizeof buf - 1 ? (int)(e - s) : (int)sizeof buf - 1;
+  memcpy(buf, s, (unsigned)n);
+  buf[n] = '\0';
+  struct css_style base, got;
+  memset(&base, 0, sizeof base);
+  memset(&got, 0, sizeof got);
+  css_style_reset(&base);
+  css_style_reset(&got);
+  bool imp = false;
+  parse_decls(buf, buf + n, &got, &imp);
+  return memcmp(&base, &got, sizeof base) != 0;
+}
+
+static bool supports_selector(const char *s, const char *e)
+{
+  struct selector sel;
+  bool ok = parse_selector(s, e, &sel);
+  for (int i = 0; ok && i < sel.n; i++)
+    for (int k = 0; k < sel.step[i].npc; k++)
+      if (sel.step[i].pc[k].kind == PC_NEVER)
+        ok = false;
+  selector_free(&sel);
+  return ok;
+}
+
+static bool supports_cond(const char **pp, const char *e);
+
+/* One `not <term>`, `(<decl or condition>)` or `selector(...)` term. */
+static bool supports_term(const char **pp, const char *e)
+{
+  const char *p = skip_sp(*pp, e);
+  if (kw(&p, e, "not")) {
+    bool r = !supports_term(&p, e);
+    *pp = p;
+    return r;
+  }
+  bool is_sel = starts_ci(p, "selector(");
+  if (p < e && (*p == '(' || is_sel)) {
+    const char *in = p + (is_sel ? 9 : 1);
+    int depth = 1;
+    const char *q = in;
+    while (q < e && depth) {
+      if (*q == '(')
+        depth++;
+      else if (*q == ')')
+        depth--;
+      if (depth)
+        q++;
+    }
+    *pp = q < e ? q + 1 : e;
+    if (is_sel)
+      return supports_selector(in, q);
+    const char *t = skip_sp(in, q);
+    if (t < q && (*t == '(' || starts_ci(t, "not") || starts_ci(t, "selector(")))
+      return supports_cond(&t, q);
+    return supports_decl(in, q);
+  }
+  *pp = e;
+  return false;
+}
+
+static bool supports_cond(const char **pp, const char *e)
+{
+  bool r = supports_term(pp, e);
+  for (;;) {
+    const char *p = skip_sp(*pp, e);
+    if (kw(&p, e, "and")) {
+      bool t = supports_term(&p, e);
+      r = r && t;
+    } else if (kw(&p, e, "or")) {
+      bool t = supports_term(&p, e);
+      r = r || t;
+    } else
+      return r;
+    *pp = p;
+  }
+}
+
 static void add_rules(css_sheet *sh, const char *p, const char *end, const struct media_query *mq)
 {
   while (p < end) {
@@ -887,11 +995,17 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
           continue;
         }
       }
-      /* @layer / @supports: flatten inner rules (layer order approximated by source; @supports assumed true). */
+      /* @layer / @supports: flatten inner rules (layer order approximated by source; @supports evaluates its
+       * condition). */
       if (starts_ci(p, "@layer") || starts_ci(p, "@supports")) {
         const char *b = p;
         while (b < end && *b != '{' && *b != ';')
           b++;
+        bool take = true;
+        if (starts_ci(p, "@supports")) {
+          const char *c = p + 9;
+          take = supports_cond(&c, b);
+        }
         if (b < end && *b == '{') {
           const char *db = b + 1, *de = db;
           int depth = 1;
@@ -903,7 +1017,8 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
             if (depth)
               de++;
           }
-          add_rules(sh, db, de, mq);
+          if (take)
+            add_rules(sh, db, de, mq);
           p = (de < end) ? de + 1 : end;
           continue;
         }

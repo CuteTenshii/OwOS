@@ -21,6 +21,8 @@
 struct sty {
   unsigned fg;
   unsigned char bold, under, italic, strike, nowrap, ttx, smallcaps;
+  unsigned char hidden;         /* inherited visibility:hidden */
+  unsigned char clip, ellipsis; /* the enclosing block clips overflow, and shows an ellipsis */
 };
 
 struct css_src {
@@ -82,7 +84,7 @@ extern unsigned g_shadow_style_gen;
 css_sheet *sheet_for(const struct dom_node *el);
 static inline unsigned style_key(void)
 {
-  return css_viewport_generation() + css_sheet_generation(g_sheet) + g_shadow_style_gen;
+  return css_viewport_generation() + css_sheet_generation(g_sheet) + g_shadow_style_gen + css_state_generation();
 }
 static inline unsigned char clamp_fontpx(int px) { return (unsigned char)(px < 8 ? 8 : (px > 120 ? 120 : px)); }
 

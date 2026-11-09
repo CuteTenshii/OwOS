@@ -35,6 +35,19 @@ void css_style_reset(struct css_style *s)
   s->n_cols = s->n_rows = -1;
   s->col_span = s->row_span = -1;
   s->justify_items = -1;
+  s->col_start = s->row_start = -1;
+  s->n_areas = -1;
+  s->area[0] = '\0';
+  s->align_self = -1;
+  s->aspect = -1;
+  s->visibility = s->text_ovf = -1;
+  s->obj_fit = s->pointer_events = s->user_select = s->cursor = -1;
+  s->has_tr = -1;
+  s->tr_x = s->tr_y = s->tr_xp = s->tr_yp = 0;
+  s->flt_bright = -1;
+  s->flt_gray = s->flt_invert = s->flt_opacity = -1;
+  s->clip_kind = -1;
+  s->clip_n = 0;
   s->overflow = -1;
   s->italic = -1;
   s->small_caps = -1;
@@ -49,6 +62,7 @@ void css_style_reset(struct css_style *s)
   s->outline_color = -1;
   s->z_index = CSS_Z_AUTO;
   s->fill = s->stroke = -1;
+  s->svg_decl[0] = '\0';
   s->anim_name[0] = '\0';
   s->anim_dur = -1;
   s->anim_delay = -1;
@@ -63,6 +77,8 @@ void css_style_reset(struct css_style *s)
   css_bgi_reset(&s->bgi);
   s->content[0] = '\0';
   s->svg_decl[0] = '\0';
+  s->backdrop = 0;
+  s->backdrop_set = 0;
   s->fam[0] = '\0';
 }
 
@@ -268,53 +284,6 @@ int parse_tracks(const char *v, struct css_track *out, int max)
       parse_track_token(tok, s, &out[n++]);
   }
   return n;
-}
-
-/* grid-column / grid-row -> span count (>=1): `span <n>`, `<a> / <b>`, `<a> / span <n>`, auto. */
-signed char parse_grid_span(const char *v)
-{
-  while (*v == ' ')
-    v++;
-  if (starts_ci(v, "span")) {
-    v += 4;
-    while (*v == ' ')
-      v++;
-    int n = 0;
-    while (*v >= '0' && *v <= '9')
-      n = n * 10 + (*v++ - '0');
-    return (signed char)(n > 0 ? n : 1);
-  }
-  int a = 0;
-  bool hasA = false;
-  while (*v >= '0' && *v <= '9') {
-    a = a * 10 + (*v++ - '0');
-    hasA = true;
-  }
-  while (*v == ' ')
-    v++;
-  if (*v == '/') {
-    v++;
-    while (*v == ' ')
-      v++;
-    if (starts_ci(v, "span")) {
-      v += 4;
-      while (*v == ' ')
-        v++;
-      int n = 0;
-      while (*v >= '0' && *v <= '9')
-        n = n * 10 + (*v++ - '0');
-      return (signed char)(n > 0 ? n : 1);
-    }
-    int b = 0;
-    bool hasB = false;
-    while (*v >= '0' && *v <= '9') {
-      b = b * 10 + (*v++ - '0');
-      hasB = true;
-    }
-    if (hasA && hasB && b > a)
-      return (signed char)(b - a);
-  }
-  return 1;
 }
 
 void parse_gap(const char *v, struct css_style *o)

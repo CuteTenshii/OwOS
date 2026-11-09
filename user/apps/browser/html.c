@@ -417,6 +417,10 @@ unsigned char sty_byte(void)
     a |= ST_STRIKE;
   if (sty_cur.nowrap)
     a |= ST_NOWRAP;
+  if (sty_cur.hidden)
+    a |= ST_HIDDEN;
+  if (sty_cur.clip)
+    a |= ST_CLIP | (sty_cur.ellipsis ? ST_ELLIPSIS : 0);
   return a;
 }
 
@@ -463,6 +467,8 @@ void apply_css(const struct css_style *cs)
     sty_cur.smallcaps = cs->small_caps ? 1 : 0;
   if (cs->ttx >= 0)
     sty_cur.ttx = (unsigned char)cs->ttx;
+  if (cs->visibility >= 0)
+    sty_cur.hidden = cs->visibility == 0;
 }
 
 /* The renderer's line-break set (distinct from dom.c's CSS-block set */
@@ -516,12 +522,26 @@ static void compute_page_colors(struct dom_node *root)
   B->pg->page_bg = canvas;
 }
 
+static struct dom_node *g_hover, *g_pressed; /* element under the pointer, and the one held down */
+
+bool html_set_pointer(int off, bool pressed)
+{
+  struct dom_node *h = off >= 0 ? html_node_at_offset(off) : 0;
+  unsigned before = css_state_generation();
+  g_hover = h;
+  g_pressed = pressed ? h : 0;
+  css_set_state(g_hover, g_pressed, g_focus);
+  return css_state_generation() != before;
+}
+
 static void layout_dom(void)
 {
   css_set_viewport(BW, BH); /* so @media re-evaluates at the current size */
+  css_set_state(g_hover, g_pressed, g_focus);
   g_walk_now = msec();
   anim_frame_begin(g_walk_now); /* advance the animation clock for this walk */
   B->pg->nlinks = 0;
+  B->pg->nregs = 0;
   if (B->img_pool_len > IMG_POOL / 2 || !img_carry_begin(&g_carry, B->pg->imgs, B->pg->n_imgs))
     B->img_pool_len = 0; /* nothing carried: the pool restarts empty */
   B->pg->n_imgs = 0;
@@ -541,6 +561,7 @@ static void layout_dom(void)
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
   sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = sty_cur.smallcaps = 0;
+  sty_cur.hidden = sty_cur.clip = sty_cur.ellipsis = 0;
   W_bg = BG_NONE;
   W_lineheight = 0;
   W_liststyle = CSS_LST_DEFAULT;
@@ -594,6 +615,8 @@ void html_page_teardown(void)
   anim_reset();  /* drop per-element animation/transition state */
   g_nspans = 0;
   g_focus = 0;
+  g_hover = g_pressed = 0;
+  css_set_state(0, 0, 0);
   B->focus_kind = 0;
 }
 
@@ -686,6 +709,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 
   B->pg->doc_title[0] = '\0';
   B->pg->nlinks = 0;
+  B->pg->nregs = 0;
   B->pg->n_imgs = 0;
   B->img_pool_len = 0;
   B->pg->favicon_href[0] = '\0';
@@ -775,6 +799,7 @@ void plain_to_text(void)
 
   B->pg->doc_title[0] = '\0';
   B->pg->nlinks = 0;
+  B->pg->nregs = 0;
   B->pg->n_imgs = 0;
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830;
@@ -846,6 +871,7 @@ void doc_message(const char *m)
   B->pg->text_len = n;
   B->pg->doc_title[0] = '\0';
   B->pg->nlinks = 0;
+  B->pg->nregs = 0;
   B->pg->n_imgs = 0;
   B->layout_dirty = 1;
 }

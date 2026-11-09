@@ -17,6 +17,7 @@ static void page_free(struct page *p)
   free(p->fg);
   free(p->bg);
   free(p->links);
+  free(p->regs);
   free(p->imgs);
   free(p->img_save);
   for (int i = 0; i < p->n_bgimgs; i++)
@@ -253,6 +254,7 @@ static void show_blank(void)
   g_fr->lt.n = 0;
   B->pg->n_imgs = 0;
   B->pg->nlinks = 0;
+  B->pg->nregs = 0;
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830; /* default canvas, not the last page's */
   B->img_pool_len = 0;

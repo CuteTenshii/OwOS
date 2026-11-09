@@ -196,6 +196,17 @@ static void svg_add_references(struct sbuf *b)
 
 struct img_carry g_carry;
 
+/* Size, object-fit and visibility of a replaced element from its computed style. */
+static void img_box_style(struct inl_img *im, const struct css_style *cs)
+{
+  im->cw = (cs->width >= 0) ? cs->width : 0;
+  im->ch = (cs->height >= 0) ? cs->height : 0;
+  if (cs->aspect > 0 && im->cw && !im->ch)
+    im->ch = (int)((long)im->cw * 1000 / cs->aspect);
+  im->fit = cs->obj_fit > 0 ? cs->obj_fit : 0;
+  im->hidden = sty_cur.hidden;
+}
+
 /* Inline <svg>…</svg> */
 void handle_svg(struct dom_node *el, const struct css_style *cs)
 {
@@ -241,8 +252,7 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
   strlcpy(im->href, key, (int)sizeof im->href);
   im->alt[0] = '\0';
   im->lazy = 0;
-  im->cw = (cs->width >= 0) ? cs->width : 0;
-  im->ch = (cs->height >= 0) ? cs->height : 0;
+  img_box_style(im, cs);
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;
@@ -308,8 +318,7 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   const char *ld = dom_get_attr(el, "loading"); /* lazy -> fetch on scroll-in */
   im->lazy = (ld && starts_ci(ld, "lazy")) ? 1 : 0;
 
-  im->cw = (cs->width >= 0) ? cs->width : 0;
-  im->ch = (cs->height >= 0) ? cs->height : 0;
+  img_box_style(im, cs);
 
   im->text_pos = W_n;
   im->rows = 0;
@@ -355,8 +364,7 @@ void handle_canvas(struct dom_node *el, const struct css_style *cs)
   strlcpy(im->href, key, (int)sizeof im->href);
   strlcpy(im->alt, "[canvas]", (int)sizeof im->alt);
   im->lazy = 0;
-  im->cw = (cs->width >= 0) ? cs->width : 0;
-  im->ch = (cs->height >= 0) ? cs->height : 0;
+  img_box_style(im, cs);
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;

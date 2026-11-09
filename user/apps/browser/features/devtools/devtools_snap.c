@@ -404,7 +404,7 @@ static void style_emit_computed(struct dom_node *n)
   if (s.sh_color >= 0)
     sty_kv_str(&dt_sty, "box-shadow", "set");
   if (s.overflow >= 0)
-    sty_kv_str(&dt_sty, "overflow", s.overflow == 1 ? "clipped" : "visible");
+    sty_kv_str(&dt_sty, "overflow", s.overflow == 1 ? "clipped" : s.overflow == 2 ? "scroll" : "visible");
   if (s.gap_row >= 0)
     sty_kv_px(&dt_sty, "row-gap", s.gap_row);
   if (s.gap_col >= 0)

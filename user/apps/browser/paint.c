@@ -15,6 +15,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     return x + m;
   }
 
+  int col_right = x + paw;       /* the column's right edge, before indent and alignment */
   x += g_ui.bindent * INDENT_PX; /* blockquote / list indent  */
   int base = run_ascent(maxpx);  /* baseline shared by the line's runs */
   if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
@@ -28,6 +29,36 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     int room = (paw - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
       x += g_ui.bcenter == 1 ? room / 2 : room;
+  }
+  bool ellipsis = false;
+  if (len > 0 && (B->pg->attr[off] & ST_CLIP)) { /* overflow:hidden: stop at the column edge, optionally with "..." */
+    int room = col_right - x, used = 0, keep = 0;
+    bool fits = true;
+    for (int p = 0; p < len;) {
+      unsigned cp;
+      int nb = utf8_decode(&B->pg->text[off + p], &B->pg->text[off + len], &cp);
+      used += body_cp_adv(&g_ui, cp, glyph_px(off + p));
+      p += nb;
+      if (used > room) {
+        fits = false;
+        break;
+      }
+    }
+    if (!fits) {
+      bool dots = (B->pg->attr[off] & ST_ELLIPSIS) != 0;
+      int avail = room - (dots ? 3 * body_cp_adv(&g_ui, '.', glyph_px(off)) : 0), w = 0;
+      for (int p = 0; p < len;) {
+        unsigned cp;
+        int nb = utf8_decode(&B->pg->text[off + p], &B->pg->text[off + len], &cp);
+        w += body_cp_adv(&g_ui, cp, glyph_px(off + p));
+        if (w > avail)
+          break;
+        p += nb;
+        keep = p;
+      }
+      len = keep;
+      ellipsis = dots;
+    }
   }
   int x0 = x; /* line content origin (for selection) */
   int justify_extra = 0, justify_rem = 0, justify_spaces = 0;
@@ -71,16 +102,18 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
         run[rl++] = B->pg->text[off + i++];
     }
     run[rl] = '\0';
-    if (bgc != BG_NONE)
+    if (bgc != BG_NONE && !(a & ST_HIDDEN))
       gfx_fill_rect(x, y, rw, line_h, bgc);
     int ital = (a & ST_ITALIC) ? 1 : 0;
-    body_draw_run(x, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
-    if (a & ST_BOLD)
-      body_draw_run(x + 1, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
-    if (a & ST_UNDER)
-      gfx_fill_rect(x, y + base + 1, rw, 1, fg);
-    if (a & ST_STRIKE)
-      gfx_fill_rect(x, y + base - rpx / 3, rw, 1, fg);
+    if (!(a & ST_HIDDEN)) {
+      body_draw_run(x, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
+      if (a & ST_BOLD)
+        body_draw_run(x + 1, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
+      if (a & ST_UNDER)
+        gfx_fill_rect(x, y + base + 1, rw, 1, fg);
+      if (a & ST_STRIKE)
+        gfx_fill_rect(x, y + base - rpx / 3, rw, 1, fg);
+    }
     x += rw;
     if (g_ui.bcenter == 3 && justify_spaces > 0) {
       int spaces = 0;
@@ -99,6 +132,10 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
         }
       }
     }
+  }
+  if (ellipsis) {
+    int rpx = glyph_px(off);
+    body_draw_run(x, y, "...", 3, 3 * body_cp_adv(&g_ui, '.', rpx), B->pg->fg[off], ct, cb, rpx, base, 0);
   }
   return x0;
 }
@@ -132,7 +169,7 @@ void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
         p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
         xe += body_cp_adv(&g_ui, cp, glyph_px(gp));
       }
-      sel_hl_rect(xs, y, xe - xs, g_fr->lt.h[idx], ct, cb);
+      sel_hl_rect(xs, y, xe - xs, g_fr->lt.h[idx], ct, cb, sel_color_at(off + s));
     }
   }
 }
@@ -404,8 +441,43 @@ static void draw_border_v(int x, int y, int w, int h, int style, unsigned color,
 }
 
 /* Paint one box's shadow, background (colour/gradient/image), border and outline into the band */
-static void paint_one_box(const struct lbox *b, const struct lgeom *ge, int py, int pw, int ct, int cb, int top_doc)
+static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py, int pw, int ct, int cb, int top_doc)
 {
+  if (src->hidden)
+    return;
+  const struct lbox *b = src;
+  struct lbox filtered;
+  const struct lext *fx = src->ext;
+  if (fx && (fx->flt_bright != 1000 || fx->flt_gray || fx->flt_invert || fx->flt_opacity != 100)) {
+    filtered = *src;
+    if (filtered.bg != BG_NONE)
+      filtered.bg = ru_filter_rgb(fx, filtered.bg);
+    if (filtered.border_color != BG_NONE)
+      filtered.border_color = ru_filter_rgb(fx, filtered.border_color);
+    for (int i = 0; i < 4; i++)
+      filtered.border_side_color[i] = ru_filter_rgb(fx, filtered.border_side_color[i]);
+    if (filtered.outline_color != BG_NONE)
+      filtered.outline_color = ru_filter_rgb(fx, filtered.outline_color);
+    if (filtered.sh_color != BG_NONE)
+      filtered.sh_color = (filtered.sh_color & 0xff000000u) | ru_filter_rgb(fx, filtered.sh_color & 0xffffffu);
+    filtered.opacity = (signed char)((filtered.opacity < 0 ? 100 : filtered.opacity) * fx->flt_opacity / 100);
+    b = &filtered;
+  }
+  if (fx && fx->clip_kind > CSS_CLIP_NONE) { /* the shape clips the solid background only */
+    if (b->bg == BG_NONE)
+      return;
+    int alpha = b->opacity < 0 ? 255 : b->opacity * 255 / 100;
+    int sy = py + ge->y - top_doc;
+    for (int row = 0; row < ge->h; row++) {
+      int xs[2 * CSS_CLIP_PTS];
+      int ns = ru_clip_spans(fx, ge->w, ge->h, row, xs);
+      for (int k = 0; k < ns; k++) {
+        int a = xs[2 * k] < 0 ? 0 : xs[2 * k], e = xs[2 * k + 1] > ge->w ? ge->w : xs[2 * k + 1];
+        fill_round_rect(ge->x + a, sy + row, e - a, 1, 0, b->bg, alpha, ct, cb);
+      }
+    }
+    return;
+  }
   int bgk = b->bgi.kind; /* CSS_BGK_* image layer, <=0 = none */
   bool has_img = bgk == CSS_BGK_LINEAR || bgk == CSS_BGK_RADIAL ||
                  (bgk == CSS_BGK_URL && b->bgi.img_idx >= 0 && b->bgi.img_idx < B->pg->n_bgimgs &&

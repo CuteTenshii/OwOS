@@ -26,7 +26,7 @@ BROWSER := user/apps/browser
 LIB     := user/lib
 # Sources shared by both test binaries
 COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)/css/engine_props.c \
-  $(BROWSER)/css/engine_decl.c $(BROWSER)/css/engine_sel.c $(BROWSER)/css/engine_sheet.c \
+  $(BROWSER)/css/engine_decl.c $(BROWSER)/css/engine_ext.c $(BROWSER)/css/engine_sel.c $(BROWSER)/css/engine_sheet.c \
   $(BROWSER)/css/sibling.c $(BROWSER)/color.c $(BROWSER)/dom.c $(BROWSER)/features/csp/csp.c \
   $(BROWSER)/js/classlist.c $(BROWSER)/js/webapi.c $(BROWSER)/features/notification/notification.c \
   $(LIB)/curl/url.c $(LIB)/curl/httpcache.c $(LIB)/curl/headers.c $(LIB)/crypto/crypto.c \

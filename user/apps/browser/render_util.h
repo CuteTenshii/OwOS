@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #include "css.h"
+#include "layout.h"
 
 /* ---- gradients ---- */
 
@@ -704,6 +705,230 @@ static inline unsigned ru_text_sig(const char *text, const unsigned char *fsz, c
     h = ru_mix(h, w ^ ((attr[i] & nowrap) ? 0x55aa55aau : 0));
   }
   return h;
+}
+
+/* ---- filter and clip-path on a box's own background and border ---- */
+
+static inline unsigned ru_filter_rgb(const struct lext *x, unsigned rgb)
+{
+  int c[3] = {(int)((rgb >> 16) & 0xff), (int)((rgb >> 8) & 0xff), (int)(rgb & 0xff)};
+  int luma = (c[0] * 299 + c[1] * 587 + c[2] * 114) / 1000;
+  for (int i = 0; i < 3; i++) {
+    int v = c[i] * x->flt_bright / 1000;
+    v += (luma * x->flt_bright / 1000 - v) * x->flt_gray / 100;
+    v += (255 - 2 * v) * x->flt_invert / 100;
+    c[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  return ((unsigned)c[0] << 16) | ((unsigned)c[1] << 8) | (unsigned)c[2];
+}
+
+/* One clip-path length resolved against a reference size; `ref` is w for x, h for y, the diagonal mean for radii. */
+static inline int ru_clip_len(const struct lext *x, int i, int ref)
+{
+  return x->clip_unit[i] == 1 ? ref * x->clip_v[i] / 1000 : x->clip_v[i];
+}
+
+/* Horizontal spans of the clip shape on row y of a w x h box: pairs [xs[2k], xs[2k+1]); returns the span count. */
+static inline int ru_clip_spans(const struct lext *x, int w, int h, int y, int *xs)
+{
+  switch (x->clip_kind) {
+  case CSS_CLIP_INSET: {
+    int t = ru_clip_len(x, 0, h), r = ru_clip_len(x, 1, w), b = ru_clip_len(x, 2, h), l = ru_clip_len(x, 3, w);
+    int rad = ru_clip_len(x, 4, w < h ? w : h);
+    int x0 = l, x1 = w - r;
+    if (y < t || y >= h - b || x1 <= x0)
+      return 0;
+    if (rad > 0) {
+      int d = y - t < rad ? rad - (y - t) : (h - b - 1 - y) < rad ? rad - (h - b - 1 - y) : 0;
+      if (d > 0) {
+        int cut = rad - (int)ru_isqrt((unsigned)(rad * rad - d * d));
+        x0 += cut;
+        x1 -= cut;
+      }
+    }
+    xs[0] = x0;
+    xs[1] = x1;
+    return x1 > x0;
+  }
+  case CSS_CLIP_CIRCLE:
+  case CSS_CLIP_ELLIPSE: {
+    bool circle = x->clip_kind == CSS_CLIP_CIRCLE;
+    int ci = circle ? 1 : 2;
+    int cx = ru_clip_len(x, ci, w), cy = ru_clip_len(x, ci + 1, h);
+    int rx = 0, ry = 0;
+    int diag = (int)ru_isqrt((unsigned)((w * w + h * h) / 2));
+    int near_x = cx < w - cx ? cx : w - cx, near_y = cy < h - cy ? cy : h - cy;
+    int far_x = cx > w - cx ? cx : w - cx, far_y = cy > h - cy ? cy : h - cy;
+    for (int k = 0; k < (circle ? 1 : 2); k++) {
+      int r;
+      bool vert = !circle && k == 1;
+      if (x->clip_unit[k] == 2)
+        r = circle ? (near_x < near_y ? near_x : near_y) : (vert ? near_y : near_x);
+      else if (x->clip_unit[k] == 3)
+        r = circle ? (far_x > far_y ? far_x : far_y) : (vert ? far_y : far_x);
+      else
+        r = ru_clip_len(x, k, circle ? diag : (vert ? h : w));
+      if (k == 0)
+        rx = r;
+      else
+        ry = r;
+    }
+    if (circle)
+      ry = rx;
+    int dy2 = 2 * (y - cy) + 1; /* the row's centre, in half pixels */
+    if (ry <= 0 || rx <= 0 || dy2 <= -2 * ry || dy2 >= 2 * ry)
+      return 0;
+    int dx = rx * (int)ru_isqrt((unsigned)(4 * ry * ry - dy2 * dy2)) / (2 * ry);
+    xs[0] = cx - dx;
+    xs[1] = cx + dx;
+    return dx > 0;
+  }
+  case CSS_CLIP_POLYGON: {
+    int n = x->clip_n / 2, hit[CSS_CLIP_PTS], nh = 0;
+    for (int i = 0; i < n; i++) {
+      int j = (i + 1) % n;
+      int xa = ru_clip_len(x, 2 * i, w), ya = ru_clip_len(x, 2 * i + 1, h);
+      int xb = ru_clip_len(x, 2 * j, w), yb = ru_clip_len(x, 2 * j + 1, h);
+      if ((ya <= y) == (yb <= y) || nh >= CSS_CLIP_PTS)
+        continue;
+      hit[nh++] = xa + (xb - xa) * (y - ya) / (yb - ya);
+    }
+    for (int i = 1; i < nh; i++) /* insertion sort */
+      for (int j = i; j > 0 && hit[j - 1] > hit[j]; j--) {
+        int t = hit[j];
+        hit[j] = hit[j - 1];
+        hit[j - 1] = t;
+      }
+    int ns = 0;
+    for (int i = 0; i + 1 < nh; i += 2) {
+      xs[2 * ns] = hit[i];
+      xs[2 * ns + 1] = hit[i + 1];
+      ns++;
+    }
+    return ns;
+  }
+  default:
+    return 0;
+  }
+}
+
+/* object-fit: the drawn size of an iw x ih image inside a dw x dh box and its offset (negative when it overflows). */
+static inline void ru_fit_rect(int fit, unsigned iw, unsigned ih, int dw, int dh, int *fw, int *fh, int *ox, int *oy)
+{
+  if (fit == CSS_OF_SCALE_DOWN)
+    fit = ((int)iw <= dw && (int)ih <= dh) ? CSS_OF_NONE : CSS_OF_CONTAIN;
+  *fw = dw;
+  *fh = dh;
+  if (fit == CSS_OF_NONE) {
+    *fw = (int)iw;
+    *fh = (int)ih;
+  } else if (fit == CSS_OF_CONTAIN || fit == CSS_OF_COVER) {
+    bool width_limits = (long)dw * (long)ih <= (long)dh * (long)iw; /* box is no wider than the image's shape */
+    if (width_limits == (fit == CSS_OF_CONTAIN)) {
+      *fw = dw;
+      *fh = (int)((long)ih * dw / (long)iw);
+    } else {
+      *fh = dh;
+      *fw = (int)((long)iw * dh / (long)ih);
+    }
+  }
+  if (*fw < 1)
+    *fw = 1;
+  if (*fh < 1)
+    *fh = 1;
+  *ox = (dw - *fw) / 2;
+  *oy = (dh - *fh) / 2;
+}
+
+/* ---- grid item placement ---- */
+
+static inline bool ru_grid_free(const unsigned char *occ, int ncols, int r, int c, int rs, int cs)
+{
+  for (int rr = r; rr < r + rs; rr++)
+    for (int cc = c; cc < c + cs; cc++)
+      if (occ[rr * ncols + cc])
+        return false;
+  return true;
+}
+
+/* Place nit items in a grid ncols wide. On entry col[k]/row[k] are the 0-based start (-1 = auto) and cs[k]/rs[k] the
+ * spans (a column span of CSS_GRID_MAX with a start means "to the last line"); on return they are the final cell.
+ * Items with a definite position take it, the others auto-flow by row around them. Returns the row count, or -1 if
+ * out of memory. */
+static inline int ru_grid_place(int ncols, int nit, int *col, int *row, int *cs, int *rs)
+{
+  int cap_rows = 1;
+  for (int k = 0; k < nit; k++)
+    cap_rows += rs[k] + (row[k] > 0 ? row[k] : 0) + 1;
+  if (cap_rows > 4096)
+    cap_rows = 4096;
+  unsigned char *occ = (unsigned char *)calloc((unsigned long)cap_rows * (unsigned long)ncols, 1);
+  if (!occ)
+    return -1;
+  int cur_c = 0, cur_r = 0, nrows = 0;
+  for (int k = 0; k < nit; k++) {
+    int c0 = col[k], r0 = row[k], w = cs[k], h = rs[k];
+    if (w >= CSS_GRID_MAX && c0 >= 0)
+      w = ncols - c0;
+    if (w > ncols)
+      w = ncols;
+    if (w < 1)
+      w = 1;
+    if (h > cap_rows)
+      h = cap_rows;
+    if (c0 >= 0 && c0 + w > ncols)
+      c0 = ncols - w;
+    int r, c;
+    if (c0 >= 0 && r0 >= 0) {
+      r = r0;
+      c = c0;
+    } else if (c0 >= 0) { /* definite column: the next row at or after the cursor with room */
+      c = c0;
+      r = c < cur_c ? cur_r + 1 : cur_r;
+      while (r + h <= cap_rows && !ru_grid_free(occ, ncols, r, c, h, w))
+        r++;
+    } else if (r0 >= 0) { /* definite row: its first free column */
+      r = r0;
+      c = 0;
+      while (r + h <= cap_rows && c + w <= ncols && !ru_grid_free(occ, ncols, r, c, h, w))
+        c++;
+      if (c + w > ncols)
+        c = 0;
+    } else {
+      r = cur_r;
+      c = cur_c;
+      for (;;) {
+        if (c + w > ncols) {
+          c = 0;
+          r++;
+        }
+        if (r + h > cap_rows || ru_grid_free(occ, ncols, r, c, h, w))
+          break;
+        c++;
+      }
+    }
+    if (r + h > cap_rows)
+      r = cap_rows - h;
+    for (int rr = r; rr < r + h; rr++)
+      for (int cc = c; cc < c + w; cc++)
+        occ[rr * ncols + cc] = 1;
+    if (r + h > nrows)
+      nrows = r + h;
+    if (col[k] < 0 && row[k] < 0) { /* only auto-placed items advance the cursor */
+      cur_c = c + w;
+      cur_r = r;
+      if (cur_c >= ncols) {
+        cur_c = 0;
+        cur_r++;
+      }
+    }
+    col[k] = c;
+    row[k] = r;
+    cs[k] = w;
+    rs[k] = h;
+  }
+  free(occ);
+  return nrows;
 }
 
 #endif /* OWOS_RENDER_UTIL_H */

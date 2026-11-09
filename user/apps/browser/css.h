@@ -15,7 +15,7 @@ enum css_justify {
   CSS_JUST_AROUND,
   CSS_JUST_EVENLY
 };
-enum css_align { CSS_ALIGN_STRETCH = 0, CSS_ALIGN_START, CSS_ALIGN_CENTER, CSS_ALIGN_END };
+enum css_align { CSS_ALIGN_STRETCH = 0, CSS_ALIGN_START, CSS_ALIGN_CENTER, CSS_ALIGN_END, CSS_ALIGN_AUTO };
 /* Grid track sizing; AUTO covers auto/min-content/max-content, FR is a flexible fraction. */
 enum css_track_kind { CSS_TRK_AUTO = 0, CSS_TRK_PX, CSS_TRK_PCT, CSS_TRK_FR };
 #define CSS_GRID_MAX 12 /* max explicit tracks per axis */
@@ -23,6 +23,30 @@ struct css_track {
   signed char kind;
   short v;
 }; /* v = px | percent | fr weight */
+#define CSS_AREA_MAX 16 /* named grid areas per container */
+#define CSS_AREA_NAME 12
+struct css_area {
+  char name[CSS_AREA_NAME];
+  signed char c0, r0, c1, r1; /* 0-based start, exclusive end */
+};
+enum css_objfit { CSS_OF_FILL = 0, CSS_OF_CONTAIN, CSS_OF_COVER, CSS_OF_NONE, CSS_OF_SCALE_DOWN };
+/* cursor values, in WIN_CURSOR_* order where one exists */
+enum css_cursor {
+  CSS_CUR_DEFAULT = 0,
+  CSS_CUR_POINTER,
+  CSS_CUR_TEXT,
+  CSS_CUR_WAIT,
+  CSS_CUR_NWSE,
+  CSS_CUR_NESW,
+  CSS_CUR_NS,
+  CSS_CUR_EW,
+  CSS_CUR_MOVE,
+  CSS_CUR_NOT_ALLOWED,
+  CSS_CUR_CROSSHAIR,
+  CSS_CUR_AUTO
+};
+enum css_clip { CSS_CLIP_NONE = 0, CSS_CLIP_INSET, CSS_CLIP_CIRCLE, CSS_CLIP_ELLIPSE, CSS_CLIP_POLYGON };
+#define CSS_CLIP_PTS 8
 enum css_ttx { CSS_TT_NONE = 0, CSS_TT_UPPER, CSS_TT_LOWER, CSS_TT_CAPITALIZE };
 enum css_ws { CSS_WS_NORMAL = 0, CSS_WS_NOWRAP, CSS_WS_PRE, CSS_WS_PRE_WRAP, CSS_WS_PRE_LINE };
 /* list-style-type (DEFAULT = the list's own ul/ol default). */
@@ -165,19 +189,44 @@ struct css_style {
   signed char justify_items;      /* enum css_align (inline axis), -1 unset */
   struct css_track grid_cols[CSS_GRID_MAX];
   struct css_track grid_rows[CSS_GRID_MAX];
-  signed char overflow;    /* 0 visible, 1 clipped, -1 unset */
-  signed char italic;      /* font-style: 1 italic/oblique, 0 normal, -1 unset */
-  signed char small_caps;  /* font-variant[-caps]: 1 small-caps, 0 normal, -1 unset */
-  signed char ttx;         /* text-transform: enum css_ttx, -1 unset */
-  signed char white_space; /* enum css_ws, -1 unset */
-  signed char list_style;  /* enum css_list (DEFAULT=0 means unset/inherit) */
-  signed char list_pos;    /* enum css_list_pos (DEFAULT=0 means unset/inherit) */
-  signed char opacity;     /* 0..100 percent, -1 unset */
-  short line_height;       /* line-height px, -1 unset */
-  short lh_pct;            /* line-height percent of font-size, -1 unset (unitless N stored as N*100) */
-  short outline_w;         /* outline width px, -1 unset */
-  int outline_color;       /* outline 0xRRGGBB, -1 unset */
-  short z_index;           /* stacking order; CSS_Z_AUTO = unset/auto */
+  short col_start, row_start; /* grid item start line (1-based), 0 auto, -1 unset */
+  signed char n_areas;        /* grid-template-areas names, -1 unset */
+  struct css_area areas[CSS_AREA_MAX];
+  char area[CSS_AREA_NAME];   /* grid-area: <name>, "" = none */
+  signed char align_self;     /* enum css_align, -1 auto/unset */
+  int aspect;                 /* aspect-ratio as width*1000/height, 0 = auto, -1 unset */
+  signed char visibility;     /* 1 visible, 0 hidden/collapse, -1 unset (inherited) */
+  signed char text_ovf;       /* text-overflow: 1 ellipsis, 0 clip, -1 unset */
+  signed char obj_fit;        /* enum css_objfit, -1 unset */
+  signed char pointer_events; /* 1 auto, 0 none, -1 unset (inherited) */
+  signed char user_select;    /* 1 auto/text, 0 none, -1 unset (inherited) */
+  signed char cursor;         /* enum css_cursor, -1 unset (inherited) */
+  /* transform: only translate renders; scale and rotate parse to nothing */
+  signed char has_tr;             /* 1 when a translate is set, 0 none, -1 unset */
+  short tr_x, tr_y;               /* px */
+  short tr_xp, tr_yp;             /* percent of the border box width/height */
+  short flt_bright;               /* filter brightness permille (1000 identity), -1 unset */
+  signed char flt_gray;           /* filter grayscale 0..100 percent, -1 unset */
+  signed char flt_invert;         /* filter invert 0..100 percent, -1 unset */
+  signed char flt_opacity;        /* filter opacity 0..100 percent, -1 unset */
+  signed char clip_kind;          /* enum css_clip, -1 unset */
+  short clip_v[CSS_CLIP_PTS * 2]; /* inset: t r b l round | circle: r cx cy | ellipse: rx ry cx cy | polygon x y pairs;
+                                     percent*10 or px */
+  signed char clip_unit[CSS_CLIP_PTS * 2]; /* 0 px, 1 percent for each clip_v */
+  signed char clip_n;                      /* number of clip_v entries used */
+  signed char overflow;                    /* horizontal overflow: 0 visible, 1 hidden/clip, 2 auto/scroll, -1 unset */
+  signed char italic;                      /* font-style: 1 italic/oblique, 0 normal, -1 unset */
+  signed char small_caps;                  /* font-variant[-caps]: 1 small-caps, 0 normal, -1 unset */
+  signed char ttx;                         /* text-transform: enum css_ttx, -1 unset */
+  signed char white_space;                 /* enum css_ws, -1 unset */
+  signed char list_style;                  /* enum css_list (DEFAULT=0 means unset/inherit) */
+  signed char list_pos;                    /* enum css_list_pos (DEFAULT=0 means unset/inherit) */
+  signed char opacity;                     /* 0..100 percent, -1 unset */
+  short line_height;                       /* line-height px, -1 unset */
+  short lh_pct;                            /* line-height percent of font-size, -1 unset (unitless N stored as N*100) */
+  short outline_w;                         /* outline width px, -1 unset */
+  int outline_color;                       /* outline 0xRRGGBB, -1 unset */
+  short z_index;                           /* stacking order; CSS_Z_AUTO = unset/auto */
   /* SVG paint: -1 unset, -2 none, -3 currentColor, else 0xRRGGBB. */
   int fill, stroke;
   /* SVG presentation declarations ("name:value;" in cascade order) for the inline-SVG serializer. */
@@ -197,6 +246,8 @@ struct css_style {
   struct css_bg_image bgi;       /* background image/gradient layer (kind<0 unset) */
   /* ::before / ::after generated content (decoded, "" = none). */
   char content[48];
+  unsigned backdrop; /* modal ::backdrop 0xAARRGGBB when backdrop_set; set by the walk, never cascaded */
+  signed char backdrop_set;
   char fam[CSS_FAM_STACK];
 };
 
@@ -215,6 +266,12 @@ void css_free(css_sheet *sheet);
 /* Viewport that @media queries test against; set before each cascade and on resize. */
 void css_set_viewport(int width, int height);
 unsigned css_viewport_generation(void);
+
+/* Pointer and focus targets for :hover/:active/:focus (any may be NULL). css_state_generation() moves
+ * only if some rule reads them, so pages without such rules never restyle on pointer movement. */
+void css_set_state(const struct dom_node *hover, const struct dom_node *active, const struct dom_node *focus);
+unsigned css_state_generation(void);
+bool css_state_in_use(void);
 
 /* @font-face faces: family + first raw TTF/OTF url (woff/woff2 are skipped, not decodable). */
 int css_fontface_count(const css_sheet *sheet);
@@ -252,6 +309,13 @@ int css_pseudo_content(css_sheet *sheet, const struct dom_node *el, int which, s
 
 /* 1 if the sheet declares any ::before/::after rule. */
 int css_sheet_has_pseudo(const css_sheet *sheet);
+
+/* ::selection: 1 if the sheet has such a rule; css_selection_color gives the background `el`'s selected text gets. */
+int css_sheet_has_selection(const css_sheet *sheet);
+int css_selection_color(css_sheet *sheet, const struct dom_node *el, unsigned *rgb);
+
+/* ::backdrop background of a modal dialog as 0xAARRGGBB; 1 if a rule sets one. */
+int css_backdrop_argb(css_sheet *sheet, const struct dom_node *el, unsigned *argb);
 
 /* Bumped by every css_add; with css_viewport_generation() it keys cached styles. */
 unsigned css_sheet_generation(const css_sheet *sheet);

@@ -44,6 +44,10 @@ enum {
   PC_NOT_LIST,     /* :not() with a complex or comma-separated argument */
   PC_HOST,         /* :host / :host(sel): the shadow host the sheet belongs to */
   PC_HOST_CONTEXT, /* :host-context(sel): the host or one of its ancestors matches sel */
+  PC_HOVER,        /* :hover, an ancestor of the pointer node */
+  PC_ACTIVE,       /* :active */
+  PC_FOCUS,        /* :focus and :focus-visible */
+  PC_FOCUS_WITHIN, /* :focus-within */
   PC_NEVER,
 };
 
@@ -78,7 +82,9 @@ enum {
   PE_AFTER = CSS_PSEUDO_AFTER,
   PE_OTHER = 3,
   PE_SLOTTED = 4,
-  PE_PART = 5
+  PE_PART = 5,
+  PE_SELECTION = 6,
+  PE_BACKDROP = 7
 };
 
 struct selector {
@@ -107,7 +113,8 @@ enum {
   MF_ORIENT_PORTRAIT,
   MF_ORIENT_LANDSCAPE,
   MF_SCHEME_LIGHT,
-  MF_SCHEME_DARK
+  MF_SCHEME_DARK,
+  MF_TRUE /* a feature the browser always satisfies, e.g. (hover: hover) */
 };
 
 struct media_feature {
@@ -183,6 +190,7 @@ struct css_sheet {
   struct css_keyframes *keyframes; /* @keyframes blocks (name -> stops) */
   struct media_query *medias;      /* every @media query parsed for this sheet */
   bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
+  bool has_selection;              /* set once any ::selection rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
   /* Rule index, rebuilt lazily when `gen` changes; each entry lives in exactly one bucket. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
@@ -233,10 +241,11 @@ void parse_flex_shorthand(const char *v, struct css_style *o);
 void parse_font_shorthand(const char *v, struct css_style *out);
 void parse_font_size(const char *v, struct css_style *o);
 void parse_gap(const char *v, struct css_style *o);
-signed char parse_grid_span(const char *v);
 signed char parse_justify(const char *v);
 int parse_len(const char *v);
 int parse_len2(const char *v, int *pct);
+bool parse_slen(const char *v, int *px, int *pct);
+bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_style *out);
 void parse_line_height(const char *v, struct css_style *o);
 signed char parse_list_position(const char *v);
 signed char parse_list_style(const char *v);
@@ -252,6 +261,8 @@ bool selector_match(const struct selector *sel, const struct dom_node *el);
 bool selector_subject_is_host(const struct selector *sel);
 bool selector_match_slotted(const struct selector *sel, const struct dom_node *el);
 bool selector_match_part(const struct selector *sel, const struct dom_node *el);
+extern const struct dom_node *g_state_hover, *g_state_active, *g_state_focus;
+extern bool g_state_used;
 extern int g_css_mode;
 extern const struct dom_node *g_css_scope_host; /* the shadow host :host refers to while a shadow sheet applies */
 

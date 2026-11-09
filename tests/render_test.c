@@ -678,6 +678,132 @@ static void layout_signatures_react_to_wrapping_inputs_only(void)
   expect(layout_box_sig(&c, 1) != h0);
 }
 
+static struct lext make_clip(int kind, int n, const short *v, const signed char *u)
+{
+  struct lext x;
+  memset(&x, 0, sizeof x);
+  x.clip_kind = (signed char)kind;
+  x.clip_n = (signed char)n;
+  memcpy(x.clip_v, v, sizeof(short) * (size_t)n);
+  memcpy(x.clip_unit, u, (size_t)n);
+  return x;
+}
+
+static void clip_shapes_cover_their_own_geometry(void)
+{
+  int xs[16];
+  /* circle(50% at 50% 50%) on a 100x100 box: radius closest-side (50) */
+  short cv[3] = {0, 500, 500};
+  signed char cu[3] = {2, 1, 1};
+  struct lext c = make_clip(CSS_CLIP_CIRCLE, 3, cv, cu);
+  expect(ru_clip_spans(&c, 100, 100, 50, xs) == 1 && xs[0] <= 1 && xs[1] >= 99);
+  expect(ru_clip_spans(&c, 100, 100, 0, xs) == 1 && xs[1] - xs[0] < 40); /* narrow at the top */
+  expect(ru_clip_spans(&c, 100, 100, 99, xs) == 1);
+  /* inset(10px 20px) */
+  short iv[5] = {10, 20, 10, 20, 0};
+  signed char iu[5] = {0, 0, 0, 0, 0};
+  struct lext in = make_clip(CSS_CLIP_INSET, 5, iv, iu);
+  expect(ru_clip_spans(&in, 100, 50, 9, xs) == 0 && ru_clip_spans(&in, 100, 50, 40, xs) == 0);
+  expect(ru_clip_spans(&in, 100, 50, 10, xs) == 1 && xs[0] == 20 && xs[1] == 80);
+  /* inset with a rounded corner trims the first row */
+  short rv[5] = {0, 0, 0, 0, 10};
+  struct lext rd = make_clip(CSS_CLIP_INSET, 5, rv, iu);
+  expect(ru_clip_spans(&rd, 100, 50, 0, xs) == 1 && xs[0] > 0 && xs[1] < 100);
+  expect(ru_clip_spans(&rd, 100, 50, 25, xs) == 1 && xs[0] == 0 && xs[1] == 100);
+  /* polygon(50% 0, 100% 100%, 0 100%): a triangle widening downward */
+  short pv[6] = {500, 0, 1000, 1000, 0, 1000};
+  signed char pu[6] = {1, 1, 1, 1, 1, 1};
+  struct lext tri = make_clip(CSS_CLIP_POLYGON, 6, pv, pu);
+  expect(ru_clip_spans(&tri, 100, 100, 50, xs) == 1 && xs[0] == 25 && xs[1] == 75);
+  expect(ru_clip_spans(&tri, 100, 100, 99, xs) == 1 && xs[1] - xs[0] > 95);
+}
+
+static void filter_colours_follow_the_css_functions(void)
+{
+  struct lext x;
+  memset(&x, 0, sizeof x);
+  x.flt_bright = 1000;
+  expect(ru_filter_rgb(&x, 0x336699) == 0x336699);
+  x.flt_bright = 500;
+  expect(ru_filter_rgb(&x, 0x804020) == 0x402010);
+  x.flt_bright = 3000;
+  expect(ru_filter_rgb(&x, 0x804020) == 0xffc060);
+  x.flt_bright = 1000;
+  x.flt_invert = 100;
+  expect(ru_filter_rgb(&x, 0x102030) == 0xefdfcf);
+  x.flt_invert = 0;
+  x.flt_gray = 100;
+  unsigned g = ru_filter_rgb(&x, 0xff0000);
+  expect(((g >> 16) & 0xff) == ((g >> 8) & 0xff) && (g & 0xff) == ((g >> 8) & 0xff));
+}
+
+static void object_fit_places_the_image_in_its_box(void)
+{
+  int fw, fh, ox, oy;
+  ru_fit_rect(CSS_OF_FILL, 200, 100, 80, 80, &fw, &fh, &ox, &oy);
+  expect(fw == 80 && fh == 80 && ox == 0 && oy == 0);
+  ru_fit_rect(CSS_OF_CONTAIN, 200, 100, 80, 80, &fw, &fh, &ox, &oy); /* letterboxed */
+  expect(fw == 80 && fh == 40 && ox == 0 && oy == 20);
+  ru_fit_rect(CSS_OF_COVER, 200, 100, 80, 80, &fw, &fh, &ox, &oy); /* crops the sides */
+  expect(fw == 160 && fh == 80 && ox == -40 && oy == 0);
+  ru_fit_rect(CSS_OF_NONE, 30, 20, 80, 80, &fw, &fh, &ox, &oy);
+  expect(fw == 30 && fh == 20 && ox == 25 && oy == 30);
+  ru_fit_rect(CSS_OF_SCALE_DOWN, 30, 20, 80, 80, &fw, &fh, &ox, &oy); /* small image stays natural */
+  expect(fw == 30 && fh == 20);
+  ru_fit_rect(CSS_OF_SCALE_DOWN, 200, 100, 80, 80, &fw, &fh, &ox, &oy);
+  expect(fw == 80 && fh == 40);
+  ru_fit_rect(CSS_OF_COVER, 100, 200, 80, 80, &fw, &fh, &ox, &oy); /* tall image */
+  expect(fw == 80 && fh == 160 && ox == 0 && oy == -40);
+}
+
+static int place(int ncols, int n, const int *c0, const int *r0, const int *cs, const int *rs, int *col, int *row)
+{
+  int c[8], r[8], w[8], h[8];
+  for (int i = 0; i < n; i++) {
+    c[i] = c0[i];
+    r[i] = r0[i];
+    w[i] = cs[i];
+    h[i] = rs[i];
+  }
+  int rows = ru_grid_place(ncols, n, c, r, w, h);
+  for (int i = 0; i < n; i++) {
+    col[i] = c[i] + 100 * w[i];
+    row[i] = r[i] + 100 * h[i];
+  }
+  return rows;
+}
+
+static void grid_cells_follow_areas_lines_and_auto_flow(void)
+{
+  int col[8], row[8];
+  /* a d-pad: up (1,0), left (0,1), right (2,1), down (1,2) in a 3x3 grid */
+  int c0[] = {1, 0, 2, 1}, r0[] = {0, 1, 1, 2}, one[] = {1, 1, 1, 1};
+  expect(place(3, 4, c0, r0, one, one, col, row) == 3);
+  expect(col[0] == 101 && row[0] == 100 && col[1] == 100 && row[1] == 101);
+  expect(col[2] == 102 && row[2] == 101 && col[3] == 101 && row[3] == 102);
+  /* four auto items wrap after three columns */
+  int a[] = {-1, -1, -1, -1};
+  expect(place(3, 4, a, a, one, one, col, row) == 2);
+  expect(col[2] == 102 && row[2] == 100 && col[3] == 100 && row[3] == 101);
+  /* auto items flow around an explicit one */
+  int c1[] = {1, -1, -1}, r1[] = {0, -1, -1};
+  expect(place(3, 3, c1, r1, one, one, col, row) == 1);
+  expect(col[1] == 100 && col[2] == 102 && row[2] == 100);
+  /* a column span that does not fit moves to the next row */
+  int sp[] = {2, 2};
+  expect(place(3, 2, a, a, sp, one, col, row) == 2);
+  expect(col[0] == 200 && col[1] == 200 && row[1] == 101);
+  /* `1 / -1` spans every column from its start */
+  int full[] = {CSS_GRID_MAX}, z[] = {0}, none[] = {-1};
+  expect(place(4, 1, z, none, full, one, col, row) == 1 && col[0] == 400);
+  /* two items in the same definite column stack into successive rows */
+  int cc[] = {1, 1}, rr[] = {-1, -1};
+  expect(place(3, 2, cc, rr, one, one, col, row) == 2 && row[0] == 100 && row[1] == 101);
+  /* a definite row takes its first free column */
+  int c3[] = {-1, -1}, r3[] = {1, 1};
+  expect(place(3, 2, c3, r3, one, one, col, row) == 2 && col[0] == 100 && col[1] == 101 && row[1] == 101);
+}
+
 int main(void)
 {
   test("gradient colour table matches per-t grad_at", gradient_colour_table_matches_per_t_grad_at);
@@ -701,5 +827,9 @@ int main(void)
   test("selection damage covers every line whose highlight changed",
        selection_damage_covers_every_line_whose_highlight_changed);
   test("layout signatures react to wrapping inputs only", layout_signatures_react_to_wrapping_inputs_only);
+  test("clip-path shapes cover their own geometry", clip_shapes_cover_their_own_geometry);
+  test("grid cells follow areas, lines and auto flow", grid_cells_follow_areas_lines_and_auto_flow);
+  test("object-fit places the image in its box", object_fit_places_the_image_in_its_box);
+  test("filter colours follow the CSS functions", filter_colours_follow_the_css_functions);
   return 0;
 }

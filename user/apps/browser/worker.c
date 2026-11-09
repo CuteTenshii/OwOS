@@ -308,9 +308,14 @@ void worker_fn(void)
       B->seq++;
     } else if (B->evt_pending) {
       worker_dispatch_event();
+    } else if (B->ptr_pending) {
+      B->ptr_pending = 0;
+      if (html_set_pointer(B->ptr_off, B->ptr_down))
+        html_relayout();
     } else if (fetch_lazy_visible()) {
       continue; /* a deferred image landed: look again */
     }
+    B->ptr_live = css_state_in_use();
     /* Drive the page's timers (setTimeout/setInterval/rAF) and live WebSockets */
     {
       unsigned mseq = dom_mutation_seq;

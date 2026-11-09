@@ -74,6 +74,21 @@ int browser_ensure_links(int need)
   return p != 0;
 }
 
+int browser_ensure_regs(int need)
+{
+  if (need <= B->pg->regs_cap)
+    return 1;
+  int nc = browser_grow_cap(B->pg->regs_cap, LINKS_INIT, need);
+  browser_buf_lock();
+  struct pregion *p = realloc(B->pg->regs, (unsigned)nc * sizeof *p);
+  if (p) {
+    B->pg->regs = p;
+    B->pg->regs_cap = nc;
+  }
+  browser_buf_unlock();
+  return p != 0;
+}
+
 int browser_ensure_imgs(int need)
 {
   if (need <= B->pg->imgs_cap)

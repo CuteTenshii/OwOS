@@ -197,13 +197,44 @@ static int count_list_items(struct dom_node *list)
   return n;
 }
 
+/* Cursor, user-select and pointer-events `el` sets itself (-1 each when unset), and its ::selection colour (-1 none);
+ * a separate frame keeps the recursive walk's stack small. */
+static __attribute__((noinline)) bool region_props(struct dom_node *el, signed char out[3], int *sel)
+{
+  struct css_style cs;
+  compute_style(el, &cs);
+  out[0] = cs.cursor;
+  out[1] = cs.user_select;
+  out[2] = cs.pointer_events;
+  *sel = -1;
+  css_sheet *sh = sheet_for(el);
+  unsigned rgb;
+  if (cs.disp != CSS_DISP_NONE && css_sheet_has_selection(sh) && css_selection_color(sh, el, &rgb))
+    *sel = (int)rgb;
+  return cs.disp != CSS_DISP_NONE && (cs.cursor >= 0 || cs.user_select >= 0 || cs.pointer_events >= 0);
+}
+
+static int g_sel_cur = -1; /* ::selection colour in effect at this depth of the walk */
+
 static void walk_element(struct dom_node *el)
 {
   if (g_walk_depth >= WALK_DEPTH_MAX)
     return;
   g_walk_depth++;
   int si = span_begin(el);
+  signed char props[3];
+  int start = W_n, sel, outer_sel = g_sel_cur;
+  bool tagged = region_props(el, props, &sel);
+  if (sel >= 0 && sel != g_sel_cur)
+    g_sel_cur = sel;
+  else
+    sel = -1; /* unchanged from the enclosing element: its region already covers this one */
   walk_element_inner(el);
+  g_sel_cur = outer_sel;
+  if ((tagged || sel >= 0) && W_n > start && browser_ensure_regs(B->pg->nregs + 1)) {
+    B->pg->regs[B->pg->nregs] = (struct pregion){start, W_n, props[0], props[1], props[2], sel};
+    B->pg->nregs++; /* published after the entry is complete: the main thread reads it concurrently */
+  }
   span_end(si);
   g_walk_depth--;
 }
@@ -432,8 +463,11 @@ static void walk_element_inner(struct dom_node *el)
   if (cs.pos == CSS_POS_FIXED)
     blk = 1; /* a fixed box is blockified so it gets a layout box */
 
-  if (blk)
+  if (blk) {
+    sty_cur.clip = cs.overflow == 1; /* each block clips (or not) on its own; inline children share their block's */
+    sty_cur.ellipsis = sty_cur.clip && cs.text_ovf == 1;
     block_break();
+  }
   if (streq(name, "li")) { /* list marker  */
     unsigned char a = sty_byte();
     /* Marker type precedence */
@@ -460,7 +494,11 @@ static void walk_element_inner(struct dom_node *el)
         bg_note_url(cs.bgi.url); /* frames don't pull background images */
       cs.bgi.img_idx = bg_image_index(cs.bgi.url, g_base_url);
     }
-    layout_box_open(el, &cs, W_n); /* a block/flex box for the layout tree */
+    if (dom_get_attr(el, "dialog-modal") && dom_get_attr(el, "open") &&
+        css_backdrop_argb(sheet_for(el), el, &cs.backdrop))
+      cs.backdrop_set = 1;
+    cs.visibility = sty_cur.hidden ? 0 : 1; /* the inherited value, not just this rule's */
+    layout_box_open(el, &cs, W_n);          /* a block/flex box for the layout tree */
   }
   emit_pseudo(el, CSS_PSEUDO_BEFORE);
   walk(el);

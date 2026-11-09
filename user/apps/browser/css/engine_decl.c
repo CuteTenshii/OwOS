@@ -364,7 +364,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     return;
 
   /* copy value to a small NUL-terminated buffer + strip !important */
-  char val[128];
+  char val[256];
   int pct; /* scratch for parse_len2's percent out-param */
   int vl = (int)(ve - v);
   if (vl > (int)sizeof val - 1)
@@ -384,6 +384,8 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   }
 
   svg_decl_add(p, pe, val, out);
+  if (parse_ext_decl(p, pe, val, out))
+    return;
   if (span_is(p, pe, "color"))
     out->color = parse_color(val);
   else if (span_is(p, pe, "background-color"))
@@ -604,10 +606,6 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->n_rows = (signed char)parse_tracks(val, out->grid_rows, CSS_GRID_MAX);
   else if (span_is(p, pe, "grid-auto-flow"))
     out->grid_flow = has_ci(val, "column") ? 1 : 0;
-  else if (span_is(p, pe, "grid-column") || span_is(p, pe, "grid-column-start") || span_is(p, pe, "grid-column-end"))
-    out->col_span = parse_grid_span(val);
-  else if (span_is(p, pe, "grid-row") || span_is(p, pe, "grid-row-start") || span_is(p, pe, "grid-row-end"))
-    out->row_span = parse_grid_span(val);
   else if (span_is(p, pe, "justify-items"))
     out->justify_items = parse_align(val);
   else if (span_is(p, pe, "place-items")) { /* align-items [justify-items] */
@@ -635,10 +633,12 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->bottom = parse_len(val);
   else if (span_is(p, pe, "left"))
     out->left = parse_len(val);
-  else if (span_is(p, pe, "overflow") || span_is(p, pe, "overflow-x") || span_is(p, pe, "overflow-y"))
-    out->overflow =
-        (has_ci(val, "hidden") || has_ci(val, "auto") || has_ci(val, "scroll") || has_ci(val, "clip")) ? 1 : 0;
-  else if (span_is(p, pe, "fill"))
+  else if (span_is(p, pe, "overflow") || span_is(p, pe, "overflow-x")) { /* the horizontal axis decides */
+    const char *f = val;
+    out->overflow = (starts_ci(f, "hidden") || starts_ci(f, "clip"))                              ? 1
+                    : (starts_ci(f, "auto") || starts_ci(f, "scroll") || starts_ci(f, "overlay")) ? 2
+                                                                                                  : 0;
+  } else if (span_is(p, pe, "fill"))
     out->fill = parse_paint_val(val);
   else if (span_is(p, pe, "stroke"))
     out->stroke = parse_paint_val(val);

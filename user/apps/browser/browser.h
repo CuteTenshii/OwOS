@@ -46,8 +46,11 @@ extern int BW, BH; /* client size (mutable: the window is resizable)    */
 #define FAVICON_W 16 /* favicon decoded to a fixed 16x16 ARGB bitmap and */
 #define FAVICON_H 16 /* shown in the page's tab (0xAARRGGBB per pixel)   */
 
-#define ST_COLOR 0x0F  /* legacy; color is now full 0xRRGGBB (B->fg) */
-#define ST_NOWRAP 0x01 /* white-space:nowrap: this glyph's line must not wrap */
+#define ST_COLOR 0x0F    /* legacy; color is now full 0xRRGGBB (B->fg) */
+#define ST_NOWRAP 0x01   /* white-space:nowrap: this glyph's line must not wrap */
+#define ST_ELLIPSIS 0x04 /* text-overflow: ellipsis on a clipping block */
+#define ST_CLIP 0x08     /* overflow:hidden block: text past the column edge is not drawn */
+#define ST_HIDDEN 0x02   /* visibility:hidden: takes space, draws nothing */
 #define ST_BOLD 0x10
 #define ST_UNDER 0x20
 #define ST_ITALIC 0x40 /* faux-italic shear */
@@ -84,6 +87,13 @@ struct link {
   signed char newtab;
 };
 
+/* Explicit cursor, user-select and pointer-events of an element, over its text range; -1 = not set there. */
+struct pregion {
+  int start, end;
+  signed char cursor, usel, pev;
+  int sel; /* ::selection background 0xRRGGBB, -1 = not set here */
+};
+
 /* An external stylesheet URL from the response's Link: header (absolute). */
 struct css_link {
   char *url;
@@ -109,6 +119,8 @@ struct inl_img {
   int cw, ch;         /* width/height from the attr or CSS, px (0=auto) */
   int is_argb;        /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
   int uid;            /* session-unique id once landed (0 = none), keys the pixel cache */
+  int fit;            /* object-fit: enum css_objfit */
+  int hidden;         /* visibility:hidden: reserve the space, draw nothing */
 };
 
 /* One tab's rendered document; B->pg points at the active tab's. */
@@ -135,6 +147,8 @@ struct page {
 
   struct link *links;
   int nlinks, links_cap;
+  struct pregion *regs; /* children before their parents, so the first containing entry is the innermost */
+  int nregs, regs_cap;
   struct inl_img *imgs;
   int n_imgs, imgs_cap; /* inline <img> list */
 
@@ -224,6 +238,10 @@ struct browser {
   volatile unsigned resize_ms; /* main: msec() of the latest resize, so the worker cascades once it settles */
   volatile int want_paw;       /* main -> worker: content-pane pixel width; the worker owns rewrap */
   volatile int events_live;    /* worker -> main: page has listeners, route clicks as events   */
+  volatile int ptr_live;       /* worker -> main: a rule reads :hover/:active, so report the pointer */
+  volatile int ptr_pending;    /* main -> worker: ptr_off/ptr_down changed                   */
+  volatile int ptr_off;        /* text offset under the pointer, -1 none                    */
+  volatile int ptr_down;       /* the button is held                                         */
   volatile int focus_kind;     /* worker -> main: 0 none, 1 text input, 2 textarea */
 
   /* History API: the main thread owns the tabs[] hist list and nav buttons. */
@@ -292,6 +310,7 @@ int browser_ensure_raw(int need);
 int browser_grow_cap(int cap, int init, int need);
 int browser_ensure_text(int need);
 int browser_ensure_links(int need);
+int browser_ensure_regs(int need);
 int browser_ensure_imgs(int need);
 unsigned *browser_surface(void);
 int browser_surface_ready(void);
@@ -318,6 +337,7 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
 int js_has_listeners(void); /* any listener registered */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
+int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */
 int js_timers_pump(void);        /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int js_workers_pump(void);       /* deliver queued Worker postMessage traffic */
 int js_websockets_pump(void);    /* drain live WebSockets -> open/message/close/error events */
@@ -330,6 +350,7 @@ void js_repl_run(const char *src);
 /* html.c: tear down the live page, re-flatten the live DOM, map a text offset to a DOM node. */
 void html_page_teardown(void);
 void html_relayout(void);
+bool html_set_pointer(int off, bool pressed); /* true when :hover/:active restyles the page */
 struct dom_node *html_node_at_offset(int off);
 /* Inverse: the [start,end) text range a node covers, 0 if never laid out. Worker-thread only. */
 int html_node_span(struct dom_node *node, int *start, int *end);

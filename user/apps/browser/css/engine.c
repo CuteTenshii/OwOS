@@ -1,5 +1,5 @@
 /* CSS parser, selector matcher and cascade. See css.h.
-   Dynamic pseudo-classes never match in a static render; descendant matching is greedy. */
+   :hover/:active/:focus read the targets set by css_set_state; descendant matching is greedy. */
 #include "engine_int.h"
 
 /* custom-property tables: the primary (page) sheet's, plus the applying shadow sheet's own */
@@ -22,6 +22,21 @@ void css_set_viewport(int width, int height)
   g_vh = vh;
 }
 unsigned css_viewport_generation(void) { return g_viewport_gen; }
+
+/* :hover/:active/:focus targets; the generation moves only when a sheet has a rule that reads them. */
+const struct dom_node *g_state_hover, *g_state_active, *g_state_focus;
+bool g_state_used;
+static unsigned g_state_gen;
+void css_set_state(const struct dom_node *hover, const struct dom_node *active, const struct dom_node *focus)
+{
+  if (g_state_used && (hover != g_state_hover || active != g_state_active || focus != g_state_focus))
+    g_state_gen++;
+  g_state_hover = hover;
+  g_state_active = active;
+  g_state_focus = focus;
+}
+unsigned css_state_generation(void) { return g_state_gen; }
+bool css_state_in_use(void) { return g_state_used; }
 
 /* cascade */
 static void fold(struct css_style *out, const struct css_style *d)
@@ -167,6 +182,54 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->row_span = d->row_span;
   if (d->justify_items >= 0)
     out->justify_items = d->justify_items;
+  if (d->col_start >= 0)
+    out->col_start = d->col_start;
+  if (d->row_start >= 0)
+    out->row_start = d->row_start;
+  if (d->n_areas >= 0) {
+    out->n_areas = d->n_areas;
+    for (int i = 0; i < d->n_areas && i < CSS_AREA_MAX; i++)
+      out->areas[i] = d->areas[i];
+  }
+  if (d->area[0])
+    memcpy(out->area, d->area, sizeof out->area);
+  if (d->align_self >= 0)
+    out->align_self = d->align_self;
+  if (d->aspect != -1)
+    out->aspect = d->aspect;
+  if (d->visibility >= 0)
+    out->visibility = d->visibility;
+  if (d->text_ovf >= 0)
+    out->text_ovf = d->text_ovf;
+  if (d->obj_fit >= 0)
+    out->obj_fit = d->obj_fit;
+  if (d->pointer_events >= 0)
+    out->pointer_events = d->pointer_events;
+  if (d->user_select >= 0)
+    out->user_select = d->user_select;
+  if (d->cursor >= 0)
+    out->cursor = d->cursor;
+  if (d->has_tr >= 0) {
+    out->has_tr = d->has_tr;
+    out->tr_x = d->tr_x;
+    out->tr_y = d->tr_y;
+    out->tr_xp = d->tr_xp;
+    out->tr_yp = d->tr_yp;
+  }
+  if (d->flt_bright >= 0)
+    out->flt_bright = d->flt_bright;
+  if (d->flt_gray >= 0)
+    out->flt_gray = d->flt_gray;
+  if (d->flt_invert >= 0)
+    out->flt_invert = d->flt_invert;
+  if (d->flt_opacity >= 0)
+    out->flt_opacity = d->flt_opacity;
+  if (d->clip_kind >= 0) {
+    out->clip_kind = d->clip_kind;
+    out->clip_n = d->clip_n;
+    memcpy(out->clip_v, d->clip_v, sizeof out->clip_v);
+    memcpy(out->clip_unit, d->clip_unit, sizeof out->clip_unit);
+  }
   if (d->overflow >= 0)
     out->overflow = d->overflow;
   if (d->italic >= 0)
@@ -798,6 +861,24 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
 
 int css_sheet_has_pseudo(const css_sheet *sh) { return sh && sh->has_pseudo_el; }
 
+int css_sheet_has_selection(const css_sheet *sh) { return sh && sh->has_selection; }
+
+int css_selection_color(css_sheet *sh, const struct dom_node *el, unsigned *rgb)
+{
+  struct css_style st;
+  css_style_reset(&st);
+  if (!sh || !el || el->type != DOM_ELEMENT)
+    return 0;
+  ensure_vars(sh);
+  int nm = collect_matches(sh, el, PE_SELECTION);
+  for (int i = 0; i < nm; i++)
+    fold(&st, rule_decl(sh->match[i]));
+  if (st.bg < 0)
+    return 0;
+  *rgb = (unsigned)st.bg;
+  return 1;
+}
+
 unsigned css_sheet_generation(const css_sheet *sh) { return sh ? (unsigned)sh->gen : 0; }
 
 void css_apply_attrs(const struct dom_node *el, struct css_style *out)
@@ -921,6 +1002,18 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
       return 1;
     }
   }
+  return 0;
+}
+
+int css_backdrop_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
+{
+  if (!sh || !el || el->type != DOM_ELEMENT)
+    return 0;
+  ensure_vars(sh);
+  int nm = collect_matches(sh, el, PE_BACKDROP);
+  for (int i = nm - 1; i >= 0; i--)
+    if (bg_decl_color(sh->match[i]->raw, out))
+      return 1;
   return 0;
 }
 

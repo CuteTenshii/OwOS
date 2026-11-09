@@ -77,9 +77,9 @@ static void unit_value(double n, const char *u, struct calcval *o)
     o->px = n * (g_vw < g_vh ? g_vw : g_vh) / 100.0;
   else if (starts_ci(u, "vmax"))
     o->px = n * (g_vw > g_vh ? g_vw : g_vh) / 100.0;
-  else if (starts_ci(u, "vw"))
+  else if (starts_ci(u, "vw") || starts_ci(u, "dvw") || starts_ci(u, "svw") || starts_ci(u, "lvw"))
     o->px = n * g_vw / 100.0;
-  else if (starts_ci(u, "vh"))
+  else if (starts_ci(u, "vh") || starts_ci(u, "dvh") || starts_ci(u, "svh") || starts_ci(u, "lvh"))
     o->px = n * g_vh / 100.0;
   else if (starts_ci(u, "cm"))
     o->px = n * 96.0 / 2.54;
@@ -149,6 +149,31 @@ static struct calcval calc_factor(struct calcctx *c)
       c->p++;
     else
       c->ok = false;
+    return v;
+  }
+  if (starts_ci(c->p, "env(")) { /* no insets or system chrome here: the fallback, else 0 */
+    c->p += 4;
+    int depth = 1;
+    const char *fb = 0;
+    while (c->p < c->e && depth) {
+      if (*c->p == '(')
+        depth++;
+      else if (*c->p == ')' && --depth == 0)
+        break;
+      else if (*c->p == ',' && depth == 1 && !fb)
+        fb = c->p + 1;
+      c->p++;
+    }
+    if (depth) {
+      c->ok = false;
+      return v;
+    }
+    const char *close = c->p++;
+    if (!fb)
+      return v;
+    struct calcctx sub = {fb, close, 1, c->depth + 1};
+    v = calc_expr(&sub);
+    c->ok = c->ok && sub.ok;
     return v;
   }
   int fn = 0; /* 1 calc, 2 min, 3 max, 4 clamp */
@@ -293,6 +318,22 @@ int parse_len2(const char *v, int *pct)
   struct calcctx c = {v, v + strlen(v), 1, 0};
   struct calcval r = calc_factor(&c); /* one length token, or a calc/min/max/clamp */
   return calc_result(&r, c.ok, pct);
+}
+
+/* Signed length: px and/or percent, rounded; false if v is not a single length. */
+bool parse_slen(const char *v, int *px, int *pct)
+{
+  while (*v == ' ' || *v == '\t')
+    v++;
+  struct calcctx c = {v, v + strlen(v), 1, 0};
+  struct calcval r = calc_factor(&c);
+  calc_skip(&c);
+  if (!c.ok || c.p < c.e)
+    return false;
+  double a = r.dimless ? r.num : r.px;
+  *px = (int)(a + (a < 0 ? -0.5 : 0.5));
+  *pct = (int)(r.pct + (r.pct < 0 ? -0.5 : 0.5));
+  return true;
 }
 
 /* Parse a CSS length: integer px (or unitless), else -1 (%, em, auto, calc...). */

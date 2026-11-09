@@ -4,12 +4,28 @@
 
 #include "css.h"
 #include "dom.h"
+#include <stddef.h>
 
 enum lbox_kind { LB_BLOCK, LB_FLEX, LB_GRID, LB_TEXT, LB_REPLACED };
 
 struct ledge {
   short t, r, b, l;
 }; /* margin / border / padding, px (resolved) */
+
+/* Rarely-set properties, allocated per box that uses any (NULL otherwise). */
+struct lext {
+  unsigned backdrop; /* modal ::backdrop 0xAARRGGBB when backdrop_set, else the default dimming */
+  unsigned char backdrop_set;
+  signed char n_areas;
+  struct css_area areas[CSS_AREA_MAX];           /* grid container's named areas */
+  char area[CSS_AREA_NAME];                      /* grid item's grid-area name */
+  short tr_x, tr_y, tr_xp, tr_yp;                /* translate: px, and percent of the border box */
+  short flt_bright;                              /* filter brightness, permille (1000 identity) */
+  signed char flt_gray, flt_invert, flt_opacity; /* filter percent */
+  signed char clip_kind, clip_n;
+  short clip_v[CSS_CLIP_PTS * 2];
+  signed char clip_unit[CSS_CLIP_PTS * 2];
+};
 
 struct lbox {
   struct dom_node *node; /* source element (NULL = anon), for spans/devtools */
@@ -25,8 +41,13 @@ struct lbox {
   signed char col_span, row_span;
   signed char justify_items;
   struct css_track cols_t[CSS_GRID_MAX], rows_t[CSS_GRID_MAX];
+  short col_start, row_start; /* grid item start line, 1-based, 0 auto */
+  signed char align_self;     /* enum css_align, -1/AUTO = the container's align-items */
+  int aspect;                 /* aspect-ratio * 1000, 0 none */
+  unsigned char hidden;       /* visibility:hidden (inherited): paint no background or border */
+  struct lext *ext;
   signed char pos;      /* enum css_pos, or -1 (static/unset)   */
-  signed char overflow; /* 0 visible / 1 clipped / -1 unset     */
+  signed char overflow; /* 0 visible / 1 hidden / 2 scroll / -1 unset */
 
   struct ledge margin, border, padding;
   signed char border_style[4];
@@ -100,6 +121,14 @@ static inline unsigned layout_box_sig(const struct lbox *b, unsigned h)
     h = layout_mix(h, (unsigned)(unsigned short)e[i]->b | ((unsigned)(unsigned short)e[i]->l << 16));
   }
   h = layout_mix(h, (unsigned)b->ml_auto | ((unsigned)b->mr_auto << 8) | ((unsigned)b->border_box << 16));
+  h = layout_mix(h, (unsigned)(unsigned short)b->col_start | ((unsigned)(unsigned short)b->row_start << 16));
+  h = layout_mix(h, (unsigned)(unsigned char)b->align_self);
+  h = layout_mix(h, (unsigned)b->aspect);
+  if (b->ext) {
+    const unsigned char *raw = (const unsigned char *)b->ext;
+    for (unsigned i = 0; i < offsetof(struct lext, flt_bright); i++)
+      h = layout_mix(h, raw[i]);
+  }
   h = layout_mix(h, (unsigned)b->spec_w);
   h = layout_mix(h, (unsigned)b->spec_h);
   h = layout_mix(h, (unsigned)(unsigned short)b->pct_w | ((unsigned)(unsigned short)b->pct_h << 16));

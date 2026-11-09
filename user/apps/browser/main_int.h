@@ -223,7 +223,8 @@ bool menu_any_open(void);
 void render_addr(void);
 
 /* input.c */
-void sel_hl_rect(int x, int y, int w, int h, int ct, int cb);
+void sel_hl_rect(int x, int y, int w, int h, int ct, int cb, unsigned rgb);
+unsigned sel_color_at(int off);
 void handle_click(int mx, int my);
 void handle_move(int mx, int my);
 void handle_drag(int mx, int my);
