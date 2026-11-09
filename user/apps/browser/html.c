@@ -710,6 +710,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
   if (root) {
     dom_attach_declarative_shadows(root);
     scan_meta_csp(root); /* fold <meta http-equiv=CSP> into B->pg->csp before any load */
+    scan_resource_hints(root);
     /* Link:-header sheets come before the document's own (then tree order). */
     for (struct css_link *L = B->ext_css; L; L = L->next)
       src_link(L->url);

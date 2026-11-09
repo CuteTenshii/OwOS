@@ -128,6 +128,7 @@ void src_link(const char *absurl);
 void collect_styles(struct dom_node *node);
 struct dom_node *find_tag(struct dom_node *node, const char *tag);
 void scan_meta_csp(struct dom_node *node);
+void scan_resource_hints(struct dom_node *root);
 void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch);
 void bg_note_url(const char *raw_url);
 void load_bg_images(const char *page_url, res_batch_fn fetch);

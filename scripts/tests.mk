@@ -50,7 +50,7 @@ EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
-IMPLS := $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
+IMPLS := $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
@@ -80,6 +80,13 @@ $(B)/suite/%.o: tests/%_test.c
 $(B)/bind/suite/%.o: tests/%_test.c
 	$(call COMPILE,$(SUITE_FLAGS))
 
+$(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
+	$(call COMPILE,-I$(LIB)/tls -Dmsec=ncp_msec -Dnet_dial=ncp_dial -Dnet_close=ncp_close -Dnet_recv_nb=ncp_recv_nb \
+	  -Dnet_recv=ncp_recv -Dnet_send=ncp_send -Dtls_client=ncp_tls_client -Dtls_last_error=ncp_tls_last_error \
+	  -Dtls_read=ncp_tls_read -Dtls_write=ncp_tls_write -Dtls_alpn=ncp_tls_alpn \
+	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close)
+$(B)/impl/h2.o: $(LIB)/curl/h2.c
+	$(call COMPILE,-Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take)
 $(B)/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c
 	$(call COMPILE,-DPERM_DB='"$(RUN)/permissions.db"')
 $(B)/impl/cache.o: $(BROWSER)/features/cache/cache.c

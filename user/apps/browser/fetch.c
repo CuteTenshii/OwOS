@@ -8,6 +8,7 @@
 #include "fetchint.h"                         /* shared transport interface + BR_* request headers   */
 #include "h3.h"                               /* HTTP/3 over QUIC (libcurl engine)                    */
 #include "headers.h"                          /* libcurl: HTTP response header parsing               */
+#include "hints.h"                            /* preconnect / preload resource hints                  */
 
 /* UA platform token from uname(2): x86, x86_64, aarch64 or arm; cached. */
 static const char *ua_arch(void)
@@ -233,6 +234,7 @@ static bool is_html_type(const char *ctype)
 struct bodysrc {
   bool chunked, have_len, done, need_crlf;
   unsigned remaining; /* bytes left in this chunk / the content-length   */
+  bool clean;         /* ended where the framing says, nothing left to read */
 };
 
 static int body_src(void *ctx)
@@ -270,6 +272,20 @@ static int body_src(void *ctx)
       }
       while (c >= 0 && c != '\n')
         c = rgetc();
+      if (any && sz == 0) { /* last chunk: the trailer section ends at a blank line */
+        for (;;) {
+          c = rgetc();
+          bool empty = true;
+          while (c >= 0 && c != '\n') {
+            empty &= c == '\r';
+            c = rgetc();
+          }
+          if (c < 0 || empty) {
+            b->clean = c >= 0;
+            break;
+          }
+        }
+      }
       if (!any || sz == 0) {
         b->done = true;
         return -1;
@@ -287,7 +303,7 @@ static int body_src(void *ctx)
   }
   if (b->have_len) {
     if (b->remaining == 0) {
-      b->done = true;
+      b->done = b->clean = true;
       return -1;
     }
     int c = rgetc();
@@ -510,23 +526,9 @@ static void ext_css_add(const char *url)
   B->ext_css = c;
 }
 
-/* True if "stylesheet" is a whitespace-delimited token of the rel value in [q,end). */
-static bool rel_has_stylesheet(const char *q, const char *end)
-{
-  for (const char *s = q; s < end;) {
-    while (s < end && (*s == ' ' || *s == '\t' || *s == '"'))
-      s++;
-    const char *tok = s;
-    while (s < end && *s != ' ' && *s != '\t' && *s != '"')
-      s++;
-    if (s - tok == 10 && starts_ci(tok, "stylesheet"))
-      return true;
-  }
-  return false;
-}
-
-/* Parse a Link: header value (RFC 8288), adding rel=stylesheet URLs resolved against `base` to B->ext_css. */
-static void parse_link_header(const char *v, const char *base)
+/* Parse a Link: header value (RFC 8288), resolved against `base`: rel=stylesheet goes to B->ext_css (when `sheets`),
+ * rel=preconnect and rel=preload to the resource hints. */
+static void parse_link_header(const char *v, const char *base, bool sheets)
 {
   while (*v) {
     while (*v == ' ' || *v == ',' || *v == '\t')
@@ -551,29 +553,44 @@ static void parse_link_header(const char *v, const char *base)
         p++;
     }
 
-    bool is_sheet = false; /* scan params (after the URL) */
+    bool is_sheet = false, is_preload = false, is_preconnect = false; /* scan params (after the URL) */
+    char as[16] = "";
     for (const char *q = p; q < eend; q++) {
-      if ((q == p || q[-1] == ';' || q[-1] == ' ') && starts_ci(q, "rel")) {
-        const char *r = q + 3;
-        while (r < eend && *r == ' ')
-          r++;
-        if (r < eend && *r == '=') {
-          r++;
-          while (r < eend && (*r == ' ' || *r == '"'))
-            r++;
-          const char *rv = r;
-          while (rv < eend && *rv != ';')
-            rv++;
-          if (rel_has_stylesheet(r, rv))
-            is_sheet = true;
-        }
+      bool rel = starts_ci(q, "rel");
+      if (!(q == p || q[-1] == ';' || q[-1] == ' ') || !(rel || starts_ci(q, "as")))
+        continue;
+      const char *r = q + (rel ? 3 : 2);
+      while (r < eend && *r == ' ')
+        r++;
+      if (r >= eend || *r != '=')
+        continue;
+      r++;
+      while (r < eend && (*r == ' ' || *r == '"'))
+        r++;
+      const char *rv = r;
+      while (rv < eend && *rv != ';')
+        rv++;
+      if (rel) {
+        is_sheet = hint_rel_has(r, rv, "stylesheet");
+        is_preload = hint_rel_has(r, rv, "preload");
+        is_preconnect = hint_rel_has(r, rv, "preconnect");
+      } else {
+        int k = 0;
+        for (; r < rv && *r != '"' && *r != ' ' && k < (int)sizeof as - 1; r++)
+          as[k++] = *r;
+        as[k] = '\0';
       }
     }
 
-    if (is_sheet && url[0]) {
+    if (url[0] && (is_sheet || is_preload || is_preconnect)) {
       char abs[URL_MAX];
       resolve_url(base, url, abs, sizeof abs);
-      ext_css_add(abs);
+      if (is_sheet && sheets)
+        ext_css_add(abs);
+      if (is_preconnect)
+        hint_preconnect(abs);
+      if (is_preload)
+        hint_preload(abs, as, base);
     }
     v = (*eend == ',') ? eend + 1 : eend;
   }
@@ -596,8 +613,8 @@ static int hdr_status(const char *hdr)
   return any ? s : 0;
 }
 
-/* 103 Early Hints: Link values stashed here because the final parse_response clears ext_css; early_apply merges them.
- */
+/* 103 Early Hints: preconnect/preload start at once; Link values are stashed because the final parse_response clears
+ * ext_css, and early_apply merges their stylesheets. */
 static char g_early[2048];
 static int g_early_len;
 
@@ -607,13 +624,14 @@ static void early_reset(void)
   g_early[0] = '\0';
 }
 
-static void early_collect(const char *hdr)
+static void early_collect(const char *hdr, const char *base)
 {
   struct http_headers H;
   http_headers_parse(&H, hdr);
   int n = http_headers_count(&H, "link");
   for (int i = 0; i < n; i++) {
     const char *v = http_headers_at(&H, "link", i);
+    parse_link_header(v, base, false);
     for (; *v && g_early_len < (int)sizeof g_early - 2; v++)
       g_early[g_early_len++] = *v;
     if (g_early_len < (int)sizeof g_early - 1)
@@ -634,7 +652,7 @@ static void early_apply(const char *base)
     if (*p == '\n')
       p++;
     if (k)
-      parse_link_header(line, base);
+      parse_link_header(line, base, true);
   }
 }
 
@@ -772,11 +790,6 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
         break;
       }
 
-  /* Link: <a.css>; rel=stylesheet - external sheets declared in the header. */
-  int nlink = http_headers_count(&H, "link");
-  for (int i = 0; i < nlink; i++)
-    parse_link_header(http_headers_at(&H, "link", i), full_url);
-
   /* nosniff: honour the declared Content-Type and never guess (see render_raw). */
   const char *xcto = http_headers_get(&H, "x-content-type-options");
   if (xcto && http_header_has_token(xcto, "nosniff"))
@@ -793,6 +806,10 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
     for (int i = 0; i < ncsp; i++)
       csp_add(B->pg->csp, http_headers_at(&H, "content-security-policy", i));
   }
+
+  /* Link: rel=stylesheet sheets, and rel=preconnect/preload hints (checked against the CSP just set). */
+  for (int i = 0, nlink = http_headers_count(&H, "link"); i < nlink; i++)
+    parse_link_header(http_headers_at(&H, "link", i), full_url, true);
 
   /* Permissions-Policy (and Feature-Policy): blocked bitmaps OR together; the final redirect hop wins. */
   B->pg->perm_policy = 0;
@@ -842,7 +859,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
   (void)len;
   struct h2tx *h = ctx;
   if (hdr_status(block) < 200) {
-    early_collect(block);
+    early_collect(block, h->full_url);
     return 0;
   } /* 103 etc. */
   bool chunked, have_len;
@@ -882,8 +899,8 @@ static void doc_req_hdrs(char *xh, int *xn, int cap, const struct purl *u)
 }
 
 /* Run the request over HTTP/2 (ALPN-confirmed); fills B->pg->raw with the raw body. */
-static int h2_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl, const char *method,
-                  const unsigned char *body, int blen, const char *bctype)
+static int h2_txn(h2_session *hs, const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
+                  const char *method, const unsigned char *body, int blen, const char *bctype, bool *stale)
 {
   char auth[URL_HOST_MAX + 8];
   int an = 0; /* :authority = host[:port] */
@@ -909,10 +926,13 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc, int loc
   struct h2_opts opts = {browser_ua(), xh, h2_headers_cb};
   char hdrbuf[RESP_HDR_MAX];
   int hlen = 0;
-  if (body && blen > 0)
-    h2_run_body(B->sock, 1, auth, method, u->path, &opts, body, blen, hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
-  else
-    h2_run(B->sock, 1, auth, method, u->path, &opts, hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+  bool reused = h2_session_used(hs);
+  int rc =
+      h2_session_run(hs, 1, auth, method, u->path, &opts, body, blen, hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+  h2_session_release(hs, u->host, u->port);
+  *stale = reused && h.status == 0 && (rc == HTTP_ESEND || rc == HTTP_ENORESP);
+  if (*stale)
+    return -5;
 
   early_apply(full_url); /* merge any 103 Early-Hints stylesheets into ext_css */
   raw_decode(h.enc);
@@ -1012,6 +1032,157 @@ static int doc_cache_finish(const struct purl *u, const char *full_url, long now
   return status;
 }
 
+/* The connection half of a document request, on an idle or new connection (h2 session or HTTP/1.1). *stale is set
+ * when a reused connection failed before any response, so retrying on a new one is safe. */
+static int http_txn_conn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
+                         const char *method, const unsigned char *body, int blen, const char *bctype, long now,
+                         bool revalidating, bool fresh, bool *stale)
+{
+  *stale = false;
+  loc[0] = '\0';
+  B->pg->ctype[0] = '\0';
+  B->dl_name[0] = '\0';
+  B->cdisp_attach = 0;
+  B->rpos = B->rlen = B->reof = 0;
+  B->pg->raw_len = 0;
+
+  /* Over TLS, offer ALPN "h2"; if selected, run over HTTP/2 instead of HTTP/1.1. */
+  h2_session *hs = h2_open(u, fresh, &B->sock);
+  if (hs) {
+    int st = h2_txn(hs, u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype, stale);
+    return *stale ? st : doc_cache_finish(u, full_url, now, revalidating, st);
+  }
+  if (!B->sock) {
+    if (nc_last_error() == NC_OPEN_RESOLVE)
+      return -2;
+    if (nc_last_error() == NC_OPEN_TLS)
+      return -6;
+    return -3;
+  }
+  bool pooled = nc_pooled(B->sock);
+
+  char req[2048];
+  int n = 0;
+  sapp(req, &n, sizeof req, method);
+  sapp(req, &n, sizeof req, " ");
+  sapp(req, &n, sizeof req, u->path);
+  sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
+  sapp(req, &n, sizeof req, u->host);
+  if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
+    sapp(req, &n, sizeof req, ":");
+    uapp(req, &n, sizeof req, (unsigned)u->port);
+  }
+  {
+    char ck[1024];
+    if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
+      sapp(req, &n, sizeof req, "\r\nCookie: ");
+      sapp(req, &n, sizeof req, ck);
+    }
+  }
+  sapp(req, &n, sizeof req, "\r\nUser-Agent: ");
+  sapp(req, &n, sizeof req, browser_ua());
+  sapp(req, &n, sizeof req,
+       "\r\nAccept: " BR_ACCEPT "\r\n"
+       "Accept-Language: " BR_ACCLNG "\r\n"
+       "Accept-Encoding: gzip, deflate, br\r\n");
+  {
+    char ch[512];
+    if (ch_headers_for(u, false, ch, sizeof ch) > 0)
+      sapp(req, &n, sizeof req, ch);
+  }
+  if (g_doc_cond[0])
+    sapp(req, &n, sizeof req, g_doc_cond); /* revalidation */
+  if (body && blen > 0) {                  /* POST/PUT body */
+    sapp(req, &n, sizeof req, "Content-Type: ");
+    sapp(req, &n, sizeof req, bctype ? bctype : "application/x-www-form-urlencoded");
+    sapp(req, &n, sizeof req, "\r\nContent-Length: ");
+    uapp(req, &n, sizeof req, (unsigned)blen);
+    sapp(req, &n, sizeof req, "\r\n");
+  }
+  sapp(req, &n, sizeof req, "\r\n");
+
+  if (nc_write(B->sock, req, n) < 0 || (body && blen > 0 && nc_write(B->sock, (const char *)body, blen) < 0)) {
+    nc_close(B->sock);
+    B->sock = 0;
+    *stale = pooled;
+    return -4;
+  }
+
+  /* Read the header block, skipping 1xx interim responses; 103 Link hints are stashed for the final response. */
+  char hdr[RESP_HDR_MAX];
+  int hlen = 0;
+  for (int interim = 0;;) {
+    hlen = 0;
+    int match = 0;
+    for (;;) {
+      int ci = rgetc();
+      if (ci < 0) {
+        nc_close(B->sock);
+        B->sock = 0;
+        *stale = pooled && ci == -1 && interim == 0;
+        return -5;
+      }
+      char c = (char)ci;
+      if (hlen < (int)sizeof hdr - 1)
+        hdr[hlen++] = c;
+      if (c == '\r')
+        match = (match == 2) ? 3 : 1;
+      else if (c == '\n')
+        match = (match == 1) ? 2 : (match == 3 ? 4 : 0);
+      else
+        match = 0;
+      if (match == 4)
+        break;
+    }
+    hdr[hlen] = '\0';
+    int s = hdr_status(hdr);
+    if (s < 100 || s >= 200)
+      break; /* the final response */
+    if (s == 103)
+      early_collect(hdr, full_url);
+    if (++interim >= 16) {
+      nc_close(B->sock);
+      B->sock = 0;
+      return -5;
+    }
+  }
+
+  bool chunked, have_len;
+  int enc_gz;
+  unsigned content_len;
+  int status = parse_response(hdr, u->host, full_url, loc, loc_cap, &chunked, &have_len, &content_len, &enc_gz);
+  early_apply(full_url); /* merge any 103 Early-Hints stylesheets into ext_css */
+
+  struct bodysrc bs = {chunked, have_len, false, false, have_len ? content_len : 0, false};
+  if (status == 204 || status == 304 || streq(method, "HEAD"))
+    bs.done = bs.clean = true; /* no body follows the header block */
+
+  /* Read the whole framed body into B->pg->raw; the common pipeline decodes and routes it. */
+  int c;
+  while ((c = body_src(&bs)) >= 0) {
+    if (!browser_ensure_raw(B->pg->raw_len + 1))
+      break; /* out of memory: stop */
+    B->pg->raw[B->pg->raw_len++] = (char)c;
+  }
+  /* A connection left at a response boundary stays open for the next request to this origin. */
+  bool keep = false;
+  if (bs.clean && !B->abort_load && !B->reof && B->rpos == B->rlen) {
+    struct http_headers H;
+    http_headers_parse(&H, g_doc_hdr);
+    const char *cn = http_headers_get(&H, "connection");
+    keep = starts_ci(g_doc_hdr, "HTTP/1.1") && !(cn && http_header_has_token(cn, "close"));
+    http_headers_free(&H);
+  }
+  if (keep)
+    nc_release(B->sock, u->host, u->port, u->tls);
+  else
+    nc_close(B->sock);
+  B->sock = 0;
+
+  raw_decode(enc_gz);
+  return doc_cache_finish(u, full_url, now, revalidating, route_body(full_url, status, allow_dl));
+}
+
 static int http_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
                     const char *method, const unsigned char *body, int blen, const char *bctype)
 {
@@ -1061,133 +1232,13 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     B->pg->raw_len = 0;
   }
 
-  /* Over TLS, offer ALPN "h2"; if selected, run over HTTP/2 instead of HTTP/1.1. */
-  B->sock = nc_open(u->host, u->port, u->tls, /*offer_h2=*/1);
-  if (!B->sock) {
-    if (nc_last_error() == NC_OPEN_RESOLVE)
-      return -2;
-    if (nc_last_error() == NC_OPEN_TLS)
-      return -6;
-    return -3;
-  }
-
-  if (u->tls && nc_alpn(B->sock) == ALPN_H2) {
-    int st = h2_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype);
-    nc_close(B->sock);
-    B->sock = 0;
-    return doc_cache_finish(u, full_url, now, revalidating, st);
-  }
-
-  char req[2048];
-  int n = 0;
-  sapp(req, &n, sizeof req, method);
-  sapp(req, &n, sizeof req, " ");
-  sapp(req, &n, sizeof req, u->path);
-  sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
-  sapp(req, &n, sizeof req, u->host);
-  if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
-    sapp(req, &n, sizeof req, ":");
-    uapp(req, &n, sizeof req, (unsigned)u->port);
-  }
-  {
-    char ck[1024];
-    if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
-      sapp(req, &n, sizeof req, "\r\nCookie: ");
-      sapp(req, &n, sizeof req, ck);
-    }
-  }
-  sapp(req, &n, sizeof req, "\r\nUser-Agent: ");
-  sapp(req, &n, sizeof req, browser_ua());
-  sapp(req, &n, sizeof req,
-       "\r\nAccept: " BR_ACCEPT "\r\n"
-       "Accept-Language: " BR_ACCLNG "\r\n"
-       "Accept-Encoding: gzip, deflate, br\r\n");
-  {
-    char ch[512];
-    if (ch_headers_for(u, false, ch, sizeof ch) > 0)
-      sapp(req, &n, sizeof req, ch);
-  }
-  sapp(req, &n, sizeof req, "Connection: close\r\n");
-  if (g_doc_cond[0])
-    sapp(req, &n, sizeof req, g_doc_cond); /* revalidation */
-  if (body && blen > 0) {                  /* POST/PUT body */
-    sapp(req, &n, sizeof req, "Content-Type: ");
-    sapp(req, &n, sizeof req, bctype ? bctype : "application/x-www-form-urlencoded");
-    sapp(req, &n, sizeof req, "\r\nContent-Length: ");
-    uapp(req, &n, sizeof req, (unsigned)blen);
-    sapp(req, &n, sizeof req, "\r\n");
-  }
-  sapp(req, &n, sizeof req, "\r\n");
-
-  if (nc_write(B->sock, req, n) < 0) {
-    nc_close(B->sock);
-    B->sock = 0;
-    return -4;
-  }
-  if (body && blen > 0 && nc_write(B->sock, (const char *)body, blen) < 0) {
-    nc_close(B->sock);
-    B->sock = 0;
-    return -4;
-  }
-
-  /* Read the header block, skipping 1xx interim responses; 103 Link hints are stashed for the final response. */
-  char hdr[RESP_HDR_MAX];
-  int hlen = 0;
-  for (int interim = 0;;) {
-    hlen = 0;
-    int match = 0;
-    for (;;) {
-      int ci = rgetc();
-      if (ci < 0) {
-        nc_close(B->sock);
-        B->sock = 0;
-        return -5;
-      }
-      char c = (char)ci;
-      if (hlen < (int)sizeof hdr - 1)
-        hdr[hlen++] = c;
-      if (c == '\r')
-        match = (match == 2) ? 3 : 1;
-      else if (c == '\n')
-        match = (match == 1) ? 2 : (match == 3 ? 4 : 0);
-      else
-        match = 0;
-      if (match == 4)
-        break;
-    }
-    hdr[hlen] = '\0';
-    int s = hdr_status(hdr);
-    if (s < 100 || s >= 200)
-      break; /* the final response */
-    if (s == 103)
-      early_collect(hdr);
-    if (++interim >= 16) {
-      nc_close(B->sock);
-      B->sock = 0;
-      return -5;
-    }
-  }
-
-  bool chunked, have_len;
-  int enc_gz;
-  unsigned content_len;
-  int status = parse_response(hdr, u->host, full_url, loc, loc_cap, &chunked, &have_len, &content_len, &enc_gz);
-  early_apply(full_url); /* merge any 103 Early-Hints stylesheets into ext_css */
-
-  struct bodysrc bs = {chunked, have_len, false, false, have_len ? content_len : 0};
-
-  /* Read the whole framed body into B->pg->raw; the common pipeline decodes and routes it. */
-  int c;
-  while ((c = body_src(&bs)) >= 0) {
-    if (!browser_ensure_raw(B->pg->raw_len + 1))
-      break; /* out of memory: stop */
-    B->pg->raw[B->pg->raw_len++] = (char)c;
-  }
-  nc_close(B->sock);
-  B->sock = 0;
-
-  raw_decode(enc_gz);
-  return doc_cache_finish(u, full_url, now, revalidating, route_body(full_url, status, allow_dl));
+  bool stale;
+  int st =
+      http_txn_conn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype, now, revalidating, false, &stale);
+  if (st < 0 && stale && !(body && blen > 0))
+    st =
+        http_txn_conn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype, now, revalidating, true, &stale);
+  return st;
 }
 
 /* ----------------------------------------------- local & inline URL schemes */
@@ -1205,6 +1256,7 @@ static void render_raw(const char *url)
     B->pg->mode = MODE_IMAGE;
     B->pg->text_len = 0;
     B->pg->nlinks = 0;
+    B->pg->nregs = 0;
     B->pg->doc_title[0] = '\0';
   } else if (starts_ci(B->pg->ctype, "image/")) {
     B->pg->mode = MODE_TEXT;
@@ -1305,6 +1357,7 @@ void do_fetch(void)
     B->referrer[0] = '\0';
     sapp(B->referrer, &k, sizeof B->referrer, B->pg->cur_url);
   }
+  hints_join();
   /* Free the previous page's DOM/CSS/JS on every navigation. */
   html_page_teardown();
   if (B->pg->csp) {
@@ -1483,6 +1536,7 @@ void do_fetch(void)
       fetch_favicon(url);
 
     /* Persist cached documents, stylesheets, images and favicon here (owofs allows one write stream at a time). */
+    hints_join();
     cache_flush();
     return;
   }

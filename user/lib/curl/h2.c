@@ -1,13 +1,15 @@
-/* h2.c — HTTP/2 client engine (see h2.h). One stream, one request: the shape
- * libcurl drives. Layered as: HPACK (Huffman + integer coding, static/dynamic
- * tables) under a header coder, the binary frame layer over a buffered reader,
- * and h2_request() tying preface → request stream → response on top.
+/* h2.c — HTTP/2 client engine (see h2.h). Layered as: HPACK (Huffman + integer
+ * coding, static/dynamic tables) under a header coder, the binary frame layer
+ * over a buffered reader, and h2_run_body()/h2_fetch_many() tying preface →
+ * request streams → responses on top. A connection can be a one-shot (the
+ * calls take a netconn) or a session that outlives requests (h2_session_*).
  *
- * Scope, deliberately: GET-shaped requests (no request body), no server push
- * (we set SETTINGS_ENABLE_PUSH=0), in-order single stream. Flow control is
- * handled by opening our receive windows wide up front (a large
+ * Scope, deliberately: no server push (we set SETTINGS_ENABLE_PUSH=0), one
+ * request in flight per connection (a batch multiplexes several GETs). Flow
+ * control is handled by opening our receive windows wide up front (a large
  * SETTINGS_INITIAL_WINDOW_SIZE + one big connection WINDOW_UPDATE) so we never
- * have to dribble per-DATA updates — enough for fetching a resource. */
+ * have to dribble per-DATA updates; a session is retired before that budget
+ * runs out. */
 
 #include "h2.h"
 #include "http.h"
@@ -253,12 +255,30 @@ struct dtent {
   int noff, nlen, voff, vlen;
 };
 
+struct frd {
+  netconn *conn;
+  unsigned char buf[4096];
+  int pos, len;
+};
+
 /* All of the engine's mutable per-connection state: the HPACK dynamic table,
  * the inbound-frame + reassembled-header buffers, the request-block builder,
- * and the literal-string scratch. Heap-allocated per request (h2_run_body /
- * h2_fetch_many), so any number of h2 connections can run concurrently on
- * different threads — the engine keeps no other mutable global state. */
+ * the literal-string scratch, and what a later request on the same connection
+ * continues from (stream ids, flow-control windows, buffered inbound bytes).
+ * Heap-allocated per session (or per one-shot request), so any number of h2
+ * connections can run concurrently on different threads — the engine keeps no
+ * other mutable global state. A session serves one request at a time. */
 struct h2_conn {
+  netconn *conn;
+  int owns;          /* h2_session_close also closes conn       */
+  struct frd r;      /* inbound bytes buffered past a request   */
+  unsigned next_sid; /* next client stream id (odd)             */
+  int prefaced;      /* preface + SETTINGS already sent         */
+  int broken;        /* not safe for another request            */
+  int served;        /* requests completed on this session      */
+  long cwnd;         /* peer's connection window for our DATA   */
+  long iws;          /* peer's INITIAL_WINDOW_SIZE              */
+  unsigned long rx;  /* DATA bytes received                     */
   unsigned char dt_arena[DT_ARENA];
   struct dtent dt[DT_MAXENT];
   int dt_n, dt_top;
@@ -654,12 +674,6 @@ static int build_request(unsigned char *hb, int https, const char *method, const
 #define FL_PADDED 0x08
 #define FL_PRIORITY 0x20
 
-struct frd {
-  netconn *conn;
-  unsigned char buf[4096];
-  int pos, len;
-};
-
 /* send all `n` bytes; 0 ok, -2 transport error, -3 interrupted. */
 static int send_all(netconn *conn, const void *p, int n)
 {
@@ -818,7 +832,8 @@ static const unsigned char PREFACE[24] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
  * send-windows allow, in DATA frames split to the max frame size (END_STREAM on
  * the final byte). Returns 0, or -1 on a send error. Called after HEADERS and
  * again whenever a WINDOW_UPDATE/SETTINGS opens the window. */
-static int h2_send_body(netconn *conn, const unsigned char *reqbody, int reqlen, int *boff, long *swnd, long *cwnd)
+static int h2_send_body(netconn *conn, unsigned sid, const unsigned char *reqbody, int reqlen, int *boff, long *swnd,
+                        long *cwnd)
 {
   while (*boff < reqlen && *swnd > 0 && *cwnd > 0) {
     long room = *swnd < *cwnd ? *swnd : *cwnd;
@@ -828,7 +843,7 @@ static int h2_send_body(netconn *conn, const unsigned char *reqbody, int reqlen,
     if (chunk > room)
       chunk = (int)room;
     int last = (*boff + chunk >= reqlen);
-    if (put_frame(conn, F_DATA, last ? FL_END_STREAM : 0, 1, reqbody + *boff, chunk) < 0)
+    if (put_frame(conn, F_DATA, last ? FL_END_STREAM : 0, sid, reqbody + *boff, chunk) < 0)
       return -1;
     *boff += chunk;
     *swnd -= chunk;
@@ -837,62 +852,100 @@ static int h2_send_body(netconn *conn, const unsigned char *reqbody, int reqlen,
   return 0;
 }
 
-int h2_run_body(netconn *conn, int scheme_https, const char *authority, const char *method, const char *path,
-                const struct h2_opts *opts, const unsigned char *reqbody, int reqlen, char *hdr, int hdrcap,
-                int *hdrlen, http_body_fn body, void *ctx)
+#define H2_RX_LIMIT (1ul << 30) /* DATA bytes after which the ~2 GiB receive window is too low to keep reusing */
+#define H2_SID_LIMIT (1u << 30)
+
+static struct h2_conn *h2_conn_new(netconn *conn, int owns)
 {
   struct h2_conn *c = malloc(sizeof *c);
   if (!c)
-    return HTTP_ENORESP;
+    return 0;
   dt_reset(c);
-  if (!method)
-    method = "GET";
+  c->conn = conn;
+  c->owns = owns;
+  c->r.conn = conn;
+  c->r.pos = c->r.len = 0;
+  c->next_sid = 1;
+  c->prefaced = 0;
+  c->broken = 0;
+  c->served = 0;
+  c->cwnd = c->iws = 65535;
+  c->rx = 0;
+  return c;
+}
 
-  /* Preface + our SETTINGS (no push; a wide stream window) + a connection
-   * WINDOW_UPDATE so the whole response flows without per-DATA updates. */
-  if (send_all(conn, PREFACE, 24) < 0) {
-    free(c);
-    return HTTP_ESEND;
-  }
+/* Connection preface + our SETTINGS (no push; a wide stream window) + a connection WINDOW_UPDATE so the whole
+ * response flows without per-DATA updates. Sent once per connection. */
+static int h2_start(struct h2_conn *c)
+{
+  if (c->prefaced)
+    return 0;
+  if (send_all(c->conn, PREFACE, 24) < 0)
+    return -1;
   unsigned char st[12] = {
       0x00, 0x02, 0x00, 0x00, 0x00, 0x00, /* ENABLE_PUSH = 0 */
       0x00, 0x04, 0x7f, 0xff, 0xff, 0xff, /* INITIAL_WINDOW_SIZE max */
   };
-  if (put_frame(conn, F_SETTINGS, 0, 0, st, 12) < 0) {
-    free(c);
-    return HTTP_ESEND;
-  }
+  if (put_frame(c->conn, F_SETTINGS, 0, 0, st, 12) < 0)
+    return -1;
   unsigned char wu[4] = {0x7f, 0xff, 0x00, 0x00}; /* +~2 GiB conn window */
-  if (put_frame(conn, F_WINUP, 0, 0, wu, 4) < 0) {
-    free(c);
+  if (put_frame(c->conn, F_WINUP, 0, 0, wu, 4) < 0)
+    return -1;
+  c->prefaced = 1;
+  return 0;
+}
+
+/* Fold the peer's INITIAL_WINDOW_SIZE into c->iws; returns the change so a stream in flight can follow. */
+static long apply_settings(struct h2_conn *c, const unsigned char *p, int len)
+{
+  long delta = 0;
+  for (int i = 0; i + 6 <= len; i += 6)
+    if (((p[i] << 8) | p[i + 1]) == 0x0004) {
+      long niw = ((long)p[i + 2] << 24) | (p[i + 3] << 16) | (p[i + 4] << 8) | p[i + 5];
+      delta += niw - c->iws;
+      c->iws = niw;
+    }
+  return delta;
+}
+
+static long wu_inc(const unsigned char *p) { return ((long)(p[0] & 0x7f) << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+
+static int h2_exec(struct h2_conn *c, int scheme_https, const char *authority, const char *method, const char *path,
+                   const struct h2_opts *opts, const unsigned char *reqbody, int reqlen, char *hdr, int hdrcap,
+                   int *hdrlen, http_body_fn body, void *ctx)
+{
+  netconn *conn = c->conn;
+  struct frd *r = &c->r;
+  if (!method)
+    method = "GET";
+  if (c->broken || h2_start(c) < 0) {
+    c->broken = 1;
     return HTTP_ESEND;
   }
 
+  unsigned my = c->next_sid;
+  c->next_sid += 2;
+  c->served++;
   int has_body = reqbody && reqlen > 0;
   int rl = build_request(c->reqhb, scheme_https, method, authority, path, opts);
   /* When a request body follows, the HEADERS frame must NOT end the stream; the
    * body rides in flow-controlled DATA frames sent below (and replenished from
    * the peer's SETTINGS/WINDOW_UPDATE in the loop), so a body of any size
    * streams. */
-  if (put_frame(conn, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, c->reqhb, rl) < 0) {
-    free(c);
+  if (put_frame(conn, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), my, c->reqhb, rl) < 0) {
+    c->broken = 1;
     return HTTP_ESEND;
   }
 
-  /* Request-body flow control. Stream + connection send-windows start at the h2
-   * default 65535 and grow via the peer's SETTINGS(INITIAL_WINDOW_SIZE) and
-   * WINDOW_UPDATE; h2_send_body emits DATA up to the smaller window, splitting
-   * at the max frame size, END_STREAM on the last byte. */
+  /* Request-body flow control. The stream window starts at the peer's INITIAL_WINDOW_SIZE, the connection window
+   * is shared by every request on this connection; both grow via SETTINGS and WINDOW_UPDATE. */
   int boff = 0;
-  long swnd = 65535, cwnd = 65535, applied_iws = 65535;
-  if (has_body && h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) {
-    free(c);
+  long swnd = c->iws;
+  if (has_body && h2_send_body(conn, my, reqbody, reqlen, &boff, &swnd, &c->cwnd) < 0) {
+    c->broken = 1;
     return HTTP_ESEND;
   }
 
-  struct frd r;
-  r.conn = conn;
-  r.pos = r.len = 0;
   struct hsink hs;
   hs.buf = hdr;
   hs.cap = (hdr ? hdrcap : 0);
@@ -904,13 +957,13 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
   e.len = 0;
   e.aborted = 0;
 
-  int done = 0, headers_done = 0, hpack_broken = 0;
+  int done = 0, ended = 0, headers_done = 0, hpack_broken = 0;
   int rc = HTTP_ENORESP;
 
   while (!done) {
     int type, flags, paylen;
     unsigned sid;
-    int fr = read_frame(&r, &type, &flags, &sid, c->framebuf, &paylen);
+    int fr = read_frame(r, &type, &flags, &sid, c->framebuf, &paylen);
     if (fr == -3) {
       rc = HTTP_EINTR;
       goto out;
@@ -930,19 +983,12 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
     switch (type) {
     case F_SETTINGS:
       if (!(flags & FL_ACK)) {
-        int i; /* apply INITIAL_WINDOW_SIZE to our send window */
-        for (i = 0; i + 6 <= paylen; i += 6)
-          if (((c->framebuf[i] << 8) | c->framebuf[i + 1]) == 0x0004) {
-            long niw = ((long)c->framebuf[i + 2] << 24) | (c->framebuf[i + 3] << 16) | (c->framebuf[i + 4] << 8) |
-                       c->framebuf[i + 5];
-            swnd += niw - applied_iws;
-            applied_iws = niw;
-          }
+        swnd += apply_settings(c, c->framebuf, paylen);
         if (put_frame(conn, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) {
           rc = HTTP_ENORESP;
           goto out;
         }
-        if (has_body && h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) {
+        if (has_body && h2_send_body(conn, my, reqbody, reqlen, &boff, &swnd, &c->cwnd) < 0) {
           rc = HTTP_ESEND;
           goto out;
         }
@@ -956,7 +1002,7 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
         }
       break;
     case F_HEADERS:
-      if (sid == 1) {
+      if (sid == my) {
         /* Once the dynamic table is desynced (a salvaged header block, see
          * below) we can't decode any further HEADERS — but a trailer is
          * optional, so just note END_STREAM and keep going for the body. */
@@ -966,7 +1012,7 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
           break;
         }
         int hbl;
-        int cr = collect_header_block(c, &r, c->framebuf, paylen, flags, &hbl);
+        int cr = collect_header_block(c, r, c->framebuf, paylen, flags, &hbl);
         if (cr == -3) {
           rc = HTTP_EINTR;
           goto out;
@@ -1022,11 +1068,12 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
           }
         }
         if (flags & FL_END_STREAM)
-          done = 1;
+          done = ended = 1;
       }
       break;
     case F_DATA:
-      if (sid == 1) {
+      c->rx += (unsigned long)paylen;
+      if (sid == my) {
         int start = 0, padlen = 0;
         if (flags & FL_PADDED)
           padlen = c->framebuf[start++];
@@ -1038,14 +1085,14 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
           goto out;
         }
         if (flags & FL_END_STREAM)
-          done = 1;
+          done = ended = 1;
       }
       break;
     case F_RST:
       /* A reset after the full response (some servers RST a stream they
        * consider done, e.g. after a redirect) isn't a failure — keep what we
        * have. Only a reset before any headers is a real error. */
-      if (sid == 1) {
+      if (sid == my) {
         if (headers_done) {
           done = 1;
           break;
@@ -1061,15 +1108,13 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
       }
       done = 1;
       break;
-    case F_WINUP: /* peer opened the send window */
-      if (has_body && boff < reqlen && paylen >= 4) {
-        long inc =
-            ((long)(c->framebuf[0] & 0x7f) << 24) | (c->framebuf[1] << 16) | (c->framebuf[2] << 8) | c->framebuf[3];
+    case F_WINUP: /* peer opened a send window */
+      if (paylen >= 4) {
         if (sid == 0)
-          cwnd += inc;
-        else if (sid == 1)
-          swnd += inc;
-        if (h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) {
+          c->cwnd += wu_inc(c->framebuf);
+        else if (sid == my)
+          swnd += wu_inc(c->framebuf);
+        if (has_body && boff < reqlen && h2_send_body(conn, my, reqbody, reqlen, &boff, &swnd, &c->cwnd) < 0) {
           rc = HTTP_ESEND;
           goto out;
         }
@@ -1085,6 +1130,9 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority, const ch
 
 out:
   emit_flush(&e);
+  /* The connection serves another request only if this stream ended cleanly with the HPACK state intact. */
+  if (!ended || hpack_broken || c->rx > H2_RX_LIMIT || c->next_sid > H2_SID_LIMIT)
+    c->broken = 1;
   /* Once we have a valid response (decoded headers + status), a transport error
    * AFTER it — a stream/connection reset, an unexpected trailer, a peer that
    * just hangs up — must not turn the whole request into "no response". google
@@ -1101,6 +1149,17 @@ out:
     if (hdrlen)
       *hdrlen = hs.len;
   }
+  return rc;
+}
+
+int h2_run_body(netconn *conn, int scheme_https, const char *authority, const char *method, const char *path,
+                const struct h2_opts *opts, const unsigned char *reqbody, int reqlen, char *hdr, int hdrcap,
+                int *hdrlen, http_body_fn body, void *ctx)
+{
+  struct h2_conn *c = h2_conn_new(conn, 0);
+  if (!c)
+    return HTTP_ENORESP;
+  int rc = h2_exec(c, scheme_https, authority, method, path, opts, reqbody, reqlen, hdr, hdrcap, hdrlen, body, ctx);
   free(c);
   return rc;
 }
@@ -1147,41 +1206,25 @@ static int h2m_grow(struct h2_mstream *s, int need)
   return 1;
 }
 
-/* Map a stream id to its request index (client streams are odd: 1,3,5,…). */
-static int h2m_idx(unsigned sid, int nreq)
+/* Map a stream id to its request index (client streams are odd, from `base`: base, base+2, …). */
+static int h2m_idx(unsigned sid, unsigned base, int nreq)
 {
-  if (sid < 1 || !(sid & 1))
+  if (sid < base || !(sid & 1))
     return -1;
-  int i = (int)((sid - 1) / 2);
+  int i = (int)((sid - base) / 2);
   return (i < nreq) ? i : -1;
 }
 
-int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const struct h2_opts *opts,
-                  struct h2_fetch *reqs, int nreq,
-                  void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx)
+static int h2_fetch_exec(struct h2_conn *c, int scheme_https, const char *authority, const struct h2_opts *opts,
+                         struct h2_fetch *reqs, int nreq,
+                         void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx)
 {
   if (nreq <= 0 || nreq > H2_FETCH_MAX)
     return HTTP_ENORESP;
-  struct h2_conn *c = malloc(sizeof *c);
-  if (!c)
-    return HTTP_ENORESP;
-  dt_reset(c);
-
-  if (send_all(conn, PREFACE, 24) < 0) {
-    free(c);
-    return HTTP_ESEND;
-  }
-  unsigned char st[12] = {
-      0x00, 0x02, 0x00, 0x00, 0x00, 0x00, /* ENABLE_PUSH = 0          */
-      0x00, 0x04, 0x7f, 0xff, 0xff, 0xff, /* INITIAL_WINDOW_SIZE max  */
-  };
-  if (put_frame(conn, F_SETTINGS, 0, 0, st, 12) < 0) {
-    free(c);
-    return HTTP_ESEND;
-  }
-  unsigned char wu[4] = {0x7f, 0xff, 0x00, 0x00}; /* +~2 GiB conn window */
-  if (put_frame(conn, F_WINUP, 0, 0, wu, 4) < 0) {
-    free(c);
+  netconn *conn = c->conn;
+  struct frd *r = &c->r;
+  if (c->broken || h2_start(c) < 0) {
+    c->broken = 1;
     return HTTP_ESEND;
   }
 
@@ -1196,25 +1239,26 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
 
   /* Send every request's HEADERS up front (END_STREAM: no request body), each
    * on its own odd stream id. The server interleaves the responses. */
+  unsigned base = c->next_sid;
+  c->next_sid += 2u * (unsigned)nreq;
+  c->served++;
+  int rc = 0;
   for (int i = 0; i < nreq; i++) {
-    unsigned sid = 1u + 2u * (unsigned)i;
+    unsigned sid = base + 2u * (unsigned)i;
     int rl = build_request(c->reqhb, scheme_https, "GET", authority, reqs[i].path, opts);
     if (put_frame(conn, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, c->reqhb, rl) < 0) {
-      free(c);
+      c->broken = 1;
       return HTTP_ESEND;
     }
   }
 
-  struct frd r;
-  r.conn = conn;
-  r.pos = r.len = 0;
   char statusbuf[64];
-  int ndone = 0, rc = 0;
+  int ndone = 0;
 
   while (ndone < nreq) {
     int type, flags, paylen;
     unsigned sid;
-    int fr = read_frame(&r, &type, &flags, &sid, c->framebuf, &paylen);
+    int fr = read_frame(r, &type, &flags, &sid, c->framebuf, &paylen);
     if (fr < 0) {
       rc = (fr == -3) ? HTTP_EINTR : HTTP_ENORESP;
       goto out;
@@ -1222,11 +1266,13 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
 
     switch (type) {
     case F_SETTINGS:
-      if (!(flags & FL_ACK))
+      if (!(flags & FL_ACK)) {
+        apply_settings(c, c->framebuf, paylen);
         if (put_frame(conn, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) {
           rc = HTTP_ENORESP;
           goto out;
         }
+      }
       break;
     case F_PING:
       if (!(flags & FL_ACK))
@@ -1237,7 +1283,7 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
       break;
     case F_HEADERS: {
       int hbl;
-      int cr = collect_header_block(c, &r, c->framebuf, paylen, flags, &hbl);
+      int cr = collect_header_block(c, r, c->framebuf, paylen, flags, &hbl);
       if (cr < 0) {
         rc = (cr == -3) ? HTTP_EINTR : HTTP_ENORESP;
         goto out;
@@ -1247,7 +1293,7 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
        * For a tracked stream whose caller wants the headers, decode straight
        * into its buffer (first HEADERS only; a later trailer block keeps the
        * throwaway sink so it can't clobber the captured response headers). */
-      int idx = h2m_idx(sid, nreq);
+      int idx = h2m_idx(sid, base, nreq);
       struct hsink hs;
       int capture = idx >= 0 && reqs[idx].hdr && reqs[idx].hdrcap > 0 && reqs[idx].hdrlen == 0;
       if (capture) {
@@ -1279,7 +1325,8 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
       break;
     }
     case F_DATA: {
-      int idx = h2m_idx(sid, nreq);
+      c->rx += (unsigned long)paylen;
+      int idx = h2m_idx(sid, base, nreq);
       int start = 0, padlen = 0;
       if (flags & FL_PADDED)
         padlen = c->framebuf[start++];
@@ -1305,7 +1352,7 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
       break;
     }
     case F_RST: {
-      int idx = h2m_idx(sid, nreq); /* refused/reset: caller retries h1.1 */
+      int idx = h2m_idx(sid, base, nreq); /* refused/reset: caller retries h1.1 */
       if (idx >= 0 && !sm[idx].done) {
         sm[idx].failed = 1;
         sm[idx].done = 1;
@@ -1316,12 +1363,18 @@ int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const 
     case F_GOAWAY:
       rc = HTTP_ENORESP;
       goto out; /* connection ending: bail, rest fail */
-    default:    /* WINDOW_UPDATE, PRIORITY, PUSH: ignore */
+    case F_WINUP:
+      if (paylen >= 4 && sid == 0)
+        c->cwnd += wu_inc(c->framebuf);
+      break;
+    default: /* PRIORITY, PUSH: ignore */
       break;
     }
   }
 
 out:
+  if (rc != 0 || c->rx > H2_RX_LIMIT || c->next_sid > H2_SID_LIMIT)
+    c->broken = 1;
   for (int i = 0; i < nreq; i++) {
     if (on_done) { /* engine owns the bodies in this mode */
       free(sm[i].body);
@@ -1334,6 +1387,62 @@ out:
     reqs[i].status = sm[i].status;
     reqs[i].failed = sm[i].failed || (!sm[i].done) || sm[i].status != 200;
   }
+  return rc;
+}
+
+int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const struct h2_opts *opts,
+                  struct h2_fetch *reqs, int nreq,
+                  void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx)
+{
+  struct h2_conn *c = h2_conn_new(conn, 0);
+  if (!c)
+    return HTTP_ENORESP;
+  int rc = h2_fetch_exec(c, scheme_https, authority, opts, reqs, nreq, on_done, cb_ctx);
   free(c);
   return rc;
+}
+
+/* ----------------------------------------------------------- sessions */
+
+h2_session *h2_session_wrap(netconn *conn)
+{
+  h2_session *s = h2_conn_new(conn, 1);
+  if (!s)
+    nc_close(conn);
+  return s;
+}
+
+int h2_session_run(h2_session *s, int scheme_https, const char *authority, const char *method, const char *path,
+                   const struct h2_opts *opts, const unsigned char *reqbody, int reqlen, char *hdr, int hdrcap,
+                   int *hdrlen, http_body_fn body, void *ctx)
+{
+  return h2_exec(s, scheme_https, authority, method, path, opts, reqbody, reqlen, hdr, hdrcap, hdrlen, body, ctx);
+}
+
+int h2_session_fetch_many(h2_session *s, int scheme_https, const char *authority, const struct h2_opts *opts,
+                          struct h2_fetch *reqs, int nreq,
+                          void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx)
+{
+  return h2_fetch_exec(s, scheme_https, authority, opts, reqs, nreq, on_done, cb_ctx);
+}
+
+int h2_session_used(const h2_session *s) { return s->served > 0; }
+
+void h2_session_close(h2_session *s)
+{
+  if (s->owns)
+    nc_close(s->conn);
+  free(s);
+}
+
+static void h2_session_destroy(void *s) { h2_session_close(s); }
+
+h2_session *h2_session_acquire(const char *host, int port) { return nc_idle_take(host, port, 1, NC_IDLE_H2); }
+
+void h2_session_release(h2_session *s, const char *host, int port)
+{
+  if (s->broken)
+    h2_session_close(s);
+  else
+    nc_idle_put(host, port, 1, NC_IDLE_H2, s, h2_session_destroy);
 }

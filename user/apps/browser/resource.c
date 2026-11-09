@@ -248,6 +248,8 @@ struct resp_meta {
   int status;
   char location[URL_MAX];
   char ctype[160];
+  bool http11;     /* HTTP/1.1 status line                         */
+  bool conn_close; /* Connection: close                            */
 };
 
 /* Parse an HTTP/1.1 or h2-synthesized header block into `meta` plus body framing. */
@@ -256,6 +258,8 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *ch
   meta->status = 0;
   meta->location[0] = '\0';
   meta->ctype[0] = '\0';
+  meta->http11 = starts_ci(hdr, "HTTP/1.1");
+  meta->conn_close = false;
   *chunked = false;
   *clen = -1;
 
@@ -281,6 +285,12 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *ch
       for (const char *q = line; *q && *q != '\n'; q++)
         if (starts_ci(q, "chunked")) {
           *chunked = true;
+          break;
+        }
+    } else if (starts_ci(line, "connection:")) {
+      for (const char *q = line; *q && *q != '\n'; q++)
+        if (starts_ci(q, "close")) {
+          meta->conn_close = true;
           break;
         }
     } else if (starts_ci(line, "location:")) {
@@ -309,12 +319,43 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *ch
   }
 }
 
-/* Read a response body into a malloc'd buffer (caller frees) for any status; NULL on error/OOM. */
-static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta, char *hdr_out, int hdr_cap)
+/* Consume the trailer section after the last chunk; false if the connection ended before its blank line. */
+static bool ir_skip_trailers(struct ireader *r)
+{
+  for (;;) {
+    int c = ir_getc(r);
+    bool empty = true;
+    while (c >= 0 && c != '\n') {
+      if (c != '\r')
+        empty = false;
+      c = ir_getc(r);
+    }
+    if (c < 0)
+      return false;
+    if (empty)
+      return true;
+  }
+}
+
+/* Read a response body into a malloc'd buffer (caller frees) for any status; NULL on error/OOM. Interim 1xx
+ * responses are skipped, and a HEAD, 204 or 304 response has no body. *keep says whether the connection is
+ * left at a response boundary and may serve another request. */
+static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta, char *hdr_out, int hdr_cap,
+                                     bool head, bool *keep)
 {
   char hdr[RESP_HDR_MAX];
-  if (ir_read_header_block(r, hdr, (int)sizeof hdr) < 0)
-    return 0;
+  bool chunked;
+  long clen;
+  *keep = false;
+  for (int interim = 0;; interim++) {
+    if (ir_read_header_block(r, hdr, (int)sizeof hdr) < 0)
+      return 0;
+    parse_resp_headers(hdr, meta, &chunked, &clen);
+    if (meta->status < 100 || meta->status >= 200 || meta->status == 101)
+      break;
+    if (interim >= 16)
+      return 0;
+  }
   if (hdr_out && hdr_cap > 0) { /* hand the raw block to the caller */
     int k = 0;
     for (; hdr[k] && k < hdr_cap - 1; k++)
@@ -322,17 +363,17 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
     hdr_out[k] = '\0';
   }
 
-  bool chunked;
-  long clen;
-  parse_resp_headers(hdr, meta, &chunked, &clen);
-
+  bool no_body = head || meta->status == 204 || meta->status == 304;
   int cap = (clen > 0 && clen < (long)RAW_MAX) ? (int)clen + 1 : 65536;
   unsigned char *body = malloc((unsigned)cap);
   if (!body)
     return 0;
   int blen = 0;
+  bool framed = no_body; /* the body ended where its framing says it does */
 
-  if (chunked) {
+  if (no_body) {
+    /* nothing follows the header block */
+  } else if (chunked) {
     for (;;) {
       unsigned sz = 0;
       int c, any = 0;
@@ -351,8 +392,12 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
       }
       while (c >= 0 && c != '\n')
         c = ir_getc(r);
-      if (!any || sz == 0)
+      if (!any)
+        goto done;
+      if (sz == 0) {
+        framed = ir_skip_trailers(r);
         break;
+      }
       if (ir_drain(r, &body, &cap, &blen, (long)sz) != (long)sz)
         goto done;
       c = ir_getc(r);
@@ -361,10 +406,12 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
     }
   } else {
     long limit = (clen >= 0) ? clen : (long)RAW_MAX;
-    ir_drain(r, &body, &cap, &blen, limit);
+    long got = ir_drain(r, &body, &cap, &blen, limit);
+    framed = clen >= 0 && got == clen;
   }
 done:
   *outlen = blen;
+  *keep = framed && meta->http11 && !meta->conn_close && !r->eof && r->pos == r->len;
   return body;
 }
 
@@ -428,7 +475,6 @@ static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
   }
 }
 
-#define IMG_ACCEPT "image/png,image/webp,image/gif,image/svg+xml,*/*"
 #define VARY_HDRS_MAX 2560
 
 /* Normalise a URL's origin (HSTS-upgrading http) into *u; 0 on a bad URL. */
@@ -502,7 +548,7 @@ static void build_request(char *req, int *n, int cap, const struct purl *u, cons
     sapp(req, n, cap, "\r\nContent-Length: ");
     uapp(req, n, cap, (unsigned)rq->body_len);
   }
-  sapp(req, n, cap, "\r\nConnection: close\r\n");
+  sapp(req, n, cap, "\r\n");
   {
     char ch[512];
     if (ch_headers_for(u, true, ch, sizeof ch) > 0)
@@ -525,6 +571,116 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
     if (body_put(&h->body, &h->cap, &h->blen, p[i]) < 0)
       return 1;
   return 0;
+}
+
+/* An h2 session to u: an idle one, else a new connection when ALPN selects h2. Otherwise NULL, with the HTTP/1.1
+ * connection in *plain (NULL if the connection failed). `fresh` skips the idle pool. */
+h2_session *h2_open(const struct purl *u, bool fresh, netconn **plain)
+{
+  *plain = 0;
+  if (u->tls && !fresh) {
+    h2_session *s = h2_session_acquire(u->host, u->port);
+    if (s)
+      return s;
+  }
+  netconn *c = fresh ? nc_open_fresh(u->host, u->port, u->tls, /*offer_h2=*/1) : nc_acquire(u->host, u->port, u->tls);
+  if (!c)
+    return 0;
+  if (u->tls && nc_alpn(c) == ALPN_H2)
+    return h2_session_wrap(c);
+  *plain = c;
+  return 0;
+}
+
+/* One request and response on an idle or new connection (h2 session or HTTP/1.1); the body, or NULL on failure.
+ * *stale is set when a reused connection failed before any response, so retrying on a new one is safe. */
+static unsigned char *http_exchange(const struct purl *u, const char *method, const char *accept,
+                                    const struct http_req *rq, struct resp_meta *meta, char *rawhdr, int *blen,
+                                    bool fresh, bool *stale)
+{
+  *stale = false;
+  *blen = 0;
+  netconn *conn;
+  h2_session *hs = h2_open(u, fresh, &conn);
+  if (hs) {
+    /* HTTP/2: :authority + lowercased headers; no accept-encoding, so the body is plain. */
+    char auth[URL_HOST_MAX + 8];
+    int an = 0;
+    sapp(auth, &an, sizeof auth, u->host);
+    if (u->port != 443) {
+      sapp(auth, &an, sizeof auth, ":");
+      uapp(auth, &an, sizeof auth, (unsigned)u->port);
+    }
+    char xh[1408];
+    int xn = 0;
+    char ck[1024];
+    if (!rq->no_cookies && cookie_header(u->host, ck, sizeof ck) > 0) {
+      sapp(xh, &xn, sizeof xh, "cookie: ");
+      sapp(xh, &xn, sizeof xh, ck);
+      sapp(xh, &xn, sizeof xh, "\r\n");
+    }
+    sapp(xh, &xn, sizeof xh, "accept: ");
+    sapp(xh, &xn, sizeof xh, accept);
+    sapp(xh, &xn, sizeof xh, "\r\n");
+    {
+      char ch[512];
+      if (ch_headers_for(u, true, ch, sizeof ch) > 0)
+        sapp(xh, &xn, sizeof xh, ch);
+    }
+    if (rq->ctype && rq->ctype[0]) {
+      sapp(xh, &xn, sizeof xh, "content-type: ");
+      sapp(xh, &xn, sizeof xh, rq->ctype);
+      sapp(xh, &xn, sizeof xh, "\r\n");
+    }
+    if (rq->extra_hdrs && rq->extra_hdrs[0])
+      h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
+    struct h2_opts opts = {browser_ua(), xh, 0};
+    struct h2buf hb;
+    hb.cap = 65536;
+    hb.blen = 0;
+    hb.body = malloc((unsigned)hb.cap);
+    if (!hb.body) {
+      h2_session_release(hs, u->host, u->port);
+      return 0;
+    }
+    bool reused = h2_session_used(hs);
+    int hlen = 0;
+    int rc = h2_session_run(hs, 1, auth, method, u->path, &opts, rq->body, rq->body_len, rawhdr, RESP_HDR_MAX, &hlen,
+                            h2buf_cb, &hb);
+    h2_session_release(hs, u->host, u->port);
+    if (rc < 0) {
+      free(hb.body);
+      *stale = reused && (rc == HTTP_ESEND || rc == HTTP_ENORESP);
+      return 0;
+    }
+    bool dchunk;
+    long dclen;
+    parse_resp_headers(rawhdr, meta, &dchunk, &dclen);
+    *blen = hb.blen;
+    return hb.body;
+  }
+  if (!conn)
+    return 0;
+
+  bool pooled = nc_pooled(conn);
+  char req[2048];
+  int n = 0;
+  build_request(req, &n, sizeof req, u, method, accept, rq);
+  if (nc_write(conn, req, n) < 0 ||
+      (rq->body && rq->body_len > 0 && nc_write(conn, (const char *)rq->body, rq->body_len) < 0)) {
+    nc_close(conn);
+    *stale = pooled;
+    return 0;
+  }
+  struct ireader r = {conn, {0}, 0, 0, false};
+  bool keep;
+  unsigned char *body = read_http_body(&r, blen, meta, rawhdr, RESP_HDR_MAX, streq_ci(method, "HEAD"), &keep);
+  if (keep)
+    nc_release(conn, u->host, u->port, u->tls);
+  else
+    nc_close(conn);
+  *stale = !body && pooled;
+  return body;
 }
 
 /* Single-request transport (h2 or h1.1, follows redirects); NULL on error. Worker-thread only. */
@@ -619,81 +775,10 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
         u.port = 443;
     }
 
-    netconn *conn = nc_open(u.host, u.port, u.tls, /*offer_h2=*/1);
-    if (!conn)
-      return 0;
-
-    if (u.tls && nc_alpn(conn) == ALPN_H2) {
-      /* HTTP/2: :authority + lowercased headers; no accept-encoding, so the body is plain. */
-      char auth[URL_HOST_MAX + 8];
-      int an = 0;
-      sapp(auth, &an, sizeof auth, u.host);
-      if (u.port != 443) {
-        sapp(auth, &an, sizeof auth, ":");
-        uapp(auth, &an, sizeof auth, (unsigned)u.port);
-      }
-      char xh[1408];
-      int xn = 0;
-      char ck[1024];
-      if (!rq->no_cookies && cookie_header(u.host, ck, sizeof ck) > 0) {
-        sapp(xh, &xn, sizeof xh, "cookie: ");
-        sapp(xh, &xn, sizeof xh, ck);
-        sapp(xh, &xn, sizeof xh, "\r\n");
-      }
-      sapp(xh, &xn, sizeof xh, "accept: ");
-      sapp(xh, &xn, sizeof xh, accept);
-      sapp(xh, &xn, sizeof xh, "\r\n");
-      {
-        char ch[512];
-        if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
-          sapp(xh, &xn, sizeof xh, ch);
-      }
-      if (rq->ctype && rq->ctype[0]) {
-        sapp(xh, &xn, sizeof xh, "content-type: ");
-        sapp(xh, &xn, sizeof xh, rq->ctype);
-        sapp(xh, &xn, sizeof xh, "\r\n");
-      }
-      if (rq->extra_hdrs && rq->extra_hdrs[0])
-        h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
-      struct h2_opts opts = {browser_ua(), xh, 0};
-      struct h2buf hb;
-      hb.cap = 65536;
-      hb.blen = 0;
-      hb.body = malloc((unsigned)hb.cap);
-      if (!hb.body) {
-        nc_close(conn);
-        return 0;
-      }
-      int hlen = 0;
-      int rc = h2_run_body(conn, 1, auth, method, u.path, &opts, rq->body, rq->body_len, rawhdr, sizeof rawhdr, &hlen,
-                           h2buf_cb, &hb);
-      nc_close(conn);
-      if (rc < 0) {
-        if (hb.body)
-          free(hb.body);
-        return 0;
-      }
-      bool dchunk;
-      long dclen;
-      parse_resp_headers(rawhdr, &meta, &dchunk, &dclen);
-      body = hb.body ? hb.body : malloc(1);
-      blen = hb.blen;
-    } else {
-      char req[2048];
-      int n = 0;
-      build_request(req, &n, sizeof req, &u, method, accept, rq);
-      if (nc_write(conn, req, n) < 0) {
-        nc_close(conn);
-        return 0;
-      }
-      if (rq->body && rq->body_len > 0 && nc_write(conn, (const char *)rq->body, rq->body_len) < 0) {
-        nc_close(conn);
-        return 0;
-      }
-      struct ireader r = {conn, {0}, 0, 0, false};
-      body = read_http_body(&r, &blen, &meta, rawhdr, sizeof rawhdr);
-      nc_close(conn);
-    }
+    bool stale;
+    body = http_exchange(&u, method, accept, rq, &meta, rawhdr, &blen, false, &stale);
+    if (!body && stale && !(rq->body && rq->body_len > 0))
+      body = http_exchange(&u, method, accept, rq, &meta, rawhdr, &blen, true, &stale);
     if (!body)
       return 0;
 
@@ -1648,8 +1733,9 @@ static void subres_job(void *vctx, int i)
     reqs[g].hdrlen = 0;
   }
 
-  netconn *conn = nc_open(u.host, u.port, /*tls=*/1, /*offer_h2=*/1);
-  if (conn && nc_alpn(conn) == ALPN_H2) {
+  netconn *plain;
+  h2_session *hs = h2_open(&u, false, &plain);
+  if (hs) {
     char auth[URL_HOST_MAX + 8];
     int an = 0;
     sapp(auth, &an, sizeof auth, u.host);
@@ -1674,33 +1760,45 @@ static void subres_job(void *vctx, int i)
         sapp(xh, &xn, sizeof xh, ch);
     }
     struct h2_opts o = {browser_ua(), xh, 0};
-    h2_fetch_many(conn, 1, auth, &o, reqs, ng, 0, 0); /* accumulate */
-    nc_close(conn);
-    for (int g = 0; g < ng; g++) {
-      /* Only a 200 is usable; others are dropped and retried over h1.1 like subres_get. */
-      if (!reqs[g].failed && reqs[g].status == 200 && reqs[g].body) {
-        c->bodies[grp[g]] = reqs[g].body;
-        c->lens[grp[g]] = reqs[g].blen;
-        if (reqs[g].hdr && reqs[g].hdrlen > 0) { /* cache the fetched 200 */
-          char vh[VARY_HDRS_MAX];
-          vary_req_hdrs(c->urls[grp[g]], c->accept, 0, true, vh);
-          cache_store("GET", c->urls[grp[g]], vh, reqs[g].status, now, reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
-        }
-        {
-          struct net_log e = {"GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0};
-          devtools_net_add(&e);
-        }
-      } else {
-        if (reqs[g].body)
-          free(reqs[g].body); /* h1.1 retry (logs itself) */
-        c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
+    for (int attempt = 0; hs; attempt++) {
+      bool reused = h2_session_used(hs), answered = false;
+      int rc = h2_session_fetch_many(hs, 1, auth, &o, reqs, ng, 0, 0); /* accumulate */
+      h2_session_release(hs, u.host, u.port);
+      hs = 0;
+      for (int g = 0; g < ng; g++)
+        answered |= reqs[g].status > 0;
+      if (rc >= 0 || !reused || answered || attempt)
+        break;
+      /* An idle session the peer had closed: redo the batch on a new connection. */
+      for (int g = 0; g < ng; g++) {
+        free(reqs[g].body);
+        reqs[g].body = 0;
+        reqs[g].blen = reqs[g].hdrlen = reqs[g].failed = 0;
       }
+      hs = h2_open(&u, true, &plain);
     }
-  } else {
-    if (conn)
-      nc_close(conn);
-    for (int g = 0; g < ng; g++) /* no h2: h1.1 each */
+  }
+  if (plain)
+    nc_release(plain, u.host, u.port, 1); /* HTTP/1.1 only: park it for the fetches below */
+  for (int g = 0; g < ng; g++) {
+    /* Only a 200 is usable; others are dropped and retried over h1.1 like subres_get. */
+    if (!reqs[g].failed && reqs[g].status == 200 && reqs[g].body) {
+      c->bodies[grp[g]] = reqs[g].body;
+      c->lens[grp[g]] = reqs[g].blen;
+      if (reqs[g].hdr && reqs[g].hdrlen > 0) { /* cache the fetched 200 */
+        char vh[VARY_HDRS_MAX];
+        vary_req_hdrs(c->urls[grp[g]], c->accept, 0, true, vh);
+        cache_store("GET", c->urls[grp[g]], vh, reqs[g].status, now, reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
+      }
+      {
+        struct net_log e = {"GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0};
+        devtools_net_add(&e);
+      }
+    } else {
+      if (reqs[g].body)
+        free(reqs[g].body); /* h1.1 retry (logs itself) */
       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
+    }
   }
   free(paths);
   free(hdrs);
@@ -1758,7 +1856,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
 /* Batch hook for html.c's external stylesheets. */
 void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens)
 {
-  subres_get_batch(urls, n, "text/css,*/*", bodies, lens);
+  subres_get_batch(urls, n, SUBRES_ACCEPT, bodies, lens);
 }
 
 /* --- parallel inline-image fetching --- */
@@ -2037,18 +2135,15 @@ static void h2_prefetch(const char *page_url)
     return;
   }
 
-  netconn *conn = nc_open(pu.host, pu.port, /*tls=*/1, /*offer_h2=*/1);
-  if (!conn) {
+  netconn *plain;
+  h2_session *hs = h2_open(&pu, false, &plain);
+  if (!hs) { /* HTTP/1.1 only, or unreachable: the h1.1 pool fetches these */
+    if (plain)
+      nc_release(plain, pu.host, pu.port, 1);
     free(paths);
     free(hdrs);
     return;
   }
-  if (nc_alpn(conn) != ALPN_H2) {
-    nc_close(conn);
-    free(paths);
-    free(hdrs);
-    return;
-  } /* pool handles */
 
   char auth[URL_HOST_MAX + 8];
   int an = 0;
@@ -2076,8 +2171,19 @@ static void h2_prefetch(const char *page_url)
 
   /* Commit each image as its stream finishes; a failed stream leaves ok=0 for the h1.1 pool. */
   struct h2img_ctx hc = {idxs, reqs, now};
-  h2_fetch_many(conn, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
-  nc_close(conn);
+  for (int attempt = 0; hs; attempt++) {
+    bool reused = h2_session_used(hs), answered = false;
+    int rc = h2_session_fetch_many(hs, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
+    h2_session_release(hs, pu.host, pu.port);
+    hs = 0;
+    for (int g = 0; g < nb; g++)
+      answered |= reqs[g].status > 0;
+    if (rc >= 0 || !reused || answered || attempt)
+      break;
+    hs = h2_open(&pu, true, &plain); /* the idle session had been closed by the peer */
+  }
+  if (plain)
+    nc_release(plain, pu.host, pu.port, 1);
   free(paths);
   free(hdrs);
 }

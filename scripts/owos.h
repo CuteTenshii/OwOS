@@ -154,5 +154,9 @@ int net_dial(const char *host, int port, int proto);
 int net_send(int h, const void *buf, int len);
 int net_recv(int h, void *buf, int max);
 int net_close(int h);
+int net_recv_nb(int h, void *buf, int max);
+#define ALPN_NONE 0
+#define ALPN_HTTP11 1
+#define ALPN_H2 2
 
 #endif /* OWOS_HOST_TEST_SHIM_H */

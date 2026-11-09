@@ -6,8 +6,8 @@
  * CONTINUATION) and HPACK (RFC 7541: static + dynamic table, integer +
  * Huffman).
  *
- * One request, one stream (stream 1), GET/HEAD/etc. with no request body — the
- * shape libcurl needs. Errors reuse http.h's HTTP_E* codes, so callers handle
+ * One request per connection at a time (a batch multiplexes several GETs), with
+ * an optional request body. Errors reuse http.h's HTTP_E* codes, so callers handle
  * an h2 transfer and an HTTP/1.1 transfer the same way. */
 #ifndef OWOS_LIBH2_H
 #define OWOS_LIBH2_H
@@ -90,5 +90,35 @@ struct h2_fetch {
 int h2_fetch_many(netconn *conn, int scheme_https, const char *authority, const struct h2_opts *opts,
                   struct h2_fetch *reqs, int nreq,
                   void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx);
+
+/* ------------------------------------------------------------- sessions
+ * A session keeps one h2 connection open across requests: the preface is sent once, stream ids, flow-control
+ * windows and the HPACK table carry on, and the connection waits in the idle pool (netconn.h) between uses. A
+ * session serves one request at a time; concurrent callers each get their own. */
+typedef struct h2_conn h2_session;
+
+/* Wrap a connection whose ALPN selected h2 (nothing sent yet). Takes ownership of `conn`, closing it on failure. */
+h2_session *h2_session_wrap(netconn *conn);
+
+/* An idle session for host:port (TLS), or NULL. It may have been closed by the peer meanwhile: when
+ * h2_session_used() and a request fails before any response, retry on a fresh connection. */
+h2_session *h2_session_acquire(const char *host, int port);
+
+/* Give a session back after a request: parked for reuse if it ended cleanly, else closed. */
+void h2_session_release(h2_session *s, const char *host, int port);
+
+/* Close a session and its connection. */
+void h2_session_close(h2_session *s);
+
+/* 1 if the session has already carried a request. */
+int h2_session_used(const h2_session *s);
+
+/* h2_run_body / h2_fetch_many over a session. */
+int h2_session_run(h2_session *s, int scheme_https, const char *authority, const char *method, const char *path,
+                   const struct h2_opts *opts, const unsigned char *reqbody, int reqlen, char *hdr, int hdrcap,
+                   int *hdrlen, http_body_fn body, void *ctx);
+int h2_session_fetch_many(h2_session *s, int scheme_https, const char *authority, const struct h2_opts *opts,
+                          struct h2_fetch *reqs, int nreq,
+                          void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx);
 
 #endif /* OWOS_LIBH2_H */

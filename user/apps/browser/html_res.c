@@ -1,5 +1,6 @@
 #include "features/clienthints/clienthints.h"
 #include "fontstore.h"
+#include "hints.h"
 #include "html_int.h"
 
 /* Stylesheets are collected as an ORDERED list of sources first */
@@ -109,6 +110,28 @@ void collect_styles(struct dom_node *node)
     } else {
       collect_styles(c);
     }
+  }
+}
+
+/* Start the <link rel=preconnect|preload> hints in <head>; a preload with a media query is skipped. */
+void scan_resource_hints(struct dom_node *root)
+{
+  struct dom_node *head = find_tag(root, "head");
+  if (!head)
+    return;
+  for (struct dom_node *c = head->first_child; c; c = c->next) {
+    if (c->type != DOM_ELEMENT || !streq(c->tag, "link"))
+      continue;
+    const char *rel = dom_get_attr(c, "rel"), *href = dom_get_attr(c, "href");
+    if (!rel || !href || !href[0])
+      continue;
+    char abs[URL_MAX];
+    resolve_url(g_page_url, href, abs, sizeof abs);
+    if (hint_rel_has(rel, rel + strlen(rel), "preconnect"))
+      hint_preconnect(abs);
+    const char *as = dom_get_attr(c, "as");
+    if (as && hint_rel_has(rel, rel + strlen(rel), "preload") && !dom_get_attr(c, "media"))
+      hint_preload(abs, as, g_page_url);
   }
 }
 
