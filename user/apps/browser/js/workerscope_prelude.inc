@@ -27,21 +27,19 @@ JS(
   hide(DOMException.prototype, "constructor", DOMException);
   hide(g, "DOMException", DOMException);
 
+  /* The defaults live on the prototype, so making an event costs two own properties plus whatever init sets */
   function Event(type, init) {
     if (arguments.length === 0) { throw typeError("Failed to construct Event: 1 argument required"); }
-    init = init || {};
-    hide(this, "@stop", false);
     this.type = String(type);
-    this.bubbles = !!init.bubbles;
-    this.cancelable = !!init.cancelable;
-    this.composed = !!init.composed;
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
-    this.eventPhase = 0;
-    this.isTrusted = false;
     this.timeStamp = g.performance.now();
+    if (init) {
+      if (init.bubbles) { this.bubbles = true; }
+      if (init.cancelable) { this.cancelable = true; }
+      if (init.composed) { this.composed = true; }
+    }
   }
+  [["bubbles", false], ["cancelable", false], ["composed", false], ["defaultPrevented", false], ["eventPhase", 0],
+    ["isTrusted", false], ["target", null], ["currentTarget", null], ["@stop", false]].forEach(function (d) { hide(Event.prototype, d[0], d[1]); });
   method(Event.prototype, "preventDefault", function () { if (this.cancelable) { this.defaultPrevented = true; } });
   method(Event.prototype, "stopPropagation", function () {});
   method(Event.prototype, "stopImmediatePropagation", function () { this["@stop"] = true; });
@@ -50,11 +48,11 @@ JS(
   function subclass(name, fields) {
     function Sub(type, init) {
       Event.call(this, type, init);
-      init = init || {};
-      for (var k in fields) { this[k] = init[k] === undefined ? fields[k] : init[k]; }
+      if (init) { for (var k in fields) { if (init[k] !== undefined) { this[k] = init[k]; } } }
     }
     Sub.prototype = Object.create(Event.prototype);
     hide(Sub.prototype, "constructor", Sub);
+    for (var k in fields) { hide(Sub.prototype, k, fields[k]); }
     hide(g, name, Sub);
     return Sub;
   }
@@ -100,12 +98,11 @@ JS(
     return !ev.defaultPrevented;
   });
   hide(g, "EventTarget", EventTarget);
-  ["addEventListener", "removeEventListener", "dispatchEvent"].forEach(function (k) { hide(g, k, EventTarget.prototype[k]); });
+  ["addEventListener", "removeEventListener", "dispatchEvent"].forEach(function (k) { hide(g, k, EventTarget.prototype[k].bind(g)); });
   hide(g, "self", g);
   g.onmessage = null;
   g.onmessageerror = null;
   g.onerror = null;
-  hide(g, "@deliver", function (data) { g.dispatchEvent(new g.MessageEvent("message", { data: data })); });
   /* An uncaught error is offered to self.onerror (legacy signature) and error listeners before it reaches the page */
   N.onerror = function (message) {
     var handled = false, ev, h = g.onerror;

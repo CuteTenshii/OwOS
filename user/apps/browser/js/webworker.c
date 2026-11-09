@@ -1215,20 +1215,83 @@ static void wt_setup(js_ctx *ctx, struct wthread *wt)
   gc_pop_scope();
 }
 
+/* Call one handler of the global with the event, reporting a throw */
+static void wt_call_handler(js_ctx *ctx, js_value fn, js_value ev)
+{
+  js_value g = js_obj_value(ctx->global);
+  if (js_is_callable(fn))
+    js_call(ctx, fn, g, &ev, 1);
+  else if (fn.type == JV_OBJ) {
+    js_value handle = js_get(ctx, fn, "handleEvent");
+    if (js_is_callable(handle))
+      js_call(ctx, handle, fn, &ev, 1);
+  }
+  if (ctx->has_exc)
+    wt_report(ctx);
+}
+
+/* A MessageEvent for `data`, built here instead of by the script-side constructor, then handed to onmessage and to
+ * the listeners the prelude recorded under "@listeners" (the same order dispatchEvent would use) */
+static void wt_fire_message(js_ctx *ctx, js_value data)
+{
+  js_value g = js_obj_value(ctx->global), ctor = js_get(ctx, g, "MessageEvent"), proto, ls, list;
+  js_object *ev;
+  unsigned n, i;
+  const unsigned char flags = P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE;
+  proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef();
+  if (proto.type != JV_OBJ)
+    return;
+  gc_push_scope();
+  ev = (js_object *)gc_keep(js_new_object(ctx, proto.u.obj));
+  js_def(ev, "type", js_mk_cstring(ctx, "message"), flags);
+  js_def(ev, "bubbles", js_bool(0), flags);
+  js_def(ev, "cancelable", js_bool(0), flags);
+  js_def(ev, "composed", js_bool(0), flags);
+  js_def(ev, "defaultPrevented", js_bool(0), flags);
+  js_def(ev, "target", g, flags);
+  js_def(ev, "currentTarget", g, flags);
+  js_def(ev, "eventPhase", js_number(0), flags);
+  js_def(ev, "isTrusted", js_bool(0), flags);
+  js_def(ev, "timeStamp", wt_perf_now(ctx, js_undef(), 0, 0), flags);
+  js_def(ev, "data", data, flags);
+  js_def(ev, "origin", js_mk_cstring(ctx, ""), flags);
+  js_def(ev, "lastEventId", js_mk_cstring(ctx, ""), flags);
+  js_def(ev, "source", js_null(), flags);
+  js_def(ev, "ports", js_obj_value(js_new_array(ctx, 0)), flags);
+  js_def(ev, "@stop", js_bool(0), P_WRITABLE | P_CONFIGURABLE);
+  wt_call_handler(ctx, js_get(ctx, g, "onmessage"), js_obj_value(ev));
+  ls = js_get(ctx, g, "@listeners");
+  list = ls.type == JV_OBJ ? js_get(ctx, ls, "message") : js_undef();
+  if (list.type == JV_OBJ) {
+    js_object *snapshot = (js_object *)gc_keep(js_new_array(ctx, 0));
+    n = js_array_len(list.u.obj);
+    for (i = 0; i < n; i++) /* listeners added during dispatch wait for the next event */
+      js_array_push(ctx, snapshot, js_get_index(ctx, list, i));
+    for (i = 0; i < n && !js_to_boolean(js_get(ctx, js_obj_value(ev), "@stop")); i++) {
+      js_value rec = js_get_index(ctx, js_obj_value(snapshot), i), fn = js_get(ctx, rec, "fn");
+      if (js_to_boolean(js_get(ctx, rec, "once"))) {
+        js_value rm[2], remove = js_get(ctx, g, "removeEventListener");
+        rm[0] = js_mk_cstring(ctx, "message");
+        rm[1] = fn;
+        js_call(ctx, remove, g, rm, 2);
+      }
+      wt_call_handler(ctx, fn, js_obj_value(ev));
+    }
+  }
+  js_set(ctx, js_obj_value(ev), "currentTarget", js_null());
+  gc_pop_scope();
+}
+
 static void wt_deliver(js_ctx *ctx, js_clone *c)
 {
-  js_value data = js_clone_read(ctx, c), fn, ev[1];
+  js_value data = js_clone_read(ctx, c);
   gc_push_scope();
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
   if (ctx->has_exc)
     wt_report(ctx);
   else {
-    fn = js_get(ctx, js_obj_value(ctx->global), "@deliver");
-    ev[0] = data;
-    js_call(ctx, fn, js_obj_value(ctx->global), ev, 1);
-    if (ctx->has_exc)
-      wt_report(ctx);
+    wt_fire_message(ctx, data);
     wt_run_microtasks(ctx);
   }
   gc_pop_scope();

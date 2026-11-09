@@ -426,6 +426,24 @@ static void test_worker_url_edges(void)
       "for (var i=0;i<want.length;i++) expect(ue[i]===want[i], 'URL case '+i+': got '+ue[i]+' want '+want[i]);\n");
 }
 
+static void test_message_dispatch(void)
+{
+  run_script(
+      "var md=null, mdw=new Worker('data:text/javascript,var log=[]; onmessage=function(e){ "
+      "log.push(\"on:\"+e.data+\":\"+(e.target===self)+(e instanceof MessageEvent)+e.ports.length); };"
+      "addEventListener(\"message\",function(e){ log.push(\"a\"); addEventListener(\"message\",function(){ "
+      "log.push(\"late\"); }); });"
+      "addEventListener(\"message\",function(e){ log.push(\"once\"); },{once:true});"
+      "addEventListener(\"message\",{handleEvent:function(e){ log.push(\"obj\"); e.stopImmediatePropagation(); }});"
+      "addEventListener(\"message\",function(e){ log.push(\"never\"); });"
+      "setTimeout(function(){ postMessage(log.join()); },60);');\n"
+      "mdw.onmessage=function(e){ md=e.data; }; mdw.onerror=function(e){ md=\"E:\"+e.message; };\n"
+      "mdw.postMessage(1); mdw.postMessage(2);\n");
+  expect(wait_for("md!==null"));
+  run_script("expect(md==='on:1:truetrue0,a,once,obj,on:2:truetrue0,a,obj', 'handler, listeners, once, handleEvent, "
+             "stopImmediatePropagation: '+md);\n");
+}
+
 static void test_blob_crosses(void)
 {
   run_script("var bl=null, bw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data; "
@@ -577,6 +595,7 @@ int main(void)
   worker_test("performance marks, error events, FileReader", test_worker_misc_apis);
   worker_test("MessagePorts move between page and worker", test_ports_cross);
   worker_test("URL edge cases", test_worker_url_edges);
+  worker_test("message events reach onmessage and every listener in order", test_message_dispatch);
   worker_test("Blobs cross between page and worker", test_blob_crosses);
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
