@@ -931,4 +931,23 @@ static inline int ru_grid_place(int ncols, int nit, int *col, int *row, int *cs,
   return nrows;
 }
 
+/* Mirror a w x h block of pixels in place: fx left-right, fy top-bottom. */
+static inline void ru_flip_rect(unsigned *px, int stride, int w, int h, bool fx, bool fy)
+{
+  if (fy)
+    for (int y = 0; y < h / 2; y++)
+      for (int x = 0; x < w; x++) {
+        unsigned t = px[(long)y * stride + x];
+        px[(long)y * stride + x] = px[(long)(h - 1 - y) * stride + x];
+        px[(long)(h - 1 - y) * stride + x] = t;
+      }
+  if (fx)
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w / 2; x++) {
+        unsigned t = px[(long)y * stride + x];
+        px[(long)y * stride + x] = px[(long)y * stride + w - 1 - x];
+        px[(long)y * stride + w - 1 - x] = t;
+      }
+}
+
 #endif /* OWOS_RENDER_UTIL_H */

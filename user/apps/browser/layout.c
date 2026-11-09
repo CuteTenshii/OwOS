@@ -128,6 +128,7 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->align_self = cs->align_self;
   b->aspect = cs->aspect > 0 ? cs->aspect : 0;
   b->hidden = (unsigned char)(cs->visibility == 0);
+  b->bg_clip = (unsigned char)(cs->bg_clip > 0 ? cs->bg_clip : 0);
   b->ext = ext_new(cs);
   if (cs->n_cols > 0)
     for (int i = 0; i < cs->n_cols && i < CSS_GRID_MAX; i++)

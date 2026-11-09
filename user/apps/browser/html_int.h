@@ -21,6 +21,8 @@
 struct sty {
   unsigned fg;
   unsigned char bold, under, italic, strike, nowrap, ttx, smallcaps;
+  signed char ls, va;           /* letter-spacing px, vertical-align shift px (down) */
+  unsigned char tabsize;        /* tab-size, in spaces */
   unsigned char hidden;         /* inherited visibility:hidden */
   unsigned char clip, ellipsis; /* the enclosing block clips overflow, and shows an ellipsis */
 };

@@ -14,6 +14,8 @@ static void page_free(struct page *p)
   free(p->align);
   free(p->fsz);
   free(p->lh);
+  free(p->ls);
+  free(p->va);
   free(p->fg);
   free(p->bg);
   free(p->links);

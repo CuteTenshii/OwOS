@@ -45,6 +45,7 @@ struct lbox {
   signed char align_self;     /* enum css_align, -1/AUTO = the container's align-items */
   int aspect;                 /* aspect-ratio * 1000, 0 none */
   unsigned char hidden;       /* visibility:hidden (inherited): paint no background or border */
+  unsigned char bg_clip;      /* background-clip: 0 border box, 1 padding box, 2 content box */
   struct lext *ext;
   signed char pos;      /* enum css_pos, or -1 (static/unset)   */
   signed char overflow; /* 0 visible / 1 hidden / 2 scroll / -1 unset */

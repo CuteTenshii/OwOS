@@ -60,7 +60,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
       for (int p = rs; p < re;) {
         int gp = p;
         p += utf8_decode(&t[p], &t[re], &cp);
-        lw += body_cp_adv(c, cp, glyph_px(gp));
+        lw += glyph_adv(c, cp, gp);
       }
       int room = (g_fr->lt.w[first] - c->bindent * INDENT_PX) - lw;
       if (room > 0)
@@ -70,13 +70,13 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
     for (int p = rs; p < a;) {
       int gp = p;
       p += utf8_decode(&t[p], &t[re], &cp);
-      x += body_cp_adv(c, cp, glyph_px(gp));
+      x += glyph_adv(c, cp, gp);
     }
     w = 0;
     for (int p = a; p < b;) {
       int gp = p;
       p += utf8_decode(&t[p], &t[re], &cp);
-      w += body_cp_adv(c, cp, glyph_px(gp));
+      w += glyph_adv(c, cp, gp);
     }
     if (w < 1)
       w = 1;
@@ -198,7 +198,7 @@ static void flow_slice(int t0, int t1, int base_x, int w)
           while (e < j) {
             unsigned cp;
             int nb = utf8_decode(&pg->text[e], &pg->text[j], &cp);
-            int cw = body_cp_adv(c, cp, glyph_px(e));
+            int cw = glyph_adv(c, cp, e);
             if (wd + cw > avail && e > ls)
               break;
             if (cp == ' ')
@@ -294,7 +294,7 @@ static int slice_maxcontent(int t0, int t1)
       for (int p = i; p < j;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[j], &cp);
-        w += body_cp_adv(&g_wk, cp, glyph_px(gp));
+        w += glyph_adv(&g_wk, cp, gp);
       }
       if (w > best)
         best = w;
@@ -997,6 +997,9 @@ unsigned layout_sig(int paw)
   h = layout_mix(h, (unsigned)pg->mode);
   if (pg->text)
     h = layout_mix(h, ru_text_sig(pg->text, pg->fsz, pg->lh, pg->bp, pg->attr, pg->text_len, ST_NOWRAP));
+  if (pg->has_ls)
+    for (int i = 0; i < pg->text_len; i++)
+      h = layout_mix(h, (unsigned)(unsigned char)pg->ls[i]);
   int n;
   const struct lbox *bx = layout_pool(&n);
   h = layout_mix(h, (unsigned)n);

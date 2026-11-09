@@ -49,6 +49,15 @@ static void dim_rect(int x, int y, int w, int h, int ct, int cb, unsigned argb)
     }
 }
 
+/* The page scrollbar; with scrollbar-width:none its strip shows the canvas instead. */
+static void draw_page_scrollbar(int pw, int py, int phh)
+{
+  if (B->pg->sb_none)
+    gfx_fill_rect(pw, py, SCROLL_W, phh, B->pg->page_bg);
+  else
+    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
+}
+
 /* Paint the position:fixed / top-layer boxes over the page, bottom to top */
 static void paint_overlays(int py, int pw, int ct, int cb)
 {
@@ -249,7 +258,7 @@ void render(void)
   } else {
     paint_page_band(py, pw, py, py + phh, bg);
     /* scrollbar (units are document pixels) */
-    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
+    draw_page_scrollbar(pw, py, phh);
   }
 
   if (hover_url[0])
@@ -390,7 +399,7 @@ bool render_incremental(unsigned seq_delta, int id)
   if (cb > ct)
     paint_page_band(py, pw, ct, cb, B->pg->page_bg);
   if (scrolled || cb > ct) {
-    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
+    draw_page_scrollbar(pw, py, phh);
     if (hover_url[0])
       draw_hover_status();
   }

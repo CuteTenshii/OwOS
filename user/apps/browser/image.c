@@ -355,6 +355,41 @@ static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned d
   return ru_imgcache_find(&g_imgc, im->uid, im->iw, im->ih, dw, dh);
 }
 
+/* The plain blit of the fitted image (fw x fh at ox,oy in a dw x dh box at x0,y0) into rows [ry0,ry1), columns [lo,hi).
+ */
+static void blit_image(struct inl_img *im, unsigned *fb, int x0, int y0, int dw, int dh, int fw, int fh, int ox, int oy,
+                       int ry0, int ry1, unsigned lo, unsigned hi, int ct, int cb)
+{
+  /* SVGs and animated frames live raw in img_pool */
+  if (im->is_argb) {
+    if (im->uid)
+      animimg_seen(im->uid);
+    const unsigned char *src = B->img_pool + im->coff;
+    const unsigned *xm = xmap_get((unsigned)fw, im->iw);
+    for (int ry = ry0; ry < ry1; ry++) {
+      const unsigned char *srow = src + (unsigned long)((unsigned)(ry - oy) * im->ih / (unsigned)fh) * im->iw * 4;
+      ru_blit_row_rgba(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, im->iw, lo, hi);
+    }
+    return;
+  }
+  const struct ru_img *c = imgc_get(im, (unsigned)fw, (unsigned)fh);
+  if (c) {
+    const unsigned *xm = c->cw == (unsigned)fw ? 0 : xmap_get((unsigned)fw, c->cw);
+    for (int ry = ry0; ry < ry1; ry++) {
+      const unsigned *srow = c->px + (unsigned long)((unsigned)(ry - oy) * c->ch / (unsigned)fh) * c->cw;
+      ru_blit_row_words(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, c->cw, c->opaque, lo, hi);
+    }
+    return;
+  }
+  /* Fallback (too large to hold / decode failed): stream it once, filling the box. */
+  unsigned flo, fhi;
+  if (!clip_cols(x0, (unsigned)dw, &flo, &fhi))
+    return;
+  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), flo, fhi};
+  struct poolrd r = {0, im->coff, im->clen};
+  png_decode(poolrd_get, &r, inl_row, &v, 0, 0);
+}
+
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 {
   if (im->hidden)
@@ -391,34 +426,35 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   if (ry1 > oy + fh)
     ry1 = oy + fh;
 
-  /* SVGs and animated frames live raw in img_pool */
-  if (im->is_argb) {
-    if (im->uid)
-      animimg_seen(im->uid);
-    const unsigned char *src = B->img_pool + im->coff;
-    const unsigned *xm = xmap_get((unsigned)fw, im->iw);
-    for (int ry = ry0; ry < ry1; ry++) {
-      const unsigned char *srow = src + (unsigned long)((unsigned)(ry - oy) * im->ih / (unsigned)fh) * im->iw * 4;
-      ru_blit_row_rgba(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, im->iw, lo, hi);
-    }
-    return;
+  bool fx = im->flip & 1, fy = im->flip & 2;
+  bool flip = (fx || fy) && lo == 0 && hi == (unsigned)fw && ry0 == oy && ry1 == oy + fh; /* whole image on screen */
+  bool filt = im->fbright != 1000 || im->fgray || im->finvert;
+  int vw = (int)(hi - lo), vh = ry1 - ry0;
+  unsigned *base = fb + (long)(y0 + ry0) * BW + x0 + ox + lo;
+  unsigned *save = filt ? malloc((unsigned long)vw * (unsigned long)vh * 4) : 0;
+  if (save)
+    for (int r = 0; r < vh; r++)
+      memcpy(save + (long)r * vw, base + (long)r * BW, (unsigned long)vw * 4);
+  /* Mirroring the backdrop first and the result after puts the image mirrored over an unmirrored backdrop. */
+  if (flip)
+    ru_flip_rect(fb + (long)(y0 + oy) * BW + x0 + ox, BW, fw, fh, fx, fy);
+  blit_image(im, fb, x0, y0, dw, dh, fw, fh, ox, oy, ry0, ry1, lo, hi, ct, cb);
+  if (flip)
+    ru_flip_rect(fb + (long)(y0 + oy) * BW + x0 + ox, BW, fw, fh, fx, fy);
+  if (save) { /* pixels the blit changed are the image's; filter those and leave the backdrop alone */
+    struct lext fe;
+    memset(&fe, 0, sizeof fe);
+    fe.flt_bright = im->fbright;
+    fe.flt_gray = im->fgray;
+    fe.flt_invert = im->finvert;
+    for (int r = 0; r < vh; r++)
+      for (int c = 0; c < vw; c++) {
+        unsigned *p = base + (long)r * BW + c;
+        if (*p != save[(long)r * vw + c])
+          *p = ru_filter_rgb(&fe, *p);
+      }
+    free(save);
   }
-  const struct ru_img *c = imgc_get(im, (unsigned)fw, (unsigned)fh);
-  if (c) {
-    const unsigned *xm = c->cw == (unsigned)fw ? 0 : xmap_get((unsigned)fw, c->cw);
-    for (int ry = ry0; ry < ry1; ry++) {
-      const unsigned *srow = c->px + (unsigned long)((unsigned)(ry - oy) * c->ch / (unsigned)fh) * c->cw;
-      ru_blit_row_words(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, c->cw, c->opaque, lo, hi);
-    }
-    return;
-  }
-  /* Fallback (too large to hold / decode failed): stream it once, filling the box. */
-  unsigned flo, fhi;
-  if (!clip_cols(x0, (unsigned)dw, &flo, &fhi))
-    return;
-  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), flo, fhi};
-  struct poolrd r = {0, im->coff, im->clen};
-  png_decode(poolrd_get, &r, inl_row, &v, 0, 0);
 }
 
 /* A placeholder box for an image that couldn't be fetched/decoded. */

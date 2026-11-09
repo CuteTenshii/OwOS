@@ -459,6 +459,8 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
         st->pseudo_el = PE_SELECTION;
       else if (dbl && span_is(ns, ne, "backdrop"))
         st->pseudo_el = PE_BACKDROP;
+      else if (span_is(ns, ne, "marker") || span_is(ns, ne, "-webkit-details-marker"))
+        st->pseudo_el = PE_MARKER;
       else if (dbl && span_is(ns, ne, "slotted") && as) {
         st->pseudo_el = PE_SLOTTED;
         st->pe_list = parse_sel_list(as, ae);

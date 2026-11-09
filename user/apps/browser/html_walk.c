@@ -25,9 +25,28 @@ static void emit_pseudo(struct dom_node *el, int which)
   const struct css_style *pcs = el->pseudo_style[which - 1];
   if (!pcs)
     return;
+  char text[256];
+  int n = 0;
+  for (const char *c = pcs->content; *c && n < (int)sizeof text - 1; c++) {
+    if (*c != CONTENT_ATTR) {
+      text[n++] = *c;
+      continue;
+    }
+    char name[48];
+    int k = 0;
+    for (c++; *c && *c != CONTENT_END && k < (int)sizeof name - 1; c++)
+      name[k++] = *c;
+    name[k] = '\0';
+    const char *v = dom_get_attr(el, name);
+    for (; v && *v && n < (int)sizeof text - 1; v++)
+      text[n++] = *v;
+    if (!*c)
+      break;
+  }
+  text[n] = '\0';
   struct sty sv = sty_cur;
   apply_css(pcs);
-  emit_text(pcs->content);
+  emit_text(text);
   sty_cur = sv;
 }
 
@@ -368,7 +387,8 @@ static void walk_element_inner(struct dom_node *el)
     sty_cur.bold = 1;
     g_has_controls = true; /* route the click that toggles it */
     bool open = el->parent && dom_get_attr(el->parent, "open");
-    emit_lit(open ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ", ST_BOLD); /* ▾ open, ▸ closed */
+    if (cs.list_style != CSS_LST_NONE && !css_marker_hidden(sheet_for(el), el)) /* list-style:none or a hidden marker */
+      emit_lit(open ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ", ST_BOLD);              /* ▾ open, ▸ closed */
     walk(el);
     sty_cur = sv;
     block_break();
@@ -406,6 +426,18 @@ static void walk_element_inner(struct dom_node *el)
     W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 5 / 6);
   else if (streq(name, "sub") || streq(name, "sup"))
     W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 3 / 4);
+  if (streq(name, "sub") || streq(name, "sup")) { /* UA baseline shift, unless CSS sets one */
+    int fp = W_fontpx ? W_fontpx : HTML_BASE_FONT;
+    sty_cur.va = (signed char)(name[2] == 'b' ? fp / 3 : -fp / 2);
+  }
+  if (cs.va_kind >= 0) {
+    int fp = W_fontpx ? W_fontpx : HTML_BASE_FONT;
+    sty_cur.va = (signed char)(cs.va_kind == CSS_VA_SUB      ? fp / 5
+                               : cs.va_kind == CSS_VA_SUPER  ? -fp / 3
+                               : cs.va_kind == CSS_VA_MIDDLE ? -fp / 4
+                               : cs.va_kind == CSS_VA_LEN    ? -cs.va_len
+                                                             : 0);
+  }
   if (streq(name, "center") || streq(name, "caption"))
     W_center = 1;
   else if (cs.center >= 0)
@@ -485,7 +517,7 @@ static void walk_element_inner(struct dom_node *el)
       W_olnum = num;
     }
     char mark[24];
-    if (li_marker(ls, num, mark, sizeof mark))
+    if (!css_marker_hidden(sheet_for(el), el) && li_marker(ls, num, mark, sizeof mark))
       emit_lit(mark, a);
   }
   if (blk) {

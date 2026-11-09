@@ -205,6 +205,10 @@ static void img_box_style(struct inl_img *im, const struct css_style *cs)
     im->ch = (int)((long)im->cw * 1000 / cs->aspect);
   im->fit = cs->obj_fit > 0 ? cs->obj_fit : 0;
   im->hidden = sty_cur.hidden;
+  im->flip = cs->tr_flip;
+  im->fbright = cs->flt_bright >= 0 ? cs->flt_bright : 1000;
+  im->fgray = cs->flt_gray >= 0 ? cs->flt_gray : 0;
+  im->finvert = cs->flt_invert >= 0 ? cs->flt_invert : 0;
 }
 
 /* Inline <svg>…</svg> */

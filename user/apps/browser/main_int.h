@@ -149,6 +149,8 @@ void set_block(struct bctx *c, int off);
 int glyph_px(int off);
 int body_cp_adv(struct bctx *c, unsigned cp, int px);
 int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px, int baseline,
+/* Advance of the glyph at text offset `off`: its font size plus its letter-spacing. */
+static inline int glyph_adv(struct bctx *c, unsigned cp, int off) { return body_cp_adv(c, cp, glyph_px(off)) + B->pg->ls[off]; }
                   int italic);
 int run_ascent(int px);
 int line_height(int maxpx, int lhmax);

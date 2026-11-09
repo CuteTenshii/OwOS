@@ -60,6 +60,28 @@ static const char *fn_args_end(const char *s)
   return s;
 }
 
+/* An <angle> in degrees; false if not an angle. */
+static bool parse_angle(const char *v, int *deg)
+{
+  v = skip_ws(v);
+  double n;
+  if (!calc_number(&v, &n))
+    return false;
+  double d;
+  if (starts_ci(v, "deg") || !*v)
+    d = n;
+  else if (starts_ci(v, "turn"))
+    d = n * 360.0;
+  else if (starts_ci(v, "grad"))
+    d = n * 0.9;
+  else if (starts_ci(v, "rad"))
+    d = n * 57.29577951;
+  else
+    return false;
+  *deg = (int)(d + (d < 0 ? -0.5 : 0.5));
+  return true;
+}
+
 /* A <number> or <percentage>: *x1000 gets the value times 1000 (percent counts as value/100). */
 static bool parse_num_pct(const char *v, int *x1000)
 {
@@ -97,8 +119,10 @@ static void tr_translate(struct css_style *o, const char *arg, int axis)
 /* `transform`: translate functions apply, other functions (scale, rotate, matrix) leave the element untransformed. */
 static void parse_transform(const char *v, struct css_style *o, bool reset)
 {
-  if (reset)
+  if (reset) {
     o->tr_x = o->tr_y = o->tr_xp = o->tr_yp = 0;
+    o->tr_flip = 0;
+  }
   o->has_tr = 0;
   for (const char *s = v; *s;) {
     s = skip_ws(s);
@@ -123,6 +147,23 @@ static void parse_transform(const char *v, struct css_style *o, bool reset)
     } else if (!strcmp(name, "translatey") && n > 0) {
       tr_translate(o, arg[0], 1);
       o->has_tr = 1;
+    } else if (!strcmp(name, "rotate") || !strcmp(name, "rotatez")) {
+      int deg;
+      if (n > 0 && parse_angle(arg[0], &deg) && ((deg % 360) + 360) % 360 == 180)
+        o->tr_flip ^= 3;
+    } else if (starts_ci(name, "scale")) {
+      int kx = 1000, ky = 1000;
+      if (n > 0 && parse_num_pct(arg[0], &kx))
+        ky = kx;
+      if (n > 1)
+        parse_num_pct(arg[1], &ky);
+      if (!strcmp(name, "scalex"))
+        ky = 1000;
+      else if (!strcmp(name, "scaley")) {
+        ky = kx;
+        kx = 1000;
+      }
+      o->tr_flip ^= (signed char)((kx < 0 ? 1 : 0) | (ky < 0 ? 2 : 0));
     }
     s = *ae ? ae + 1 : ae;
   }
@@ -591,6 +632,30 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
   } else if (span_is(p, pe, "user-select") || span_is(p, pe, "-webkit-user-select") ||
              span_is(p, pe, "-moz-user-select")) {
     out->user_select = has_ci(val, "none") ? 0 : 1;
+  } else if (span_is(p, pe, "letter-spacing")) {
+    int px, pct;
+    if (has_ci(val, "normal"))
+      out->letter_sp = 0;
+    else if (parse_slen(val, &px, &pct) && !pct)
+      out->letter_sp = clamp16(px);
+  } else if (span_is(p, pe, "vertical-align")) {
+    int px, pct;
+    out->va_kind = has_ci(val, "sub")        ? CSS_VA_SUB
+                   : has_ci(val, "super")    ? CSS_VA_SUPER
+                   : has_ci(val, "middle")   ? CSS_VA_MIDDLE
+                   : has_ci(val, "baseline") ? CSS_VA_BASELINE
+                                             : out->va_kind;
+    if (parse_slen(val, &px, &pct) && !pct) {
+      out->va_kind = CSS_VA_LEN;
+      out->va_len = clamp16(px);
+    }
+  } else if (span_is(p, pe, "scrollbar-width")) {
+    out->sb_none = has_ci(val, "none") ? 1 : 0;
+  } else if (span_is(p, pe, "tab-size") || span_is(p, pe, "-moz-tab-size")) {
+    const char *f = val;
+    double n;
+    if (calc_number(&f, &n) && n >= 0 && n <= 16)
+      out->tab_size = (signed char)n;
   } else if (span_is(p, pe, "cursor")) {
     out->cursor = parse_cursor(val);
   } else if (span_is(p, pe, "grid-template-areas")) {
@@ -645,6 +710,17 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
     for (char *c = buf + 10; *c; c++)
       if (*c == ' ')
         *c = ',';
+    parse_transform(buf, out, false);
+  } else if (span_is(p, pe, "scale")) {
+    char buf[96];
+    snprintf(buf, sizeof buf, "scale(%s)", val);
+    for (char *c = buf + 6; *c; c++)
+      if (*c == ' ')
+        *c = ',';
+    parse_transform(buf, out, false);
+  } else if (span_is(p, pe, "rotate")) {
+    char buf[96];
+    snprintf(buf, sizeof buf, "rotate(%s)", val);
     parse_transform(buf, out, false);
   } else if (span_is(p, pe, "filter") || span_is(p, pe, "-webkit-filter")) {
     parse_filter(val, out);

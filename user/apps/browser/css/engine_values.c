@@ -529,57 +529,98 @@ bool has_ci(const char *hay, const char *needle)
   return false;
 }
 
-/* Decode a `content` value into out[cap]: quoted string (\HHHH and \" \\ escapes) -> UTF-8, else "". */
-void parse_content(const char *v, char *out, int cap)
+static void put_utf8(char *out, int *k, int cap, unsigned cp)
 {
-  out[0] = '\0';
-  while (*v == ' ' || *v == '\t')
-    v++;
-  if (*v != '"' && *v != '\'')
-    return; /* only literal strings */
-  char q = *v++;
-  int k = 0;
-  while (*v && *v != q && k < cap - 1) {
+  int n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  if (*k + n >= cap)
+    return;
+  if (n == 1)
+    out[(*k)++] = (char)cp;
+  else if (n == 2) {
+    out[(*k)++] = (char)(0xC0 | (cp >> 6));
+    out[(*k)++] = (char)(0x80 | (cp & 0x3F));
+  } else if (n == 3) {
+    out[(*k)++] = (char)(0xE0 | (cp >> 12));
+    out[(*k)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[(*k)++] = (char)(0x80 | (cp & 0x3F));
+  } else {
+    out[(*k)++] = (char)(0xF0 | (cp >> 18));
+    out[(*k)++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[(*k)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[(*k)++] = (char)(0x80 | (cp & 0x3F));
+  }
+}
+
+/* Append the quoted string at *pp (past its opening quote q) to out, decoding \HHHH, \" and \\; leaves *pp past the
+ * close. */
+static void content_string(const char **pp, char q, char *out, int *k, int cap)
+{
+  const char *v = *pp;
+  while (*v && *v != q) {
     if (*v == '\\') {
       v++;
       int h = 0, n = 0;
       while (n < 6 && ((*v >= '0' && *v <= '9') || (*v >= 'a' && *v <= 'f') || (*v >= 'A' && *v <= 'F'))) {
-        int d = (*v <= '9') ? *v - '0' : ((*v | 32) - 'a' + 10);
-        h = h * 16 + d;
+        h = h * 16 + ((*v <= '9') ? *v - '0' : ((*v | 32) - 'a' + 10));
         v++;
         n++;
       }
-      if (n) { /* \HHHH unicode escape -> UTF-8 */
-        unsigned cp = (unsigned)h;
+      if (n) {
         if (*v == ' ')
           v++; /* one trailing space terminates the escape */
-        if (cp < 0x80) {
-          if (k < cap - 1)
-            out[k++] = (char)cp;
-        } else if (cp < 0x800) {
-          if (k + 2 < cap) {
-            out[k++] = 0xC0 | (cp >> 6);
-            out[k++] = 0x80 | (cp & 0x3F);
-          }
-        } else if (cp < 0x10000) {
-          if (k + 3 < cap) {
-            out[k++] = 0xE0 | (cp >> 12);
-            out[k++] = 0x80 | ((cp >> 6) & 0x3F);
-            out[k++] = 0x80 | (cp & 0x3F);
-          }
-        } else {
-          if (k + 4 < cap) {
-            out[k++] = 0xF0 | (cp >> 18);
-            out[k++] = 0x80 | ((cp >> 12) & 0x3F);
-            out[k++] = 0x80 | ((cp >> 6) & 0x3F);
-            out[k++] = 0x80 | (cp & 0x3F);
-          }
-        }
-      } else if (*v) { /* \" or \\ etc. */
-        out[k++] = *v++;
+        put_utf8(out, k, cap, (unsigned)h);
+      } else if (*v) {
+        if (*k < cap - 1)
+          out[(*k)++] = *v;
+        v++;
       }
-    } else {
-      out[k++] = *v++;
+    } else if (*k < cap - 1)
+      out[(*k)++] = *v++;
+    else
+      v++;
+  }
+  *pp = *v ? v + 1 : v;
+}
+
+/* Decode a `content` value into out[cap]: quoted strings (\HHHH and \" \\ escapes) -> UTF-8, open/close-quote, and
+ * attr(name) kept as CONTENT_ATTR name CONTENT_END for the renderer to fill from the element. */
+void parse_content(const char *v, char *out, int cap)
+{
+  int k = 0;
+  out[0] = '\0';
+  for (;;) {
+    while (*v == ' ' || *v == '\t')
+      v++;
+    if (!*v)
+      break;
+    if (*v == '"' || *v == '\'') {
+      char q = *v++;
+      content_string(&v, q, out, &k, cap);
+    } else if (starts_ci(v, "attr(")) {
+      v += 5;
+      if (k < cap - 2)
+        out[k++] = CONTENT_ATTR;
+      while (*v && *v != ')' && *v != ' ' && k < cap - 2)
+        out[k++] = *v++;
+      if (k < cap - 1)
+        out[k++] = CONTENT_END;
+      while (*v && *v != ')')
+        v++;
+      if (*v)
+        v++;
+    } else if (starts_ci(v, "open-quote")) {
+      put_utf8(out, &k, cap, 0x201C);
+      v += 10;
+    } else if (starts_ci(v, "close-quote")) {
+      put_utf8(out, &k, cap, 0x201D);
+      v += 11;
+    } else { /* none, normal, counter(), url()... contribute nothing */
+      int depth = 0;
+      while (*v && (depth || (*v != ' ' && *v != '\t'))) {
+        depth += *v == '(';
+        depth -= *v == ')';
+        v++;
+      }
     }
   }
   out[k] = '\0';

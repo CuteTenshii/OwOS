@@ -207,6 +207,18 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->pointer_events = d->pointer_events;
   if (d->user_select >= 0)
     out->user_select = d->user_select;
+  if (d->letter_sp != CSS_LS_UNSET)
+    out->letter_sp = d->letter_sp;
+  if (d->va_kind >= 0) {
+    out->va_kind = d->va_kind;
+    out->va_len = d->va_len;
+  }
+  if (d->bg_clip >= 0)
+    out->bg_clip = d->bg_clip;
+  if (d->sb_none >= 0)
+    out->sb_none = d->sb_none;
+  if (d->tab_size >= 0)
+    out->tab_size = d->tab_size;
   if (d->cursor >= 0)
     out->cursor = d->cursor;
   if (d->has_tr >= 0) {
@@ -215,6 +227,7 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->tr_y = d->tr_y;
     out->tr_xp = d->tr_xp;
     out->tr_yp = d->tr_yp;
+    out->tr_flip = d->tr_flip;
   }
   if (d->flt_bright >= 0)
     out->flt_bright = d->flt_bright;
@@ -1003,6 +1016,19 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
     }
   }
   return 0;
+}
+
+int css_marker_hidden(css_sheet *sh, const struct dom_node *el)
+{
+  if (!sh || !sh->has_marker || !el || el->type != DOM_ELEMENT)
+    return 0;
+  ensure_vars(sh);
+  struct css_style st;
+  css_style_reset(&st);
+  int nm = collect_matches(sh, el, PE_MARKER);
+  for (int i = 0; i < nm; i++)
+    fold(&st, rule_decl(sh->match[i]));
+  return st.disp == CSS_DISP_NONE;
 }
 
 int css_backdrop_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)

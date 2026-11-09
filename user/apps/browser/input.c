@@ -76,7 +76,7 @@ static int line_content_x(const struct ltab *t, int row)
     for (int p = base; p < base + len;) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp);
-      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
+      lw += glyph_adv(&g_ui, cp, gp);
     }
     int room = (t->w[row] - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
@@ -91,7 +91,7 @@ static int glyph_col(int x, int base, int len, int mx)
   for (int k = 0; mx >= x && k < len;) {
     unsigned cp;
     int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-    int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
+    int cw = glyph_adv(&g_ui, cp, base + k);
     if (mx < x + cw)
       return k;
     x += cw;
@@ -289,7 +289,7 @@ static void pane_linecol(int mx, int my, int *line, int *col)
     for (int k = 0; k < len;) {
       unsigned cp;
       int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
+      int cw = glyph_adv(&g_ui, cp, base + k);
       if (mx < x + cw / 2) {
         c = k;
         break;
@@ -543,7 +543,7 @@ void handle_click(int mx, int my)
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   int right = devtools_visible() ? devtools_left() : BW;
-  int sbpart = scrollbar_hit(right - SCROLL_W, py, SCROLL_W, phh, mx, my);
+  int sbpart = B->pg->sb_none ? SCROLLBAR_NONE : scrollbar_hit(right - SCROLL_W, py, SCROLL_W, phh, mx, my);
   if (sbpart != SCROLLBAR_NONE) { /* scrollbar */
     int target;
     if (sbpart == SCROLLBAR_UP)

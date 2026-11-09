@@ -24,7 +24,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     while (p < end) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
-      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
+      lw += glyph_adv(&g_ui, cp, gp);
     }
     int room = (paw - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
@@ -37,7 +37,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     for (int p = 0; p < len;) {
       unsigned cp;
       int nb = utf8_decode(&B->pg->text[off + p], &B->pg->text[off + len], &cp);
-      used += body_cp_adv(&g_ui, cp, glyph_px(off + p));
+      used += glyph_adv(&g_ui, cp, off + p);
       p += nb;
       if (used > room) {
         fits = false;
@@ -50,7 +50,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
       for (int p = 0; p < len;) {
         unsigned cp;
         int nb = utf8_decode(&B->pg->text[off + p], &B->pg->text[off + len], &cp);
-        w += body_cp_adv(&g_ui, cp, glyph_px(off + p));
+        w += glyph_adv(&g_ui, cp, off + p);
         if (w > avail)
           break;
         p += nb;
@@ -68,7 +68,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     while (p < end) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
-      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
+      lw += glyph_adv(&g_ui, cp, gp);
       if (cp == ' ')
         justify_spaces++;
     }
@@ -85,11 +85,12 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     unsigned fg = B->pg->fg[off + i];
     unsigned bgc = B->pg->bg[off + i];
     int rpx = glyph_px(off + i);
+    int rls = B->pg->ls[off + i], rva = B->pg->va[off + i];
     char run[260];
     int rl = 0, rw = 0;
-    /* Accumulate codepoints sharing one (attr,fg,bg,size) so any change starts a new run */
+    /* Accumulate codepoints sharing one (attr,fg,bg,size,spacing,shift) so any change starts a new run */
     while (i < len && B->pg->attr[off + i] == a && B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc &&
-           glyph_px(off + i) == rpx) {
+           glyph_px(off + i) == rpx && B->pg->ls[off + i] == rls && B->pg->va[off + i] == rva) {
       int nb = utf8_seqlen((unsigned char)B->pg->text[off + i]);
       if (i + nb > len)
         nb = 1;
@@ -97,7 +98,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
         break;
       unsigned cp;
       utf8_decode(&B->pg->text[off + i], &B->pg->text[off + len], &cp);
-      rw += body_cp_adv(&g_ui, cp, rpx);
+      rw += body_cp_adv(&g_ui, cp, rpx) + rls;
       for (int b = 0; b < nb; b++)
         run[rl++] = B->pg->text[off + i++];
     }
@@ -106,9 +107,27 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
       gfx_fill_rect(x, y, rw, line_h, bgc);
     int ital = (a & ST_ITALIC) ? 1 : 0;
     if (!(a & ST_HIDDEN)) {
-      body_draw_run(x, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
-      if (a & ST_BOLD)
-        body_draw_run(x + 1, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
+      if (rls) { /* letter-spaced: place each glyph on its own */
+        int gx = x;
+        for (int p = 0; p < rl;) {
+          unsigned cp;
+          int n = utf8_decode(&run[p], &run[rl], &cp);
+          int adv = body_cp_adv(&g_ui, cp, rpx);
+          char one[5]; /* body_draw_run reads to the terminator */
+          for (int q = 0; q < n; q++)
+            one[q] = run[p + q];
+          one[n] = '\0';
+          body_draw_run(gx, y + rva, one, n, adv, fg, ct, cb, rpx, base, ital);
+          if (a & ST_BOLD)
+            body_draw_run(gx + 1, y + rva, one, n, adv, fg, ct, cb, rpx, base, ital);
+          gx += adv + rls;
+          p += n;
+        }
+      } else {
+        body_draw_run(x, y + rva, run, rl, rw, fg, ct, cb, rpx, base, ital);
+        if (a & ST_BOLD)
+          body_draw_run(x + 1, y + rva, run, rl, rw, fg, ct, cb, rpx, base, ital);
+      }
       if (a & ST_UNDER)
         gfx_fill_rect(x, y + base + 1, rw, 1, fg);
       if (a & ST_STRIKE)
@@ -161,13 +180,13 @@ void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
       for (int p = off; p < off + s;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
-        xs += body_cp_adv(&g_ui, cp, glyph_px(gp));
+        xs += glyph_adv(&g_ui, cp, gp);
       }
       xe = xs;
       for (int p = off + s; p < off + e;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
-        xe += body_cp_adv(&g_ui, cp, glyph_px(gp));
+        xe += glyph_adv(&g_ui, cp, gp);
       }
       sel_hl_rect(xs, y, xe - xs, g_fr->lt.h[idx], ct, cb, sel_color_at(off + s));
     }
@@ -517,17 +536,24 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
       fill_round_rect(ge->x, sy, ge->w, ge->h, r, b->bg, alpha, ct, cb);
     }
   } else if (bh > 0) {
-    if (has_bg) {
-      if (alpha < 255)
-        fill_round_rect(ge->x, by, ge->w, bh, 0, b->bg, alpha, ct, cb);
+    /* background-clip: the area the background covers, inside the border (and padding for content-box) */
+    int cl = b->bg_clip ? b->border.l + (b->bg_clip > 1 ? b->padding.l : 0) : 0;
+    int cr = b->bg_clip ? b->border.r + (b->bg_clip > 1 ? b->padding.r : 0) : 0;
+    int ctp = b->bg_clip ? b->border.t + (b->bg_clip > 1 ? b->padding.t : 0) : 0;
+    int cbt = b->bg_clip ? b->border.b + (b->bg_clip > 1 ? b->padding.b : 0) : 0;
+    int gx = ge->x + cl, gw = ge->w - cl - cr, gy = sy + ctp, gh = ge->h - ctp - cbt;
+    int gby = gy < ct ? ct : gy, gbh = (gy + gh > cb ? cb : gy + gh) - gby;
+    if (has_bg && gw > 0 && gbh > 0) {
+      if (alpha < 255 || b->bg_clip)
+        fill_round_rect(gx, gby, gw, gbh, 0, b->bg, alpha, ct, cb);
       else
-        fill_clip(ge->x, by, ge->w, bh, b->bg, ct, cb);
+        fill_clip(gx, gby, gw, gbh, b->bg, ct, cb);
     }
-    if (has_img) {
+    if (has_img && gw > 0 && gbh > 0) {
       if (bgk == CSS_BGK_URL)
-        paint_bg_image(&B->pg->bgimgs[b->bgi.img_idx], &b->bgi, ge->x, sy, ge->w, ge->h, by, bh, pw);
+        paint_bg_image(&B->pg->bgimgs[b->bgi.img_idx], &b->bgi, gx, gy, gw, gh, gby, gbh, pw);
       else
-        paint_gradient(&b->bgi, ge->x, sy, ge->w, ge->h, by, bh, pw);
+        paint_gradient(&b->bgi, gx, gy, gw, gh, gby, gbh, pw);
     }
     if (has_bd) { /* 4 edges, clipped to the visible band */
       if (b->border.t && sy >= ct && sy < cb)

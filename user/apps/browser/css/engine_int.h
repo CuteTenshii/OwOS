@@ -84,7 +84,8 @@ enum {
   PE_SLOTTED = 4,
   PE_PART = 5,
   PE_SELECTION = 6,
-  PE_BACKDROP = 7
+  PE_BACKDROP = 7,
+  PE_MARKER = 8
 };
 
 struct selector {
@@ -191,6 +192,7 @@ struct css_sheet {
   struct media_query *medias;      /* every @media query parsed for this sheet */
   bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
   bool has_selection;              /* set once any ::selection rule is pushed */
+  bool has_marker;                 /* set once any ::marker / ::-webkit-details-marker rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
   /* Rule index, rebuilt lazily when `gen` changes; each entry lives in exactly one bucket. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;

@@ -47,6 +47,8 @@ enum css_cursor {
 };
 enum css_clip { CSS_CLIP_NONE = 0, CSS_CLIP_INSET, CSS_CLIP_CIRCLE, CSS_CLIP_ELLIPSE, CSS_CLIP_POLYGON };
 #define CSS_CLIP_PTS 8
+#define CSS_LS_UNSET (-32768)
+enum css_valign { CSS_VA_BASELINE = 0, CSS_VA_SUB, CSS_VA_SUPER, CSS_VA_MIDDLE, CSS_VA_LEN };
 enum css_ttx { CSS_TT_NONE = 0, CSS_TT_UPPER, CSS_TT_LOWER, CSS_TT_CAPITALIZE };
 enum css_ws { CSS_WS_NORMAL = 0, CSS_WS_NOWRAP, CSS_WS_PRE, CSS_WS_PRE_WRAP, CSS_WS_PRE_LINE };
 /* list-style-type (DEFAULT = the list's own ul/ol default). */
@@ -199,17 +201,24 @@ struct css_style {
   signed char text_ovf;       /* text-overflow: 1 ellipsis, 0 clip, -1 unset */
   signed char obj_fit;        /* enum css_objfit, -1 unset */
   signed char pointer_events; /* 1 auto, 0 none, -1 unset (inherited) */
+  short letter_sp;            /* letter-spacing px, CSS_LS_UNSET unset (inherited) */
+  signed char va_kind;        /* vertical-align: enum css_valign, -1 unset */
+  short va_len;               /* CSS_VA_LEN: px raised (negative lowers) */
+  signed char bg_clip;        /* background-clip: 0 border-box, 1 padding-box, 2 content-box, -1 unset */
+  signed char sb_none;        /* scrollbar-width: 1 none, 0 auto/thin, -1 unset */
+  signed char tab_size;       /* tab-size in spaces (1..16), -1 unset (inherited) */
   signed char user_select;    /* 1 auto/text, 0 none, -1 unset (inherited) */
   signed char cursor;         /* enum css_cursor, -1 unset (inherited) */
   /* transform: only translate renders; scale and rotate parse to nothing */
-  signed char has_tr;             /* 1 when a translate is set, 0 none, -1 unset */
-  short tr_x, tr_y;               /* px */
-  short tr_xp, tr_yp;             /* percent of the border box width/height */
-  short flt_bright;               /* filter brightness permille (1000 identity), -1 unset */
-  signed char flt_gray;           /* filter grayscale 0..100 percent, -1 unset */
-  signed char flt_invert;         /* filter invert 0..100 percent, -1 unset */
-  signed char flt_opacity;        /* filter opacity 0..100 percent, -1 unset */
-  signed char clip_kind;          /* enum css_clip, -1 unset */
+  signed char has_tr;      /* 1 when a translate is set, 0 none, -1 unset */
+  short tr_x, tr_y;        /* px */
+  short tr_xp, tr_yp;      /* percent of the border box width/height */
+  signed char tr_flip;     /* replaced elements: 1 mirror horizontally, 2 vertically (rotate(180deg), scale(-1)) */
+  short flt_bright;        /* filter brightness permille (1000 identity), -1 unset */
+  signed char flt_gray;    /* filter grayscale 0..100 percent, -1 unset */
+  signed char flt_invert;  /* filter invert 0..100 percent, -1 unset */
+  signed char flt_opacity; /* filter opacity 0..100 percent, -1 unset */
+  signed char clip_kind;   /* enum css_clip, -1 unset */
   short clip_v[CSS_CLIP_PTS * 2]; /* inset: t r b l round | circle: r cx cy | ellipse: rx ry cx cy | polygon x y pairs;
                                      percent*10 or px */
   signed char clip_unit[CSS_CLIP_PTS * 2]; /* 0 px, 1 percent for each clip_v */
@@ -245,12 +254,14 @@ struct css_style {
   signed char trans_timing;      /* enum css_easing, -1 unset */
   struct css_bg_image bgi;       /* background image/gradient layer (kind<0 unset) */
   /* ::before / ::after generated content (decoded, "" = none). */
-  char content[48];
+  char content[80];  /* strings, with attr(name) as CONTENT_ATTR name CONTENT_END */
   unsigned backdrop; /* modal ::backdrop 0xAARRGGBB when backdrop_set; set by the walk, never cascaded */
   signed char backdrop_set;
   char fam[CSS_FAM_STACK];
 };
 
+#define CONTENT_ATTR 0x01 /* brackets an attr() name inside css_style.content */
+#define CONTENT_END 0x02
 #define CSS_Z_AUTO (-32768) /* z_index sentinel: auto (no explicit stacking level) */
 
 typedef struct css_sheet css_sheet;
@@ -313,6 +324,9 @@ int css_sheet_has_pseudo(const css_sheet *sheet);
 /* ::selection: 1 if the sheet has such a rule; css_selection_color gives the background `el`'s selected text gets. */
 int css_sheet_has_selection(const css_sheet *sheet);
 int css_selection_color(css_sheet *sheet, const struct dom_node *el, unsigned *rgb);
+
+/* 1 if a ::marker or ::-webkit-details-marker rule hides the list or disclosure marker of `el` (display:none). */
+int css_marker_hidden(css_sheet *sheet, const struct dom_node *el);
 
 /* ::backdrop background of a modal dialog as 0xAARRGGBB; 1 if a rule sets one. */
 int css_backdrop_argb(css_sheet *sheet, const struct dom_node *el, unsigned *argb);

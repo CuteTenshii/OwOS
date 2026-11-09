@@ -41,9 +41,13 @@ void css_style_reset(struct css_style *s)
   s->align_self = -1;
   s->aspect = -1;
   s->visibility = s->text_ovf = -1;
-  s->obj_fit = s->pointer_events = s->user_select = s->cursor = -1;
+  s->obj_fit = s->pointer_events = s->user_select = s->cursor = s->tab_size = s->sb_none = s->bg_clip = -1;
+  s->letter_sp = CSS_LS_UNSET;
+  s->va_kind = -1;
+  s->va_len = 0;
   s->has_tr = -1;
   s->tr_x = s->tr_y = s->tr_xp = s->tr_yp = 0;
+  s->tr_flip = 0;
   s->flt_bright = -1;
   s->flt_gray = s->flt_invert = s->flt_opacity = -1;
   s->clip_kind = -1;

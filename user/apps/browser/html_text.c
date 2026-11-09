@@ -31,6 +31,9 @@ int text_put(int n, char c, unsigned char a)
   B->pg->align[n] = W_center;
   B->pg->fsz[n] = W_fontpx;
   B->pg->lh[n] = W_lineheight;
+  B->pg->ls[n] = sty_cur.ls;
+  B->pg->has_ls |= sty_cur.ls != 0;
+  B->pg->va[n] = sty_cur.va;
   B->pg->fg[n] = sty_cur.fg;
   B->pg->bg[n] = W_bg;
   return n + 1;
@@ -193,7 +196,7 @@ void emit_text(const char *s)
       if (c == '\r')
         continue;
       if (c == '\t') {
-        for (int t = 0; t < 4; t++)
+        for (int t = 0; t < sty_cur.tabsize; t++)
           W_n = text_put(W_n, ' ', sty_byte());
         W_run_nl = 0;
         ws = true;

@@ -105,22 +105,25 @@ typedef void (*res_batch_fn)(char *const *urls, int n, unsigned char **bodies, i
 
 /* An inline <img>, anchored at a text offset and blitted decode-on-scroll. */
 struct inl_img {
-  char href[URL_MAX]; /* src, resolved against the page URL            */
-  char alt[48];       /* alt text, shown when the image can't be drawn */
-  int text_pos;       /* offset into B->text where it is anchored      */
-  int start_row;      /* first display row (set by rewrap)             */
-  int rows;           /* reserved display rows (set by rewrap)         */
-  int ok;             /* 1 = img_pool holds a decodable PNG            */
-  unsigned iw, ih;    /* natural pixel dimensions                      */
-  int coff, clen;     /* its PNG bytes within img_pool                 */
-  int lazy;           /* 1 = loading="lazy": fetch only when in view   */
-  int want;           /* UI flag: a lazy image is now scrolled in      */
-  int fetched;        /* 1 = a fetch has been attempted (ok = result)  */
-  int cw, ch;         /* width/height from the attr or CSS, px (0=auto) */
-  int is_argb;        /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
-  int uid;            /* session-unique id once landed (0 = none), keys the pixel cache */
-  int fit;            /* object-fit: enum css_objfit */
-  int hidden;         /* visibility:hidden: reserve the space, draw nothing */
+  char href[URL_MAX];         /* src, resolved against the page URL            */
+  char alt[48];               /* alt text, shown when the image can't be drawn */
+  int text_pos;               /* offset into B->text where it is anchored      */
+  int start_row;              /* first display row (set by rewrap)             */
+  int rows;                   /* reserved display rows (set by rewrap)         */
+  int ok;                     /* 1 = img_pool holds a decodable PNG            */
+  unsigned iw, ih;            /* natural pixel dimensions                      */
+  int coff, clen;             /* its PNG bytes within img_pool                 */
+  int lazy;                   /* 1 = loading="lazy": fetch only when in view   */
+  int want;                   /* UI flag: a lazy image is now scrolled in      */
+  int fetched;                /* 1 = a fetch has been attempted (ok = result)  */
+  int cw, ch;                 /* width/height from the attr or CSS, px (0=auto) */
+  int is_argb;                /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
+  int uid;                    /* session-unique id once landed (0 = none), keys the pixel cache */
+  int fit;                    /* object-fit: enum css_objfit */
+  int hidden;                 /* visibility:hidden: reserve the space, draw nothing */
+  int flip;                   /* transform: 1 mirror horizontally, 2 vertically */
+  short fbright;              /* filter brightness permille, 1000 = none */
+  signed char fgray, finvert; /* filter grayscale / invert percent */
 };
 
 /* One tab's rendered document; B->pg points at the active tab's. */
@@ -140,6 +143,10 @@ struct page {
   unsigned char *align; /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
   unsigned char *fsz;   /* per-glyph CSS font-size px (0 = default body font) */
   unsigned char *lh;    /* per-glyph CSS line-height px (0 = font-derived default) */
+  signed char *ls;      /* per-glyph letter-spacing px */
+  signed char *va;      /* per-glyph vertical-align shift, px down */
+  bool sb_none;         /* the page sets scrollbar-width:none on its root */
+  bool has_ls;          /* some glyph has letter-spacing (the layout signature must see it) */
   unsigned *fg;
   unsigned *bg;
   /* Page canvas colours from the <html>/<body> cascade. */

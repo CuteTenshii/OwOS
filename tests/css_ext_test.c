@@ -75,6 +75,10 @@ static void check_text(void)
 {
   struct css_style s = parse("visibility: hidden; text-overflow: ellipsis; object-fit: cover; pointer-events: none");
   expect(s.visibility == 0 && s.text_ovf == 1 && s.obj_fit == CSS_OF_COVER && s.pointer_events == 0);
+  expect_eq(parse("tab-size: 2").tab_size, 2);
+  expect_eq(parse("scrollbar-width: none").sb_none, 1);
+  expect_eq(parse("scrollbar-width: thin").sb_none, 0);
+  expect_eq(parse("tab-size: 0").tab_size, 0);
   s = parse("user-select: none");
   expect(s.user_select == 0);
   s = parse("-webkit-user-select: text");
@@ -101,7 +105,14 @@ static void check_transform(void)
   s = parse("transform: translate(5px); transform: none");
   expect(s.has_tr == 0 && s.tr_x == 0);
   s = parse("transform: rotate(180deg)");
-  expect(s.has_tr == 0);
+  expect(s.has_tr == 0 && s.tr_flip == 3);
+  expect_eq(parse("transform: scaleX(-1)").tr_flip, 1);
+  expect_eq(parse("transform: scale(1, -1)").tr_flip, 2);
+  expect_eq(parse("transform: scale(-1)").tr_flip, 3);
+  expect_eq(parse("transform: rotate(180deg) scaleX(-1)").tr_flip, 2);
+  expect_eq(parse("transform: rotate(90deg)").tr_flip, 0);
+  expect_eq(parse("transform: scale(2)").tr_flip, 0);
+  expect_eq(parse("rotate: 0.5turn").tr_flip, 3);
 }
 
 static void check_filter(void)
@@ -244,6 +255,50 @@ static void check_selection(void)
   dom_free(doc);
 }
 
+static void check_content(void)
+{
+  struct css_style s = parse("content: \"a\" attr(data-n) \"b\\2192 c\" open-quote");
+  char want[] = {'a', CONTENT_ATTR, 'd',        'a',        't', 'a',        '-',        'n',        CONTENT_END,
+                 'b', (char)0xE2,   (char)0x86, (char)0x92, 'c', (char)0xE2, (char)0x80, (char)0x9C, 0};
+  expect_string(s.content, want);
+  s = parse("content: none");
+  expect(s.content[0] == '\0');
+  s = parse("content: \"x\\\"y\"");
+  expect_string(s.content, "x\"y");
+}
+
+static void check_spacing(void)
+{
+  expect_eq(parse("letter-spacing: 2px").letter_sp, 2);
+  expect_eq(parse("letter-spacing: .2px").letter_sp, 0);
+  expect_eq(parse("letter-spacing: 0.1em").letter_sp, 2);
+  expect_eq(parse("letter-spacing: -1px").letter_sp, -1);
+  expect_eq(parse("letter-spacing: normal").letter_sp, 0);
+  expect_eq(parse("color: red").letter_sp, CSS_LS_UNSET);
+  struct css_style s = parse("vertical-align: super");
+  expect(s.va_kind == CSS_VA_SUPER);
+  s = parse("vertical-align: 3px");
+  expect(s.va_kind == CSS_VA_LEN && s.va_len == 3);
+  expect_eq(parse("vertical-align: baseline").va_kind, CSS_VA_BASELINE);
+}
+
+static void check_marker_and_clip(void)
+{
+  const char *html = "<details><summary id=a>x</summary></details><ul><li id=b>y</li></ul>";
+  struct dom_node *doc = dom_parse(html, (int)strlen(html));
+  css_sheet *sh = css_new();
+  const char *css = "summary::-webkit-details-marker{display:none} li::marker{color:red}";
+  css_add(sh, css, (int)strlen(css), "http://t/");
+  expect(css_marker_hidden(sh, find(doc, "a")));
+  expect(!css_marker_hidden(sh, find(doc, "b")));
+  css_free(sh);
+  dom_free(doc);
+  expect_eq(parse("background-clip: content-box").bg_clip, 2);
+  expect_eq(parse("background-clip: padding-box").bg_clip, 1);
+  expect_eq(parse("background-clip: border-box").bg_clip, 0);
+  expect_eq(parse("background-clip: text").bg_clip, -1);
+}
+
 int main(void)
 {
   test("grid-template areas", check_areas);
@@ -263,5 +318,8 @@ int main(void)
   test("hover, pointer and motion media features", check_media_features);
   test("@supports", check_supports);
   test("::selection", check_selection);
+  test("::marker and background-clip", check_marker_and_clip);
+  test("letter-spacing and vertical-align", check_spacing);
+  test("content strings and attr()", check_content);
   return 0;
 }

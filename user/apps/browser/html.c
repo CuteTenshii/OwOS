@@ -469,6 +469,10 @@ void apply_css(const struct css_style *cs)
     sty_cur.ttx = (unsigned char)cs->ttx;
   if (cs->visibility >= 0)
     sty_cur.hidden = cs->visibility == 0;
+  if (cs->letter_sp != CSS_LS_UNSET)
+    sty_cur.ls = (signed char)(cs->letter_sp < -8 ? -8 : cs->letter_sp > 32 ? 32 : cs->letter_sp);
+  if (cs->tab_size >= 0)
+    sty_cur.tabsize = (unsigned char)cs->tab_size;
 }
 
 /* The renderer's line-break set (distinct from dom.c's CSS-block set */
@@ -506,6 +510,7 @@ static void compute_page_colors(struct dom_node *root)
 {
   unsigned canvas = 0xffffff;
   B->pg->page_fg = 0x202830;
+  B->pg->sb_none = false;
   struct css_style cs;
   const char *who[] = {"html", "body"};
   for (int i = 0; i < 2; i++) {
@@ -515,6 +520,8 @@ static void compute_page_colors(struct dom_node *root)
     compute_style(el, &cs);
     if (cs.color >= 0)
       B->pg->page_fg = (unsigned)cs.color;
+    if (cs.sb_none >= 0)
+      B->pg->sb_none = cs.sb_none == 1;
     unsigned argb;
     if (css_bg_argb(sheet_for(el), el, &argb))
       canvas = composite_over(canvas, argb);
@@ -562,6 +569,9 @@ static void layout_dom(void)
   sty_cur.bold = sty_cur.under = 0;
   sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = sty_cur.smallcaps = 0;
   sty_cur.hidden = sty_cur.clip = sty_cur.ellipsis = 0;
+  sty_cur.tabsize = 4;
+  sty_cur.ls = sty_cur.va = 0;
+  B->pg->has_ls = false;
   W_bg = BG_NONE;
   W_lineheight = 0;
   W_liststyle = CSS_LST_DEFAULT;
@@ -803,6 +813,7 @@ void plain_to_text(void)
   B->pg->n_imgs = 0;
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830;
+  B->pg->sb_none = false;
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
   W_bg = BG_NONE;
@@ -855,6 +866,7 @@ void doc_message(const char *m)
   int n = 0;
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830;
+  B->pg->sb_none = false;
   while (m[n]) {
     if (!browser_ensure_text(n + 1))
       break;
@@ -864,6 +876,7 @@ void doc_message(const char *m)
     B->pg->align[n] = 0;
     B->pg->fsz[n] = 0;
     B->pg->lh[n] = 0;
+    B->pg->ls[n] = B->pg->va[n] = 0;
     B->pg->fg[n] = B->pg->page_fg;
     B->pg->bg[n] = BG_NONE;
     n++;

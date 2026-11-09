@@ -422,10 +422,11 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
       out->bgi.size_w = sw;
       out->bgi.size_h = sh;
     }
+  } else if (span_is(p, pe, "background-clip")) {
+    out->bg_clip = has_ci(val, "content-box") ? 2 : has_ci(val, "padding-box") ? 1 : has_ci(val, "border-box") ? 0 : -1;
   }
-  /* background-attachment / -origin / -clip: parsed and ignored */
-  else if (span_is(p, pe, "background-attachment") || span_is(p, pe, "background-origin") ||
-           span_is(p, pe, "background-clip")) {
+  /* background-attachment / -origin: parsed and ignored */
+  else if (span_is(p, pe, "background-attachment") || span_is(p, pe, "background-origin")) {
   } else if (span_is(p, pe, "font-weight"))
     out->bold = parse_weight(val);
   else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line")) {

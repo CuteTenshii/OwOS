@@ -804,6 +804,26 @@ static void grid_cells_follow_areas_lines_and_auto_flow(void)
   expect(place(3, 2, c3, r3, one, one, col, row) == 2 && col[0] == 100 && col[1] == 101 && row[1] == 101);
 }
 
+static void flip_rect_mirrors_in_place(void)
+{
+  unsigned px[3 * 4]; /* a 3x2 block inside a stride-4 buffer */
+  for (int i = 0; i < 12; i++)
+    px[i] = (unsigned)i;
+  ru_flip_rect(px, 4, 3, 2, true, false);
+  expect(px[0] == 2 && px[1] == 1 && px[2] == 0 && px[4] == 6 && px[6] == 4);
+  expect(px[3] == 3 && px[7] == 7); /* outside the block: untouched */
+  for (int i = 0; i < 12; i++)
+    px[i] = (unsigned)i;
+  ru_flip_rect(px, 4, 3, 2, false, true);
+  expect(px[0] == 4 && px[1] == 5 && px[4] == 0 && px[6] == 2);
+  ru_flip_rect(px, 4, 3, 2, false, true);
+  expect(px[0] == 0 && px[6] == 6); /* twice is the identity */
+  for (int i = 0; i < 12; i++)
+    px[i] = (unsigned)i;
+  ru_flip_rect(px, 4, 3, 2, true, true);
+  expect(px[0] == 6 && px[2] == 4 && px[4] == 2 && px[6] == 0);
+}
+
 int main(void)
 {
   test("gradient colour table matches per-t grad_at", gradient_colour_table_matches_per_t_grad_at);
@@ -829,6 +849,7 @@ int main(void)
   test("layout signatures react to wrapping inputs only", layout_signatures_react_to_wrapping_inputs_only);
   test("clip-path shapes cover their own geometry", clip_shapes_cover_their_own_geometry);
   test("grid cells follow areas, lines and auto flow", grid_cells_follow_areas_lines_and_auto_flow);
+  test("flip rect mirrors in place", flip_rect_mirrors_in_place);
   test("object-fit places the image in its box", object_fit_places_the_image_in_its_box);
   test("filter colours follow the CSS functions", filter_colours_follow_the_css_functions);
   return 0;
