@@ -130,6 +130,11 @@ typedef struct {
   double max_ms;             /* longest single collection (pause time)       */
 } gc_stats_t;
 void gc_get_stats(gc_stats_t *out);
+/* Record that `obj` keeps `bytes` of memory outside the collector (an ArrayBuffer's data): it then counts
+ * towards the nursery budget and the old generation, so garbage made of such objects is reclaimed in step with
+ * the allocations that produce it. Call it again to change the figure. */
+void gc_set_external(void *obj, unsigned bytes);
+
 /* Collect automatically once this many bytes have been allocated since the last
  * collection. The collector also raises this adaptively to ~2x the live set. */
 void gc_set_threshold(unsigned bytes);

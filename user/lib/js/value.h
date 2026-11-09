@@ -124,9 +124,8 @@ typedef struct {
 } pmap;
 
 struct js_string {
-  char *data; /* malloc'd UTF-8 bytes (NUL-terminated)         */
+  char *data; /* UTF-8 bytes, NUL-terminated, stored right after this header in the same collector cell */
   int len;    /* byte length                                   */
-  unsigned hash;
 };
 
 /* C function backing a native callable */

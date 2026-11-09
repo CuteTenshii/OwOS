@@ -302,12 +302,8 @@ void (*js_host_finalizer)(js_object *o);
 
 static void finalize(void *obj, int kind)
 {
-  if (kind == GCK_STRING) {
-    js_string *s = (js_string *)obj;
-    if (s->data)
-      free(s->data);
-    return;
-  }
+  if (kind == GCK_STRING)
+    return; /* the bytes are part of the cell */
   if (kind == GCK_ENV) {
     js_env *e = (js_env *)obj;
     pmap_free(&e->vars);
@@ -389,12 +385,13 @@ void js_gc_setup(void)
 
 js_value js_mk_string(js_ctx *ctx, const char *s, int len)
 {
-  js_string *str = (js_string *)gc_alloc(sizeof(js_string), GCK_STRING);
+  js_string *str = (js_string *)gc_alloc(sizeof(js_string) + (unsigned)len + 1, GCK_STRING);
   js_value v;
   (void)ctx;
-  str->data = dupz(s ? s : "", len);
+  str->data = (char *)(str + 1);
+  if (len > 0)
+    memcpy(str->data, s ? s : "", (unsigned)len);
   str->len = len;
-  str->hash = js_str_hash(s ? s : "", len);
   v.type = JV_STR;
   v.u.str = str;
   return v;
@@ -1305,7 +1302,7 @@ int js_same_string(js_string *a, js_string *b)
 {
   if (a == b)
     return 1;
-  if (a->len != b->len || a->hash != b->hash)
+  if (a->len != b->len)
     return 0;
   return memcmp_(a->data, b->data, a->len) == 0;
 }
@@ -1317,15 +1314,12 @@ js_string *js_str_concat(js_ctx *ctx, js_string *a, js_string *b)
   gc_push_scope();
   gc_keep(a);
   gc_keep(b);
-  s = (js_string *)gc_alloc(sizeof(js_string), GCK_STRING);
-  s->data = (char *)malloc((unsigned)n + 1);
-  if (!s->data)
-    gc_oom();
+  s = (js_string *)gc_alloc(sizeof(js_string) + (unsigned)n + 1, GCK_STRING);
+  s->data = (char *)(s + 1);
   memcpy(s->data, a->data, (unsigned)a->len);
   memcpy(s->data + a->len, b->data, (unsigned)b->len);
   s->data[n] = 0;
   s->len = n;
-  s->hash = js_str_hash(s->data, n);
   gc_pop_scope();
   (void)ctx;
   return s;

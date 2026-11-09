@@ -42,7 +42,7 @@ typedef struct gc_obj {
   unsigned char gen; /* GEN_YOUNG / GEN_OLD                      */
   unsigned char rem; /* 1 if already in the remembered set       */
   unsigned char kind;
-  unsigned _pad; /* keep header 16 -> payload 8-aligned      */
+  unsigned ext; /* bytes held outside the cell (gc_set_external) */
 } gc_obj;
 
 #define MIN_THRESHOLD (256u * 1024u)     /* smallest nursery budget */
@@ -292,8 +292,8 @@ static unsigned sweep(gc_heap *H, gc_obj **list, unsigned *pbytes, void (*on_sur
       *pp = o->next;
       if (H->finalizer)
         H->finalizer(body(o), o->kind);
-      *pbytes -= o->size;
-      freed += o->size;
+      *pbytes -= o->size + o->ext;
+      freed += o->size + o->ext;
 #ifdef GC_PROFILE
       H->stats.freed++;
 #endif
@@ -368,7 +368,7 @@ static void gc_minor(gc_heap *H)
         *pp = o->next;
         if (H->finalizer)
           H->finalizer(body(o), o->kind);
-        H->young_bytes -= o->size;
+        H->young_bytes -= o->size + o->ext;
 #ifdef GC_PROFILE
         H->stats.freed++;
 #endif
@@ -376,8 +376,8 @@ static void gc_minor(gc_heap *H)
       } else {
         o->mark = WHITE;
         o->gen = GEN_OLD;
-        H->young_bytes -= o->size;
-        H->old_bytes += o->size;
+        H->young_bytes -= o->size + o->ext;
+        H->old_bytes += o->size + o->ext;
         *pp = o->next; /* unlink from young                    */
         o->next = H->old;
         H->old = o; /* prepend to old                       */
@@ -428,8 +428,8 @@ static unsigned gc_major(gc_heap *H)
         *pp = o->next;
         if (H->finalizer)
           H->finalizer(body(o), o->kind);
-        H->young_bytes -= o->size;
-        freed += o->size;
+        H->young_bytes -= o->size + o->ext;
+        freed += o->size + o->ext;
 #ifdef GC_PROFILE
         H->stats.freed++;
 #endif
@@ -437,8 +437,8 @@ static unsigned gc_major(gc_heap *H)
       } else {
         o->mark = WHITE;
         o->gen = GEN_OLD;
-        H->young_bytes -= o->size;
-        H->old_bytes += o->size;
+        H->young_bytes -= o->size + o->ext;
+        H->old_bytes += o->size + o->ext;
         *pp = o->next;
         o->next = H->old;
         H->old = o;
@@ -681,5 +681,16 @@ void gc_get_stats(gc_stats_t *out)
 {
   if (out)
     *out = cur_heap()->stats;
+}
+void gc_set_external(void *obj, unsigned bytes)
+{
+  gc_heap *H = cur_heap();
+  gc_obj *o = hdr(obj);
+  H->alloc_since += bytes;
+  if (o->gen == GEN_OLD)
+    H->old_bytes += bytes - o->ext;
+  else
+    H->young_bytes += bytes - o->ext;
+  o->ext = bytes;
 }
 void gc_set_threshold(unsigned bytes) { cur_heap()->threshold = bytes ? bytes : MIN_THRESHOLD; }

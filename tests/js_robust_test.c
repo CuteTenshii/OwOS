@@ -288,6 +288,18 @@ static void check_typed_array_copy(void)
       0));
 }
 
+static void check_string_append(void)
+{
+  expect(run("var s='', t='', parts=[], mark=0;\n"
+             "for (var i=0;i<20000;i++) { s+='k'+i+'='+i+'&'; parts.push('k'+i+'='+i+'&'); if (i===19000) { t=s; "
+             "mark=parts.join('').length; } }\n"
+             "expect(s===parts.join(''), 'an appended string equals the joined one: '+s.length);\n"
+             "expect(t.length===mark && t.slice(-6)==='19000&', 'an older value is not disturbed by later appends');\n"
+             "var big=0; for (var j=0;j<300;j++) { var b=new Uint8Array(1<<18); b[0]=j; big=b.length; }\n"
+             "expect(big===262144, 'buffers made in a loop are collected as they go');\n",
+             0));
+}
+
 static void check_json_parse(void)
 {
   expect(
@@ -587,6 +599,7 @@ int main(void)
   test("structured clone across heaps", check_structured_clone);
   test("Promise.all, allSettled, race and any with pending promises", check_promise_combinators);
   test("typed array set, slice and copy construction", check_typed_array_copy);
+  test("long string appends and buffer garbage", check_string_append);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

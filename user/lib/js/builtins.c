@@ -7898,6 +7898,7 @@ static js_object *buffer_object(js_ctx *ctx, js_object *proto, unsigned char *da
   ab->shared = shared;
   if (!data) /* too big for the heap */
     js_throw_range(ctx, "Array buffer allocation failed");
+  gc_set_external(o, (unsigned)ab->byteLength); /* the bytes are malloc'd, outside the collector */
   o->host = ab;
   gc_pop_scope();
   return o;
