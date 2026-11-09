@@ -182,6 +182,8 @@ js_value loc_reload(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value loc_tostring(js_ctx *ctx, js_value t, js_value *args, int argc);
 void lower_into(char *dst, int cap, const char *src);
 js_value make_blob(js_ctx *ctx, const char *data, int len, const char *type);
+int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
+js_value blob_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
 js_value make_search_params(js_ctx *ctx, const char *query);
 js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc);
 bool node_connected(struct dom_node *n);

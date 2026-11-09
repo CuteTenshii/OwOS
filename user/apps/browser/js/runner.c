@@ -495,6 +495,8 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
     return;
   }
   g_ctx->now_ms = now_ms;
+  g_ctx->clone_write_ext = blob_clone_write;
+  g_ctx->clone_read_ext = blob_clone_read;
   js_set_stack_limit(g_ctx, browser_js_stack_floor()); /* bound recursion to the worker stack */
   js_set_script(g_ctx, g_cur_script);                  /* origin frame for captured stacks */
   g_has_listeners = false;

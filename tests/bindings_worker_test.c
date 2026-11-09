@@ -334,6 +334,21 @@ static void test_worker_network(void)
       "expect(net.mc==='1:1', 'MessageChannel inside a worker: '+net.mc);\n");
 }
 
+static void test_blob_crosses(void)
+{
+  run_script("var bl=null, bw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data; "
+             "b.text().then(function(t){ "
+             "postMessage({echo:new Blob([t+\\\"!\\\"],{type:\\\"text/x\\\"}), size:b.size, type:b.type, isBlob:b "
+             "instanceof Blob}); }); };');\n"
+             "bw.onmessage=function(e){ bl=e.data; };\n"
+             "bw.postMessage(new Blob([\"abc\"],{type:\"text/plain\"}));\n");
+  expect(wait_for("bl!==null"));
+  run_script("expect(bl.size===3 && bl.type==='text/plain' && bl.isBlob===true, 'a page Blob arrives as a Blob in the "
+             "worker');\n"
+             "expect(bl.echo instanceof Blob && bl.echo.size===4 && bl.echo.type==='text/x', 'and a worker Blob as a "
+             "page Blob');\n");
+}
+
 static void test_transfer_and_collections(void)
 {
   run_script("var tr=null, tbuf=new ArrayBuffer(16), tv=new Uint8Array(tbuf); tv[3]=5;\n"
@@ -431,6 +446,18 @@ static void test_errors(void)
   run_script("expect(errs===2, 'script errors surface as error events: '+errs);\n");
 }
 
+/* Free the page's worker slots between tests */
+static void terminate_workers(void)
+{
+  run_script("__workers.forEach(function(w){ w.terminate(); }); __workers.length=0;\n");
+}
+
+static void worker_test(const char *name, void (*fn)(void))
+{
+  test(name, fn);
+  terminate_workers();
+}
+
 static const char page[] = "<html><body><script>var ready=1</script></body></html>";
 
 int main(void)
@@ -441,21 +468,25 @@ int main(void)
   js_run_document(root, "https://example.com/dir/p.html", fetch_none);
   js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
   js_def_native(g_ctx, g_ctx->global, "fixture", test_fixture, 0);
+  run_script("var __workers=[]; (function(){ var W=Worker; Worker=function(a,b){ var w=new W(a,b); __workers.push(w); "
+             "return w; };"
+             "Worker.prototype=W.prototype; })();\n");
 
-  test("postMessage round trip and ordering", test_round_trip);
-  test("self.addEventListener and structured clone", test_self_listeners_and_clone);
-  test("terminate and close", test_terminate_and_close);
-  test("importScripts, location and name", test_import_scripts_and_location);
-  test("module workers", test_module_worker);
-  test("worker timers", test_worker_timers);
-  test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
-  test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
-  test("worker network: fetch, XMLHttpRequest, WebSocket, MessageChannel", test_worker_network);
-  test("transferred buffers and collections", test_transfer_and_collections);
-  test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
-  test("MessageChannel and MessagePort", test_message_channel);
-  test("ErrorEvent and MessageEvent", test_event_interfaces);
-  test("script and construction errors", test_errors);
+  worker_test("postMessage round trip and ordering", test_round_trip);
+  worker_test("self.addEventListener and structured clone", test_self_listeners_and_clone);
+  worker_test("terminate and close", test_terminate_and_close);
+  worker_test("importScripts, location and name", test_import_scripts_and_location);
+  worker_test("module workers", test_module_worker);
+  worker_test("worker timers", test_worker_timers);
+  worker_test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
+  worker_test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
+  worker_test("worker network: fetch, XMLHttpRequest, WebSocket, MessageChannel", test_worker_network);
+  worker_test("Blobs cross between page and worker", test_blob_crosses);
+  worker_test("transferred buffers and collections", test_transfer_and_collections);
+  worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
+  worker_test("MessageChannel and MessagePort", test_message_channel);
+  worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
+  worker_test("script and construction errors", test_errors);
 
   test("page end stops workers stuck in a loop or a wait", test_page_end_stops_stuck_workers);
   dom_free(root);

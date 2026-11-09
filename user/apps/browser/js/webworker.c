@@ -527,6 +527,54 @@ static js_object *wt_load_module(js_ctx *ctx, const char *spec, void *ud)
   return ctx->has_exc ? NULL : exports;
 }
 
+/* A worker's Blob (or File) crosses by its bytes and type */
+static int wt_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
+{
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "Blob"),
+           proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef(), data, type;
+  js_object *p;
+  const unsigned char *src;
+  int n = 0;
+  if (proto.type != JV_OBJ)
+    return 0;
+  for (p = v.u.obj->proto; p && p != proto.u.obj; p = p->proto)
+    ;
+  if (!p)
+    return 0;
+  data = js_get(ctx, v, "@bytes");
+  type = js_get(ctx, v, "type");
+  src = view_bytes(data, &n);
+  *bytes = (unsigned char *)malloc((unsigned)n + 1);
+  if (!src || !*bytes)
+    return 0;
+  memcpy(*bytes, src, (unsigned)n);
+  *len = n;
+  *meta = type.type == JV_STR ? strdup(type.u.str->data) : 0;
+  strcpy(kind, "blob");
+  return 1;
+}
+
+static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
+{
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "Blob"), args[2], parts, r;
+  js_object *opts;
+  if (!streq(kind, "blob") || !js_is_callable(ctor))
+    return js_undef();
+  gc_push_scope();
+  args[0] = js_obj_value(gc_keep(js_new_array(ctx, 0)));
+  parts = js_new_typedarray(ctx, TA_U8, len);
+  gc_keep(parts.u.obj);
+  if (len > 0)
+    memcpy(((js_arraybuffer *)((js_typedarray *)parts.u.obj->host)->buffer->host)->data, bytes, (unsigned)len);
+  js_array_push(ctx, args[0].u.obj, parts);
+  opts = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(opts, "type", js_mk_cstring(ctx, meta ? meta : ""), P_ENUMERABLE);
+  args[1] = js_obj_value(opts);
+  r = js_construct(ctx, ctor, args, 2);
+  gc_pop_scope();
+  return r;
+}
+
 static void wt_def_location(js_ctx *ctx, struct wthread *wt)
 {
   js_object *loc;
@@ -930,6 +978,8 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   ctx->now_ms = now_ms;
   ctx->can_block = 1;
   ctx->irq = &wt->irq;
+  ctx->clone_write_ext = wt_clone_write;
+  ctx->clone_read_ext = wt_clone_read;
   js_set_stack_limit(ctx, wt->stack_lo + WORKER_HEADROOM);
   wt_setup(ctx, wt);
   if (!wt_run_parts(ctx, wt)) {

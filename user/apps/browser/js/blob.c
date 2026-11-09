@@ -38,6 +38,33 @@ static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v)
   }
 }
 
+/* structured clone of a page Blob: its bytes travel with its type */
+int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
+{
+  js_value b, type;
+  if (v.u.obj->proto != g_blob_proto)
+    return 0;
+  b = js_get(ctx, v, "@bytes");
+  type = js_get(ctx, v, "type");
+  if (b.type != JV_STR)
+    return 0;
+  *bytes = (unsigned char *)malloc((unsigned)b.u.str->len + 1);
+  if (!*bytes)
+    return 0;
+  memcpy(*bytes, b.u.str->data, (unsigned)b.u.str->len);
+  *len = b.u.str->len;
+  *meta = type.type == JV_STR ? strdup(type.u.str->data) : 0;
+  strcpy(kind, "blob");
+  return 1;
+}
+
+js_value blob_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
+{
+  if (!streq(kind, "blob"))
+    return js_undef();
+  return make_blob(ctx, (const char *)bytes, len, meta);
+}
+
 /* Make a Blob object holding `data[0..len)` with content type `type`. */
 js_value make_blob(js_ctx *ctx, const char *data, int len, const char *type)
 {

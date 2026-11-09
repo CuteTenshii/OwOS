@@ -87,27 +87,32 @@ struct js_ctx {
   int frame_line[64];     /* source line of each frame's active call site   */
   int frame_col[64];
   int nframes;
-  int cur_line, cur_col;    /* location of the node currently evaluating —
-                             * the innermost frame's spot in a stack trace    */
-  char *async_stack;        /* while a deferred callback runs (a timer/event
-                             * job), the formatted frames captured at the point
-                             * it was scheduled; capture_stack appends them so a
-                             * throw names the scheduling site, not just the
-                             * callback body. Not owned — the embedder installs
-                             * and clears it around the call (js_async_*).      */
-  const char *cur_script;   /* embedder-set label of the top-level script or
-                             * async entry currently executing (a source URL, or
-                             * "<timer callback>"/"<click listener>"). The engine
-                             * emits it as the outermost frame of every captured
-                             * stack, so a trace bottoms out at its origin even
-                             * when no JS function is on the stack (a timer armed
-                             * at script top level). Snapshotted into each async
-                             * capture, so a grafted "scheduled from" segment
-                             * names the script that armed it. Not owned; the
-                             * embedder keeps the storage valid (js_set_script). */
-  unsigned rng;             /* Math.random state                             */
-  int can_block;            /* Atomics.wait may block this context's thread */
-  js_irq *irq;              /* another thread's way to stop this context (NULL: none) */
+  int cur_line, cur_col;  /* location of the node currently evaluating —
+                           * the innermost frame's spot in a stack trace    */
+  char *async_stack;      /* while a deferred callback runs (a timer/event
+                           * job), the formatted frames captured at the point
+                           * it was scheduled; capture_stack appends them so a
+                           * throw names the scheduling site, not just the
+                           * callback body. Not owned — the embedder installs
+                           * and clears it around the call (js_async_*).      */
+  const char *cur_script; /* embedder-set label of the top-level script or
+                           * async entry currently executing (a source URL, or
+                           * "<timer callback>"/"<click listener>"). The engine
+                           * emits it as the outermost frame of every captured
+                           * stack, so a trace bottoms out at its origin even
+                           * when no JS function is on the stack (a timer armed
+                           * at script top level). Snapshotted into each async
+                           * capture, so a grafted "scheduled from" segment
+                           * names the script that armed it. Not owned; the
+                           * embedder keeps the storage valid (js_set_script). */
+  unsigned rng;           /* Math.random state                             */
+  int can_block;          /* Atomics.wait may block this context's thread */
+  js_irq *irq;            /* another thread's way to stop this context (NULL: none) */
+  /* Embedder objects that structured clone should carry across (a Blob, say): write returns nonzero when it
+   * recognised `v`, filling a short `kind`, malloc'd bytes and an optional malloc'd `meta` string; read rebuilds one.
+   */
+  int (*clone_write_ext)(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
+  js_value (*clone_read_ext)(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
   void *re_cache;           /* compiled-RegExp cache (builtins.c)         */
   unsigned ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped
                              * by direct eval, which can inject a binding into an

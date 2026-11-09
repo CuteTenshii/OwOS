@@ -9258,7 +9258,8 @@ enum {
   CL_MAP,
   CL_SET,
   CL_REGEXP,
-  CL_ABUF_MOVE
+  CL_ABUF_MOVE,
+  CL_EXT
 };
 #define CLONE_DEPTH 200
 
@@ -9404,6 +9405,25 @@ static void clone_value(clone_w *w, js_value v, int depth)
     clone_tag(w, CL_REF);
     clone_u32(w, (unsigned)idx);
     return;
+  }
+  if (ctx->clone_write_ext && (o->kind == OBJ_PLAIN || o->kind == OBJ_HOST)) {
+    char kind[16] = "", *meta = 0;
+    unsigned char *bytes = 0;
+    int len = 0;
+    if (ctx->clone_write_ext(ctx, v, kind, &bytes, &len, &meta)) {
+      if (!clone_note(w, o)) {
+        free(bytes);
+        free(meta);
+        return;
+      }
+      clone_tag(w, CL_EXT);
+      clone_str(w, kind, (int)strlen(kind));
+      clone_str(w, meta ? meta : "", meta ? (int)strlen(meta) : 0);
+      clone_str(w, (const char *)bytes, len);
+      free(bytes);
+      free(meta);
+      return;
+    }
   }
   if (o->kind == OBJ_FUNCTION || o->kind == OBJ_HOST || o->kind == OBJ_PROXY || o->kind == OBJ_GENERATOR ||
       o->kind == OBJ_SYMBOL) {
@@ -9822,6 +9842,33 @@ static js_value clone_read_value(clone_r *r, int depth)
     clone_made(r, o);
     gc_pop_scope();
     return js_obj_value(o);
+  }
+  case CL_EXT: {
+    int kl, ml, bl;
+    const unsigned char *kp = clone_get_bytes(r, &kl), *mp = clone_get_bytes(r, &ml), *bp = clone_get_bytes(r, &bl);
+    char kind[16], *meta;
+    js_value ov;
+    if (!kp || !mp || !bp || kl >= (int)sizeof kind || !ctx->clone_read_ext) {
+      r->failed = 1;
+      return js_undef();
+    }
+    memcpy(kind, kp, (unsigned)kl);
+    kind[kl] = 0;
+    meta = (char *)malloc((unsigned)ml + 1);
+    if (!meta) {
+      r->failed = 1;
+      return js_undef();
+    }
+    memcpy(meta, mp, (unsigned)ml);
+    meta[ml] = 0;
+    ov = ctx->clone_read_ext(ctx, kind, bp, bl, meta);
+    free(meta);
+    if (ov.type != JV_OBJ) {
+      r->failed = 1;
+      return js_undef();
+    }
+    clone_made(r, ov.u.obj);
+    return ov;
   }
   case CL_ABUF_MOVE: {
     unsigned i = clone_get_u32(r);
