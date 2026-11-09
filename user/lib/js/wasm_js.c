@@ -2082,17 +2082,23 @@ static void def_error(js_ctx *ctx, js_object *state, js_object *ns, const char *
   js_def(ns, name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
 }
 
+static int hooks_installed;
+
 void js_setup_wasm(js_ctx *ctx)
 {
   js_object *ns, *state, *p, *c;
   gc_push_scope();
-  js_wasm_trace = wasm_trace;
-  js_wasm_finalizer = wasm_finalize;
-  js_wasm_clone_write = wasm_clone_write;
-  js_wasm_clone_read = wasm_clone_read;
-  wasm_shared_alloc = shared_alloc;
-  wasm_shared_retain = shared_retain;
-  wasm_shared_release = shared_release;
+  if (!__atomic_exchange_n(
+          &hooks_installed, 1,
+          __ATOMIC_ACQ_REL)) { /* the process-wide hooks are set once, before any worker thread reads them */
+    js_wasm_trace = wasm_trace;
+    js_wasm_finalizer = wasm_finalize;
+    js_wasm_clone_write = wasm_clone_write;
+    js_wasm_clone_read = wasm_clone_read;
+    wasm_shared_alloc = shared_alloc;
+    wasm_shared_retain = shared_retain;
+    wasm_shared_release = shared_release;
+  }
   ns = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(ctx->global, "WebAssembly", js_obj_value(ns), P_WRITABLE | P_CONFIGURABLE);
   state = (js_object *)gc_keep(js_new_object(ctx, NULL));
