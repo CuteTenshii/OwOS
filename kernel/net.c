@@ -1,4 +1,5 @@
-/* net.c: minimal IPv4 stack (Ethernet, ARP, IPv4, ICMP, UDP, sockets) over the RTL8139 driver. */
+/* net.c: minimal dual-stack IP (Ethernet, ARP, NDP, IPv4/IPv6, ICMP/ICMPv6, UDP, sockets). Addresses are 16 bytes; IPv4
+ * is v4-mapped. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,7 +19,9 @@
 #include "timer.h"
 
 static inline uint16_t bswap16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
+static inline uint32_t bswap32(uint32_t x) { return (x << 24) | ((x & 0xFF00) << 8) | ((x >> 8) & 0xFF00) | (x >> 24); }
 #define htons(x) bswap16((uint16_t)(x))
+#define htonl(x) bswap32((uint32_t)(x))
 #define ntohs(x) bswap16((uint16_t)(x))
 
 /* Internet checksum (RFC 1071), host value; the csum field must be zero while computing. Even lengths only. */
@@ -37,14 +40,39 @@ static uint16_t inet_csum(const uint8_t *p, uint32_t len)
   return (uint16_t)~sum;
 }
 
-static uint16_t udp_checksum(const uint8_t src[4], const uint8_t dst[4], const uint8_t *seg, uint32_t len)
+static const uint8_t v4_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+
+static bool addr_is_v4(const uint8_t a[16]) { return memcmp(a, v4_prefix, 12) == 0; }
+
+static void addr_map_v4(uint8_t out[16], const uint8_t v4[4])
+{
+  memcpy(out, v4_prefix, 12);
+  memcpy(out + 12, v4, 4);
+}
+
+static bool addr_is_link_local6(const uint8_t a[16]) { return a[0] == 0xFE && (a[1] & 0xC0) == 0x80; }
+
+static bool addr_is_mcast6(const uint8_t a[16]) { return a[0] == 0xFF; }
+
+static bool addr_is_unspec(const uint8_t a[16])
+{
+  for (int i = 0; i < 16; i++)
+    if (a[i])
+      return false;
+  return true;
+}
+
+/* UDP/TCP/ICMPv6 checksum over the family's pseudo-header + segment; host value, 0 when valid on receive. */
+uint16_t net_l4_csum(const uint8_t src[16], const uint8_t dst[16], uint8_t proto, const uint8_t *seg, uint32_t len)
 {
   uint32_t sum = 0;
-  sum += ((uint32_t)src[0] << 8) | src[1];
-  sum += ((uint32_t)src[2] << 8) | src[3];
-  sum += ((uint32_t)dst[0] << 8) | dst[1];
-  sum += ((uint32_t)dst[2] << 8) | dst[3];
-  sum += 17;
+  bool v4 = addr_is_v4(src) && addr_is_v4(dst);
+  const uint8_t *s = v4 ? src + 12 : src, *d = v4 ? dst + 12 : dst;
+  for (int i = 0; i < (v4 ? 4 : 16); i += 2) {
+    sum += ((uint32_t)s[i] << 8) | s[i + 1];
+    sum += ((uint32_t)d[i] << 8) | d[i + 1];
+  }
+  sum += proto;
   sum += len;
   for (uint32_t i = 0; i + 1 < len; i += 2)
     sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
@@ -86,11 +114,31 @@ struct udp_hdr {
   uint16_t sport, dport, len, csum;
 } __attribute__((packed));
 
+struct ip6_hdr {
+  uint32_t vtf;
+  uint16_t plen;
+  uint8_t nh, hlim;
+  uint8_t src[16], dst[16];
+} __attribute__((packed));
+
 #define ETH_IP 0x0800
 #define ETH_ARP 0x0806
+#define ETH_IP6 0x86DD
 #define IP_ICMP 1
 #define IP_TCP 6
 #define IP_UDP 17
+#define IP_ICMP6 58
+#define IP6_HBH 0
+#define IP6_DSTOPTS 60
+
+#define ICMP6_ECHO_REPLY 129
+#define ICMP6_RS 133
+#define ICMP6_RA 134
+#define ICMP6_NS 135
+#define ICMP6_NA 136
+#define ND_OPT_SLLA 1
+#define ND_OPT_TLLA 2
+#define ND_OPT_PREFIX 3
 
 /* Unconfigured (0.0.0.0) until /bin/dhcpcd applies a lease via net_ifconfig(); /24 keeps same_subnet() defined. */
 static uint8_t my_ip[4] = {0, 0, 0, 0};
@@ -98,47 +146,55 @@ static uint8_t gw_ip[4] = {0, 0, 0, 0};
 static uint8_t dns_ip[4] = {0, 0, 0, 0}; /* leased DNS server; no in-kernel reader */
 static uint8_t netmask[4] = {255, 255, 255, 0};
 
-#define ARP_CACHE 8
-static struct arp_entry {
-  uint8_t ip[4];
+/* IPv6: link-local from the MAC at net_init, a global address and default router from router advertisements. */
+static uint8_t ll6[16];
+static uint8_t gua6[16];
+static uint8_t prefix6[8];
+static uint8_t gw6[16];
+static bool have_gua6, have_gw6;
+
+/* Neighbor cache for both families (ARP for v4, NDP for v6); keys are 16-byte addresses. */
+#define NBR_CACHE 16
+static struct nbr_entry {
+  uint8_t ip[16];
   uint8_t mac[6];
   bool valid;
-} arp_cache[ARP_CACHE];
+} nbr_cache[NBR_CACHE];
 
-/* IPs with an outstanding ARP request; only solicited replies are cached. */
-#define ARP_PENDING 8
+/* Addresses with an outstanding ARP/NS request; only solicited replies are cached. */
+#define NBR_PENDING 8
 static struct {
-  uint8_t ip[4];
+  uint8_t ip[16];
   bool valid;
-} arp_pending[ARP_PENDING];
+} nbr_pending[NBR_PENDING];
 
-static void arp_pending_add(const uint8_t ip[4])
+static void nbr_pending_add(const uint8_t ip[16])
 {
-  for (int i = 0; i < ARP_PENDING; i++)
-    if (arp_pending[i].valid && memcmp(arp_pending[i].ip, ip, 4) == 0)
+  for (int i = 0; i < NBR_PENDING; i++)
+    if (nbr_pending[i].valid && memcmp(nbr_pending[i].ip, ip, 16) == 0)
       return;
-  for (int i = 0; i < ARP_PENDING; i++)
-    if (!arp_pending[i].valid) {
-      memcpy(arp_pending[i].ip, ip, 4);
-      arp_pending[i].valid = true;
+  for (int i = 0; i < NBR_PENDING; i++)
+    if (!nbr_pending[i].valid) {
+      memcpy(nbr_pending[i].ip, ip, 16);
+      nbr_pending[i].valid = true;
       return;
     }
-  memcpy(arp_pending[0].ip, ip, 4);
-  arp_pending[0].valid = true;
+  memcpy(nbr_pending[0].ip, ip, 16);
+  nbr_pending[0].valid = true;
 }
 
 /* Consume a pending request for `ip`; 1 if one existed. */
-static bool arp_pending_take(const uint8_t ip[4])
+static bool nbr_pending_take(const uint8_t ip[16])
 {
-  for (int i = 0; i < ARP_PENDING; i++)
-    if (arp_pending[i].valid && memcmp(arp_pending[i].ip, ip, 4) == 0) {
-      arp_pending[i].valid = false;
+  for (int i = 0; i < NBR_PENDING; i++)
+    if (nbr_pending[i].valid && memcmp(nbr_pending[i].ip, ip, 16) == 0) {
+      nbr_pending[i].valid = false;
       return true;
     }
   return false;
 }
 
-/* Apply an IPv4 config (SYS_IFCONFIG); NULL args are skipped. Flushes the ARP cache. */
+/* Apply an IPv4 config (SYS_IFCONFIG); NULL args are skipped. Flushes the neighbor cache. */
 void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4], const uint8_t dns[4])
 {
   if (ip)
@@ -149,10 +205,10 @@ void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4
     memcpy(gw_ip, gw, 4);
   if (dns)
     memcpy(dns_ip, dns, 4);
-  for (int i = 0; i < ARP_CACHE; i++)
-    arp_cache[i].valid = false;
-  for (int i = 0; i < ARP_PENDING; i++)
-    arp_pending[i].valid = false;
+  for (int i = 0; i < NBR_CACHE; i++)
+    nbr_cache[i].valid = false;
+  for (int i = 0; i < NBR_PENDING; i++)
+    nbr_pending[i].valid = false;
 }
 
 /* Reply slots written by the RX interrupt, polled by the command context. */
@@ -164,7 +220,7 @@ static volatile uint32_t icmp_rtt_us;  /* recv timestamp - send, set by IRQ  */
 
 static uint16_t ip_ident = 1;
 
-/* Nonzero inside net_rx_frame; stops arp_resolve from blocking in the IRQ. */
+/* Nonzero inside net_rx_frame; stops nbr_resolve from blocking in the IRQ. */
 static volatile int net_rx_depth;
 
 /* Assemble an Ethernet frame in a stack buffer (senders and the IRQ ARP reply never share one). */
@@ -181,33 +237,33 @@ static void eth_send(const uint8_t dst[6], uint16_t type, const uint8_t *payload
   nic_send(frame, 14 + plen);
 }
 
-static bool arp_lookup(const uint8_t ip[4], uint8_t out[6])
+static bool nbr_lookup(const uint8_t ip[16], uint8_t out[6])
 {
-  for (int i = 0; i < ARP_CACHE; i++) {
-    if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
-      memcpy(out, arp_cache[i].mac, 6);
+  for (int i = 0; i < NBR_CACHE; i++) {
+    if (nbr_cache[i].valid && memcmp(nbr_cache[i].ip, ip, 16) == 0) {
+      memcpy(out, nbr_cache[i].mac, 6);
       return true;
     }
   }
   return false;
 }
 
-static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
+static void nbr_cache_put(const uint8_t ip[16], const uint8_t m[6])
 {
   int slot = -1;
-  for (int i = 0; i < ARP_CACHE; i++) {
-    if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
+  for (int i = 0; i < NBR_CACHE; i++) {
+    if (nbr_cache[i].valid && memcmp(nbr_cache[i].ip, ip, 16) == 0) {
       slot = i;
       break;
     }
-    if (slot < 0 && !arp_cache[i].valid)
+    if (slot < 0 && !nbr_cache[i].valid)
       slot = i;
   }
   if (slot < 0)
     slot = 0;
-  memcpy(arp_cache[slot].ip, ip, 4);
-  memcpy(arp_cache[slot].mac, m, 6);
-  arp_cache[slot].valid = true;
+  memcpy(nbr_cache[slot].ip, ip, 16);
+  memcpy(nbr_cache[slot].mac, m, 6);
+  nbr_cache[slot].valid = true;
 }
 
 static void arp_build(uint8_t *pkt, uint16_t oper, const uint8_t tha[6], const uint8_t tpa[4])
@@ -229,8 +285,10 @@ static void arp_request(const uint8_t ip[4])
   static const uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   static const uint8_t zero[6] = {0};
   uint8_t pkt[28];
+  uint8_t key[16];
   arp_build(pkt, 1, zero, ip);
-  arp_pending_add(ip);
+  addr_map_v4(key, ip);
+  nbr_pending_add(key);
   eth_send(bcast, ETH_ARP, pkt, 28);
 }
 
@@ -242,34 +300,104 @@ static void arp_recv(const uint8_t *p, uint32_t len)
   if (ntohs(a->ptype) != ETH_IP)
     return;
 
+  uint8_t spa[16];
+  addr_map_v4(spa, a->spa);
   uint16_t op = ntohs(a->oper);
   if (op == 2) { /* reply: trust it only if solicited */
-    if (arp_pending_take(a->spa))
-      arp_cache_put(a->spa, a->sha);
+    if (nbr_pending_take(spa))
+      nbr_cache_put(spa, a->sha);
   } else if (op == 1 && memcmp(a->tpa, my_ip, 4) == 0) {
-    arp_cache_put(a->spa, a->sha); /* someone is asking for us: answer */
+    nbr_cache_put(spa, a->sha); /* someone is asking for us: answer */
     uint8_t pkt[28];
     arp_build(pkt, 2, a->sha, a->spa);
     eth_send(a->sha, ETH_ARP, pkt, 28);
   }
 }
 
-/* Resolve an IP to a MAC, sending requests and waiting on the RX interrupt. */
-static bool arp_resolve(const uint8_t ip[4], uint8_t out[6])
+/* Source address for a packet to `dst`: our v4, a global v6 for off-link targets, else link-local. */
+void net_src_addr(const uint8_t dst[16], uint8_t out[16])
 {
-  if (arp_lookup(ip, out))
+  if (addr_is_v4(dst))
+    addr_map_v4(out, my_ip);
+  else if (have_gua6 && !addr_is_link_local6(dst) && !addr_is_mcast6(dst))
+    memcpy(out, gua6, 16);
+  else
+    memcpy(out, ll6, 16);
+}
+
+static void ip6_send_from(const uint8_t src[16], const uint8_t dst[16], uint8_t proto, const uint8_t *payload,
+                          uint32_t plen, uint8_t hlim);
+
+/* Fill the ICMPv6 checksum of `msg` and send it from src to dst. */
+static void icmp6_send(const uint8_t src[16], const uint8_t dst[16], uint8_t *msg, uint32_t len, uint8_t hlim)
+{
+  msg[2] = msg[3] = 0;
+  uint16_t c = net_l4_csum(src, dst, IP_ICMP6, msg, len);
+  msg[2] = (uint8_t)(c >> 8);
+  msg[3] = (uint8_t)c;
+  ip6_send_from(src, dst, IP_ICMP6, msg, len, hlim);
+}
+
+/* Solicited-node multicast address of `target` (ff02::1:ffXX:XXXX). */
+static void solicited_node(const uint8_t target[16], uint8_t out[16])
+{
+  memset(out, 0, 16);
+  out[0] = 0xFF;
+  out[1] = 0x02;
+  out[11] = 0x01;
+  out[12] = 0xFF;
+  memcpy(out + 13, target + 13, 3);
+}
+
+static void ns_send(const uint8_t target[16])
+{
+  uint8_t dst[16], src[16], msg[32] = {0};
+  solicited_node(target, dst);
+  net_src_addr(target, src);
+  msg[0] = ICMP6_NS;
+  memcpy(msg + 8, target, 16);
+  msg[24] = ND_OPT_SLLA;
+  msg[25] = 1;
+  memcpy(msg + 26, nic_mac(), 6);
+  nbr_pending_add(target);
+  icmp6_send(src, dst, msg, sizeof msg, 255);
+}
+
+static void rs_send(void)
+{
+  static const uint8_t all_routers[16] = {0xFF, 0x02, [15] = 0x02};
+  uint8_t msg[16] = {0};
+  msg[0] = ICMP6_RS;
+  msg[8] = ND_OPT_SLLA;
+  msg[9] = 1;
+  memcpy(msg + 10, nic_mac(), 6);
+  icmp6_send(ll6, all_routers, msg, sizeof msg, 255);
+}
+
+static void nbr_request(const uint8_t ip[16])
+{
+  if (addr_is_v4(ip))
+    arp_request(ip + 12);
+  else
+    ns_send(ip);
+}
+
+/* Resolve an address to a MAC, sending requests and waiting on the RX interrupt. */
+static bool nbr_resolve(const uint8_t ip[16], uint8_t out[6])
+{
+  if (nbr_lookup(ip, out))
     return true;
   /* In the RX IRQ never block: send a request and fail; the TCP retransmit resolves later. */
   if (net_rx_depth > 0) {
-    arp_request(ip);
+    nbr_request(ip);
     return false;
   }
   for (int tries = 0; tries < 4; tries++) {
-    arp_request(ip);
+    nbr_request(ip);
     uint32_t deadline = timer_ticks() + TIMER_HZ / 4;
     while (timer_ticks() < deadline) {
       __asm__ volatile("" ::: "memory");
-      if (arp_lookup(ip, out))
+      if (nbr_lookup(ip, out))
         return true;
       if (sched_intr_pending()) /* Ctrl+C: give up resolving */
         return false;
@@ -289,22 +417,64 @@ static bool same_subnet(const uint8_t ip[4])
 }
 
 /* Pick the next hop (host directly, or the gateway) and resolve its MAC. */
-static int next_hop_mac(const uint8_t dst[4], uint8_t out[6])
+static int next_hop_mac(const uint8_t dst[16], uint8_t out[6])
 {
-  if (dst[0] >= 224 && dst[0] <= 239) { /* IPv4 multicast: RFC 1112 MAC map */
-    out[0] = 0x01;
-    out[1] = 0x00;
-    out[2] = 0x5e;
-    out[3] = dst[1] & 0x7f;
-    out[4] = dst[2];
-    out[5] = dst[3];
+  if (addr_is_v4(dst)) {
+    const uint8_t *d = dst + 12;
+    if (d[0] >= 224 && d[0] <= 239) { /* IPv4 multicast: RFC 1112 MAC map */
+      out[0] = 0x01;
+      out[1] = 0x00;
+      out[2] = 0x5e;
+      out[3] = d[1] & 0x7f;
+      out[4] = d[2];
+      out[5] = d[3];
+      return 1;
+    }
+    uint8_t hop[16];
+    addr_map_v4(hop, same_subnet(d) ? d : gw_ip);
+    return nbr_resolve(hop, out);
+  }
+  if (addr_is_mcast6(dst)) { /* RFC 2464: 33:33 + low 32 bits */
+    out[0] = out[1] = 0x33;
+    memcpy(out + 2, dst + 12, 4);
     return 1;
   }
-  return arp_resolve(same_subnet(dst) ? dst : gw_ip, out);
+  bool onlink = addr_is_link_local6(dst) || (have_gua6 && memcmp(dst, prefix6, 8) == 0);
+  if (onlink)
+    return nbr_resolve(dst, out);
+  return have_gw6 && nbr_resolve(gw6, out);
 }
 
-static void ip_send_ttl(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, uint32_t plen, uint8_t ttl)
+static void ip6_send_from(const uint8_t src[16], const uint8_t dst[16], uint8_t proto, const uint8_t *payload,
+                          uint32_t plen, uint8_t hlim)
 {
+  uint8_t nh[6];
+  if (!next_hop_mac(dst, nh))
+    return;
+
+  uint8_t buf[1500];
+  if (40 + plen > sizeof(buf))
+    return;
+  struct ip6_hdr *ip = (struct ip6_hdr *)buf;
+  ip->vtf = htonl(0x60000000);
+  ip->plen = htons(plen);
+  ip->nh = proto;
+  ip->hlim = hlim;
+  memcpy(ip->src, src, 16);
+  memcpy(ip->dst, dst, 16);
+  memcpy(buf + 40, payload, plen);
+  eth_send(nh, ETH_IP6, buf, 40 + plen);
+}
+
+static void ip_send_ttl(const uint8_t dst[16], uint8_t proto, const uint8_t *payload, uint32_t plen, uint8_t ttl)
+{
+  if (!addr_is_v4(dst)) {
+    uint8_t src[16];
+    net_src_addr(dst, src);
+    ip6_send_from(src, dst, proto, payload, plen, ttl);
+    return;
+  }
+
   uint8_t nh[6];
   if (!next_hop_mac(dst, nh))
     return;
@@ -324,36 +494,43 @@ static void ip_send_ttl(const uint8_t dst[4], uint8_t proto, const uint8_t *payl
   ip->proto = proto;
   ip->csum = 0;
   memcpy(ip->src, my_ip, 4);
-  memcpy(ip->dst, dst, 4);
+  memcpy(ip->dst, dst + 12, 4);
   ip->csum = htons(inet_csum(buf, 20));
 
   memcpy(buf + 20, payload, plen);
   eth_send(nh, ETH_IP, buf, 20 + plen);
 }
 
-static void ip_send(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, uint32_t plen)
+static void ip_send(const uint8_t dst[16], uint8_t proto, const uint8_t *payload, uint32_t plen)
 {
   ip_send_ttl(dst, proto, payload, plen, 64);
 }
 
 /* Lower-layer hooks for the transport layer. */
-void net_ip_send(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, uint32_t plen)
+void net_ip_send(const uint8_t dst[16], uint8_t proto, const uint8_t *payload, uint32_t plen)
 {
   ip_send(dst, proto, payload, plen);
 }
+
+/* Largest TCP payload per segment toward `dst` (MTU 1500 minus IP and TCP headers). */
+uint32_t net_tcp_mss(const uint8_t dst[16]) { return addr_is_v4(dst) ? 1460 : 1440; }
 
 const uint8_t *net_my_ip(void) { return my_ip; }
 
 /* True once a real IPv4 address is held (non-zero my_ip). */
 bool net_have_ip(void) { return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3]; }
 
+const uint8_t *net_my_ip6(void) { return have_gua6 ? gua6 : NULL; }
+
+const uint8_t *net_ll_ip6(void) { return ll6; }
+
 /* Client-socket RX delivery (defined with the usock layer below). */
-static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
+static bool usock_udp_deliver(const uint8_t src_ip[16], uint16_t sport, uint16_t dport, const uint8_t *data,
                               uint32_t len);
 static void usock_icmp_deliver(const uint8_t *msg, uint32_t len);
 static void usock_raw_deliver(const uint8_t *frame, uint32_t len);
 
-static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
+static void icmp_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
 {
   if (len < 8)
     return;
@@ -363,9 +540,108 @@ static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
     icmp_id_rx = ntohs(ic->id);
     icmp_seq_rx = ntohs(ic->seq);
     for (int i = 0; i < 4; i++)
-      icmp_from[i] = src[i];
+      icmp_from[i] = src[12 + i];
     icmp_got = 1;
     usock_icmp_deliver(p, len);
+  }
+}
+
+/* Walk an ND option list (type, length in 8-byte units) for `want`; returns its body (6-byte MAC or prefix info). */
+static const uint8_t *nd_option(const uint8_t *p, uint32_t len, uint8_t want)
+{
+  while (len >= 8) {
+    uint32_t olen = (uint32_t)p[1] * 8;
+    if (olen == 0 || olen > len)
+      return NULL;
+    if (p[0] == want)
+      return p + 2;
+    p += olen;
+    len -= olen;
+  }
+  return NULL;
+}
+
+static void ra_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
+{
+  if (len < 16 || !addr_is_link_local6(src))
+    return;
+  const uint8_t *opts = p + 16;
+  uint32_t olen = len - 16;
+  uint16_t lifetime = (uint16_t)((p[6] << 8) | p[7]);
+  if (lifetime) {
+    memcpy(gw6, src, 16);
+    have_gw6 = true;
+    const uint8_t *mac = nd_option(opts, olen, ND_OPT_SLLA);
+    if (mac)
+      nbr_cache_put(src, mac);
+  } else if (have_gw6 && memcmp(gw6, src, 16) == 0) {
+    have_gw6 = false;
+  }
+  const uint8_t *pi = nd_option(opts, olen, ND_OPT_PREFIX);
+  /* Prefix information body: plen, flags (A=0x40), valid(4), preferred(4), reserved(4), prefix(16). */
+  if (pi && pi[0] == 64 && (pi[1] & 0x40) && (pi[2] | pi[3] | pi[4] | pi[5]) && !addr_is_link_local6(pi + 14)) {
+    memcpy(prefix6, pi + 14, 8);
+    memcpy(gua6, pi + 14, 8);
+    memcpy(gua6 + 8, ll6 + 8, 8);
+    have_gua6 = true;
+  }
+}
+
+static void ns_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
+{
+  if (len < 24)
+    return;
+  const uint8_t *target = p + 8;
+  bool ours = memcmp(target, ll6, 16) == 0 || (have_gua6 && memcmp(target, gua6, 16) == 0);
+  if (!ours || addr_is_unspec(src))
+    return;
+  const uint8_t *mac = nd_option(p + 24, len - 24, ND_OPT_SLLA);
+  if (!mac)
+    return;
+  nbr_cache_put(src, mac);
+  uint8_t msg[32] = {0};
+  msg[0] = ICMP6_NA;
+  msg[4] = 0x60; /* solicited | override */
+  memcpy(msg + 8, target, 16);
+  msg[24] = ND_OPT_TLLA;
+  msg[25] = 1;
+  memcpy(msg + 26, nic_mac(), 6);
+  icmp6_send(target, src, msg, sizeof msg, 255);
+}
+
+static void na_recv(const uint8_t *p, uint32_t len)
+{
+  if (len < 24)
+    return;
+  const uint8_t *mac = nd_option(p + 24, len - 24, ND_OPT_TLLA);
+  if (mac && nbr_pending_take(p + 8))
+    nbr_cache_put(p + 8, mac);
+}
+
+static void icmp6_recv(const uint8_t src[16], const uint8_t dst[16], uint8_t hlim, const uint8_t *p, uint32_t len)
+{
+  if (len < 8 || net_l4_csum(src, dst, IP_ICMP6, p, len) != 0)
+    return;
+  switch (p[0]) {
+  case ICMP6_ECHO_REPLY:
+    icmp_rtt_us = timer_us() - icmp_send_us;
+    icmp_id_rx = ntohs(((const struct icmp_hdr *)p)->id);
+    icmp_seq_rx = ntohs(((const struct icmp_hdr *)p)->seq);
+    icmp_got = 1;
+    usock_icmp_deliver(p, len);
+    break;
+  case ICMP6_RA:
+    if (hlim == 255)
+      ra_recv(src, p, len);
+    break;
+  case ICMP6_NS:
+    if (hlim == 255)
+      ns_recv(src, p, len);
+    break;
+  case ICMP6_NA:
+    if (hlim == 255)
+      na_recv(p, len);
+    break;
   }
 }
 
@@ -407,12 +683,14 @@ void net_udp_unlisten(uint16_t port)
       udp_listeners[i].fn = 0;
 }
 
-void net_udp_send_ttl(const uint8_t dst[4], uint16_t dport, uint16_t sport, const uint8_t *data, uint32_t len,
+/* Largest UDP payload toward `dst`; QUIC needs >=1200. */
+static uint32_t udp_max_payload(const uint8_t dst[16]) { return addr_is_v4(dst) ? 1472 : 1452; }
+
+void net_udp_send_ttl(const uint8_t dst[16], uint16_t dport, uint16_t sport, const uint8_t *data, uint32_t len,
                       uint8_t ttl)
 {
-  /* Cap at what ip_send's 1500-byte buffer allows (20 IP + 8 UDP headers); QUIC needs >=1200. */
-  if (len > 1472)
-    len = 1472;
+  if (len > udp_max_payload(dst))
+    len = udp_max_payload(dst);
   uint8_t pkt[8 + 1472];
   struct udp_hdr *u = (struct udp_hdr *)pkt;
   u->sport = htons(sport);
@@ -421,17 +699,19 @@ void net_udp_send_ttl(const uint8_t dst[4], uint16_t dport, uint16_t sport, cons
   u->csum = 0;
   for (uint32_t i = 0; i < len; i++)
     pkt[8 + i] = data[i];
-  uint16_t csum = udp_checksum(my_ip, dst, pkt, 8 + len);
+  uint8_t src[16];
+  net_src_addr(dst, src);
+  uint16_t csum = net_l4_csum(src, dst, IP_UDP, pkt, 8 + len);
   u->csum = htons(csum ? csum : 0xFFFF);
   ip_send_ttl(dst, IP_UDP, pkt, 8 + len, ttl);
 }
 
-void net_udp_send(const uint8_t dst[4], uint16_t dport, uint16_t sport, const uint8_t *data, uint32_t len)
+void net_udp_send(const uint8_t dst[16], uint16_t dport, uint16_t sport, const uint8_t *data, uint32_t len)
 {
   net_udp_send_ttl(dst, dport, sport, data, len, 64);
 }
 
-static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
+static void udp_recv(const uint8_t src[16], const uint8_t dst[16], const uint8_t *p, uint32_t len)
 {
   if (len < 8)
     return;
@@ -439,7 +719,9 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
   uint32_t ulen = ntohs(u->len);
   if (ulen < 8 || ulen > len)
     return;
-  if (u->csum && udp_checksum(src, my_ip, p, ulen) != 0)
+  if (!u->csum && !addr_is_v4(src)) /* mandatory over IPv6 */
+    return;
+  if (u->csum && net_l4_csum(src, dst, IP_UDP, p, ulen) != 0)
     return;
   /* A bound socket gets the datagram. */
   if (usock_udp_deliver(src, ntohs(u->sport), ntohs(u->dport), p + 8, ulen - 8))
@@ -495,12 +777,51 @@ static void ip_recv(const uint8_t *p, uint32_t len)
 
   const uint8_t *payload = p + ihl;
   uint32_t plen = total - ihl;
+  uint8_t src[16], dst[16];
+  addr_map_v4(src, ip->src);
+  addr_map_v4(dst, ip->dst);
   if (ip->proto == IP_ICMP)
-    icmp_recv(ip->src, payload, plen);
+    icmp_recv(src, payload, plen);
   else if (ip->proto == IP_UDP)
-    udp_recv(ip->src, payload, plen);
+    udp_recv(src, dst, payload, plen);
   else if (ip->proto == IP_TCP)
-    tcp_input(ip->src, payload, plen);
+    tcp_input(src, dst, payload, plen);
+}
+
+static bool ip6_dst_ok(const uint8_t dst[16])
+{
+  return addr_is_mcast6(dst) || memcmp(dst, ll6, 16) == 0 || (have_gua6 && memcmp(dst, gua6, 16) == 0);
+}
+
+static void ip6_recv(const uint8_t *p, uint32_t len)
+{
+  if (len < 40)
+    return;
+  const struct ip6_hdr *ip = (const struct ip6_hdr *)p;
+  if ((p[0] >> 4) != 6 || !ip6_dst_ok(ip->dst))
+    return;
+  uint32_t plen = ntohs(ip->plen);
+  if (40 + plen > len)
+    return;
+
+  const uint8_t *payload = p + 40;
+  uint8_t nh = ip->nh;
+  while (nh == IP6_HBH || nh == IP6_DSTOPTS) { /* skip option headers; fragments are dropped below */
+    if (plen < 8)
+      return;
+    uint32_t hl = ((uint32_t)payload[1] + 1) * 8;
+    if (hl > plen)
+      return;
+    nh = payload[0];
+    payload += hl;
+    plen -= hl;
+  }
+  if (nh == IP_ICMP6)
+    icmp6_recv(ip->src, ip->dst, ip->hlim, payload, plen);
+  else if (nh == IP_UDP)
+    udp_recv(ip->src, ip->dst, payload, plen);
+  else if (nh == IP_TCP)
+    tcp_input(ip->src, ip->dst, payload, plen);
 }
 
 /* The NIC driver hands every inbound Ethernet frame (FCS stripped) here. */
@@ -517,6 +838,8 @@ void net_rx_frame(const uint8_t *f, uint32_t len)
     arp_recv(f + 14, len - 14);
   else if (type == ETH_IP)
     ip_recv(f + 14, len - 14);
+  else if (type == ETH_IP6)
+    ip6_recv(f + 14, len - 14);
   net_rx_depth--;
 }
 
@@ -541,6 +864,124 @@ static int parse_ipv4(const char *s, uint8_t out[4])
   return *s == '\0';
 }
 
+static int hex_digit(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  c |= 32;
+  return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* Parse an IPv6 literal (optional "%zone" suffix, ignored) into 16 bytes. */
+static int parse_ipv6(const char *s, uint8_t out[16])
+{
+  uint16_t head[8], tail[8];
+  int nh = 0, nt = 0;
+  bool gap = false;
+  if (s[0] == ':') {
+    if (s[1] != ':')
+      return 0;
+    gap = true;
+    s += 2;
+  }
+  while (*s && *s != '%') {
+    uint32_t v = 0;
+    int digits = 0;
+    while (hex_digit(*s) >= 0) {
+      v = v * 16 + (uint32_t)hex_digit(*s++);
+      if (++digits > 4)
+        return 0;
+    }
+    if (!digits || nh + nt >= 8)
+      return 0;
+    if (gap)
+      tail[nt++] = (uint16_t)v;
+    else
+      head[nh++] = (uint16_t)v;
+    if (*s == ':') {
+      s++;
+      if (*s == ':') {
+        if (gap)
+          return 0;
+        gap = true;
+        s++;
+      } else if (!*s || *s == '%') {
+        return 0;
+      }
+    } else if (*s && *s != '%') {
+      return 0;
+    }
+  }
+  if (gap ? nh + nt > 7 : nh != 8)
+    return 0;
+  memset(out, 0, 16);
+  for (int i = 0; i < nh; i++) {
+    out[2 * i] = (uint8_t)(head[i] >> 8);
+    out[2 * i + 1] = (uint8_t)head[i];
+  }
+  for (int i = 0; i < nt; i++) {
+    out[16 - 2 * (nt - i)] = (uint8_t)(tail[i] >> 8);
+    out[16 - 2 * (nt - i) + 1] = (uint8_t)tail[i];
+  }
+  return 1;
+}
+
+/* Parse an IPv4 or IPv6 literal into a 16-byte (v4-mapped) address. */
+static int parse_ip(const char *s, uint8_t out[16])
+{
+  uint8_t v4[4];
+  if (parse_ipv4(s, v4)) {
+    addr_map_v4(out, v4);
+    return 1;
+  }
+  return parse_ipv6(s, out);
+}
+
+/* Format an address into out (>= 40 bytes): dotted quad for v4-mapped, RFC 5952 for v6. Returns the length. */
+int net_addr_str(const uint8_t a[16], char *out)
+{
+  int n = 0;
+  if (addr_is_v4(a)) {
+    for (int i = 12; i < 16; i++) {
+      if (a[i] >= 100)
+        out[n++] = (char)('0' + a[i] / 100);
+      if (a[i] >= 10)
+        out[n++] = (char)('0' + a[i] / 10 % 10);
+      out[n++] = (char)('0' + a[i] % 10);
+      if (i < 15)
+        out[n++] = '.';
+    }
+    out[n] = '\0';
+    return n;
+  }
+  int best = -1, best_len = 1;
+  for (int i = 0; i < 8;) {
+    int j = i;
+    while (j < 8 && !a[2 * j] && !a[2 * j + 1])
+      j++;
+    if (j - i > best_len)
+      best = i, best_len = j - i;
+    i = j > i ? j : i + 1;
+  }
+  for (int i = 0; i < 8; i++) {
+    if (i == best) {
+      out[n++] = ':';
+      if (i == 0)
+        out[n++] = ':';
+      i += best_len - 1;
+      continue;
+    }
+    uint32_t g = ((uint32_t)a[2 * i] << 8) | a[2 * i + 1];
+    int shift = g > 0xFFF ? 12 : g > 0xFF ? 8 : g > 0xF ? 4 : 0;
+    for (; shift >= 0; shift -= 4)
+      out[n++] = "0123456789abcdef"[(g >> shift) & 0xF];
+    if (i < 7)
+      out[n++] = ':';
+  }
+  out[n] = '\0';
+  return n;
+}
+
 /* Socket handles: a small connection table user programs drive via connect/send/recv/close. */
 #define NET_SOCK_MAX 8
 #define SOCK_DGRAM 1500 /* one datagram's worth of rx per UDP/ICMP socket */
@@ -554,13 +995,13 @@ static struct usock {
   uint8_t listening;     /* TCP passive-open slot (accept()s on lport)   */
   uint32_t owner;        /* task that opened the handle                  */
   tcp_conn_t *conn;      /* bare-TCP connection (TCP only)              */
-  uint8_t peer[4];       /* UDP/ICMP destination                        */
+  uint8_t peer[16];      /* UDP/ICMP destination (v4-mapped for IPv4)   */
   uint16_t lport, rport; /* UDP local / remote ports                    */
   uint8_t ttl;           /* outgoing IP TTL (UDP); mDNS/SSDP need 255   */
   /* Datagram ring (UDP/ICMP): RX IRQ enqueues at dg_tail, recv dequeues at dg_head (empty when equal). */
   volatile uint32_t dg_head, dg_tail;
   uint32_t dg_len[SOCK_DGRING];
-  uint8_t dg_src_ip[SOCK_DGRING][4]; /* per-datagram sender, for recvfrom */
+  uint8_t dg_src_ip[SOCK_DGRING][16]; /* per-datagram sender, for recvfrom */
   uint16_t dg_src_port[SOCK_DGRING];
   uint8_t dg[SOCK_DGRING][SOCK_DGRAM];
   /* Raw Ethernet ring (SK_RAWETH): separate from dg[] because a frame exceeds SOCK_DGRAM. */
@@ -589,12 +1030,12 @@ static void usock_raw_deliver(const uint8_t *frame, uint32_t len)
 }
 
 /* Deliver a UDP datagram to the socket on its local port (RX IRQ); 1 if claimed. */
-static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
+static bool usock_udp_deliver(const uint8_t src_ip[16], uint16_t sport, uint16_t dport, const uint8_t *data,
                               uint32_t len)
 {
   for (int i = 0; i < NET_SOCK_MAX; i++) {
     struct usock *s = &usocks[i];
-    int peer_match = s->rport == 0 || (s->rport == sport && memcmp(s->peer, src_ip, 4) == 0);
+    int peer_match = s->rport == 0 || (s->rport == sport && memcmp(s->peer, src_ip, 16) == 0);
     if (s->used && s->proto == SK_UDP && s->lport == dport && peer_match) {
       uint32_t next = (s->dg_tail + 1) % SOCK_DGRING;
       if (next == s->dg_head)
@@ -604,8 +1045,7 @@ static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t 
       for (uint32_t k = 0; k < len; k++)
         s->dg[s->dg_tail][k] = data[k];
       s->dg_len[s->dg_tail] = len;
-      for (int k = 0; k < 4; k++)
-        s->dg_src_ip[s->dg_tail][k] = src_ip[k];
+      memcpy(s->dg_src_ip[s->dg_tail], src_ip, 16);
       s->dg_src_port[s->dg_tail] = sport;
       s->dg_tail = next;
       return true;
@@ -635,7 +1075,7 @@ static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
 }
 
 /* Block ~2 s for a datagram; out_ip/out_port may be NULL. >0 bytes, 0 timeout, -4 intr. */
-static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t *out_ip, uint16_t *out_port)
+static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t out_ip[16], uint16_t *out_port)
 {
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
   for (;;) {
@@ -648,8 +1088,7 @@ static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t
       for (uint32_t i = 0; i < n; i++)
         ((uint8_t *)buf)[i] = s->dg[idx][i];
       if (out_ip)
-        for (int i = 0; i < 4; i++)
-          out_ip[i] = s->dg_src_ip[idx][i];
+        memcpy(out_ip, s->dg_src_ip[idx], 16);
       if (out_port)
         *out_port = s->dg_src_port[idx];
       s->dg_head = (idx + 1) % SOCK_DGRING;
@@ -666,6 +1105,14 @@ static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t
 
 static int sock_dgram_recv(struct usock *s, void *buf, uint32_t max)
 {
+  return sock_dgram_recvfrom(s, buf, max, NULL, NULL);
+}
+
+/* The next queued datagram, or 0 if none: never waits. */
+static int sock_dgram_recv_nb(struct usock *s, void *buf, uint32_t max)
+{
+  if (s->dg_head == s->dg_tail)
+    return sched_intr_pending() ? -4 : 0;
   return sock_dgram_recvfrom(s, buf, max, NULL, NULL);
 }
 
@@ -726,7 +1173,7 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
     return net_raw_open();
   if (!nic_present())
     return -1;
-  if (port == 0)
+  if (port == 0 && proto != SK_ICMP)
     return -1;
   int h = -1;
   for (int i = 0; i < NET_SOCK_MAX; i++)
@@ -748,13 +1195,12 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
   s->dg_head = s->dg_tail = 0;
   s->ttl = 64;
 
-  uint8_t ip[4];
-  if (!parse_ipv4(host, ip)) {
+  uint8_t ip[16];
+  if (!parse_ip(host, ip)) {
     s->used = 0;
     return -2;
   }
-  for (int i = 0; i < 4; i++)
-    s->peer[i] = ip[i];
+  memcpy(s->peer, ip, 16);
 
   switch (proto) {
   case SK_TCP:
@@ -787,12 +1233,22 @@ int net_sock_send(int h, const void *buf, uint32_t len)
   case SK_TCP:
     return tcp_write(s->conn, buf, len);
   case SK_UDP:
-    if (len > 1472) /* one IPv4/UDP datagram won't hold more */
+    if (len > udp_max_payload(s->peer)) /* one datagram won't hold more */
       return -1;
     net_udp_send_ttl(s->peer, s->rport, s->lport, buf, len, s->ttl);
     return (int)len;
   case SK_ICMP:
-    ip_send(s->peer, IP_ICMP, buf, len);
+    if (addr_is_v4(s->peer)) {
+      ip_send(s->peer, IP_ICMP, buf, len);
+    } else {
+      /* ICMPv6 carries a pseudo-header checksum the program can't know: fill it in. */
+      uint8_t msg[1440], src[16];
+      if (len < 8 || len > sizeof msg)
+        return -1;
+      memcpy(msg, buf, len);
+      net_src_addr(s->peer, src);
+      icmp6_send(src, s->peer, msg, len, 64);
+    }
     return (int)len;
   case SK_RAWETH:
     if (len < 14 || len > RAW_FRAME)
@@ -832,7 +1288,9 @@ int net_sock_recv_nb(int h, void *buf, uint32_t max)
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
     return -1;
   struct usock *s = &usocks[h];
-  if (s->proto == SK_UDP || s->proto == SK_ICMP)
+  if (s->proto == SK_UDP)
+    return sock_dgram_recv_nb(s, buf, max);
+  if (s->proto == SK_ICMP)
     return sock_dgram_recv(s, buf, max);
   if (s->proto == SK_RAWETH)
     return sock_raw_recv(s, buf, max, 0);
@@ -949,7 +1407,7 @@ int net_sock_bind(int port)
 }
 
 /* Receive one datagram on a bound UDP socket; out pointers may be NULL. >0, 0 timeout, -1 bad fd, -4 intr. */
-int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[4], uint16_t *out_port)
+int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[16], uint16_t *out_port)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
     return -1;
@@ -957,13 +1415,13 @@ int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[4], uint16_
 }
 
 /* Send a datagram from a bound UDP socket to ip:port. Returns len or -1. */
-int net_sock_sendto(int h, const uint8_t ip[4], int port, const void *buf, uint32_t len)
+int net_sock_sendto(int h, const uint8_t ip[16], int port, const void *buf, uint32_t len)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
     return -1;
   if (!ip || (!buf && len) || port < 1 || port > 65535)
     return -1;
-  if (len > 1472) /* one IPv4/UDP datagram won't hold more */
+  if (len > udp_max_payload(ip)) /* one datagram won't hold more */
     return -1;
   struct usock *s = &usocks[h];
   net_udp_send_ttl(ip, (uint16_t)port, s->lport, buf, len, s->ttl);
@@ -982,14 +1440,34 @@ void net_init(void)
   nic_init();
   if (!nic_present())
     return;
+  ll6[0] = 0xFE;
+  ll6[1] = 0x80;
+  memcpy(ll6 + 8, nic_mac(), 3);
+  memcpy(ll6 + 13, nic_mac() + 3, 3);
+  ll6[8] ^= 0x02; /* EUI-64: flip the universal/local bit, insert ff:fe */
+  ll6[11] = 0xFF;
+  ll6[12] = 0xFE;
   /* No IP is announced here: /bin/dhcpcd applies the lease after sti. */
   con_write("net: requesting address via DHCP\n");
+}
+
+/* Router solicitations every 4 s until a router answers (max 5). */
+static void rs_tick(void)
+{
+  static uint32_t next;
+  static int sent;
+  if (have_gw6 || sent >= 5 || timer_ticks() < next)
+    return;
+  rs_send();
+  sent++;
+  next = timer_ticks() + 4 * TIMER_HZ;
 }
 
 static void net_poll_thread(void)
 {
   for (;;) {
     nic_poll();
+    rs_tick();
     timer_sleep(1);
   }
 }
