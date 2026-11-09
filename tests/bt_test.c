@@ -19,6 +19,31 @@ static uint32_t now;
 static bool auto_complete; /* answer ACL with Number Of Completed Packets */
 static bool no_le;
 static int acl_pkts = 8;
+static bool no_p256;
+static uint8_t enc_status;
+static uint8_t last_enc[28], last_dh_req[64];
+static int enc_cmds;
+
+/* Fixed P-256 pairs (openssl) and their shared secret; the fake controller plays the local side, the test the peer. */
+static uint8_t key_a[64], key_b[64], shared[32];
+
+static void hexle(const char *be, uint8_t *out, int n)
+{
+  for (int i = 0; i < n; i++) {
+    unsigned v;
+    sscanf(be + 2 * (n - 1 - i), "%2x", &v);
+    out[i] = (uint8_t)v;
+  }
+}
+
+static void keys_init(void)
+{
+  hexle("f246a4da51aee184c16482464a6b7e1f0c2130802e63e5daa4b2be72ccb3617f", key_a, 32);
+  hexle("887a41139d4337074a4e9d6a7d67bf06be8499b66f11da56147e7ea62fac7b18", key_a + 32, 32);
+  hexle("d405079a21b52ae5c8ecf40885771f5549a5660b114ceffed377758a1f6268f2", key_b, 32);
+  hexle("250d36bb53b1d9c3807f286e0989f2034402fcdade01838eeafd95b42893c13a", key_b + 32, 32);
+  hexle("6314d02e01f0522bf1ce8a11e58a74bcd77dca64dff2cba37606d43057f506c0", shared, 32);
+}
 
 static void evt(uint8_t code, const void *params, int len)
 {
@@ -72,6 +97,35 @@ static void respond(const uint8_t *c)
     r[3] = (uint8_t)acl_pkts;
     cmd_complete(op, r, 4);
     return;
+  case 0x2025: {
+    if (no_p256) {
+      cmd_status(op, 1);
+      return;
+    }
+    cmd_status(op, 0);
+    uint8_t e[66] = {0x08, 0};
+    memcpy(e + 2, key_a, 64);
+    evt(0x3E, e, 66);
+    return;
+  }
+  case 0x2026: {
+    memcpy(last_dh_req, c + 3, 64);
+    cmd_status(op, 0);
+    uint8_t e[34] = {0x09, !memcmp(c + 3, key_b, 64) ? 0 : 0x12};
+    memcpy(e + 2, shared, 32);
+    evt(0x3E, e, 34);
+    return;
+  }
+  case 0x2019: {
+    memcpy(last_enc, c + 3, 28);
+    enc_cmds++;
+    cmd_status(op, 0);
+    uint8_t e[4] = {enc_status};
+    memcpy(e + 1, c + 3, 2);
+    e[3] = !enc_status;
+    evt(0x08, e, 4);
+    return;
+  }
   case 0x0401:
   case 0x0405:
   case 0x0406:
@@ -117,6 +171,7 @@ static void start(void)
   nsent = rd = 0;
   now = 0;
   auto_complete = true;
+  keys_init();
   bt_host_yield = NULL;
   bt_attach(&transport);
   tick(50);
@@ -126,6 +181,9 @@ static void stop(void)
 {
   bt_host_yield = NULL;
   bt_detach();
+  no_p256 = false;
+  enc_status = 0;
+  enc_cmds = 0;
 }
 
 /* Next command with this opcode after the read cursor; skips the rest. */
@@ -967,6 +1025,528 @@ static void headset_still_gets_a2dp(void)
   stop();
 }
 
+static void unhex(const char *hex, uint8_t *out, int n)
+{
+  for (int i = 0; i < n; i++) {
+    unsigned v;
+    sscanf(hex + 2 * i, "%2x", &v);
+    out[i] = (uint8_t)v;
+  }
+}
+
+static void expect_hex(const uint8_t *got, const char *hex, int n)
+{
+  uint8_t want[64];
+  unhex(hex, want, n);
+  expect(!memcmp(got, want, (size_t)n));
+}
+
+static void aes_and_cmac_vectors(void)
+{
+  uint8_t k[16], m[64], out[16];
+  unhex("000102030405060708090a0b0c0d0e0f", k, 16);
+  unhex("00112233445566778899aabbccddeeff", m, 16);
+  bt_aes128(k, m, out);
+  expect_hex(out, "69c4e0d86a7b0430d8cdb78070b4c55a", 16);
+
+  unhex("2b7e151628aed2a6abf7158809cf4f3c", k, 16);
+  unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411", m, 40);
+  bt_cmac(k, m, 0, out);
+  expect_hex(out, "bb1d6929e95937287fa37d129b756746", 16);
+  bt_cmac(k, m, 16, out);
+  expect_hex(out, "070a16b46b4d4144f79bdd9dd04a287c", 16);
+  bt_cmac(k, m, 40, out);
+  expect_hex(out, "dfa66747de9ae63030ca32611497c827", 16);
+}
+
+/* Core spec vol 3 part H appendix D samples, written most significant octet first. */
+static void smp_function_vectors(void)
+{
+  uint8_t k[16] = {0}, r[16], preq[7], pres[7], ia[6], ra[6], out[16];
+  hexle("5783D52156AD6F0E6388274EC6702EE0", r, 16);
+  hexle("07071000000101", preq, 7);
+  hexle("05000800000302", pres, 7);
+  hexle("A1A2A3A4A5A6", ia, 6);
+  hexle("B1B2B3B4B5B6", ra, 6);
+  smp_c1(k, r, preq, pres, 1, ia, 0, ra, out);
+  uint8_t want[16];
+  hexle("1e1e3fef878988ead2a74dc5bef13b86", want, 16);
+  expect(!memcmp(out, want, 16));
+
+  uint8_t r1[16], r2[16];
+  hexle("000F0E0D0C0B0A091122334455667788", r1, 16);
+  hexle("010203040506070899AABBCCDDEEFF00", r2, 16);
+  smp_s1(k, r1, r2, out);
+  hexle("9a1fe1f0e8b0f49b5b4216ae796da062", want, 16);
+  expect(!memcmp(out, want, 16));
+
+  uint8_t u[32], v[32], x[16], n1[16], n2[16], a1[7], a2[7], w[32], mac[16], ltk[16], rr[16], io[3];
+  hexle("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6", u, 32);
+  hexle("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd", v, 32);
+  hexle("d5cb8454d177733effffb2ec712baeab", x, 16);
+  smp_f4(u, v, x, 0, out);
+  hexle("f2c916f107a9bd1cf1eda1bea974872d", want, 16);
+  expect(!memcmp(out, want, 16));
+
+  hexle("ec0234a357c8ad05341010a60a397d9b99796b13b4f866f1868d34f373bfa698", w, 32);
+  hexle("d5cb8454d177733effffb2ec712baeab", n1, 16);
+  hexle("a6e8e7cc25a75f6e216583f7ff3dc4cf", n2, 16);
+  hexle("0056123737bfce", a1, 7);
+  hexle("00a713702dcfc1", a2, 7);
+  smp_f5(w, n1, n2, a1, a2, mac, ltk);
+  hexle("2965f176a1084a02fd3f6a20ce636e20", want, 16);
+  expect(!memcmp(mac, want, 16));
+  hexle("6986791169d7cd23980522b594750a38", want, 16);
+  expect(!memcmp(ltk, want, 16));
+
+  hexle("12a3343bb453bb5408da42d20c2d0fc8", rr, 16);
+  hexle("010102", io, 3);
+  smp_f6(mac, n1, n2, rr, io, a1, a2, out);
+  hexle("e3c473989cd0e8c5d26c0b09da958f61", want, 16);
+  expect(!memcmp(out, want, 16));
+}
+
+static void smp_in(const uint8_t *pdu, int len) { acl_in(LE_HANDLE, 6, pdu, len, 27); }
+
+static bool take_smp(uint8_t *pdu, int *len)
+{
+  struct l2 f;
+  while (take_l2(&f))
+    if (f.cid == 6) {
+      memcpy(pdu, f.d, (size_t)f.len);
+      *len = f.len;
+      return true;
+    }
+  return false;
+}
+
+#define PRIV_A "93daa58fe97921af752cb96daf569e342a1c426d0eb9d0826293f7c33ef87e5b"
+#define PRIV_B "8adc8649be241e1e0c0546a0d214873f3e34933b84f0d7b82692ed0f976f4ee2"
+
+static const uint8_t peer_rnd_a[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+static void le_connect(void)
+{
+  start();
+  bt_command("scan on");
+  tick(5);
+  uint8_t adv[] = {2, 1, 0, 1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0, (uint8_t)-40};
+  evt(0x3E, adv, sizeof adv);
+  tick(5);
+  evt(0x01, (uint8_t[]){0}, 1);
+  tick(5);
+  expect_eq(bt_command("connect a6:a5:a4:a3:a2:a1"), 0);
+  tick(20);
+  uint8_t cc[19] = {1, 0};
+  bt_put16(cc + 2, LE_HANDLE);
+  cc[5] = 1;
+  memcpy(cc + 6, le_peer, 6);
+  evt(0x3E, cc, 19);
+  tick(5);
+}
+
+struct pairing {
+  bool sc, bad_confirm;
+  uint8_t key_size; /* the peripheral's maximum, 0 for 16 */
+  uint8_t ltk[16], rand[8];
+  uint16_t ediv;
+};
+
+/* The peripheral side of a Just Works pairing, answering the stack's Pairing Request (already queued). */
+static void peer_pairs(struct pairing *pr)
+{
+  uint8_t pdu[80], req[7], rsp[7], a1[7], a2[7], mackey[16], ltk[16];
+  uint8_t nb[16], na[16];
+  int len;
+  memset(nb, 0xB0, 16);
+  expect(take_smp(pdu, &len));
+  expect_eq(len, 7);
+  expect_eq(pdu[0], 1);
+  expect_eq(pdu[1], 3);
+  expect_eq(pdu[4], 16);
+  expect_eq(pdu[3] & 0x08, 0x08);
+  memcpy(req, pdu, 7);
+  memcpy(rsp, (uint8_t[]){2, 1, 0, (uint8_t)(pr->sc ? 0x0D : 0x05), pr->key_size ? pr->key_size : 16, 0, 0x03}, 7);
+  smp_in(rsp, 7);
+  tick(5);
+
+  memcpy(a1, local_addr, 6);
+  a1[6] = 0;
+  memcpy(a2, le_peer, 6);
+  a2[6] = 1;
+  if (pr->sc) {
+    uint8_t pk[65] = {0x0C};
+    expect(take_smp(pdu, &len));
+    expect_eq(len, 65);
+    expect_eq(pdu[0], 0x0C);
+    uint8_t ours[64], dhkey[32], dh_be[32];
+    memcpy(ours, pdu + 1, 64);
+    if (!no_p256)
+      expect(!memcmp(ours, key_a, 64));
+    memcpy(pk + 1, key_b, 64);
+    smp_in(pk, 65);
+    tick(5);
+    const uint8_t *dh = take_cmd(0x2026);
+    expect_eq(dh != NULL, !no_p256);
+    if (dh)
+      expect(!memcmp(dh, key_b, 64));
+    uint8_t ours_be[64], priv_b[32];
+    for (int i = 0; i < 32; i++) {
+      ours_be[i] = ours[31 - i];
+      ours_be[32 + i] = ours[63 - i];
+    }
+    unhex(PRIV_B, priv_b, 32);
+    expect(p256_ecdh(priv_b, ours_be, dh_be));
+    for (int i = 0; i < 32; i++)
+      dhkey[i] = dh_be[31 - i];
+    if (!no_p256)
+      expect(!memcmp(dhkey, shared, 32));
+
+    uint8_t cfm[17] = {3};
+    smp_f4(key_b, ours, nb, 0, cfm + 1);
+    if (pr->bad_confirm)
+      cfm[1] ^= 1;
+    smp_in(cfm, 17);
+    tick(5);
+    expect(take_smp(pdu, &len));
+    expect_eq(pdu[0], 4);
+    memcpy(na, pdu + 1, 16);
+    uint8_t rnd[17] = {4};
+    memcpy(rnd + 1, nb, 16);
+    smp_in(rnd, 17);
+    tick(5);
+    if (pr->bad_confirm)
+      goto refused;
+
+    uint8_t zero[16] = {0}, e[17] = {0x0D};
+    smp_f5(dhkey, na, nb, a1, a2, mackey, ltk);
+    expect(take_smp(pdu, &len));
+    expect_eq(pdu[0], 0x0D);
+    smp_f6(mackey, na, nb, zero, req + 1, a1, a2, e + 1);
+    expect(!memcmp(pdu + 1, e + 1, 16));
+    smp_f6(mackey, nb, na, zero, rsp + 1, a2, a1, e + 1);
+    smp_in(e, 17);
+    tick(5);
+    pr->ediv = 0;
+    memset(pr->rand, 0, 8);
+  } else {
+    uint8_t tk[16] = {0}, srand[16], sconf[17] = {3}, mconf[16], stk[16];
+    memset(srand, 0xC0, 16);
+    expect(take_smp(pdu, &len));
+    expect_eq(pdu[0], 3);
+    memcpy(mconf, pdu + 1, 16);
+    smp_c1(tk, srand, req, rsp, 0, local_addr, 1, le_peer, sconf + 1);
+    if (pr->bad_confirm)
+      sconf[1] ^= 1;
+    smp_in(sconf, 17);
+    tick(5);
+    expect(take_smp(pdu, &len));
+    expect_eq(pdu[0], 4);
+    memcpy(na, pdu + 1, 16);
+    uint8_t chk[16];
+    smp_c1(tk, na, req, rsp, 0, local_addr, 1, le_peer, chk);
+    expect(!memcmp(chk, mconf, 16));
+    uint8_t rnd[17] = {4};
+    memcpy(rnd + 1, srand, 16);
+    smp_in(rnd, 17);
+    tick(5);
+    if (pr->bad_confirm)
+      goto refused;
+    smp_s1(tk, srand, na, stk);
+    if (pr->key_size)
+      memset(stk + pr->key_size, 0, (size_t)(16 - pr->key_size));
+    memcpy(ltk, stk, 16);
+  }
+
+  const uint8_t *enc = take_cmd(0x2019);
+  expect(enc != NULL);
+  expect_eq(bt_get16(enc), LE_HANDLE);
+  expect(!memcmp(enc + 12, ltk, 16));
+  memcpy(pr->ltk, ltk, 16);
+
+  if (!pr->sc) {
+    uint8_t ek[17] = {6}, ci[11] = {7};
+    memset(ek + 1, 0x77, 16);
+    memcpy(pr->ltk, ek + 1, 16);
+    pr->ediv = 0x1234;
+    bt_put16(ci + 1, pr->ediv);
+    memset(pr->rand, 0x55, 8);
+    memcpy(ci + 3, pr->rand, 8);
+    smp_in(ek, 17);
+    smp_in(ci, 11);
+  }
+  uint8_t irk[17] = {8}, id[8] = {9, 1};
+  memcpy(id + 2, le_peer, 6);
+  smp_in(irk, 17);
+  smp_in(id, 8);
+  tick(5);
+  return;
+
+refused:
+  expect(take_smp(pdu, &len));
+  expect_eq(pdu[0], 5);
+  expect_eq(pdu[1], 4);
+}
+
+static void pairing_secure_connections(void)
+{
+  struct pairing pr = {.sc = true};
+  le_connect();
+  expect_eq(bt_command("pair"), 0);
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("pairing complete"));
+  expect(status_have("bond a6:a5:a4:a3:a2:a1"));
+  expect(status_have("connection a6:a5:a4:a3:a2:a1 le encrypted"));
+  stop();
+}
+
+static void pairing_legacy_with_peer_lacking_sc(void)
+{
+  struct pairing pr = {.sc = false};
+  le_connect();
+  expect_eq(bt_command("pair"), 0);
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("pairing complete"));
+  expect(status_have("bond a6:a5:a4:a3:a2:a1"));
+  stop();
+}
+
+static void pairing_secure_connections_host_ecc(void)
+{
+  struct pairing pr = {.sc = true};
+  no_p256 = true;
+  le_connect();
+  expect_eq(bt_command("pair"), 0);
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("pairing complete"));
+  expect(status_have("bond a6:a5:a4:a3:a2:a1"));
+  stop();
+}
+
+static void p256_matches_openssl(void)
+{
+  uint8_t a[32], b[32], pa[64], pb[64], want[64], out[32], out2[32];
+  unhex(PRIV_A, a, 32);
+  unhex(PRIV_B, b, 32);
+  expect(p256_pub(a, pa));
+  unhex("f246a4da51aee184c16482464a6b7e1f0c2130802e63e5daa4b2be72ccb3617f887a41139d4337074a4e9d6a7d67bf06be8499b66f11da"
+        "56147e7ea62fac7b18",
+        want, 64);
+  expect(!memcmp(pa, want, 64));
+  expect(p256_pub(b, pb));
+  expect(p256_ecdh(a, pb, out));
+  expect(p256_ecdh(b, pa, out2));
+  unhex("6314d02e01f0522bf1ce8a11e58a74bcd77dca64dff2cba37606d43057f506c0", want, 32);
+  expect(!memcmp(out, want, 32));
+  expect(!memcmp(out2, want, 32));
+
+  pb[63] ^= 1;
+  expect(!p256_ecdh(a, pb, out));
+  uint8_t zero[32] = {0}, order[32];
+  unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", order, 32);
+  expect(!p256_pub(zero, pa));
+  expect(!p256_pub(order, pa));
+  uint8_t one[32] = {0};
+  one[31] = 1;
+  expect(p256_pub(one, pa));
+  unhex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315e"
+        "cecbb6406837bf51f5",
+        want, 64);
+  expect(!memcmp(pa, want, 64));
+}
+
+static void unpair_drops_bond_and_link(void)
+{
+  struct pairing pr = {.sc = false};
+  le_connect();
+  bt_command("pair");
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("bond a6:a5:a4:a3:a2:a1"));
+  expect_eq(bt_command("unpair a6:a5:a4:a3:a2:a1"), 0);
+  tick(5);
+  expect(!status_have("bond"));
+  const uint8_t *dc = take_cmd(0x0406);
+  expect(dc && bt_get16(dc) == LE_HANDLE);
+
+  stop();
+
+  start();
+  secure_link();
+  expect_eq(bt_command("unpair aa:bb:cc:dd:ee:01"), 0);
+  tick(5);
+  dc = take_cmd(0x0406);
+  expect(dc && bt_get16(dc) == HANDLE);
+  evt(0x17, peer, 6);
+  tick(5);
+  expect(take_cmd(0x040C) != NULL);
+  stop();
+}
+
+static void pairing_legacy_short_key(void)
+{
+  struct pairing pr = {.sc = false, .key_size = 8};
+  le_connect();
+  bt_command("pair");
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("pairing complete"));
+  stop();
+}
+
+static void pairing_rejects_weak_key_size(void)
+{
+  uint8_t pdu[16];
+  int len;
+  le_connect();
+  bt_command("pair");
+  tick(5);
+  expect(take_smp(pdu, &len));
+  smp_in((uint8_t[]){2, 3, 0, 1, 6, 0, 0}, 7);
+  tick(5);
+  expect(take_smp(pdu, &len));
+  expect_eq(pdu[0], 5);
+  expect_eq(pdu[1], 6);
+  expect_eq(enc_cmds, 0);
+  stop();
+}
+
+static void pairing_rejects_bad_confirm(void)
+{
+  for (int sc = 0; sc < 2; sc++) {
+    struct pairing pr = {.sc = sc, .bad_confirm = true};
+    le_connect();
+    expect_eq(bt_command("pair"), 0);
+    tick(5);
+    peer_pairs(&pr);
+    expect(status_have("pairing failed, reason 04"));
+    expect(!status_have("bond"));
+    expect_eq(enc_cmds, 0);
+    stop();
+  }
+}
+
+static void bonded_link_reencrypts(void)
+{
+  struct pairing pr = {.sc = false};
+  le_connect();
+  bt_command("pair");
+  tick(5);
+  peer_pairs(&pr);
+
+  uint8_t d[4] = {0, 0, 0, 0x13};
+  bt_put16(d + 1, LE_HANDLE);
+  evt(0x05, d, 4);
+  tick(5);
+  expect(!status_have("connection"));
+  enc_cmds = 0;
+
+  expect_eq(bt_command("connect a6:a5:a4:a3:a2:a1"), 0);
+  tick(20);
+  uint8_t cc[19] = {1, 0};
+  bt_put16(cc + 2, LE_HANDLE);
+  cc[5] = 1;
+  memcpy(cc + 6, le_peer, 6);
+  evt(0x3E, cc, 19);
+  tick(5);
+  expect_eq(enc_cmds, 1);
+  expect(!memcmp(last_enc + 2, pr.rand, 8));
+  expect_eq(bt_get16(last_enc + 10), pr.ediv);
+  expect(!memcmp(last_enc + 12, pr.ltk, 16));
+  expect(status_have("encrypted"));
+  stop();
+}
+
+static void lost_bond_is_dropped(void)
+{
+  struct pairing pr = {.sc = false};
+  le_connect();
+  bt_command("pair");
+  tick(5);
+  peer_pairs(&pr);
+  uint8_t d[4] = {0, 0, 0, 0x13};
+  bt_put16(d + 1, LE_HANDLE);
+  evt(0x05, d, 4);
+  tick(5);
+
+  enc_status = 0x06;
+  bt_command("connect a6:a5:a4:a3:a2:a1");
+  tick(20);
+  uint8_t cc[19] = {1, 0};
+  bt_put16(cc + 2, LE_HANDLE);
+  cc[5] = 1;
+  memcpy(cc + 6, le_peer, 6);
+  evt(0x3E, cc, 19);
+  tick(5);
+  expect(!status_have("bond"));
+  expect(status_have("connection a6:a5:a4:a3:a2:a1 le"));
+  stop();
+}
+
+static void gatt_pairs_when_security_is_required(void)
+{
+  struct pairing pr = {.sc = true};
+  uint8_t pdu[64];
+  int len;
+  le_connect();
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x02);
+  att_in((uint8_t[]){0x01, 0x02, 0x00, 0x00, 0x05}, 5);
+  tick(5);
+  peer_pairs(&pr);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x02);
+  stop();
+}
+
+static void peripheral_security_request_starts_pairing(void)
+{
+  struct pairing pr = {.sc = true};
+  le_connect();
+  smp_in((uint8_t[]){0x0B, 0x09}, 2);
+  tick(5);
+  peer_pairs(&pr);
+  expect(status_have("pairing complete"));
+  stop();
+}
+
+static void peripheral_refusal_and_stray_requests(void)
+{
+  uint8_t pdu[16];
+  int len;
+  le_connect();
+  smp_in((uint8_t[]){0x01, 0x03, 0x00, 0x09, 0x10, 0x03, 0x03}, 7);
+  tick(5);
+  expect(take_smp(pdu, &len));
+  expect_eq(pdu[0], 5);
+  expect_eq(pdu[1], 5);
+
+  no_p256 = true;
+  bt_command("pair");
+  tick(5);
+  smp_in((uint8_t[]){0x05, 0x01}, 2);
+  tick(5);
+  expect(status_have("pairing failed, reason 01"));
+  expect(!status_have("in progress"));
+  stop();
+}
+
+static void pairing_times_out(void)
+{
+  le_connect();
+  no_p256 = true;
+  bt_command("pair");
+  tick(5);
+  expect(status_have("in progress"));
+  tick(31000);
+  expect(!status_have("in progress"));
+  expect(status_have("pairing failed"));
+  stop();
+}
+
 int main(void)
 {
   test("bringup", bringup);
@@ -982,5 +1562,21 @@ int main(void)
   test("hid_sdp_without_descriptor_fails", hid_sdp_without_descriptor_fails);
   test("hid_setup_times_out", hid_setup_times_out);
   test("headset_still_gets_a2dp", headset_still_gets_a2dp);
+  test("aes_and_cmac_vectors", aes_and_cmac_vectors);
+  test("smp_function_vectors", smp_function_vectors);
+  test("pairing_secure_connections", pairing_secure_connections);
+  test("pairing_legacy_with_peer_lacking_sc", pairing_legacy_with_peer_lacking_sc);
+  test("pairing_secure_connections_host_ecc", pairing_secure_connections_host_ecc);
+  test("p256_matches_openssl", p256_matches_openssl);
+  test("unpair_drops_bond_and_link", unpair_drops_bond_and_link);
+  test("pairing_legacy_short_key", pairing_legacy_short_key);
+  test("pairing_rejects_weak_key_size", pairing_rejects_weak_key_size);
+  test("pairing_rejects_bad_confirm", pairing_rejects_bad_confirm);
+  test("bonded_link_reencrypts", bonded_link_reencrypts);
+  test("lost_bond_is_dropped", lost_bond_is_dropped);
+  test("gatt_pairs_when_security_is_required", gatt_pairs_when_security_is_required);
+  test("peripheral_security_request_starts_pairing", peripheral_security_request_starts_pairing);
+  test("peripheral_refusal_and_stray_requests", peripheral_refusal_and_stray_requests);
+  test("pairing_times_out", pairing_times_out);
   return 0;
 }

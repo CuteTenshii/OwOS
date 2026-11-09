@@ -3,6 +3,7 @@
 #include "bt_int.h"
 
 #if !__STDC_HOSTED__
+#include "entropy.h"
 #include "log.h"
 #include "sched.h"
 #endif
@@ -61,6 +62,8 @@
 
 #define LE_CONN_COMPLETE 0x01
 #define LE_ADV_REPORT 0x02
+#define LE_P256_KEY_COMPLETE 0x08
+#define LE_DHKEY_COMPLETE 0x09
 #define LE_ENH_CONN_COMPLETE 0x0A
 
 #define COD_MAJOR_PERIPHERAL 5
@@ -177,6 +180,20 @@ void bt_log(const char *fmt, ...)
 
 uint32_t bt_now(void) { return h.now; }
 
+void bt_random(uint8_t *buf, int n)
+{
+#if __STDC_HOSTED__
+  FILE *f = fopen("/dev/urandom", "rb");
+  if (f) {
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n)
+      memset(buf, 0, (size_t)n);
+    fclose(f);
+  }
+#else
+  entropy_get(buf, (uint32_t)n);
+#endif
+}
+
 void (*bt_host_yield)(void);
 
 void bt_yield(void)
@@ -212,7 +229,7 @@ void bt_irq_restore(uintptr_t f)
 
 /* ---- commands */
 
-static bool hci_cmd(uint16_t op, const void *params, int len)
+bool hci_cmd(uint16_t op, const void *params, int len)
 {
   int next = (h.cq_head + 1) % CMDQ;
   if (next == h.cq_tail || len > (int)sizeof h.cq[0].params)
@@ -411,6 +428,8 @@ bool hci_find_key(const uint8_t *addr, uint8_t key[16])
   return false;
 }
 
+const uint8_t *hci_local_addr(void) { return h.bdaddr; }
+
 uint32_t hci_dev_cod(const uint8_t *addr)
 {
   for (int i = 0; i < BT_MAX_DEV; i++)
@@ -457,8 +476,10 @@ static void conn_up(struct bt_conn *c)
   char a[18];
   bt_log("%s connection %04x to %s", c->le ? "le" : "br", c->handle, addr_str(c->addr, a));
   l2cap_conn_up(c);
-  if (c->le)
+  if (c->le) {
     gatt_conn_up(c);
+    smp_conn_up(c);
+  }
 }
 
 static void conn_down(struct bt_conn *c)
@@ -466,6 +487,7 @@ static void conn_down(struct bt_conn *c)
   avdtp_conn_down(c);
   bthid_conn_down(c);
   gatt_conn_down(c);
+  smp_conn_down(c);
   l2cap_conn_down(c);
   c->used = false;
 }
@@ -521,7 +543,7 @@ static void tx_pump(void)
 
 static const uint8_t cod_computer[3] = {0x04, 0x01, 0x00};
 static const uint8_t event_mask[8] = {0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D};
-static const uint8_t le_event_mask[8] = {0x1F};
+static const uint8_t le_event_mask[8] = {0x9F, 0x01};
 
 static void init_step(void)
 {
@@ -609,6 +631,8 @@ static void cmd_done(uint16_t op, uint8_t status, const uint8_t *ret, int rlen)
     }
     return;
   }
+  if (status)
+    smp_cmd_failed(op, status);
   if (status && (op == OP_CREATE_CONN || op == OP_LE_CREATE_CONN)) {
     bt_log("connect failed: status %02x", status);
     h.cn.pending = false;
@@ -679,6 +703,10 @@ static void on_le_meta(const uint8_t *p, int len)
     struct bt_conn *c = conn_add(bt_get16(p + 2), p + 6, p[5], true);
     if (c)
       conn_up(c);
+  } else if (p[0] == LE_P256_KEY_COMPLETE && len >= 2) {
+    smp_p256_key(p[1], len >= 66 ? p + 2 : NULL);
+  } else if (p[0] == LE_DHKEY_COMPLETE && len >= 2) {
+    smp_dhkey(p[1], len >= 34 ? p + 2 : NULL);
   } else if (p[0] == LE_ADV_REPORT) {
     int n = len > 1 ? p[1] : 0, off = 2;
     for (int i = 0; i < n && off + 9 <= len; i++) {
@@ -794,14 +822,14 @@ static void on_event(const uint8_t *p, int len)
   case EVT_ENCRYPT_CHANGE:
     if (plen >= 4) {
       struct bt_conn *c = hci_conn_by_handle(bt_get16(q + 1));
-      if (c && !q[0] && q[3] && !c->secure) {
+      if (c && c->le) {
+        smp_enc_change(c, q[0], q[3]);
+      } else if (c && !q[0] && q[3] && !c->secure) {
         c->secure = true;
-        if (!c->le) {
-          if (((hci_dev_cod(c->addr) >> 8) & 0x1F) == COD_MAJOR_PERIPHERAL)
-            bthid_conn_ready(c);
-          else
-            avdtp_conn_ready(c);
-        }
+        if (((hci_dev_cod(c->addr) >> 8) & 0x1F) == COD_MAJOR_PERIPHERAL)
+          bthid_conn_ready(c);
+        else
+          avdtp_conn_ready(c);
       } else if (c && q[0]) {
         hci_disconnect(c);
       }
@@ -957,6 +985,26 @@ static int run_command(const char *line)
   }
   if (bt_has(line, "gatt "))
     return gatt_command(line + 5);
+  if (bt_has(line, "unpair ")) {
+    uint8_t a[6];
+    if (!addr_parse(line + 7, a))
+      return -1;
+    bool known = smp_unbond(a);
+    for (int i = 0; i < MAX_KEYS; i++)
+      if (h.keys[i].used && !memcmp(h.keys[i].addr, a, 6))
+        known = true;
+    struct bt_conn *c = conn_by_addr(a);
+    if (!known && !c)
+      return -1;
+    key_drop(a);
+    if (c)
+      hci_disconnect(c);
+    return 0;
+  }
+  if (!strcmp(line, "pair")) {
+    struct bt_conn *c = hci_connected_le();
+    return c ? smp_start(c) : -1;
+  }
   return -1;
 }
 
@@ -1010,6 +1058,7 @@ void bt_detach(void)
       conn_down(&h.conns[i]);
     bt_free(h.conns[i].rx);
   }
+  smp_reset();
   bt_free(h.rx);
   bt_free(h.tx);
   memset(&h, 0, sizeof h);
@@ -1067,6 +1116,7 @@ void bt_poll(uint32_t now)
     connect_pump();
     name_pump();
     gatt_poll();
+    smp_poll(now);
     avdtp_poll(now);
     bthid_poll(now);
     tx_pump();
@@ -1092,6 +1142,7 @@ int bt_status_text(char *buf, int max)
       n += bt_snprintf(buf + n, (uint32_t)(max - n), "connection %s %s%s\n", addr_str(c->addr, a), c->le ? "le" : "br",
                        c->secure ? " encrypted" : "");
   }
+  n += smp_status_text(buf + n, n < max ? max - n : 0);
   n += avdtp_status_text(buf + n, n < max ? max - n : 0);
   n += bthid_status_text(buf + n, n < max ? max - n : 0);
   return n < max ? n : max;

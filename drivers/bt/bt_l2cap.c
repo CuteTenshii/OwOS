@@ -61,7 +61,7 @@ static void chan_release(struct l2cap_chan *ch)
   ch->used = false;
 }
 
-static int send_frame(struct bt_conn *c, uint16_t cid, const uint8_t *data, int len)
+int l2cap_send_cid(struct bt_conn *c, uint16_t cid, const uint8_t *data, int len)
 {
   uint8_t buf[BT_RX_MAX];
   if (len + 4 > (int)sizeof buf)
@@ -81,7 +81,7 @@ static void sig_send(struct bt_conn *c, uint8_t code, uint8_t ident, const uint8
   cmd[1] = ident;
   bt_put16(cmd + 2, (uint16_t)len);
   memcpy(cmd + 4, data, (uint32_t)len);
-  send_frame(c, c->le ? L2CAP_CID_LE_SIGNALING : L2CAP_CID_SIGNALING, cmd, 4 + len);
+  l2cap_send_cid(c, c->le ? L2CAP_CID_LE_SIGNALING : L2CAP_CID_SIGNALING, cmd, 4 + len);
 }
 
 static void send_config_req(struct l2cap_chan *ch)
@@ -203,6 +203,10 @@ static void frame_rx(struct bt_conn *c, const uint8_t *f, int len)
     sig_rx(c, p, plen);
     return;
   }
+  if (cid == L2CAP_CID_SMP && c->le) {
+    smp_rx(c, p, plen);
+    return;
+  }
   struct l2cap_chan *ch = chan_by_scid(c, cid);
   if (ch && ch->open && ch->on_data)
     ch->on_data(ch, p, plen);
@@ -256,7 +260,7 @@ int l2cap_send(struct l2cap_chan *ch, const uint8_t *data, int len)
 {
   if (!ch->open || len > ch->out_mtu)
     return -1;
-  return send_frame(ch->conn, ch->dcid, data, len);
+  return l2cap_send_cid(ch->conn, ch->dcid, data, len);
 }
 
 bool l2cap_room(const struct l2cap_chan *ch) { return ch->open && hci_acl_room(ch->conn, 4); }

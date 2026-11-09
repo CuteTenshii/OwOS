@@ -19,6 +19,8 @@
 #define ATT_INDICATE 0x1D
 #define ATT_CONFIRM 0x1E
 
+#define ERR_INSUFF_AUTH 0x05
+#define ERR_INSUFF_ENC 0x0F
 #define ERR_NOT_FOUND 0x0A
 #define UUID_PRIMARY 0x2800
 #define UUID_CHARACTERISTIC 0x2803
@@ -71,7 +73,8 @@ static struct {
   struct op ops[MAX_OPS];
   int ops_head, ops_tail;
   struct op cur;
-  bool cur_active, cur_finding;
+  bool cur_active, cur_finding, sec_wait;
+  uint8_t last[24], last_len;
   char log[MAX_LOG][64];
   int log_n;
 } g;
@@ -110,6 +113,8 @@ static void att_send(const uint8_t *pdu, int len)
   if (g.att && l2cap_send(g.att, pdu, len) == 0) {
     g.waiting = true;
     g.sent_at = bt_now();
+    g.last_len = (uint8_t)(len < (int)sizeof g.last ? len : 0);
+    memcpy(g.last, pdu, g.last_len);
   }
 }
 
@@ -161,6 +166,11 @@ static void on_error(const uint8_t *d, int len)
   uint8_t op = d[0];
   if (len < 4)
     return;
+  if ((d[3] == ERR_INSUFF_AUTH || d[3] == ERR_INSUFF_ENC) && !g.c->secure && !g.sec_wait && g.last_len &&
+      smp_start(g.c) == 0) {
+    g.sec_wait = true;
+    return;
+  }
   if (g.stage == ST_SERVICES && op == ATT_READ_GROUP_REQ)
     discovery_done_services();
   else if (g.stage == ST_CHARS && op == ATT_READ_TYPE_REQ)
@@ -318,6 +328,19 @@ void gatt_conn_up(struct bt_conn *c)
   uint8_t p[3] = {ATT_MTU_REQ};
   bt_put16(p + 1, CLIENT_MTU);
   att_send(p, 3);
+}
+
+void gatt_secured(struct bt_conn *c, bool ok)
+{
+  if (g.c != c || !g.sec_wait)
+    return;
+  g.sec_wait = false;
+  if (ok) {
+    att_send(g.last, g.last_len);
+  } else {
+    g.cur_active = g.cur_finding = false;
+    g.stage = ST_READY;
+  }
 }
 
 void gatt_conn_down(struct bt_conn *c)

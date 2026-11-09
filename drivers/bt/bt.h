@@ -30,7 +30,8 @@ int bt_devices_text(char *buf, int max);
 int bt_gatt_text(char *buf, int max);
 
 /* Run one control line: "scan on|off", "connect <addr>", "disconnect", "gatt read <handle>", "gatt write <handle>
- * <hex>", "gatt notify <handle> on|off". Returns 0 once queued, -1 if malformed. */
+ * <hex>", "gatt notify <handle> on|off", "pair" (LE link), "unpair <addr>" (drop the bond or link key, disconnect).
+ * Returns 0 once queued, -1 if malformed. */
 int bt_command(const char *line);
 
 /* A2DP source: PCM is 48 kHz signed 16-bit stereo, as in the audio syscalls. */
