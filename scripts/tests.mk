@@ -11,7 +11,7 @@ INCLUDES := -Iscripts -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/li
             -Iuser/lib/mp4 -Iuser/lib/jpeg -Iuser/lib/media -Iuser/lib/sqlite -Iuser/lib/gfx -Iuser/lib/png -Iuser/lib/webp -Iuser/lib/gif -Iuser/lib/imganim -Iuser/lib/canvas2d -Iuser/lib/font -Iuser/lib/tz -Iuser/lib/desktop \
             -Iuser/lib/ntp -Iuser/lib/netconn -Iuser/lib/notify -Iuser/lib/mediactl -Iuser/apps/browser \
             -Iuser/apps/browser/js -Iuser/lib/cast -Iuser/lib/clipboard -Iuser/lib/websocket \
-            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm
+            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm -Iuser/lib/zstd
 CFLAGS_T := -std=gnu11 -O2 $(INCLUDES) -MMD -MP
 
 # Host compressors the btrfs test cross-checks against; each is used only when pkg-config finds it.
@@ -37,7 +37,8 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
 MAIN_SRCS := $(COMMON_SRCS) $(wildcard $(BROWSER)/features/svg/*.c) $(BROWSER)/imgdec.c $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/gfx/toggle.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(LIB)/media/tags.c $(LIB)/jpeg/jpeg.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/video/dpaux.c drivers/video/edidparse.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
-  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c
+  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c \
+  $(LIB)/zstd/zstd_common.c $(LIB)/zstd/fse.c $(LIB)/zstd/huf.c $(LIB)/zstd/zstd_enc.c
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c
 
@@ -55,10 +56,14 @@ EXTRA_pki         := -Iuser/lib/tls -Iuser/lib/pki
 EXTRA_quic_conn   := -Iuser/lib/tls -Iuser/lib/pki
 EXTRA_resolve     := -Iuser/lib/mdns
 EXTRA_net6        := -Idrivers/net
+# kernel/zstd.c (pulled in by the btrfs suite) also defines zstd_decompress; the user-space codec is renamed here
+ZSTD_RENAME       := -Dzstd_decompress=user_zstd_decompress
+EXTRA_zstd        := $(ZSTD_RENAME)
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
-         $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
+         $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
+         $(B)/impl/zstd_dec.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
@@ -111,6 +116,8 @@ $(B)/impl/desktop.o: $(LIB)/desktop/desktop.c
 	$(call COMPILE,-Dreaddir=desktop_test_readdir -include tests/desktop_fs.h)
 $(B)/impl/filelist.o: $(LIB)/gfx/filelist.c
 	$(call COMPILE,-Dreaddir=filelist_test_readdir -include tests/filelist_fs.h)
+$(B)/impl/zstd_dec.o: $(LIB)/zstd/zstd_dec.c
+	$(call COMPILE,$(ZSTD_RENAME))
 $(B)/impl/browser_js_host.o: tests/browser_js_host.c
 	$(call COMPILE,)
 $(B)/impl/test_runner.o: tests/test_runner.c
