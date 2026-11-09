@@ -9,6 +9,7 @@
 
 #include "../user/lib/ascii.h"
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>

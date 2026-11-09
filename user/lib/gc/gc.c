@@ -89,6 +89,8 @@ struct gc_heap {
   /* old objects of the rescan kind, scanned wholesale each minor. */
   gc_obj **rescan;
   int rescan_n, rescan_cap;
+  void (*oom)(void *);
+  void *oom_arg;
 };
 
 static inline gc_obj *hdr(void *payload) { return (gc_obj *)payload - 1; }
@@ -163,7 +165,21 @@ static int grow(void ***a, int *cap, int need)
 
 int raise(int sig);
 
-void gc_oom(void) { raise(6); /* SIGABRT: crash handler drops the page */ }
+void gc_heap_on_oom(gc_heap *h, void (*fn)(void *), void *arg)
+{
+  h->oom = fn;
+  h->oom_arg = arg;
+}
+
+void gc_oom(void)
+{
+  gc_heap *H = cur_heap();
+  void (*fn)(void *) = H->oom;
+  H->oom = 0; /* a second failure while recovering is fatal */
+  if (fn)
+    fn(H->oom_arg);
+  raise(6); /* SIGABRT: crash handler drops the page */
+}
 
 void gc_init(gc_tracer trace, gc_finalizer finalize)
 {

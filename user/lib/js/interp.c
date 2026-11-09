@@ -310,7 +310,13 @@ void js_set_stack_limit(js_ctx *ctx, void *low_limit)
  * the floor the embedder reserved headroom above. A fixed call-count cap can't
  * catch this: per-frame stack cost varies, and expression recursion never bumps
  * the count. */
-static int stack_overflow(js_ctx *ctx, void *sp) { return ctx->stack_limit && (char *)sp < ctx->stack_limit; }
+static int stack_overflow(js_ctx *ctx, void *sp)
+{
+  return (ctx->stack_limit && (char *)sp < ctx->stack_limit) || js_irq_stopped(ctx->irq);
+}
+
+/* a stop request is not an exception scripts may catch, and no finally block may run on the way out */
+static int stopping(js_ctx *ctx) { return js_irq_stopped(ctx->irq); }
 
 void js_def_native(js_ctx *ctx, js_object *o, const char *name, js_native fn, int arity)
 {
@@ -2690,7 +2696,7 @@ static completion exec_try(js_ctx *ctx, js_node *n)
 {
   completion c;
   c = exec_stmt(ctx, n->u.tc.block, NULL);
-  if (ctx->has_exc && n->u.tc.handler && !ctx->gen_unwind) {
+  if (ctx->has_exc && n->u.tc.handler && !ctx->gen_unwind && !stopping(ctx)) {
     js_value ex = ctx->exc;
     js_env *saved = ctx->cur_env;
     ctx->has_exc = 0;
@@ -2705,7 +2711,7 @@ static completion exec_try(js_ctx *ctx, js_node *n)
     ctx->cur_env = saved;
     gc_pop_scope();
   }
-  if (n->u.tc.finalizer) {
+  if (n->u.tc.finalizer && !stopping(ctx)) {
     int had = ctx->has_exc;
     js_value saved_exc = ctx->exc;
     void *saved_root = ctx->exc_root;

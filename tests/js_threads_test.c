@@ -3,10 +3,13 @@
 #include "ast.h"
 #include "gc.h"
 #include "interp.h"
+#include "mutex.h"
 #include "parser.h"
 #include "value.h"
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #define NTHREADS 8
 #define ROUNDS 30
@@ -37,6 +40,8 @@ struct job {
   double result;
   const char *script;
   unsigned char *shared; /* SharedArrayBuffer store handed to this thread, or NULL */
+  js_irq irq;            /* lets the test stop the thread; used when `stoppable` */
+  int stoppable;
 };
 
 static void *worker(void *arg)
@@ -51,6 +56,8 @@ static void *worker(void *arg)
   gc_heap_attach(heap);
   ctx = js_ctx_new(con_print);
   ctx->can_block = 1;
+  if (job->stoppable)
+    ctx->irq = &job->irq;
   if (job->shared)
     js_def(ctx->global, "sab", js_sab_wrap(ctx, job->shared, SHARED_BYTES), 0);
   gc_set_threshold(2048);
@@ -81,7 +88,7 @@ static void run_jobs(struct job *jobs, int n)
 
 static void check_parallel_contexts(void)
 {
-  struct job jobs[NTHREADS];
+  struct job jobs[NTHREADS] = {0};
   int i;
   for (i = 0; i < NTHREADS; i++) {
     jobs[i].id = i + 1;
@@ -110,7 +117,7 @@ static void check_shared_buffer(void)
                                         "Atomics.store(i, 1, 21);\n"
                                         "Atomics.notify(i, 1);\n"
                                         "result = 1;\n";
-  struct job jobs[NTHREADS];
+  struct job jobs[NTHREADS] = {0};
   unsigned char *store = js_sab_alloc(SHARED_BYTES);
   int i, *words = (int *)store;
   expect(store != NULL);
@@ -130,9 +137,66 @@ static void check_shared_buffer(void)
   js_sab_release(store);
 }
 
+/* A stop request ends a script that would never return: a busy loop, or an Atomics.wait with no waker */
+static void check_stop_request(void)
+{
+  static const char *const scripts[] = {"try { while (true) {} } catch (e) { result = 1 } finally { result = 1 }",
+                                        "var i = new Int32Array(sab); Atomics.wait(i, 0, 0); result = 1"};
+  int k;
+  for (k = 0; k < 2; k++) {
+    struct job job = {0};
+    pthread_t thread;
+    unsigned char *store = js_sab_alloc(SHARED_BYTES);
+    job.script = scripts[k];
+    job.shared = store;
+    job.stoppable = 1;
+    pthread_create(&thread, NULL, worker, &job);
+    usleep(30000);
+    __atomic_store_n(&job.irq.stop, 1, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&job.irq.waiting, __ATOMIC_ACQUIRE))
+      futex_wake(__atomic_load_n(&job.irq.waiting, __ATOMIC_ACQUIRE), 1 << 30);
+    pthread_join(thread, NULL);
+    expect(!job.ok); /* the script was cut short: neither catch nor finally nor the next statement ran */
+    js_sab_release(store);
+  }
+}
+
+static jmp_buf oom_env;
+static void recover_from_oom(void *arg)
+{
+  (void)arg;
+  longjmp(oom_env, 1);
+}
+static void *oom_thread(void *arg)
+{
+  int *recovered = arg;
+  gc_heap *heap = gc_heap_new();
+  gc_heap_attach(heap);
+  gc_heap_on_oom(heap, recover_from_oom, 0);
+  if (setjmp(oom_env) == 0)
+    gc_oom();
+  else
+    *recovered = 1;
+  gc_heap_detach();
+  gc_heap_free(heap);
+  return NULL;
+}
+
+/* An allocation failure in a thread's heap unwinds to the thread instead of aborting the process */
+static void check_oom_hook(void)
+{
+  pthread_t thread;
+  int recovered = 0;
+  pthread_create(&thread, NULL, oom_thread, &recovered);
+  pthread_join(thread, NULL);
+  expect(recovered);
+}
+
 int main(void)
 {
   test("contexts on separate threads and heaps", check_parallel_contexts);
   test("SharedArrayBuffer and Atomics across threads", check_shared_buffer);
+  test("a stop request ends a running or blocked script", check_stop_request);
+  test("heap out-of-memory hook unwinds to the thread", check_oom_hook);
   return 0;
 }

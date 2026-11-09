@@ -19,7 +19,8 @@
 #include "bigint.h" /* the bignum behind the JV_BIGINT primitive    */
 #include "gc.h"     /* gc_stash, for a suspended generator's pinned locals */
 
-struct js_node;               /* ast.h — function bodies are AST nodes        */
+struct js_node; /* ast.h — function bodies are AST nodes        */
+typedef struct js_irq js_irq;
 typedef struct js_ctx js_ctx; /* interp.h — the engine context                */
 
 typedef struct js_object js_object;

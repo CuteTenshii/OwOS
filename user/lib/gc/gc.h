@@ -52,6 +52,11 @@ void gc_init(gc_tracer trace, gc_finalizer finalize);
  * the very next allocation collects. */
 void *gc_alloc(unsigned size, int kind);
 
+/* Run `fn(arg)` when this heap hits an allocation failure it cannot recover from, once; it may longjmp out
+ * (the heap and everything in it is then only good for gc_heap_free). Without a hook, or if fn returns, gc_oom
+ * raises SIGABRT. */
+void gc_heap_on_oom(gc_heap *h, void (*fn)(void *), void *arg);
+
 /* Unrecoverable allocation failure: raises SIGABRT so the embedder can drop the page. */
 void gc_oom(void);
 

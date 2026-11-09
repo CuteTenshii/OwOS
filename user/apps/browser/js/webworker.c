@@ -35,7 +35,8 @@ struct wthread {
   mutex_t lock; /* guards both queues */
   struct wq in, out;
   unsigned seq; /* bumped whenever the worker has something new to look at */
-  int stop;     /* the page (or the worker itself) wants it to end */
+  js_irq irq;   /* irq.stop: the page wants the worker gone, even mid-script */
+  int closing;  /* the worker called close(): finish the current task, then end */
   int done;     /* the thread has finished running JS */
   unsigned rpc; /* 0 idle, 1 the worker is waiting for the page, 2 answered */
   char rpc_base[URL_MAX], rpc_spec[URL_MAX], rpc_url[URL_MAX];
@@ -127,6 +128,18 @@ static void wthread_wake(struct wthread *wt)
 {
   __atomic_fetch_add(&wt->seq, 1, __ATOMIC_ACQ_REL);
   futex_wake(&wt->seq, 1);
+}
+
+/* Make the worker stop, even inside a script or a blocked Atomics.wait */
+static void wthread_stop(struct wthread *wt)
+{
+  unsigned *waiting;
+  __atomic_store_n(&wt->irq.stop, 1, __ATOMIC_RELEASE);
+  wthread_wake(wt);
+  futex_wake(&wt->rpc, 1);
+  waiting = __atomic_load_n(&wt->irq.waiting, __ATOMIC_ACQUIRE);
+  if (waiting)
+    futex_wake(waiting, 1 << 30);
 }
 
 static void wmsg_post(struct wthread *wt, struct wq *q, int kind, int level, js_clone *clone, const char *text)
@@ -228,7 +241,7 @@ static const char *wt_fetch(struct wthread *wt, const char *base, const char *sp
   snprintf(wt->rpc_base, sizeof wt->rpc_base, "%s", base);
   snprintf(wt->rpc_spec, sizeof wt->rpc_spec, "%s", spec);
   __atomic_store_n(&wt->rpc, 1, __ATOMIC_RELEASE);
-  while (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) == 1 && !__atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE))
+  while (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) == 1 && !__atomic_load_n(&wt->irq.stop, __ATOMIC_ACQUIRE))
     futex_wait(&wt->rpc, 1, 50);
   if (__atomic_load_n(&wt->rpc, __ATOMIC_ACQUIRE) != 2) {
     __atomic_store_n(&wt->rpc, 0, __ATOMIC_RELEASE);
@@ -256,7 +269,7 @@ static js_value wt_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)args;
   (void)argc;
-  __atomic_store_n(&cur_wt->stop, 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&cur_wt->closing, 1, __ATOMIC_RELEASE);
   return js_undef();
 }
 
@@ -529,7 +542,7 @@ static void wt_deliver(js_ctx *ctx, js_clone *c)
 
 static void wt_loop(js_ctx *ctx, struct wthread *wt)
 {
-  while (!__atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE)) {
+  while (!__atomic_load_n(&wt->irq.stop, __ATOMIC_ACQUIRE) && !__atomic_load_n(&wt->closing, __ATOMIC_ACQUIRE)) {
     unsigned seen, wait = 0;
     struct wmsg *m = wq_take_one(wt, &wt->in, &seen);
     int i;
@@ -558,6 +571,7 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   js_object *exports = 0;
   ctx->now_ms = now_ms;
   ctx->can_block = 1;
+  ctx->irq = &wt->irq;
   js_set_stack_limit(ctx, wt->stack_lo + WORKER_HEADROOM);
   wt_setup(ctx, wt);
   if (!wt_eval(ctx, wt, wt_prelude, wt->url, 0)) {
@@ -579,19 +593,38 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   wt_loop(ctx, wt);
 }
 
+/* An allocation this worker cannot survive lands here and unwinds to worker_main, which frees the heap */
+static __thread jmp_buf oom_env;
+
+static void wt_oom(void *unused)
+{
+  (void)unused;
+  longjmp(oom_env, 1);
+}
+
 static void worker_main(void *arg)
 {
   struct wthread *wt = (struct wthread *)arg;
   gc_heap *heap = gc_heap_new();
-  js_ctx *ctx;
+  js_ctx *volatile ctx = 0;
   int i;
   cur_wt = wt;
   if (heap) {
     gc_heap_attach(heap);
-    ctx = js_ctx_new(wt_print);
-    if (ctx) {
-      wt_run(ctx, wt);
-      js_ctx_free(ctx);
+    gc_heap_on_oom(heap, wt_oom, 0);
+    if (setjmp(oom_env) == 0) {
+      ctx = js_ctx_new(wt_print);
+      if (ctx) {
+        wt_run(ctx, wt);
+        js_ctx_free(ctx);
+      }
+    } else {
+      /* memory is gone: report, then drop the heap without running more JS or collecting */
+      wmsg_post(wt, &wt->out, WM_ERROR, 0, 0, "Worker ran out of memory");
+      if (ctx) {
+        js_regex_cache_free(ctx);
+        free(ctx);
+      }
     }
     gc_heap_detach();
     gc_heap_free(heap);
@@ -808,7 +841,7 @@ static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct wthread *wt = worker_of(ctx, t);
   js_clone *c;
-  if (!wt || __atomic_load_n(&wt->stop, __ATOMIC_ACQUIRE))
+  if (!wt || __atomic_load_n(&wt->irq.stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&wt->closing, __ATOMIC_ACQUIRE))
     return js_undef();
   c = js_clone_write(ctx, A(0));
   if (c)
@@ -823,11 +856,8 @@ static js_value worker_terminate(js_ctx *ctx, js_value t, js_value *args, int ar
   (void)argc;
   if (t.type == JV_OBJ)
     js_set(ctx, t, "@dead", js_bool(1));
-  if (wt) {
-    __atomic_store_n(&wt->stop, 1, __ATOMIC_RELEASE);
-    wthread_wake(wt);
-    futex_wake(&wt->rpc, 1);
-  }
+  if (wt)
+    wthread_stop(wt);
   return js_undef();
 }
 
@@ -922,11 +952,8 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
 void js_worker_teardown(void)
 {
   int i, waited;
-  for (i = 0; i < g_nworkers; i++) {
-    __atomic_store_n(&g_workers[i]->stop, 1, __ATOMIC_RELEASE);
-    wthread_wake(g_workers[i]);
-    futex_wake(&g_workers[i]->rpc, 1);
-  }
+  for (i = 0; i < g_nworkers; i++)
+    wthread_stop(g_workers[i]);
   for (waited = 0; g_nworkers && waited < 1000; waited += 5) {
     for (i = 0; i < g_nworkers;)
       if (!worker_reap(i))

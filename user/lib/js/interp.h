@@ -107,6 +107,7 @@ struct js_ctx {
                              * embedder keeps the storage valid (js_set_script). */
   unsigned rng;             /* Math.random state                             */
   int can_block;            /* Atomics.wait may block this context's thread */
+  js_irq *irq;              /* another thread's way to stop this context (NULL: none) */
   void *re_cache;           /* compiled-RegExp cache (builtins.c)         */
   unsigned ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped
                              * by direct eval, which can inject a binding into an
@@ -143,6 +144,15 @@ void js_ctx_free(js_ctx *ctx);
  * script overflows the stack into neighbouring memory. NULL disables the check.
  */
 void js_set_stack_limit(js_ctx *ctx, void *low_limit);
+/* Lets another thread stop a context: it sets `stop`, and every evaluation step then unwinds with an exception
+ * that try/catch and finally cannot intercept. A thread blocked in Atomics.wait publishes its futex word in
+ * `waiting` so the stopper can wake it. */
+struct js_irq {
+  int stop;
+  unsigned *waiting;
+};
+static inline int js_irq_stopped(const js_irq *irq) { return irq && __atomic_load_n(&irq->stop, __ATOMIC_ACQUIRE); }
+
 /* Structured clone across heaps: js_clone_write flattens a value into pointer-free bytes (a SharedArrayBuffer
  * store is retained, not copied), js_clone_read rebuilds it in any context, js_clone_free drops the bytes and
  * the store references. Write returns NULL with a DataCloneError pending for functions and host objects. */

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int js_workers_pump(void);
 void msleep(unsigned ms);
@@ -197,6 +198,22 @@ static void test_shared_memory(void)
   run_script("expect(woke==='ok' || woke==='not-equal', 'a blocked worker is woken by the page: '+woke);\n");
 }
 
+/* Leaving the page must not wait for a worker that never returns to its event loop */
+static void test_page_end_stops_stuck_workers(void)
+{
+  struct timespec t0, t1;
+  double elapsed_ms;
+  run_script(
+      "var spin=new Worker('data:text/javascript,try{ while(true){} }catch(e){} finally{ postMessage(1); }'),\n"
+      "blocked=new Worker('data:text/javascript,Atomics.wait(new Int32Array(new SharedArrayBuffer(8)),0,0);');\n");
+  msleep(50);
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  js_page_end();
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  elapsed_ms = (double)(t1.tv_sec - t0.tv_sec) * 1000 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+  expect(elapsed_ms < 500);
+}
+
 static void test_message_channel(void)
 {
   run_script("var mc=new MessageChannel(), seen=[], back=[];\n"
@@ -264,7 +281,7 @@ int main(void)
   test("ErrorEvent and MessageEvent", test_event_interfaces);
   test("script and construction errors", test_errors);
 
-  js_page_end();
+  test("page end stops workers stuck in a loop or a wait", test_page_end_stops_stuck_workers);
   dom_free(root);
   free(B->pg);
   free(B);

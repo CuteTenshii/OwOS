@@ -8937,8 +8937,34 @@ static js_value atomics_wait(js_ctx *ctx, js_value t, js_value *a, int n)
   if (timeout == 0)
     return js_mk_cstring(ctx, "timed-out");
   {
-    unsigned ms = timeout >= 4294967295.0 ? 0 : (unsigned)timeout < 1 ? 1 : (unsigned)timeout; /* 0 = forever */
-    return js_mk_cstring(ctx, futex_wait((unsigned *)p, (unsigned)expected, ms) ? "timed-out" : "ok");
+    unsigned limit = timeout >= 4294967295.0 ? 0 : (unsigned)timeout < 1 ? 1 : (unsigned)timeout; /* 0 = none */
+    unsigned *word = (unsigned *)p, waited = 0;
+    js_irq *irq = ctx->irq;
+    const char *result = "ok";
+    if (!irq)
+      return js_mk_cstring(ctx, futex_wait(word, (unsigned)expected, limit) ? "timed-out" : "ok");
+    /* In slices, so a stop request is noticed even if its wake-up lands before this thread is asleep */
+    __atomic_store_n(&irq->waiting, word, __ATOMIC_RELEASE);
+    for (;;) {
+      unsigned slice = 50;
+      if (js_irq_stopped(irq)) {
+        result = "timed-out";
+        break;
+      }
+      if (limit) {
+        if (waited >= limit) {
+          result = "timed-out";
+          break;
+        }
+        if (limit - waited < slice)
+          slice = limit - waited;
+      }
+      if (!futex_wait(word, (unsigned)expected, slice))
+        break;
+      waited += slice;
+    }
+    __atomic_store_n(&irq->waiting, (unsigned *)0, __ATOMIC_RELEASE);
+    return js_mk_cstring(ctx, result);
   }
 }
 static js_value atomics_notify(js_ctx *ctx, js_value t, js_value *a, int n)
