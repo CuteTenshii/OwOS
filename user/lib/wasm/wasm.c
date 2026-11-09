@@ -7,7 +7,7 @@
 #include "wasm_int.h"
 
 enum { MAX_LOCALS = 50000, MAX_CODE_WORDS = 1 << 26, MAX_NAME = 100000 };
-enum { K_FUNC, K_BLOCK, K_LOOP, K_IF, K_ELSE };
+enum { K_FUNC, K_BLOCK, K_LOOP, K_IF, K_ELSE, K_TRY, K_CATCH, K_TRYTABLE };
 enum { MEM_NONE, MEM_FIRST };
 
 typedef struct blk {
@@ -22,7 +22,19 @@ typedef struct {
   uint32_t patch; /* forward branch fixups, as index + 1 into code */
   uint32_t loop_pc;
   uint32_t else_patch; /* the JMP_UNLESS target word of an `if`, index + 1 */
+  uint32_t start_pc;   /* pc where the block begins (the marker word of a try) */
+  uint32_t body_end;   /* try: pc where its protected body ends */
+  uint32_t cl_begin;   /* try_table: its catch clauses are tcl[cl_begin, cl_end) */
+  uint32_t cl_end;
+  uint8_t hidden; /* a catch arm keeps its exnref in one slot below its operands */
 } ctrl;
+
+/* A catch clause of try_table; label is an absolute index into the control stack */
+typedef struct {
+  uint8_t kind;
+  int32_t tag;
+  uint32_t label;
+} tclause;
 
 typedef struct {
   wasm_module *m;
@@ -42,6 +54,10 @@ typedef struct {
   uint32_t sh, maxsh;
   uint32_t *lslot;
   uint8_t *ltype;
+  wasm_handler *hv;
+  uint32_t nhv, caphv;
+  tclause *tcl;
+  uint32_t ntcl, captcl;
   uint32_t nloc, caploc, nlocal_slots;
   wasm_functype fbt; /* the function's results as the type of its outermost block */
 } C;
@@ -126,6 +142,22 @@ static uint32_t rd_u32(C *c)
     if (i == 4 && (b & 0xf0))
       fail(c, "invalid LEB128");
     r |= (uint32_t)(b & 0x7f) << (7 * i);
+    if (!(b & 0x80))
+      return r;
+  }
+  fail(c, "invalid LEB128");
+  return 0;
+}
+
+static uint64_t rd_u64(C *c)
+{
+  uint64_t r = 0;
+  int i;
+  for (i = 0; i < 10; i++) {
+    uint8_t b = rd_u8(c);
+    if (i == 9 && (b & 0xfe))
+      fail(c, "invalid LEB128");
+    r |= (uint64_t)(b & 0x7f) << (7 * i);
     if (!(b & 0x80))
       return r;
   }
@@ -222,10 +254,21 @@ static uint8_t rd_valtype(C *c)
 {
   uint8_t t = rd_u8(c);
   if (t == WASM_I32 || t == WASM_I64 || t == WASM_F32 || t == WASM_F64 || t == WASM_V128 || t == WASM_FUNCREF ||
-      t == WASM_EXTERNREF)
+      t == WASM_EXTERNREF || t == WASM_EXNREF)
     return t;
   c->p--;
   fail(c, "invalid value type");
+  return 0;
+}
+
+/* The heap type of ref.null: also exnref */
+static uint8_t rd_nulltype(C *c)
+{
+  uint8_t t = rd_u8(c);
+  if (t == WASM_FUNCREF || t == WASM_EXTERNREF || t == WASM_EXNREF)
+    return t;
+  c->p--;
+  fail(c, "invalid reference type");
   return 0;
 }
 
@@ -239,29 +282,39 @@ static uint8_t rd_reftype(C *c)
   return 0;
 }
 
-static void rd_limits(C *c, wasm_limits *l, uint32_t cap, const char *what)
+/* Table limits (flags 0 and 1) or memory limits (also shared and 64-bit) */
+static void rd_limits(C *c, wasm_limits *l, uint64_t cap, const char *what, int is_memory)
 {
   uint8_t f = rd_u8(c);
-  if (f > 1) {
+  int has_max = f & 1;
+  memset(l, 0, sizeof *l);
+  if (f > (is_memory ? 7 : 1)) {
     c->p--;
-    fail(c, f == 3 || f == 2 ? "shared memory is not supported" : "invalid limits flags");
+    fail(c, "invalid limits flags");
   }
-  l->min = rd_u32(c);
-  l->has_max = f;
-  l->max = f ? rd_u32(c) : 0;
-  if (l->min > cap || (f && l->max > cap))
+  l->shared = (f >> 1) & 1;
+  l->is64 = (f >> 2) & 1;
+  if (l->shared && !has_max)
+    fail(c, "shared memory must have a maximum");
+  if (l->is64)
+    cap = (uint64_t)1 << 48;
+  l->min = l->is64 ? rd_u64(c) : rd_u32(c);
+  l->has_max = (uint8_t)has_max;
+  l->max = has_max ? (l->is64 ? rd_u64(c) : rd_u32(c)) : 0;
+  if (l->min > cap || (has_max && l->max > cap))
     fail(c, what);
-  if (f && l->max < l->min)
+  if (has_max && l->max < l->min)
     fail(c, "maximum is less than the minimum");
 }
 
 /* ---- types --------------------------------------------------------------- */
 
-static const uint8_t VT1[8] = {WASM_I32, WASM_I64, WASM_F32, WASM_F64, WASM_V128, WASM_FUNCREF, WASM_EXTERNREF, 0};
+static const uint8_t VT1[8] = {WASM_I32,  WASM_I64,     WASM_F32,       WASM_F64,
+                               WASM_V128, WASM_FUNCREF, WASM_EXTERNREF, WASM_EXNREF};
 static const wasm_functype FT_EMPTY = {0, 0, 0, 0, NULL, NULL};
-static const wasm_functype FT_1[7] = {
+static const wasm_functype FT_1[8] = {
     {0, 1, 0, 1, NULL, &VT1[0]}, {0, 1, 0, 1, NULL, &VT1[1]}, {0, 1, 0, 1, NULL, &VT1[2]}, {0, 1, 0, 1, NULL, &VT1[3]},
-    {0, 1, 0, 2, NULL, &VT1[4]}, {0, 1, 0, 1, NULL, &VT1[5]}, {0, 1, 0, 1, NULL, &VT1[6]}};
+    {0, 1, 0, 2, NULL, &VT1[4]}, {0, 1, 0, 1, NULL, &VT1[5]}, {0, 1, 0, 1, NULL, &VT1[6]}, {0, 1, 0, 1, NULL, &VT1[7]}};
 
 static int vt_index(int t)
 {
@@ -280,8 +333,15 @@ static int vt_index(int t)
     return 5;
   case WASM_EXTERNREF:
     return 6;
+  case WASM_EXNREF:
+    return 7;
   }
   return -1;
+}
+
+static int wasm_results_eq(const wasm_functype *a, const wasm_functype *b)
+{
+  return a->nr == b->nr && !memcmp(a->r, b->r, a->nr);
 }
 
 int wasm_functype_eq(const wasm_functype *a, const wasm_functype *b)
@@ -321,75 +381,106 @@ static void sec_types(C *c)
 
 /* ---- constant expressions ------------------------------------------------ */
 
-/* Parse one constant expression of type `want`; its operator is recorded in *e */
+/* Parse one constant expression of type `want` into *e */
 static void rd_const(C *c, wasm_constexpr *e, int want, uint32_t nglobals_visible)
 {
+  enum { MAX_OPS = 64 };
   wasm_module *m = c->m;
-  int got;
-  uint8_t op = rd_u8(c);
-  memset(e, 0, sizeof *e);
-  e->op = op;
-  switch (op) {
-  case 0x41:
-    e->v[0] = (uint32_t)rd_s32(c);
-    got = WASM_I32;
-    break;
-  case 0x42:
-    e->v[0] = (uint64_t)rd_s64(c);
-    got = WASM_I64;
-    break;
-  case 0x43:
-    need(c, 4);
-    memcpy(&e->v[0], c->p, 4);
-    c->p += 4;
-    got = WASM_F32;
-    break;
-  case 0x44:
-    need(c, 8);
-    memcpy(&e->v[0], c->p, 8);
-    c->p += 8;
-    got = WASM_F64;
-    break;
-  case 0xfd:
-    if (rd_u32(c) != 0x0c)
-      fail(c, "invalid constant expression");
-    need(c, 16);
-    memcpy(e->v, c->p, 16);
-    c->p += 16;
-    got = WASM_V128;
-    break;
-  case 0x23: {
-    uint32_t g = rd_u32(c);
-    if (g >= nglobals_visible)
-      fail(c, "unknown global in constant expression");
-    if (m->globals[g].mut)
-      fail(c, "constant expression refers to a mutable global");
-    e->v[0] = g;
-    got = m->globals[g].type;
-    break;
+  wasm_cop ops[MAX_OPS];
+  uint8_t ts[MAX_OPS];
+  uint32_t n = 0, depth = 0;
+  for (;;) {
+    wasm_cop *o;
+    int got = 0, arith = 0;
+    uint8_t op = rd_u8(c);
+    if (op == 0x0b)
+      break;
+    if (n >= MAX_OPS)
+      fail(c, "constant expression too long");
+    o = &ops[n];
+    memset(o, 0, sizeof *o);
+    o->op = op;
+    switch (op) {
+    case 0x41:
+      o->v[0] = (uint32_t)rd_s32(c);
+      got = WASM_I32;
+      break;
+    case 0x42:
+      o->v[0] = (uint64_t)rd_s64(c);
+      got = WASM_I64;
+      break;
+    case 0x43:
+      need(c, 4);
+      memcpy(&o->v[0], c->p, 4);
+      c->p += 4;
+      got = WASM_F32;
+      break;
+    case 0x44:
+      need(c, 8);
+      memcpy(&o->v[0], c->p, 8);
+      c->p += 8;
+      got = WASM_F64;
+      break;
+    case 0xfd:
+      if (rd_u32(c) != 0x0c)
+        fail(c, "invalid constant expression");
+      need(c, 16);
+      memcpy(o->v, c->p, 16);
+      c->p += 16;
+      got = WASM_V128;
+      break;
+    case 0x23: {
+      uint32_t g = rd_u32(c);
+      if (g >= nglobals_visible)
+        fail(c, "unknown global in constant expression");
+      if (m->globals[g].mut)
+        fail(c, "constant expression refers to a mutable global");
+      o->v[0] = g;
+      got = m->globals[g].type;
+      break;
+    }
+    case 0xd0:
+      got = rd_reftype(c);
+      break;
+    case 0xd2: {
+      uint32_t f = rd_u32(c);
+      if (f >= m->nfuncs)
+        fail(c, "unknown function in constant expression");
+      o->v[0] = f;
+      got = WASM_FUNCREF;
+      break;
+    }
+    case 0x6a:
+    case 0x6b:
+    case 0x6c:
+      arith = WASM_I32;
+      break;
+    case 0x7c:
+    case 0x7d:
+    case 0x7e:
+      arith = WASM_I64;
+      break;
+    default:
+      c->p--;
+      fail(c, "unsupported constant expression");
+      return;
+    }
+    if (arith) {
+      if (depth < 2 || ts[depth - 1] != arith || ts[depth - 2] != arith)
+        fail(c, "type mismatch in constant expression");
+      depth--;
+    } else {
+      if (depth >= MAX_OPS)
+        fail(c, "constant expression too long");
+      ts[depth++] = (uint8_t)got;
+    }
+    n++;
   }
-  case 0xd0:
-    got = rd_reftype(c);
-    break;
-  case 0xd2: {
-    uint32_t f = rd_u32(c);
-    if (f >= m->nfuncs)
-      fail(c, "unknown function in constant expression");
-    e->v[0] = f;
-    got = WASM_FUNCREF;
-    break;
-  }
-  default:
-    c->p--;
-    fail(c, "unsupported constant expression");
-    return;
-  }
-  if (rd_u8(c) != 0x0b)
-    fail(c, "constant expression must end with `end`");
-  if (got != want)
+  if (depth != 1 || ts[0] != want)
     fail(c, "type mismatch in constant expression");
-  if (op == 0xd0)
-    e->v[1] = (uint64_t)got;
+  e->n = n;
+  e->ops = (wasm_cop *)ma(c, n * sizeof *e->ops);
+  memcpy(e->ops, ops, n * sizeof *e->ops);
 }
 
 /* ---- sections ------------------------------------------------------------ */
@@ -404,6 +495,7 @@ static void sec_imports(C *c)
   m->tables = (wasm_tabletype *)ma(c, n * sizeof *m->tables);
   m->mems = (wasm_limits *)ma(c, n * sizeof *m->mems);
   m->globals = (wasm_globaltype *)ma(c, n * sizeof *m->globals);
+  m->tag_type = (uint32_t *)ma(c, n * sizeof *m->tag_type);
   for (i = 0; i < n; i++) {
     wasm_import *im = &m->imports[i];
     im->module = rd_name(c);
@@ -418,21 +510,31 @@ static void sec_imports(C *c)
       break;
     case WASM_KIND_TABLE:
       im->table.elem = rd_reftype(c);
-      rd_limits(c, &im->table.lim, WASM_MAX_TABLE, "table size is too large");
+      rd_limits(c, &im->table.lim, WASM_MAX_TABLE, "table size is too large", 0);
       m->tables[m->ntable_imports++] = im->table;
       break;
     case WASM_KIND_MEMORY:
-      if (m->nmem_imports)
-        fail(c, "multiple memories are not supported");
-      rd_limits(c, &im->mem, WASM_MAX_PAGES, "memory size is too large");
+      rd_limits(c, &im->mem, 65536, "memory size is too large", 1);
       m->mems[m->nmem_imports++] = im->mem;
       break;
     case WASM_KIND_GLOBAL:
       im->global.type = rd_valtype(c);
+      if (im->global.type == WASM_EXNREF)
+        fail(c, "exnref globals are not supported");
       im->global.mut = rd_u8(c);
       if (im->global.mut > 1)
         fail(c, "invalid mutability");
       m->globals[m->nglobal_imports++] = im->global;
+      break;
+    case WASM_KIND_TAG:
+      if (rd_u8(c) != 0)
+        fail(c, "invalid tag attribute");
+      im->type = rd_u32(c);
+      if (im->type >= m->ntypes)
+        fail(c, "unknown type");
+      if (m->types[im->type].nr)
+        fail(c, "tag type must not have results");
+      m->tag_type[m->ntag_imports++] = im->type;
       break;
     default:
       c->p--;
@@ -443,6 +545,28 @@ static void sec_imports(C *c)
   m->ntables = m->ntable_imports;
   m->nmems = m->nmem_imports;
   m->nglobals = m->nglobal_imports;
+  m->ntags = m->ntag_imports;
+}
+
+static void sec_tags(C *c)
+{
+  wasm_module *m = c->m;
+  uint32_t n = rd_count(c), i;
+  uint32_t *t = (uint32_t *)ma(c, (m->ntag_imports + n) * sizeof *t);
+  memcpy(t, m->tag_type, m->ntag_imports * sizeof *t);
+  for (i = 0; i < n; i++) {
+    uint32_t ty;
+    if (rd_u8(c) != 0)
+      fail(c, "invalid tag attribute");
+    ty = rd_u32(c);
+    if (ty >= m->ntypes)
+      fail(c, "unknown type");
+    if (m->types[ty].nr)
+      fail(c, "tag type must not have results");
+    t[m->ntag_imports + i] = ty;
+  }
+  m->tag_type = t;
+  m->ntags = m->ntag_imports + n;
 }
 
 static void sec_functions(C *c)
@@ -470,7 +594,7 @@ static void sec_tables(C *c)
   for (i = 0; i < n; i++) {
     wasm_tabletype *d = &t[m->ntable_imports + i];
     d->elem = rd_reftype(c);
-    rd_limits(c, &d->lim, WASM_MAX_TABLE, "table size is too large");
+    rd_limits(c, &d->lim, WASM_MAX_TABLE, "table size is too large", 0);
   }
   m->tables = t;
   m->ntables = m->ntable_imports + n;
@@ -481,12 +605,10 @@ static void sec_memories(C *c)
   wasm_module *m = c->m;
   uint32_t n = rd_count(c), i;
   wasm_limits *t;
-  if (m->nmem_imports + n > 1)
-    fail(c, "multiple memories are not supported");
   t = (wasm_limits *)ma(c, (m->nmem_imports + n) * sizeof *t);
   memcpy(t, m->mems, m->nmem_imports * sizeof *t);
   for (i = 0; i < n; i++)
-    rd_limits(c, &t[m->nmem_imports + i], WASM_MAX_PAGES, "memory size is too large");
+    rd_limits(c, &t[m->nmem_imports + i], 65536, "memory size is too large", 1);
   m->mems = t;
   m->nmems = m->nmem_imports + n;
 }
@@ -503,6 +625,8 @@ static void sec_globals(C *c)
   for (i = 0; i < n; i++) {
     wasm_globaltype *d = &g[m->nglobal_imports + i];
     d->type = rd_valtype(c);
+    if (d->type == WASM_EXNREF)
+      fail(c, "exnref globals are not supported");
     d->mut = rd_u8(c);
     if (d->mut > 1)
       fail(c, "invalid mutability");
@@ -534,6 +658,9 @@ static void sec_exports(C *c)
       break;
     case WASM_KIND_GLOBAL:
       lim = m->nglobals;
+      break;
+    case WASM_KIND_TAG:
+      lim = m->ntags;
       break;
     default:
       c->p--;
@@ -600,9 +727,9 @@ static void sec_elements(C *c)
       } else {
         wasm_constexpr x;
         rd_const(c, &x, e->type, 0);
-        if (x.op == 0xd2)
-          e->funcs[j] = (int32_t)x.v[0];
-        else if (x.op == 0xd0)
+        if (x.n == 1 && x.ops[0].op == 0xd2)
+          e->funcs[j] = (int32_t)x.ops[0].v[0];
+        else if (x.n == 1 && x.ops[0].op == 0xd0)
           e->funcs[j] = -1;
         else
           fail(c, "unsupported element expression");
@@ -626,11 +753,10 @@ static void sec_data(C *c)
       fail(c, "invalid data segment flags");
     d->active = flag != 1;
     if (d->active) {
-      if (flag == 2 && rd_u32(c) != 0)
+      d->mem = flag == 2 ? rd_u32(c) : 0;
+      if (d->mem >= m->nmems)
         fail(c, "unknown memory");
-      if (!m->nmems)
-        fail(c, "unknown memory");
-      rd_const(c, &d->offset, WASM_I32, m->nglobals);
+      rd_const(c, &d->offset, m->mems[d->mem].is64 ? WASM_I64 : WASM_I32, m->nglobals);
     }
     d->len = rd_u32(c);
     need(c, d->len);
@@ -716,6 +842,7 @@ static void push_ctrl(C *c, int kind, const wasm_functype *bt)
   f->height = c->nvt;
   f->sheight = c->sh;
   f->loop_pc = c->ncode;
+  f->start_pc = c->ncode;
   push_vals(c, bt->p, bt->np);
 }
 
@@ -723,17 +850,52 @@ static void set_unreachable(C *c)
 {
   ctrl *f = top(c);
   c->nvt = f->height;
-  c->sh = f->sheight;
+  c->sh = f->sheight + f->hidden;
   f->unreachable = 1;
 }
 
+/* A fixup chain runs through the unresolved target words: code positions as pos + 1, handler targets as
+ * (handler + 1) | 0x80000000 */
 static void patch_to(C *c, uint32_t head, uint32_t target)
 {
   while (head) {
-    uint32_t pos = head - 1;
-    head = c->code[pos];
-    c->code[pos] = target;
+    if (head & 0x80000000u) {
+      uint32_t h = (head & 0x7fffffffu) - 1;
+      head = c->hv[h].target;
+      c->hv[h].target = target;
+    } else {
+      uint32_t pos = head - 1;
+      head = c->code[pos];
+      c->code[pos] = target;
+    }
   }
+}
+
+static uint32_t add_handler(C *c, wasm_handler h)
+{
+  if (c->nhv >= c->caphv)
+    c->hv = (wasm_handler *)vec_grow(c, c->hv, &c->caphv, c->nhv + 1, sizeof *c->hv);
+  c->hv[c->nhv] = h;
+  return c->nhv++;
+}
+
+/* Point handler hi's target at label frame t: now for a loop, once t ends otherwise */
+static void handler_target(C *c, ctrl *t, uint32_t hi)
+{
+  if (t->kind == K_LOOP)
+    c->hv[hi].target = t->loop_pc;
+  else {
+    c->hv[hi].target = t->patch;
+    t->patch = (hi + 1) | 0x80000000u;
+  }
+}
+
+/* Where a search for a handler resumes when a try delegates to frame t */
+static uint32_t resume_pc(const ctrl *t)
+{
+  if (t->kind == K_FUNC)
+    return 0;
+  return t->kind == K_TRY || t->kind == K_TRYTABLE ? t->start_pc + 1 : t->start_pc;
 }
 
 /* Emit a forward branch target word, to be fixed when frame f ends */
@@ -797,18 +959,47 @@ static const wasm_functype *read_blocktype(C *c)
   }
 }
 
-static int is_ref(int t) { return t == WASM_FUNCREF || t == WASM_EXTERNREF; }
+static int is_ref(int t) { return t == WASM_FUNCREF || t == WASM_EXTERNREF || t == WASM_EXNREF; }
 
-static uint32_t rd_memarg(C *c, uint32_t max_align)
+typedef struct {
+  uint32_t mem;
+  uint64_t off;
+  int addr; /* the memory's address type */
+} memarg;
+
+static int mem_addr_type(const C *c, uint32_t mem) { return c->m->mems[mem].is64 ? WASM_I64 : WASM_I32; }
+
+static memarg rd_memarg(C *c, uint32_t max_align)
 {
+  memarg a;
   uint32_t align = rd_u32(c);
-  if (!c->m->nmems)
+  a.mem = 0;
+  if (align & 0x40) {
+    a.mem = rd_u32(c);
+    align &= ~0x40u;
+  }
+  if (a.mem >= c->m->nmems)
     fail(c, "unknown memory");
-  if (align & 0x40)
-    fail(c, "multiple memories are not supported");
   if (align > max_align)
     fail(c, "alignment must not be larger than natural");
-  return rd_u32(c);
+  a.addr = mem_addr_type(c, a.mem);
+  a.off = a.addr == WASM_I64 ? rd_u64(c) : rd_u32(c);
+  return a;
+}
+
+static void emit_memarg(C *c, const memarg *a)
+{
+  emit(c, (uint32_t)a->off);
+  emit(c, (uint32_t)(a->off >> 32));
+  emit(c, a->mem);
+}
+
+static uint32_t rd_memidx(C *c)
+{
+  uint32_t i = rd_u32(c);
+  if (i >= c->m->nmems)
+    fail(c, "unknown memory");
+  return i;
 }
 
 static const struct {
@@ -895,6 +1086,15 @@ static simd_sig simd_info(unsigned s)
   } lane[] = {{'i', 16, 0}, {'i', 16, 0}, {'i', 16, 1}, {'i', 8, 0}, {'i', 8, 0}, {'i', 8, 1}, {'i', 4, 0},
               {'i', 4, 1},  {'I', 2, 0},  {'I', 2, 1},  {'f', 4, 0}, {'f', 4, 1}, {'F', 2, 0}, {'F', 2, 1}};
   simd_sig g = {SC_NONE, 0, 0, 0};
+  if (s >= 0x100) {
+    if (s == 0x100 || (s >= 0x10d && s <= 0x112))
+      g.cls = SC_BIN;
+    else if (s >= 0x101 && s <= 0x104)
+      g.cls = SC_UN;
+    else if ((s >= 0x105 && s <= 0x10c) || s == 0x113)
+      g.cls = SC_TER;
+    return g;
+  }
   if (s <= 0x0a) {
     static const uint8_t al[] = {4, 3, 3, 3, 3, 3, 3, 0, 1, 2, 3};
     g.cls = SC_LOAD;
@@ -941,7 +1141,8 @@ static void compile_simd(C *c, unsigned s)
 {
   simd_sig g = simd_info(s);
   int live = alive(c);
-  uint32_t off, lane, i;
+  uint32_t lane, i;
+  memarg ma;
   switch (g.cls) {
   case SC_UN:
     pop_t(c, WASM_V128);
@@ -986,36 +1187,36 @@ static void compile_simd(C *c, unsigned s)
     }
     return;
   case SC_LOAD:
-    off = rd_memarg(c, g.align);
-    pop_t(c, WASM_I32);
+    ma = rd_memarg(c, g.align);
+    pop_t(c, ma.addr);
     push(c, WASM_V128);
     if (live) {
       emit(c, OP_FD(s));
-      emit(c, off);
+      emit_memarg(c, &ma);
     }
     return;
   case SC_STORE:
-    off = rd_memarg(c, g.align);
+    ma = rd_memarg(c, g.align);
     pop_t(c, WASM_V128);
-    pop_t(c, WASM_I32);
+    pop_t(c, ma.addr);
     if (live) {
       emit(c, OP_FD(s));
-      emit(c, off);
+      emit_memarg(c, &ma);
     }
     return;
   case SC_LOADLANE:
   case SC_STORELANE:
-    off = rd_memarg(c, g.align);
+    ma = rd_memarg(c, g.align);
     lane = rd_u8(c);
     if (lane >= g.lanes)
       fail(c, "invalid lane index");
     pop_t(c, WASM_V128);
-    pop_t(c, WASM_I32);
+    pop_t(c, ma.addr);
     if (g.cls == SC_LOADLANE)
       push(c, WASM_V128);
     if (live) {
       emit(c, OP_FD(s));
-      emit(c, off);
+      emit_memarg(c, &ma);
       emit(c, lane);
     }
     return;
@@ -1074,20 +1275,20 @@ static void compile_fc(C *c, unsigned s)
     pop_t(c, (s & 2) ? WASM_F64 : WASM_F32);
     push(c, s < 4 ? WASM_I32 : WASM_I64);
     break;
-  case 8: /* memory.init */
+  case 8: { /* memory.init */
+    int addr;
     a = rd_u32(c);
-    if (rd_u8(c) != 0)
-      fail(c, "unknown memory");
-    if (!m->nmems)
-      fail(c, "unknown memory");
+    b = rd_memidx(c);
+    addr = mem_addr_type(c, b);
     if (!c->has_datacount)
       fail(c, "data count section required");
     if (a >= c->datacount)
       fail(c, "unknown data segment");
     pop_t(c, WASM_I32);
     pop_t(c, WASM_I32);
-    pop_t(c, WASM_I32);
+    pop_t(c, addr);
     break;
+  }
   case 9: /* data.drop */
     a = rd_u32(c);
     if (!c->has_datacount)
@@ -1095,24 +1296,26 @@ static void compile_fc(C *c, unsigned s)
     if (a >= c->datacount)
       fail(c, "unknown data segment");
     break;
-  case 10: /* memory.copy */
-    if (rd_u8(c) != 0 || rd_u8(c) != 0)
-      fail(c, "unknown memory");
-    if (!m->nmems)
-      fail(c, "unknown memory");
-    pop_t(c, WASM_I32);
-    pop_t(c, WASM_I32);
-    pop_t(c, WASM_I32);
+  case 10: { /* memory.copy */
+    int da, sa;
+    a = rd_memidx(c);
+    b = rd_memidx(c);
+    da = mem_addr_type(c, a);
+    sa = mem_addr_type(c, b);
+    pop_t(c, da == WASM_I64 && sa == WASM_I64 ? WASM_I64 : WASM_I32);
+    pop_t(c, sa);
+    pop_t(c, da);
     break;
-  case 11: /* memory.fill */
-    if (rd_u8(c) != 0)
-      fail(c, "unknown memory");
-    if (!m->nmems)
-      fail(c, "unknown memory");
+  }
+  case 11: { /* memory.fill */
+    int addr;
+    a = rd_memidx(c);
+    addr = mem_addr_type(c, a);
+    pop_t(c, addr);
     pop_t(c, WASM_I32);
-    pop_t(c, WASM_I32);
-    pop_t(c, WASM_I32);
+    pop_t(c, addr);
     break;
+  }
   case 12: /* table.init */
     a = rd_u32(c);
     b = rd_u32(c);
@@ -1169,12 +1372,34 @@ static void compile_fc(C *c, unsigned s)
   }
   if (live) {
     emit(c, OP_FC(s));
-    if (s == 8 || s == 9 || s == 13 || s == 15 || s == 16 || s == 17)
+    if (s == 9 || s == 13 || s == 15 || s == 16 || s == 17)
       emit(c, a);
-    else if (s == 12 || s == 14) {
+    else if (s == 8 || s == 10 || s == 12 || s == 14) {
       emit(c, a);
       emit(c, b);
-    }
+    } else if (s == 11)
+      emit(c, a);
+  }
+}
+
+/* At the end of a try_table: one handler per catch clause */
+static void finish_trytable(C *c, ctrl *f)
+{
+  uint32_t j;
+  for (j = f->cl_begin; j < f->cl_end; j++) {
+    const tclause *cl = &c->tcl[j];
+    ctrl *t = &c->cs[cl->label];
+    wasm_handler h;
+    uint32_t hi;
+    memset(&h, 0, sizeof h);
+    h.start = f->start_pc;
+    h.end = c->ncode;
+    h.tag = cl->tag;
+    h.kind = (cl->kind & 1) ? H_CATCH_REF : H_CATCH;
+    h.arity = (cl->tag >= 0 ? c->m->types[c->m->tag_type[cl->tag]].pslots : 0) + (cl->kind & 1);
+    h.dest = c->nlocal_slots + t->sheight;
+    hi = add_handler(c, h);
+    handler_target(c, t, hi);
   }
 }
 
@@ -1190,6 +1415,7 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
   c->p = body;
   c->end = bend;
   c->nvt = c->ncs = c->ncode = 0;
+  c->nhv = c->ntcl = 0;
   c->sh = c->maxsh = 0;
 
   /* locals: parameters first, then the declared groups */
@@ -1286,12 +1512,175 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
       push_vals(c, f->bt->p, f->bt->np);
       break;
     }
+    case 0x06: {
+      const wasm_functype *bt = read_blocktype(c);
+      ctrl *f;
+      push_ctrl(c, K_TRY, bt);
+      f = top(c);
+      f->start_pc = c->ncode;
+      if (!f->dead)
+        emit(c, 0x01);
+      break;
+    }
+    case 0x1f: {
+      const wasm_functype *bt = read_blocktype(c);
+      uint32_t ncl = rd_count(c), k, cl_begin = c->ntcl;
+      ctrl *f;
+      for (k = 0; k < ncl; k++) {
+        uint8_t kind = rd_u8(c);
+        int32_t tag = -1;
+        uint32_t depth, np = 0, tn;
+        const uint8_t *ts, *tp = NULL;
+        ctrl *t;
+        if (kind > 3)
+          fail(c, "invalid catch clause");
+        if (kind < 2) {
+          uint32_t tg = rd_u32(c);
+          if (tg >= m->ntags)
+            fail(c, "unknown tag");
+          tag = (int32_t)tg;
+          np = m->types[m->tag_type[tg]].np;
+          tp = m->types[m->tag_type[tg]].p;
+        }
+        depth = rd_u32(c);
+        t = label(c, depth);
+        label_types(t, &ts, &tn);
+        if (tn != np + (kind & 1u) || (np && memcmp(ts, tp, np)) || ((kind & 1) && ts[np] != WASM_EXNREF))
+          fail(c, "type mismatch in catch clause");
+        if (c->ntcl >= c->captcl)
+          c->tcl = (tclause *)vec_grow(c, c->tcl, &c->captcl, c->ntcl + 1, sizeof *c->tcl);
+        c->tcl[c->ntcl].kind = kind;
+        c->tcl[c->ntcl].tag = tag;
+        c->tcl[c->ntcl].label = c->ncs - 1 - depth;
+        c->ntcl++;
+      }
+      push_ctrl(c, K_TRYTABLE, bt);
+      f = top(c);
+      f->cl_begin = cl_begin;
+      f->cl_end = c->ntcl;
+      f->start_pc = c->ncode;
+      if (!f->dead)
+        emit(c, 0x01);
+      break;
+    }
+    case 0x07:
+    case 0x19: {
+      ctrl *f = top(c);
+      uint32_t tg = 0;
+      const wasm_functype *tt = NULL;
+      if (op == 0x07) {
+        tg = rd_u32(c);
+        if (tg >= m->ntags)
+          fail(c, "unknown tag");
+        tt = &m->types[m->tag_type[tg]];
+      }
+      if (f->kind != K_TRY && f->kind != K_CATCH)
+        fail(c, "catch without a matching try");
+      pop_vals(c, f->bt->r, f->bt->nr);
+      if (c->nvt != f->height)
+        fail(c, "type mismatch: operands left on stack");
+      if (!f->dead) {
+        wasm_handler h;
+        if (f->kind == K_TRY)
+          f->body_end = c->ncode;
+        if (!f->unreachable) {
+          if (f->kind == K_CATCH) {
+            emit(c, OP_SQUASH);
+            emit(c, f->bt->rslots);
+          }
+          emit(c, OP_JMP);
+          emit_fwd(c, f);
+        }
+        memset(&h, 0, sizeof h);
+        h.start = f->start_pc;
+        h.end = f->body_end;
+        h.tag = tt ? (int32_t)tg : -1;
+        h.kind = H_LEGACY;
+        h.target = c->ncode;
+        h.dest = c->nlocal_slots + f->sheight;
+        add_handler(c, h);
+      }
+      f->kind = K_CATCH;
+      f->hidden = 1;
+      f->unreachable = 0;
+      c->nvt = f->height;
+      c->sh = f->sheight + 1;
+      if (c->sh > c->maxsh)
+        c->maxsh = c->sh;
+      if (tt)
+        push_vals(c, tt->p, tt->np);
+      break;
+    }
+    case 0x18: {
+      uint32_t l = rd_u32(c);
+      ctrl *f = top(c), *t;
+      const wasm_functype *bt = f->bt;
+      if (f->kind != K_TRY)
+        fail(c, "delegate without a matching try");
+      t = label(c, l + 1);
+      pop_vals(c, bt->r, bt->nr);
+      if (c->nvt != f->height)
+        fail(c, "type mismatch: operands left on stack");
+      if (!f->dead) {
+        wasm_handler h;
+        memset(&h, 0, sizeof h);
+        h.start = f->start_pc;
+        h.end = c->ncode;
+        h.kind = H_DELEGATE;
+        h.tag = -1;
+        h.resume = resume_pc(t);
+        add_handler(c, h);
+      }
+      patch_to(c, f->patch, c->ncode);
+      c->ncs--;
+      c->nvt = f->height;
+      c->sh = f->sheight;
+      push_vals(c, bt->r, bt->nr);
+      break;
+    }
+    case 0x08: {
+      uint32_t tg = rd_u32(c);
+      const wasm_functype *tt;
+      if (tg >= m->ntags)
+        fail(c, "unknown tag");
+      tt = &m->types[m->tag_type[tg]];
+      pop_vals(c, tt->p, tt->np);
+      if (live) {
+        emit(c, op);
+        emit(c, tg);
+      }
+      set_unreachable(c);
+      break;
+    }
+    case 0x09: {
+      ctrl *t = label(c, rd_u32(c));
+      if (t->kind != K_CATCH)
+        fail(c, "rethrow must target a catch");
+      if (live) {
+        emit(c, op);
+        emit(c, c->nlocal_slots + t->sheight);
+      }
+      set_unreachable(c);
+      break;
+    }
+    case 0x0a:
+      pop_t(c, WASM_EXNREF);
+      if (live)
+        emit(c, op);
+      set_unreachable(c);
+      break;
     case 0x0b: {
       ctrl *f = top(c);
       const wasm_functype *bt = f->bt;
       pop_vals(c, bt->r, bt->nr);
       if (c->nvt != f->height)
         fail(c, "type mismatch: operands left on stack");
+      if (f->kind == K_CATCH && live) {
+        emit(c, OP_SQUASH);
+        emit(c, bt->rslots);
+      }
+      if (f->kind == K_TRYTABLE && !f->dead)
+        finish_trytable(c, f);
       if (f->kind == K_IF) {
         /* no else arm: the missing one must pass its parameters through as results */
         if (bt->np != bt->nr || memcmp(bt->p, bt->r, bt->np))
@@ -1402,6 +1791,44 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
         emit(c, op);
         emit(c, f);
       }
+      break;
+    }
+    case 0x12: {
+      uint32_t f = rd_u32(c);
+      const wasm_functype *t;
+      if (f >= m->nfuncs)
+        fail(c, "unknown function");
+      t = &m->types[m->func_type[f]];
+      if (!wasm_results_eq(t, ft))
+        fail(c, "return_call callee results do not match the caller");
+      pop_vals(c, t->p, t->np);
+      if (live) {
+        emit(c, op);
+        emit(c, f);
+      }
+      set_unreachable(c);
+      break;
+    }
+    case 0x13: {
+      uint32_t ti = rd_u32(c), tb = rd_u32(c);
+      const wasm_functype *t;
+      if (ti >= m->ntypes)
+        fail(c, "unknown type");
+      if (tb >= m->ntables)
+        fail(c, "unknown table");
+      if (m->tables[tb].elem != WASM_FUNCREF)
+        fail(c, "return_call_indirect requires a funcref table");
+      t = &m->types[ti];
+      if (!wasm_results_eq(t, ft))
+        fail(c, "return_call_indirect callee results do not match the caller");
+      pop_t(c, WASM_I32);
+      pop_vals(c, t->p, t->np);
+      if (live) {
+        emit(c, op);
+        emit(c, ti);
+        emit(c, tb);
+      }
+      set_unreachable(c);
       break;
     }
     case 0x11: {
@@ -1520,15 +1947,18 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
       break;
     }
     case 0x3f:
-    case 0x40:
-      if (rd_u8(c) != 0 || !m->nmems)
-        fail(c, "unknown memory");
+    case 0x40: {
+      uint32_t mi = rd_memidx(c);
+      int addr = mem_addr_type(c, mi);
       if (op == 0x40)
-        pop_t(c, WASM_I32);
-      push(c, WASM_I32);
-      if (live)
+        pop_t(c, addr);
+      push(c, addr);
+      if (live) {
         emit(c, op);
+        emit(c, mi);
+      }
       break;
+    }
     case 0x41:
       push(c, WASM_I32);
       if (live) {
@@ -1573,7 +2003,7 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
       break;
     }
     case 0xd0:
-      push(c, rd_reftype(c));
+      push(c, rd_nulltype(c));
       if (live)
         emit(c, op);
       break;
@@ -1605,18 +2035,18 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
       break;
     default:
       if (op >= 0x28 && op <= 0x3e) {
-        uint32_t off = rd_memarg(c, MEM_ALIGN[op - 0x28]);
+        memarg ma = rd_memarg(c, MEM_ALIGN[op - 0x28]);
         int vt = ch_type(MEM_TYPE[op - 0x28]);
         if (op < 0x36) {
-          pop_t(c, WASM_I32);
+          pop_t(c, ma.addr);
           push(c, vt);
         } else {
           pop_t(c, vt);
-          pop_t(c, WASM_I32);
+          pop_t(c, ma.addr);
         }
         if (live) {
           emit(c, op);
-          emit(c, off);
+          emit_memarg(c, &ma);
         }
       } else if (op >= 0x45 && op <= 0xc4) {
         unsigned k;
@@ -1640,6 +2070,9 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
   if (c->p != bend)
     fail(c, "operators remaining after the end of the function");
 
+  wc->handlers = (wasm_handler *)ma(c, c->nhv * sizeof *wc->handlers);
+  memcpy(wc->handlers, c->hv, c->nhv * sizeof *wc->handlers);
+  wc->nhandlers = c->nhv;
   wc->code = (uint32_t *)ma(c, c->ncode * sizeof(uint32_t));
   memcpy(wc->code, c->code, c->ncode * sizeof(uint32_t));
   wc->ncode = c->ncode;
@@ -1670,8 +2103,17 @@ static void sec_code(C *c)
 
 static int section_rank(uint8_t id)
 {
-  static const int8_t rank[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 10};
-  return id <= 12 ? rank[id] : -1;
+  switch (id) {
+  case 13:
+    return 6;
+  case 12:
+    return 12;
+  case 10:
+    return 13;
+  case 11:
+    return 14;
+  }
+  return id >= 1 && id <= 9 ? (id <= 5 ? id : id + 1) : -1;
 }
 
 static void parse_module(C *c)
@@ -1746,6 +2188,9 @@ static void parse_module(C *c)
         c->datacount = rd_u32(c);
         c->has_datacount = 1;
         break;
+      case 13:
+        sec_tags(c);
+        break;
       case 10:
         sec_code(c);
         break;
@@ -1792,6 +2237,8 @@ wasm_module *wasm_module_new(const uint8_t *bytes, size_t len, char *err, size_t
   free(c->code);
   free(c->lslot);
   free(c->ltype);
+  free(c->hv);
+  free(c->tcl);
   free(c);
   if (!ok) {
     wasm_module_free(m);

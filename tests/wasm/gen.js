@@ -8,9 +8,10 @@ const path = require("path");
 const vm = require("vm");
 const dir = __dirname;
 
+const FEATURES = "--enable-threads";
 function wasmOf(file) {
   const out = path.join(require("os").tmpdir(), "owos_" + path.basename(file, ".wat") + ".wasm");
-  execSync(`wat2wasm "${file}" -o "${out}"`);
+  execSync(`wat2wasm ${FEATURES} "${file}" -o "${out}"`);
   return fs.readFileSync(out);
 }
 

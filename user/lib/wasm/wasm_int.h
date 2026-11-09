@@ -24,7 +24,8 @@ enum {
   OP_GLOBAL_GET2, /* index */
   OP_GLOBAL_SET2,
   OP_GLOBAL_GET_X, /* externref global */
-  OP_GLOBAL_SET_X
+  OP_GLOBAL_SET_X,
+  OP_SQUASH /* n: drop the slot below the top n (the end of a catch arm) */
 };
 
 #define OP_FC(n) (0x200 + (n))
@@ -162,6 +163,6 @@ static inline uint64_t wasm_sat_i64u(double d)
 }
 
 /* Execute one 0xFD operator. *sp and *pc advance; returns a trap message or NULL. */
-const char *wasm_simd_exec(unsigned sub, uint64_t **sp, const uint32_t **pc, wasm_memory *mem);
+const char *wasm_simd_exec(unsigned sub, uint64_t **sp, const uint32_t **pc, wasm_instance *inst);
 
 #endif

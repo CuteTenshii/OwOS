@@ -27,9 +27,10 @@ enum {
   WASM_F64 = 0x7c,
   WASM_V128 = 0x7b,
   WASM_FUNCREF = 0x70,
-  WASM_EXTERNREF = 0x6f
+  WASM_EXTERNREF = 0x6f,
+  WASM_EXNREF = 0x69 /* only on the stack, in locals and across calls: never in a table or global */
 };
-enum { WASM_KIND_FUNC, WASM_KIND_TABLE, WASM_KIND_MEMORY, WASM_KIND_GLOBAL };
+enum { WASM_KIND_FUNC, WASM_KIND_TABLE, WASM_KIND_MEMORY, WASM_KIND_GLOBAL, WASM_KIND_TAG };
 
 #define WASM_PAGE 65536u
 #define WASM_MAX_PAGES 32767u
@@ -42,6 +43,8 @@ typedef struct wasm_table wasm_table;
 typedef struct wasm_memory wasm_memory;
 typedef struct wasm_global wasm_global;
 typedef struct wasm_exec wasm_exec;
+typedef struct wasm_tag wasm_tag;
+typedef struct wasm_exn wasm_exn;
 
 /* The payload of an externref held in a table or global; all zero is null. The embedder gives it meaning. */
 typedef struct {
@@ -55,8 +58,8 @@ typedef struct {
 } wasm_functype;
 
 typedef struct {
-  uint32_t min, max;
-  uint8_t has_max;
+  uint64_t min, max;
+  uint8_t has_max, shared, is64;
 } wasm_limits;
 
 typedef struct {
@@ -68,11 +71,16 @@ typedef struct {
   uint8_t type, mut;
 } wasm_globaltype;
 
-/* A constant expression: op is 0x41-0x44 (i32/i64/f32/f64.const), 0xfd (v128.const), 0x23 (global.get v[0]),
- * 0xd0 (ref.null) or 0xd2 (ref.func v[0]) */
+/* A constant expression is a short program: op is 0x41-0x44 (i32/i64/f32/f64.const), 0xfd (v128.const),
+ * 0x23 (global.get v[0]), 0xd0 (ref.null), 0xd2 (ref.func v[0]) or an i32/i64 add, sub or mul */
 typedef struct {
   uint8_t op;
   uint64_t v[2];
+} wasm_cop;
+
+typedef struct {
+  uint32_t n;
+  wasm_cop *ops;
 } wasm_constexpr;
 
 typedef struct {
@@ -107,16 +115,29 @@ typedef struct {
 
 typedef struct {
   uint8_t active;
+  uint32_t mem;
   wasm_constexpr offset;
   uint32_t len;
   uint8_t *bytes;
 } wasm_data;
+
+/* An exception handler covers the instructions whose following pc lies in (start, end] */
+enum { H_CATCH, H_CATCH_REF, H_LEGACY, H_DELEGATE };
+typedef struct {
+  uint32_t start, end;
+  uint32_t target, arity, dest; /* a branch triple, or for H_LEGACY the arm's pc and the slot of its exnref */
+  uint32_t resume;              /* H_DELEGATE: where the search continues */
+  int32_t tag;                  /* module tag index, or -1 for catch_all */
+  uint8_t kind;
+} wasm_handler;
 
 typedef struct {
   uint32_t *code;
   uint32_t ncode;
   uint32_t nlocals;  /* slots: parameters and locals */
   uint32_t maxstack; /* operand stack slots above the locals */
+  wasm_handler *handlers;
+  uint32_t nhandlers;
 } wasm_code;
 
 struct wasm_module {
@@ -126,7 +147,9 @@ struct wasm_module {
   wasm_import *imports;
   uint32_t nfunc_imports, ntable_imports, nmem_imports, nglobal_imports;
   uint32_t nfuncs, ntables, nmems, nglobals; /* including imports */
-  uint32_t *func_type;                       /* per function: type index */
+  uint32_t ntags, ntag_imports;
+  uint32_t *tag_type;  /* per tag: type index of its parameters */
+  uint32_t *func_type; /* per function: type index */
   wasm_tabletype *tables;
   wasm_limits *mems;
   wasm_globaltype *globals;
@@ -142,6 +165,21 @@ struct wasm_module {
   wasm_custom *custom;
   wasm_code *code; /* per defined function */
   void *arena;
+};
+
+struct wasm_tag {
+  uint32_t np, pslots;
+  uint8_t *types; /* owned */
+  void *self;     /* embedder object that owns this tag */
+};
+
+/* A thrown exception: a tag and its values, or (tag NULL) a foreign value carried in `js` */
+struct wasm_exn {
+  wasm_exn *next;
+  wasm_tag *tag;
+  wasm_extern js;
+  uint32_t nslots;
+  uint64_t slots[1];
 };
 
 struct wasm_func {
@@ -165,7 +203,7 @@ struct wasm_memory {
   uint8_t *data;
   uint64_t size;
   uint32_t pages, max;
-  uint8_t has_max;
+  uint8_t has_max, is64;
   void (*on_grow)(wasm_memory *m); /* called after the bytes moved or grew */
   void *self;                      /* embedder object that owns this memory */
 };
@@ -183,6 +221,7 @@ struct wasm_instance {
   wasm_table **tables;
   wasm_memory **mems;
   wasm_global **globals;
+  wasm_tag **tags;
   wasm_func *store;    /* backing for host stubs and defined functions */
   wasm_func ***elem_f; /* per element segment: its funcref items */
   uint32_t *elem_n;    /* and their count, 0 after elem.drop     */
@@ -201,10 +240,16 @@ struct wasm_exec {
   wasm_frame *frames;
   uint32_t nframes, maxframes;
   void *ud;
+  wasm_exn *exns; /* exceptions made since the outermost call began */
+  wasm_exn *exc;
+  int depth;             /* nesting of wasm_call */
   unsigned short fpu_cw; /* x87 control word to give back to the host */
   const char *trap;      /* set when a call returns -1 */
   /* Host functions: read args from slots, write results to slots; nonzero means the host threw. */
   int (*host_call)(void *ud, wasm_func *f, uint64_t *slots);
+  /* After a host call failed: turn the pending exception into a record (wasm_exn_new), clearing it, and return 1;
+   * 0 leaves it pending and aborts the call. */
+  int (*exn_catch)(void *ud, wasm_exn **out);
   /* externref <-> handle (handle 0 is null; the same value may intern to different handles) */
   uint64_t (*xr_intern)(void *ud, const wasm_extern *v);
   void (*xr_value)(void *ud, uint64_t handle, wasm_extern *out);
@@ -231,10 +276,15 @@ int64_t wasm_table_grow(wasm_table *t, uint32_t delta, wasm_func *f, const wasm_
 void wasm_table_free(wasm_table *t);
 
 /* Does a memory or table of size `cur` and the given maximum satisfy an import's limits? */
-int wasm_limits_match(uint32_t cur, int has_max, uint32_t max, const wasm_limits *want);
+int wasm_limits_match(uint64_t cur, int has_max, uint64_t max, const wasm_limits *want);
 
-/* Execution: args/results are slot arrays (a v128 takes two). 0 ok, -1 trap (x->trap), -2 a host call failed */
+/* Execution: args/results are slot arrays (a v128 takes two). 0 ok, -1 trap (x->trap), -2 a host call failed,
+ * -3 an exception escaped (x->exc, valid until the next outermost wasm_call) */
 wasm_exec *wasm_exec_new(void *ud);
+wasm_exn *wasm_exn_new(wasm_exec *x, wasm_tag *tag, uint32_t nslots); /* NULL when out of memory */
+void wasm_exec_reset(wasm_exec *x); /* drop the exceptions made so far, once no call is running */
+int wasm_tag_new(wasm_tag *t, const uint8_t *types, uint32_t np);
+void wasm_tag_free(wasm_tag *t);
 void wasm_exec_free(wasm_exec *x);
 int wasm_call(wasm_exec *x, wasm_func *f, const uint64_t *args, uint64_t *results);
 

@@ -52,20 +52,70 @@ static int64_t clamp64(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo :
   }                                                                                                                    \
   break
 
-const char *wasm_simd_exec(unsigned sub, uint64_t **spp, const uint32_t **pcp, wasm_memory *mem)
+const char *wasm_simd_exec(unsigned sub, uint64_t **spp, const uint32_t **pcp, wasm_instance *inst)
 {
   uint64_t *sp = *spp;
   const uint32_t *pc = *pcp;
   v128 a, b, c, r;
   unsigned i;
-  uint64_t ea;
+  uint64_t ea, eo;
+  wasm_memory *mem;
   uint32_t cnt = 0;
   memset(&r, 0, sizeof r);
+  if (sub >= 0x100) {
+    /* relaxed SIMD: where results may vary the choice here is the strict operator's */
+    static const unsigned short same[] = {0x0e, 0xf8, 0xf9, 0xfc, 0xfd, 0,    0,    0,    0,
+                                          0,    0,    0,    0,    0xe8, 0xe9, 0xf4, 0xf5, 0x82};
+    if (sub <= 0x111 && same[sub - 0x100])
+      sub = same[sub - 0x100];
+    else if (sub >= 0x105 && sub <= 0x10c) {
+      c = ld(sp - 2);
+      b = ld(sp - 4);
+      a = ld(sp - 6);
+      if (sub <= 0x106)
+        EACH(4) r.f32[i] = sub == 0x105 ? a.f32[i] * b.f32[i] + c.f32[i] : -a.f32[i] * b.f32[i] + c.f32[i];
+      else if (sub <= 0x108)
+        EACH(2) r.f64[i] = sub == 0x107 ? a.f64[i] * b.f64[i] + c.f64[i] : -a.f64[i] * b.f64[i] + c.f64[i];
+      else
+        EACH(2) r.u64[i] = (a.u64[i] & c.u64[i]) | (b.u64[i] & ~c.u64[i]);
+      sp -= 4;
+      st(sp - 2, r);
+      *spp = sp;
+      *pcp = pc;
+      return NULL;
+    } else if (sub == 0x112) {
+      b = ld(sp - 2);
+      a = ld(sp - 4);
+      EACH(8) r.i16[i] = (int16_t)(a.i8[2 * i] * b.i8[2 * i] + a.i8[2 * i + 1] * b.i8[2 * i + 1]);
+      sp -= 2;
+      st(sp - 2, r);
+      *spp = sp;
+      *pcp = pc;
+      return NULL;
+    } else if (sub == 0x113) {
+      c = ld(sp - 2);
+      b = ld(sp - 4);
+      a = ld(sp - 6);
+      EACH(4)
+      r.u32[i] = (uint32_t)(a.i8[4 * i] * b.i8[4 * i] + a.i8[4 * i + 1] * b.i8[4 * i + 1]) +
+                 (uint32_t)(a.i8[4 * i + 2] * b.i8[4 * i + 2] + a.i8[4 * i + 3] * b.i8[4 * i + 3]) + c.u32[i];
+      sp -= 4;
+      st(sp - 2, r);
+      *spp = sp;
+      *pcp = pc;
+      return NULL;
+    } else
+      return "invalid SIMD instruction";
+  }
 
 #define MEMCHK(sz)                                                                                                     \
-  ea = (uint64_t)(uint32_t)sp[-1] + *pc++;                                                                             \
-  if (ea + (sz) > mem->size)                                                                                           \
-  return "memory access out of bounds"
+  mem = inst->mems[pc[2]];                                                                                             \
+  ea = mem->is64 ? sp[-1] : (uint64_t)(uint32_t)sp[-1];                                                                \
+  eo = ea + (((uint64_t)pc[1] << 32) | pc[0]);                                                                         \
+  pc += 3;                                                                                                             \
+  if (eo < ea || eo + (sz) < eo || eo + (sz) > mem->size)                                                              \
+    return "memory access out of bounds";                                                                              \
+  ea = eo
 
   switch (sub) {
   /* loads */
@@ -136,11 +186,9 @@ const char *wasm_simd_exec(unsigned sub, uint64_t **spp, const uint32_t **pcp, w
     uint32_t lane;
     c = ld(sp - 2);
     sp -= 2;
-    lane = pc[1];
-    ea = (uint64_t)(uint32_t)sp[-1] + pc[0];
-    pc += 2;
-    if (ea + sz > mem->size)
-      return "memory access out of bounds";
+    lane = pc[3];
+    MEMCHK(sz);
+    pc++;
     memcpy(c.u8 + lane * sz, mem->data + ea, sz);
     sp[-1] = c.u64[0];
     *sp++ = c.u64[1];
@@ -154,11 +202,9 @@ const char *wasm_simd_exec(unsigned sub, uint64_t **spp, const uint32_t **pcp, w
     uint32_t lane;
     c = ld(sp - 2);
     sp -= 2;
-    lane = pc[1];
-    ea = (uint64_t)(uint32_t)sp[-1] + pc[0];
-    pc += 2;
-    if (ea + sz > mem->size)
-      return "memory access out of bounds";
+    lane = pc[3];
+    MEMCHK(sz);
+    pc++;
     memcpy(mem->data + ea, c.u8 + lane * sz, sz);
     sp--;
     break;

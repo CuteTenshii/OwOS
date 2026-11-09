@@ -31,6 +31,8 @@ int wasm_memory_alloc(wasm_memory *m, uint32_t pages)
   m->data = NULL;
   m->size = 0;
   m->pages = 0;
+  if (pages > WASM_MAX_PAGES)
+    return -1;
   if (pages) {
     m->data = (uint8_t *)calloc(1, (unsigned)(pages * WASM_PAGE));
     if (!m->data)
@@ -123,7 +125,7 @@ void wasm_table_free(wasm_table *t)
   t->n = 0;
 }
 
-int wasm_limits_match(uint32_t cur, int has_max, uint32_t max, const wasm_limits *want)
+int wasm_limits_match(uint64_t cur, int has_max, uint64_t max, const wasm_limits *want)
 {
   if (cur < want->min)
     return 0;
@@ -145,11 +147,13 @@ wasm_instance *wasm_instance_new(const wasm_module *m)
   i->tables = (wasm_table **)calloc(m->ntables + 1, sizeof *i->tables);
   i->mems = (wasm_memory **)calloc(m->nmems + 1, sizeof *i->mems);
   i->globals = (wasm_global **)calloc(m->nglobals + 1, sizeof *i->globals);
+  i->tags = (wasm_tag **)calloc(m->ntags + 1, sizeof *i->tags);
   i->store = (wasm_func *)calloc(m->nfuncs + 1, sizeof *i->store);
   i->elem_f = (wasm_func ***)calloc(m->nelems + 1, sizeof *i->elem_f);
   i->elem_n = (uint32_t *)calloc(m->nelems + 1, sizeof *i->elem_n);
   i->data_dropped = (uint8_t *)calloc(m->ndatas + 1, 1);
-  if (!i->funcs || !i->tables || !i->mems || !i->globals || !i->store || !i->elem_f || !i->elem_n || !i->data_dropped) {
+  if (!i->funcs || !i->tables || !i->mems || !i->globals || !i->tags || !i->store || !i->elem_f || !i->elem_n ||
+      !i->data_dropped) {
     wasm_instance_free(i);
     return NULL;
   }
@@ -168,6 +172,7 @@ void wasm_instance_free(wasm_instance *i)
   free(i->tables);
   free(i->mems);
   free(i->globals);
+  free(i->tags);
   free(i->store);
   free(i->elem_f);
   free(i->elem_n);
@@ -177,21 +182,55 @@ void wasm_instance_free(wasm_instance *i)
 
 void wasm_eval_const(const wasm_instance *i, const wasm_constexpr *e, uint64_t out[2])
 {
-  out[0] = out[1] = 0;
-  switch (e->op) {
-  case 0x23:
-    out[0] = i->globals[e->v[0]]->v[0];
-    out[1] = i->globals[e->v[0]]->v[1];
-    break;
-  case 0xd2:
-    out[0] = (uint64_t)(uintptr_t)i->funcs[e->v[0]];
-    break;
-  case 0xd0:
-    break;
-  default:
-    out[0] = e->v[0];
-    out[1] = e->v[1];
+  uint64_t st[64][2];
+  uint32_t k, sp = 0;
+  for (k = 0; k < e->n; k++) {
+    const wasm_cop *o = &e->ops[k];
+    switch (o->op) {
+    case 0x23:
+      st[sp][0] = i->globals[o->v[0]]->v[0];
+      st[sp][1] = i->globals[o->v[0]]->v[1];
+      sp++;
+      break;
+    case 0xd2:
+      st[sp][0] = (uint64_t)(uintptr_t)i->funcs[o->v[0]];
+      st[sp++][1] = 0;
+      break;
+    case 0xd0:
+      st[sp][0] = st[sp][1] = 0;
+      sp++;
+      break;
+    case 0x6a:
+      sp--;
+      st[sp - 1][0] = (uint32_t)(st[sp - 1][0] + st[sp][0]);
+      break;
+    case 0x6b:
+      sp--;
+      st[sp - 1][0] = (uint32_t)(st[sp - 1][0] - st[sp][0]);
+      break;
+    case 0x6c:
+      sp--;
+      st[sp - 1][0] = (uint32_t)(st[sp - 1][0] * st[sp][0]);
+      break;
+    case 0x7c:
+      sp--;
+      st[sp - 1][0] += st[sp][0];
+      break;
+    case 0x7d:
+      sp--;
+      st[sp - 1][0] -= st[sp][0];
+      break;
+    case 0x7e:
+      sp--;
+      st[sp - 1][0] *= st[sp][0];
+      break;
+    default:
+      st[sp][0] = o->v[0];
+      st[sp++][1] = o->v[1];
+    }
   }
+  out[0] = st[0][0];
+  out[1] = st[0][1];
 }
 
 int wasm_instance_define(wasm_instance *i)
@@ -223,8 +262,9 @@ int wasm_instance_define(wasm_instance *i)
       return -1;
     i->mems[k] = mem;
     mem->has_max = m->mems[k].has_max;
-    mem->max = m->mems[k].max;
-    if (wasm_memory_alloc(mem, m->mems[k].min))
+    mem->is64 = m->mems[k].is64;
+    mem->max = m->mems[k].max > WASM_MAX_PAGES ? WASM_MAX_PAGES : (uint32_t)m->mems[k].max;
+    if (m->mems[k].min > WASM_MAX_PAGES || wasm_memory_alloc(mem, (uint32_t)m->mems[k].min))
       return -1;
   }
   for (k = m->nglobal_imports; k < m->nglobals; k++) {
@@ -235,6 +275,15 @@ int wasm_instance_define(wasm_instance *i)
     g->type = m->globals[k].type;
     g->mut = m->globals[k].mut;
     wasm_eval_const(i, &m->global_init[k - m->nglobal_imports], g->v);
+  }
+  for (k = m->ntag_imports; k < m->ntags; k++) {
+    wasm_tag *t = (wasm_tag *)calloc(1, sizeof *t);
+    const wasm_functype *ft = &m->types[m->tag_type[k]];
+    if (!t)
+      return -1;
+    i->tags[k] = t;
+    if (wasm_tag_new(t, ft->p, ft->np))
+      return -1;
   }
   for (k = 0; k < m->nelems; k++) {
     const wasm_elem *e = &m->elems[k];
@@ -274,12 +323,58 @@ const char *wasm_instance_apply_segments(wasm_instance *i)
     if (!d->active)
       continue;
     wasm_eval_const(i, &d->offset, off);
-    if ((uint64_t)(uint32_t)off[0] + d->len > i->mems[0]->size)
-      return "data segment is out of bounds";
-    memcpy(i->mems[0]->data + (uint32_t)off[0], d->bytes, d->len);
+    {
+      wasm_memory *mm = i->mems[d->mem];
+      uint64_t at = mm->is64 ? off[0] : (uint32_t)off[0];
+      if (at + d->len < at || at + d->len > mm->size)
+        return "data segment is out of bounds";
+      memcpy(mm->data + at, d->bytes, d->len);
+    }
     i->data_dropped[k] = 1;
   }
   return NULL;
+}
+
+int wasm_tag_new(wasm_tag *t, const uint8_t *types, uint32_t np)
+{
+  uint32_t k;
+  t->types = (uint8_t *)malloc(np ? np : 1);
+  if (!t->types)
+    return -1;
+  memcpy(t->types, types, np);
+  t->np = np;
+  t->pslots = 0;
+  for (k = 0; k < np; k++)
+    t->pslots += types[k] == WASM_V128 ? 2 : 1;
+  return 0;
+}
+
+void wasm_tag_free(wasm_tag *t)
+{
+  free(t->types);
+  t->types = NULL;
+}
+
+wasm_exn *wasm_exn_new(wasm_exec *x, wasm_tag *tag, uint32_t nslots)
+{
+  wasm_exn *e = (wasm_exn *)calloc(1, sizeof *e + nslots * sizeof(uint64_t));
+  if (!e)
+    return NULL;
+  e->tag = tag;
+  e->nslots = nslots;
+  e->next = x->exns;
+  x->exns = e;
+  return e;
+}
+
+void wasm_exec_reset(wasm_exec *x)
+{
+  while (x->exns) {
+    wasm_exn *n = x->exns->next;
+    free(x->exns);
+    x->exns = n;
+  }
+  x->exc = NULL;
 }
 
 /* ---- execution contexts -------------------------------------------------- */
@@ -306,6 +401,7 @@ void wasm_exec_free(wasm_exec *x)
 {
   if (!x)
     return;
+  wasm_exec_reset(x);
   free(x->stack);
   free(x->frames);
   free(x);
@@ -330,9 +426,28 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
   wasm_memory *mem;
   const uint32_t entry_frames = x->nframes;
   const char *trap;
+  wasm_exn *exn;
   uint32_t i, nl;
 
 #define SETMEM() (mem = inst->module->nmems ? inst->mems[0] : NULL)
+#define HOSTCALL(h)                                                                                                    \
+  do {                                                                                                                 \
+    uint32_t ps_ = (h)->type->pslots, rs_ = (h)->type->rslots;                                                         \
+    uint64_t *args_ = sp - ps_;                                                                                        \
+    if (args_ + rs_ + 64 > x->stack_end)                                                                               \
+      TRAP("call stack exhausted");                                                                                    \
+    x->sp = args_ + (ps_ > rs_ ? ps_ : rs_);                                                                           \
+    fpu_set(x->fpu_cw);                                                                                                \
+    if (x->host_call(x->ud, (h), args_)) {                                                                             \
+      fpu_narrow();                                                                                                    \
+      if (x->exn_catch && x->exn_catch(x->ud, &exn))                                                                   \
+        goto do_throw;                                                                                                 \
+      return -2;                                                                                                       \
+    }                                                                                                                  \
+    fpu_narrow();                                                                                                      \
+    sp = args_ + rs_;                                                                                                  \
+    SETMEM();                                                                                                          \
+  } while (0)
 #define TRAP(msg)                                                                                                      \
   do {                                                                                                                 \
     trap = (msg);                                                                                                      \
@@ -347,11 +462,38 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
   sp = fp + nl;
   SETMEM();
 
+resume:
   for (;;) {
     uint32_t op = *pc++;
     switch (op) {
     case 0x00:
       TRAP("unreachable");
+    case 0x01:
+      break;
+    case 0x08: {
+      wasm_tag *tg = inst->tags[*pc++];
+      uint32_t ns = tg->pslots;
+      exn = wasm_exn_new(x, tg, ns);
+      if (!exn)
+        TRAP("out of memory");
+      memcpy(exn->slots, sp - ns, ns * sizeof *sp);
+      sp -= ns;
+      goto do_throw;
+    }
+    case 0x09:
+      exn = (wasm_exn *)(uintptr_t)fp[*pc++];
+      goto do_throw;
+    case 0x0a:
+      exn = (wasm_exn *)(uintptr_t)*--sp;
+      if (!exn)
+        TRAP("null reference");
+      goto do_throw;
+    case OP_SQUASH: {
+      uint32_t n = *pc++;
+      memmove(sp - n - 1, sp - n, n * sizeof *sp);
+      sp--;
+      break;
+    }
     case OP_JMP:
       pc = code + *pc;
       break;
@@ -382,23 +524,25 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
       pc += 1 + 3 * (idx < n ? idx : n);
       goto do_br;
     }
-    case OP_RETURN: {
-      uint32_t rs = f->type->rslots;
-      memmove(fp, sp - rs, rs * sizeof *sp);
-      sp = fp + rs;
-      if (x->nframes == entry_frames)
-        return 0;
+    case OP_RETURN:
+    do_return:
       {
-        wasm_frame *fr = &x->frames[--x->nframes];
-        f = fr->fn;
-        pc = fr->pc;
-        fp = fr->fp;
-        inst = f->inst;
-        code = f->code->code;
-        SETMEM();
+        uint32_t rs = f->type->rslots;
+        memmove(fp, sp - rs, rs * sizeof *sp);
+        sp = fp + rs;
+        if (x->nframes == entry_frames)
+          return 0;
+        {
+          wasm_frame *fr = &x->frames[--x->nframes];
+          f = fr->fn;
+          pc = fr->pc;
+          fp = fr->fp;
+          inst = f->inst;
+          code = f->code->code;
+          SETMEM();
+        }
+        break;
       }
-      break;
-    }
     case 0x10:
       g = inst->funcs[*pc++];
       goto call_g;
@@ -414,21 +558,41 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
         TRAP("function signature mismatch");
       goto call_g;
     }
+    case 0x12:
+      g = inst->funcs[*pc++];
+      goto tail_g;
+    case 0x13: {
+      uint32_t ti = pc[0];
+      wasm_table *t = inst->tables[pc[1]];
+      uint32_t idx = (uint32_t)*--sp;
+      pc += 2;
+      if (idx >= t->n)
+        TRAP("table index is out of bounds");
+      g = t->f[idx];
+      if (!g || !wasm_functype_eq(g->type, &inst->module->types[ti]))
+        TRAP("function signature mismatch");
+    }
+    tail_g:
+      if (!g->code) {
+        HOSTCALL(g);
+        goto do_return;
+      }
+      memmove(fp, sp - g->type->pslots, g->type->pslots * sizeof *sp);
+      f = g;
+      inst = f->inst;
+      code = f->code->code;
+      pc = code;
+      nl = f->code->nlocals;
+      if (fp + nl + f->code->maxstack > x->stack_end)
+        TRAP("call stack exhausted");
+      for (i = f->type->pslots; i < nl; i++)
+        fp[i] = 0;
+      sp = fp + nl;
+      SETMEM();
+      break;
     call_g:
       if (!g->code) {
-        uint32_t ps = g->type->pslots, rs = g->type->rslots;
-        uint64_t *args = sp - ps;
-        if (args + rs + 64 > x->stack_end)
-          TRAP("call stack exhausted");
-        x->sp = args + (ps > rs ? ps : rs);
-        fpu_set(x->fpu_cw);
-        if (x->host_call(x->ud, g, args)) {
-          fpu_narrow();
-          return -2;
-        }
-        fpu_narrow();
-        sp = args + rs;
-        SETMEM();
+        HOSTCALL(g);
         break;
       }
       if (x->nframes >= x->maxframes)
@@ -557,15 +721,20 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
       break;
     }
 
+#define MEMSEL(i) ((i) ? inst->mems[(i)] : mem)
 #define EA(sz)                                                                                                         \
-  uint64_t ea = (uint64_t)(uint32_t)sp[-1] + *pc++;                                                                    \
-  if (ea + (sz) > mem->size)                                                                                           \
-    TRAP(OOB);
+  wasm_memory *mm = MEMSEL(pc[2]);                                                                                     \
+  uint64_t ea = mm->is64 ? sp[-1] : (uint64_t)(uint32_t)sp[-1];                                                        \
+  uint64_t eo = ea + (((uint64_t)pc[1] << 32) | pc[0]);                                                                \
+  pc += 3;                                                                                                             \
+  if (eo < ea || eo + (sz) < eo || eo + (sz) > mm->size)                                                               \
+    TRAP(OOB);                                                                                                         \
+  ea = eo;
 #define LOAD(T, conv)                                                                                                  \
   {                                                                                                                    \
     EA(sizeof(T));                                                                                                     \
     T v;                                                                                                               \
-    memcpy(&v, mem->data + ea, sizeof v);                                                                              \
+    memcpy(&v, mm->data + ea, sizeof v);                                                                               \
     sp[-1] = (conv);                                                                                                   \
     break;                                                                                                             \
   }
@@ -575,7 +744,7 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
     T v = (T)val;                                                                                                      \
     sp--;                                                                                                              \
     EA(sizeof(T));                                                                                                     \
-    memcpy(mem->data + ea, &v, sizeof v);                                                                              \
+    memcpy(mm->data + ea, &v, sizeof v);                                                                               \
     sp--;                                                                                                              \
     break;                                                                                                             \
   }
@@ -626,11 +795,17 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
     case 0x3e:
       STORE(uint32_t)
     case 0x3f:
-      *sp++ = mem->pages;
+      *sp++ = MEMSEL(pc[0])->pages;
+      pc++;
       break;
-    case 0x40:
-      sp[-1] = (uint32_t)(int32_t)wasm_memory_grow(mem, (uint32_t)sp[-1]);
+    case 0x40: {
+      wasm_memory *mm = MEMSEL(pc[0]);
+      uint64_t d = mm->is64 ? sp[-1] : (uint32_t)sp[-1];
+      pc++;
+      int64_t g = d > 0xffffffffu ? -1 : wasm_memory_grow(mm, (uint32_t)d);
+      sp[-1] = mm->is64 ? (uint64_t)g : (uint32_t)(int32_t)g;
       break;
+    }
 
     case 0x41:
       *sp++ = *pc++;
@@ -1086,31 +1261,42 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
       sp[-1] = wasm_sat_i64u(f64_of(sp[-1]));
       break;
     case OP_FC(8): {
-      uint32_t seg = *pc++, n = (uint32_t)sp[-1], s = (uint32_t)sp[-2], d = (uint32_t)sp[-3];
+      uint32_t seg = pc[0], n = (uint32_t)sp[-1], s = (uint32_t)sp[-2];
+      wasm_memory *mm = MEMSEL(pc[1]);
+      uint64_t d = mm->is64 ? sp[-3] : (uint32_t)sp[-3];
       uint32_t len = inst->data_dropped[seg] ? 0 : inst->module->datas[seg].len;
+      pc += 2;
       sp -= 3;
-      if ((uint64_t)s + n > len || (uint64_t)d + n > mem->size)
+      if ((uint64_t)s + n > len || d + n < d || d + n > mm->size)
         TRAP(OOB);
-      memcpy(mem->data + d, inst->module->datas[seg].bytes + s, n);
+      memcpy(mm->data + d, inst->module->datas[seg].bytes + s, n);
       break;
     }
     case OP_FC(9):
       inst->data_dropped[*pc++] = 1;
       break;
     case OP_FC(10): {
-      uint32_t n = (uint32_t)sp[-1], s = (uint32_t)sp[-2], d = (uint32_t)sp[-3];
+      wasm_memory *dm = MEMSEL(pc[0]), *sm = MEMSEL(pc[1]);
+      uint64_t n = dm->is64 && sm->is64 ? sp[-1] : (uint32_t)sp[-1];
+      uint64_t s = sm->is64 ? sp[-2] : (uint32_t)sp[-2];
+      uint64_t d = dm->is64 ? sp[-3] : (uint32_t)sp[-3];
+      pc += 2;
       sp -= 3;
-      if ((uint64_t)s + n > mem->size || (uint64_t)d + n > mem->size)
+      if (s + n < s || d + n < d || s + n > sm->size || d + n > dm->size)
         TRAP(OOB);
-      memmove(mem->data + d, mem->data + s, n);
+      memmove(dm->data + d, sm->data + s, n);
       break;
     }
     case OP_FC(11): {
-      uint32_t n = (uint32_t)sp[-1], v = (uint32_t)sp[-2], d = (uint32_t)sp[-3];
+      wasm_memory *mm = MEMSEL(pc[0]);
+      uint64_t n = mm->is64 ? sp[-1] : (uint32_t)sp[-1];
+      pc++;
+      uint32_t v = (uint32_t)sp[-2];
+      uint64_t d = mm->is64 ? sp[-3] : (uint32_t)sp[-3];
       sp -= 3;
-      if ((uint64_t)d + n > mem->size)
+      if (d + n < d || d + n > mm->size)
         TRAP(OOB);
-      memset(mem->data + d, (int)(v & 0xff), n);
+      memset(mm->data + d, (int)(v & 0xff), n);
       break;
     }
     case OP_FC(12): {
@@ -1183,8 +1369,8 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
     }
 
     default:
-      if (op >= OP_FD(0) && op <= OP_FD(0xff)) {
-        trap = wasm_simd_exec(op - OP_FD(0), &sp, &pc, mem);
+      if (op >= OP_FD(0) && op <= OP_FD(0x113)) {
+        trap = wasm_simd_exec(op - OP_FD(0), &sp, &pc, inst);
         if (trap)
           goto do_trap;
         break;
@@ -1192,6 +1378,55 @@ static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
       TRAP("invalid instruction");
     }
   }
+do_throw:
+  for (;;) {
+    const wasm_code *wc = f->code;
+    uint32_t p = (uint32_t)(pc - code), hi;
+    const wasm_handler *h = NULL;
+    for (hi = 0; hi < wc->nhandlers; hi++) {
+      const wasm_handler *k = &wc->handlers[hi];
+      if (!(k->start < p && p <= k->end))
+        continue;
+      if (k->kind == H_DELEGATE) {
+        p = k->resume;
+        continue;
+      }
+      if (k->tag >= 0 && !(exn->tag && inst->tags[k->tag] == exn->tag))
+        continue;
+      h = k;
+      break;
+    }
+    if (h) {
+      uint64_t *dst = fp + h->dest;
+      uint32_t n = h->tag >= 0 ? exn->nslots : 0;
+      if (h->kind == H_LEGACY) {
+        dst[0] = (uint64_t)(uintptr_t)exn;
+        memcpy(dst + 1, exn->slots, n * sizeof *sp);
+        sp = dst + 1 + n;
+      } else {
+        memcpy(dst, exn->slots, n * sizeof *sp);
+        if (h->kind == H_CATCH_REF)
+          dst[n] = (uint64_t)(uintptr_t)exn;
+        sp = dst + h->arity;
+      }
+      pc = code + h->target;
+      break;
+    }
+    if (x->nframes == entry_frames) {
+      x->exc = exn;
+      return -3;
+    }
+    {
+      wasm_frame *fr = &x->frames[--x->nframes];
+      f = fr->fn;
+      pc = fr->pc;
+      fp = fr->fp;
+      inst = f->inst;
+      code = f->code->code;
+      SETMEM();
+    }
+  }
+  goto resume;
 do_trap:
   x->trap = trap;
   return -1;
@@ -1215,7 +1450,9 @@ int wasm_call(wasm_exec *x, wasm_func *f, const uint64_t *args, uint64_t *result
   } else {
     unsigned short outer = x->fpu_cw;
     x->fpu_cw = fpu_narrow();
+    x->depth++;
     r = run(x, f, base);
+    x->depth--;
     fpu_set(x->fpu_cw);
     x->fpu_cw = outer;
   }

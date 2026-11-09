@@ -1,0 +1,12 @@
+(module
+  (memory (export "m") i64 1 4)
+  (data (i64.const 8) "\01\02\03\04")
+  (func (export "ld") (param i64) (result i32) local.get 0 i32.load)
+  (func (export "st") (param i64 i32) local.get 0 local.get 1 i32.store offset=16)
+  (func (export "sz") (result i64) memory.size)
+  (func (export "gr") (param i64) (result i64) local.get 0 memory.grow)
+  (func (export "fill") (param i64 i32 i64) local.get 0 local.get 1 local.get 2 memory.fill)
+  (func (export "cp") (param i64 i64 i64) local.get 0 local.get 1 local.get 2 memory.copy)
+  (func (export "far") (result i32) i64.const 0x100000000 i32.load)
+  (func (export "wrap") (param i64) (result i32) local.get 0 i32.load offset=0xffffffffffffffff)
+  (func (export "ldv") (param i64) (result i32) local.get 0 v128.load i32x4.extract_lane 1))

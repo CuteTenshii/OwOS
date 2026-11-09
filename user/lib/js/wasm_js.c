@@ -17,7 +17,7 @@
 
 #define ARG(i) ((i) < n ? a[i] : js_undef())
 
-enum { WT_MODULE = 1, WT_INSTANCE, WT_MEMORY, WT_TABLE, WT_GLOBAL, WT_EXEC };
+enum { WT_MODULE = 1, WT_INSTANCE, WT_MEMORY, WT_TABLE, WT_GLOBAL, WT_EXEC, WT_TAG, WT_EXN };
 
 typedef struct {
   int tag;
@@ -41,6 +41,15 @@ typedef struct {
   int tag;
   wasm_global *g;
 } wglobal;
+typedef struct {
+  int tag;
+  wasm_tag *t;
+} wtagw;
+typedef struct {
+  int tag;
+  js_object *tagobj; /* the WebAssembly.Tag */
+  js_object *vals;   /* the payload as JS values */
+} wexn;
 typedef struct {
   int tag;
   wasm_exec *x;
@@ -207,6 +216,8 @@ static void xr_value(void *ud, uint64_t h, wasm_extern *out)
 static js_value func_to_js(js_ctx *ctx, wasm_func *wf);
 static js_value wasm_call_native(js_ctx *ctx, js_value thisv, js_value *a, int n);
 static wexec *get_exec(js_ctx *ctx);
+static js_value exn_to_js(js_ctx *ctx, wexec *wx, wasm_exn *e);
+static wasm_exn *exn_from_js(js_ctx *ctx, wexec *wx, js_value v);
 
 static wasm_func *func_of(js_value v)
 {
@@ -287,6 +298,8 @@ static js_value from_wasm(js_ctx *ctx, wexec *wx, const uint64_t *s, int type)
     xr_value(wx, s[0], &e);
     return ext_decode(&e);
   }
+  case WASM_EXNREF:
+    return js_throw_type(ctx, "type incompatibility when transforming from/to JS");
   }
   return js_undef();
 }
@@ -317,6 +330,9 @@ static void wasm_trace(js_object *o)
     for (k = 0; k < m->nglobals; k++)
       if (in->globals[k])
         gc_mark(in->globals[k]->self);
+    for (k = 0; k < m->ntags; k++)
+      if (in->tags[k])
+        gc_mark(in->tags[k]->self);
     break;
   }
   case WT_MEMORY:
@@ -344,11 +360,19 @@ static void wasm_trace(js_object *o)
   }
   case WT_EXEC: {
     wexec *wx = (wexec *)o->host;
+    wasm_exn *e;
     uint32_t k;
     for (k = 0; k < wx->nxs; k++)
       mark_val(ext_decode(&wx->xs[k]));
+    for (e = wx->x->exns; e; e = e->next)
+      if (!e->tag)
+        mark_val(ext_decode(&e->js));
     break;
   }
+  case WT_EXN:
+    gc_mark(((wexn *)o->host)->tagobj);
+    gc_mark(((wexn *)o->host)->vals);
+    break;
   }
 }
 
@@ -371,6 +395,10 @@ static void wasm_finalize(js_object *o)
     break;
   case WT_GLOBAL:
     free(((wglobal *)o->host)->g);
+    break;
+  case WT_TAG:
+    wasm_tag_free(((wtagw *)o->host)->t);
+    free(((wtagw *)o->host)->t);
     break;
   case WT_EXEC: {
     wexec *wx = (wexec *)o->host;
@@ -409,6 +437,10 @@ static int host_call(void *ud, wasm_func *f, uint64_t *slots)
       break;
     }
     argv[i] = from_wasm(ctx, wx, slots + pos, t->p[i]);
+    if (ctx->has_exc) {
+      bad = 1;
+      break;
+    }
     pos += slots_of(t->p[i]);
     if (argv[i].type == JV_OBJ || argv[i].type == JV_BIGINT)
       gc_keep(argv[i].u.obj);
@@ -447,6 +479,37 @@ static int host_call(void *ud, wasm_func *f, uint64_t *slots)
   return bad;
 }
 
+static int exn_catch(void *ud, wasm_exn **out)
+{
+  wexec *wx = (wexec *)ud;
+  js_ctx *ctx = wx->ctx;
+  js_value e = ctx->exc;
+  wasm_exn *r;
+  if (!ctx->has_exc || js_irq_stopped(ctx->irq))
+    return 0;
+  ctx->has_exc = 0;
+  if (tag_of(e) == WT_EXN) {
+    r = exn_from_js(ctx, wx, e);
+    if (!r) {
+      if (!ctx->has_exc) {
+        ctx->has_exc = 1;
+        ctx->exc = e;
+      }
+      return 0;
+    }
+  } else {
+    r = wasm_exn_new(wx->x, NULL, 0);
+    if (!r) {
+      ctx->has_exc = 1;
+      ctx->exc = e;
+      return 0;
+    }
+    ext_encode(e, &r->js);
+  }
+  *out = r;
+  return 1;
+}
+
 static wexec *get_exec(js_ctx *ctx)
 {
   pentry *e = pmap_find_pub(ctx->global, "@wasmx");
@@ -471,6 +534,7 @@ static wexec *get_exec(js_ctx *ctx)
   wx->x->host_call = host_call;
   wx->x->xr_intern = xr_intern;
   wx->x->xr_value = xr_value;
+  wx->x->exn_catch = exn_catch;
   o = new_wasm(ctx, "@Exec", wx);
   js_def(ctx->global, "@wasmx", js_obj_value(o), 0);
   return wx;
@@ -479,6 +543,7 @@ static wexec *get_exec(js_ctx *ctx)
 static void exec_leave(wexec *wx)
 {
   if (wx->depth == 0) {
+    wasm_exec_reset(wx->x);
     wx->nxs = 0;
     if (wx->htcap)
       memset(wx->ht, 0, wx->htcap * sizeof *wx->ht);
@@ -498,7 +563,8 @@ static int invoke(js_ctx *ctx, wexec *wx, wasm_func *wf, const uint64_t *args, u
       js_throw_range(ctx, "Maximum call stack size exceeded");
     else
       throw_wasm(ctx, "RuntimeError", msg);
-  }
+  } else if (r == -3)
+    js_throw(ctx, exn_to_js(ctx, wx, wx->x->exc));
   return r;
 }
 
@@ -649,7 +715,7 @@ static js_value module_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   return o ? js_obj_value(o) : js_undef();
 }
 
-static const char *const KIND_NAME[4] = {"function", "table", "memory", "global"};
+static const char *const KIND_NAME[5] = {"function", "table", "memory", "global", "tag"};
 
 static wasm_module *module_arg(js_ctx *ctx, js_value v, const char *api)
 {
@@ -810,17 +876,62 @@ static int desc_limit(js_ctx *ctx, js_value d, const char *key, const char *alt,
   return 1;
 }
 
+/* A 64-bit memory's limits are BigInts. 1 present, 0 absent, -1 an exception is pending */
+static int desc_big(js_ctx *ctx, js_value d, const char *key, const char *alt, uint64_t *out)
+{
+  js_value v = js_get(ctx, d, key);
+  unsigned lo, hi;
+  if (v.type == JV_UNDEF && alt)
+    v = js_get(ctx, d, alt);
+  if (ctx->has_exc)
+    return -1;
+  if (v.type == JV_UNDEF)
+    return 0;
+  if (!js_bigint_to_u64(ctx, v, &lo, &hi))
+    return -1;
+  *out = (uint64_t)lo | ((uint64_t)hi << 32);
+  return 1;
+}
+
 static js_value memory_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   const char *api = "WebAssembly.Memory()";
   uint32_t init = 0, max = 0;
-  int r, has_max;
+  uint64_t init64 = 0, max64 = 0;
+  int r, has_max, is64 = 0;
+  js_value av;
   wasm_memory *m;
   (void)t;
   if (ARG(0).type != JV_OBJ)
     return js_throw_type(ctx, "WebAssembly.Memory(): Argument 0 must be a memory descriptor");
   if (js_to_boolean(js_get(ctx, a[0], "shared"))) {
     return js_throw_type(ctx, "WebAssembly.Memory(): shared memory is not supported");
+  }
+  av = js_get(ctx, a[0], "address");
+  if (av.type != JV_UNDEF) {
+    av = js_to_string(ctx, av);
+    if (ctx->has_exc)
+      return js_undef();
+    is64 = !strcmp(av.u.str->data, "i64");
+    if (!is64 && strcmp(av.u.str->data, "i32"))
+      return js_throw_type(ctx, "WebAssembly.Memory(): Descriptor property 'address' must be 'i32' or 'i64'");
+  }
+  if (is64) {
+    r = desc_big(ctx, a[0], "initial", "minimum", &init64);
+    if (r < 0)
+      return js_undef();
+    if (r == 0)
+      return js_throw_type(ctx, "WebAssembly.Memory(): Property 'initial' is required");
+    if (init64 > WASM_MAX_PAGES)
+      return js_throw_range(ctx, "WebAssembly.Memory(): Property 'initial': value is above the upper bound");
+    init = (uint32_t)init64;
+    has_max = desc_big(ctx, a[0], "maximum", NULL, &max64);
+    if (has_max < 0)
+      return js_undef();
+    if (has_max && max64 < init64)
+      return js_throw_range(ctx, "WebAssembly.Memory(): Property 'maximum': value is below the lower bound");
+    max = max64 > WASM_MAX_PAGES ? WASM_MAX_PAGES : (uint32_t)max64;
+    goto limits_done;
   }
   r = desc_limit(ctx, a[0], "initial", "minimum", WASM_MAX_PAGES, api, &init);
   if (r < 0)
@@ -834,6 +945,7 @@ static js_value memory_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_throw_range(ctx, "WebAssembly.Memory(): Property 'maximum': value is below the lower bound");
   if (has_max && max > WASM_MAX_PAGES)
     max = WASM_MAX_PAGES;
+limits_done:
   m = (wasm_memory *)calloc(1, sizeof *m);
   if (!m || wasm_memory_alloc(m, init)) {
     free(m);
@@ -841,6 +953,7 @@ static js_value memory_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   }
   m->has_max = (uint8_t)has_max;
   m->max = max;
+  m->is64 = (uint8_t)is64;
   return js_obj_value(wrap_memory(ctx, m));
 }
 
@@ -882,6 +995,15 @@ static js_value memory_grow(js_ctx *ctx, js_value t, js_value *a, int n)
   int64_t r;
   if (!wm)
     return js_throw_type(ctx, "WebAssembly.Memory.grow(): Receiver is not a WebAssembly.Memory");
+  if (wm->mem->is64) {
+    unsigned lo, hi;
+    if (!js_bigint_to_u64(ctx, ARG(0), &lo, &hi))
+      return js_undef();
+    r = hi ? -1 : wasm_memory_grow(wm->mem, lo);
+    if (r < 0)
+      return js_throw_range(ctx, "WebAssembly.Memory.grow(): Maximum memory size exceeded");
+    return js_bigint_from_u64(ctx, (unsigned)r, 0, 0);
+  }
   if (!arg_u32(ctx, ARG(0), "WebAssembly.Memory.grow()", &delta))
     return js_undef();
   r = wasm_memory_grow(wm->mem, delta);
@@ -1125,6 +1247,210 @@ static js_value global_value_set(js_ctx *ctx, js_value t, js_value *a, int n)
   return js_undef();
 }
 
+static js_object *wrap_tag(js_ctx *ctx, wasm_tag *t)
+{
+  wtagw *wt = (wtagw *)calloc(1, sizeof *wt);
+  js_object *o;
+  if (!wt)
+    gc_oom();
+  wt->tag = WT_TAG;
+  wt->t = t;
+  o = new_wasm(ctx, "@Tag", wt);
+  t->self = o;
+  return o;
+}
+
+static js_value exn_to_js(js_ctx *ctx, wexec *wx, wasm_exn *e)
+{
+  wexn *we;
+  js_object *vals, *o;
+  uint32_t i, pos = 0;
+  if (!e->tag)
+    return ext_decode(&e->js);
+  we = (wexn *)calloc(1, sizeof *we);
+  if (!we)
+    gc_oom();
+  we->tag = WT_EXN;
+  gc_push_scope();
+  vals = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < e->tag->np; i++) {
+    js_value v = from_wasm(ctx, wx, e->slots + pos, e->tag->types[i]);
+    if (v.type == JV_OBJ || v.type == JV_BIGINT)
+      gc_keep(v.u.obj);
+    else if (v.type == JV_STR)
+      gc_keep(v.u.str);
+    js_array_push(ctx, vals, v);
+    pos += slots_of(e->tag->types[i]);
+  }
+  we->tagobj = (js_object *)e->tag->self;
+  we->vals = vals;
+  o = new_wasm(ctx, "@Exception", we);
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+
+static wasm_exn *exn_from_js(js_ctx *ctx, wexec *wx, js_value v)
+{
+  wexn *we = (wexn *)host_of(v, WT_EXN);
+  wasm_tag *tg;
+  wasm_exn *e;
+  uint32_t i, pos = 0;
+  if (!we)
+    return NULL;
+  tg = ((wtagw *)we->tagobj->host)->t;
+  e = wasm_exn_new(wx->x, tg, tg->pslots);
+  if (!e) {
+    js_throw_range(ctx, "WebAssembly: out of memory");
+    return NULL;
+  }
+  for (i = 0; i < tg->np; i++) {
+    if (!to_wasm(ctx, wx, js_get_index(ctx, js_obj_value(we->vals), i), tg->types[i], e->slots + pos))
+      return NULL;
+    pos += slots_of(tg->types[i]);
+  }
+  return e;
+}
+
+/* The value a JS argument becomes in a tag's payload */
+static int canon_arg(js_ctx *ctx, js_value v, int type, js_value *out)
+{
+  switch (type) {
+  case WASM_I32:
+    *out = js_number((double)js_to_int32(ctx, v));
+    return !ctx->has_exc;
+  case WASM_I64: {
+    unsigned lo, hi;
+    if (!js_bigint_to_u64(ctx, v, &lo, &hi))
+      return 0;
+    *out = js_bigint_from_u64(ctx, lo, hi, 1);
+    return !ctx->has_exc;
+  }
+  case WASM_F32:
+    *out = js_number((double)(float)js_to_number(ctx, v));
+    return !ctx->has_exc;
+  case WASM_F64:
+    *out = js_number(js_to_number(ctx, v));
+    return !ctx->has_exc;
+  case WASM_FUNCREF:
+    if (v.type != JV_NULL && !func_of(v)) {
+      js_throw_type(ctx, "WebAssembly.Exception: function reference must be null or an exported WebAssembly function");
+      return 0;
+    }
+    *out = v;
+    return 1;
+  case WASM_EXTERNREF:
+    *out = v;
+    return 1;
+  }
+  js_throw_type(ctx, "WebAssembly.Exception: type incompatibility when transforming from/to JS");
+  return 0;
+}
+
+static js_value tag_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value list, len;
+  uint8_t types[64];
+  uint32_t np, i;
+  wasm_tag *tg;
+  (void)t;
+  if (ARG(0).type != JV_OBJ)
+    return js_throw_type(ctx, "WebAssembly.Tag(): Argument 0 must be a tag type");
+  list = js_get(ctx, a[0], "parameters");
+  if (list.type != JV_OBJ)
+    return js_throw_type(ctx, "WebAssembly.Tag(): Argument 0 must be a tag type with 'parameters'");
+  len = js_get(ctx, list, "length");
+  np = (uint32_t)js_to_number(ctx, len);
+  if (ctx->has_exc)
+    return js_undef();
+  if (np > sizeof types)
+    return js_throw_range(ctx, "WebAssembly.Tag(): too many parameters");
+  for (i = 0; i < np; i++) {
+    js_value s = js_to_string(ctx, js_get_index(ctx, list, i));
+    if (ctx->has_exc)
+      return js_undef();
+    types[i] = (uint8_t)parse_valtype(s.u.str->data);
+    if (!types[i] || types[i] == WASM_V128)
+      return js_throw_type(ctx, "WebAssembly.Tag(): Argument 0 parameter type at index #0 must be a value type");
+  }
+  tg = (wasm_tag *)calloc(1, sizeof *tg);
+  if (!tg || wasm_tag_new(tg, types, np)) {
+    free(tg);
+    return js_throw_range(ctx, "WebAssembly.Tag(): out of memory");
+  }
+  return js_obj_value(wrap_tag(ctx, tg));
+}
+
+static js_value exception_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  wtagw *wt = (wtagw *)host_of(ARG(0), WT_TAG);
+  wexn *we;
+  js_object *vals, *o;
+  uint32_t i;
+  js_value len;
+  (void)t;
+  if (!wt)
+    return js_throw_type(ctx, "WebAssembly.Exception(): Argument 0 must be a WebAssembly tag");
+  if (ARG(1).type != JV_OBJ)
+    return js_throw_type(ctx, "WebAssembly.Exception(): Argument 1 must be an iterable");
+  len = js_get(ctx, a[1], "length");
+  if (ctx->has_exc)
+    return js_undef();
+  if (js_to_number(ctx, len) != (double)wt->t->np)
+    return js_throw_type(ctx, "WebAssembly.Exception(): Number of exception values does not match signature length");
+  gc_push_scope();
+  vals = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < wt->t->np; i++) {
+    js_value v;
+    if (!canon_arg(ctx, js_get_index(ctx, a[1], i), wt->t->types[i], &v)) {
+      gc_pop_scope();
+      return js_undef();
+    }
+    if (v.type == JV_OBJ || v.type == JV_BIGINT)
+      gc_keep(v.u.obj);
+    else if (v.type == JV_STR)
+      gc_keep(v.u.str);
+    js_array_push(ctx, vals, v);
+  }
+  we = (wexn *)calloc(1, sizeof *we);
+  if (!we)
+    gc_oom();
+  we->tag = WT_EXN;
+  we->tagobj = a[0].u.obj;
+  we->vals = vals;
+  o = new_wasm(ctx, "@Exception", we);
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+
+static js_value exception_is(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  wexn *we = (wexn *)host_of(t, WT_EXN);
+  wtagw *wt = (wtagw *)host_of(ARG(0), WT_TAG);
+  if (!we)
+    return js_throw_type(ctx, "WebAssembly.Exception.is(): Receiver is not a WebAssembly.Exception");
+  if (!wt)
+    return js_throw_type(ctx, "WebAssembly.Exception.is(): Argument 0 must be a WebAssembly tag");
+  return js_bool(((wtagw *)we->tagobj->host)->t == wt->t);
+}
+
+static js_value exception_get_arg(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  wexn *we = (wexn *)host_of(t, WT_EXN);
+  wtagw *wt = (wtagw *)host_of(ARG(0), WT_TAG);
+  uint32_t i;
+  if (!we)
+    return js_throw_type(ctx, "WebAssembly.Exception.getArg(): Receiver is not a WebAssembly.Exception");
+  if (!wt)
+    return js_throw_type(ctx, "WebAssembly.Exception.getArg(): Argument 0 must be a WebAssembly tag");
+  if (((wtagw *)we->tagobj->host)->t != wt->t)
+    return js_throw_type(ctx, "WebAssembly.Exception.getArg(): First argument does not match the exception tag");
+  if (!arg_u32(ctx, ARG(1), "WebAssembly.Exception.getArg()", &i))
+    return js_undef();
+  if (i >= wt->t->np)
+    return js_throw_range(ctx, "WebAssembly.Exception.getArg(): Index out of range");
+  return js_get_index(ctx, js_obj_value(we->vals), i);
+}
+
 /* ---- instances ----------------------------------------------------------- */
 
 static js_object *make_global(js_ctx *ctx, int type, int mut, const uint64_t v[2])
@@ -1233,11 +1559,30 @@ static int resolve_import(js_ctx *ctx, wasm_instance *in, const wasm_module *m, 
       link_error(ctx, api, k, im, 1, "memory import must be a WebAssembly.Memory object");
       return 0;
     }
+    if (wm->mem->is64 != im->mem.is64) {
+      link_error(ctx, api, k, im, 1, "memory import has a different address type than declared");
+      return 0;
+    }
     if (!wasm_limits_match(wm->mem->pages, wm->mem->has_max, wm->mem->max, &im->mem)) {
       link_error(ctx, api, k, im, 1, "memory import has fewer pages or a larger maximum than declared");
       return 0;
     }
     in->mems[mi] = wm->mem;
+    return 1;
+  }
+  case WASM_KIND_TAG: {
+    wtagw *wt = (wtagw *)host_of(v, WT_TAG);
+    const wasm_functype *want = &m->types[im->type];
+    uint32_t gi = cnt[WASM_KIND_TAG]++;
+    if (!wt) {
+      link_error(ctx, api, k, im, 1, "tag import requires a WebAssembly.Tag");
+      return 0;
+    }
+    if (wt->t->np != want->np || memcmp(wt->t->types, want->p, want->np)) {
+      link_error(ctx, api, k, im, 1, "imported tag does not match the expected type");
+      return 0;
+    }
+    in->tags[gi] = wt->t;
     return 1;
   }
   default: {
@@ -1298,7 +1643,7 @@ static js_object *instantiate_module(js_ctx *ctx, js_object *module_obj, js_valu
   wasm_instance *in = wasm_instance_new(m);
   winstance *wi = (winstance *)calloc(1, sizeof *wi);
   js_object *io, *exports;
-  uint32_t k, cnt[4] = {0, 0, 0, 0};
+  uint32_t k, cnt[5] = {0, 0, 0, 0, 0};
   const char *trap;
   wexec *wx = NULL;
   if (!in || !wi) {
@@ -1332,6 +1677,8 @@ static js_object *instantiate_module(js_ctx *ctx, js_object *module_obj, js_valu
     wrap_memory(ctx, in->mems[k]);
   for (k = m->nglobal_imports; k < m->nglobals; k++)
     wrap_global(ctx, in->globals[k]);
+  for (k = m->ntag_imports; k < m->ntags; k++)
+    wrap_tag(ctx, in->tags[k]);
   trap = wasm_instance_apply_segments(in);
   if (trap) {
     api_error(ctx, "RuntimeError", api, trap);
@@ -1351,6 +1698,9 @@ static js_object *instantiate_module(js_ctx *ctx, js_object *module_obj, js_valu
       break;
     case WASM_KIND_MEMORY:
       v = js_obj_value((js_object *)in->mems[e->idx]->self);
+      break;
+    case WASM_KIND_TAG:
+      v = js_obj_value((js_object *)in->tags[e->idx]->self);
       break;
     default:
       v = js_obj_value((js_object *)in->globals[e->idx]->self);
@@ -1640,6 +1990,13 @@ void js_setup_wasm(js_ctx *ctx)
   def_class(ctx, state, ns, "Global", global_ctor, 1, p);
   def_getter(ctx, p, "value", global_value_get, global_value_set);
   js_def_native(ctx, p, "valueOf", global_value_get, 0);
+
+  p = def_proto(ctx, "Tag");
+  def_class(ctx, state, ns, "Tag", tag_ctor, 1, p);
+  p = def_proto(ctx, "Exception");
+  def_class(ctx, state, ns, "Exception", exception_ctor, 2, p);
+  js_def_native(ctx, p, "is", exception_is, 1);
+  js_def_native(ctx, p, "getArg", exception_get_arg, 2);
 
   def_error(ctx, state, ns, "CompileError");
   def_error(ctx, state, ns, "LinkError");

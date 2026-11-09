@@ -47,7 +47,24 @@ static const char *const k_wasm_script[] = {
     "\"validate-bad\":\"throw:TypeError\",\"module-bad\":\"throw:TypeError\",\"module-empty\":\"throw:CompileError\","
     "\"module-trunc\":\"throw:CompileError\",\"module-buf\":\"true\",\"instance-bad\":\"throw:TypeError\",\"types\":\"["
     "object,[object WebAssembly],function,[object WebAssembly.Module],CompileError,true,RuntimeError: "
-    "z]\",\"promises\":\"compile-bad:CompileError|compile:true|cstream:true|inst2:true|inst:module/"
+    "z]\",\"extconst\":\"[22,58n,104]\",\"tail-self\":\"[55,1784293664]\",\"tail-indirect\":\"[55,446198416]\",\"tail-"
+    "host\":\"42\",\"tail-multi\":\"[6,5]\",\"relaxed-fp\":\"[17,4,1.5,-1]\",\"relaxed-int\":\"[-7,12,252645135,9,13,0,"
+    "8192,30,148]\",\"multimem\":\"[97,121,98,101,1,2,65536,131072,false]\",\"multimem-ops\":\"[77,9,9,0,121,122,"
+    "151587081]\",\"multimem-grow\":\"[2,3,0,196608,1,true]\",\"multimem-grow-fail\":\"[-1,3]\",\"multimem-oob\":"
+    "\"throw:RuntimeError\",\"multimem-copy-oob\":\"throw:RuntimeError\",\"mem64\":\"[67305985,16909060,1n,65536]\","
+    "\"mem64-grow\":\"[1n,2n,0,131072,-1n,2n,bigint,3n]\",\"mem64-bulk\":\"[1515870810,1515870810,1515870810]\","
+    "\"mem64-oob\":\"throw:RuntimeError\",\"mem64-wrap\":\"throw:RuntimeError\",\"mem64-i32-arg\":\"throw:TypeError\","
+    "\"mem64-js\":\"[65536,1n,131072,bigint]\",\"mem64-js-num\":\"throw:TypeError\",\"mem64-import\":\"2n\",\"mem64-"
+    "import-bad\":\"throw:LinkError\",\"eh-catch\":\"[105,1,2,1004,10,17,6,8,42]\",\"eh-pair\":\"[5n,1.5]\",\"eh-"
+    "escape\":\"[true,true,false,9,false]\",\"eh-delegate-out\":\"[true,3]\",\"eh-js\":\"[0,99,99,99,0,87]\",\"eh-js-"
+    "identity\":\"[true,true,5,true]\",\"eh-trap\":\"throw:RuntimeError\",\"eh-tags\":\"[true,true,false,[object "
+    "WebAssembly.Tag]]\",\"eh2-basic\":\"[9,1,2,5,105]\",\"eh2-mk\":\"throw:TypeError\",\"eh2-throw-ref\":\"throw:"
+    "TypeError\",\"eh2-throw-ref-null\":\"throw:TypeError\",\"eh2-bad-exnref\":\"throw:TypeError\",\"eh2-escape\":\"["
+    "true,false]\",\"Exception\":\"[true,false,3,true,[object WebAssembly.Exception],[object "
+    "WebAssembly.Exception]]\",\"Exception-bad\":\"throw:TypeError\",\"Exception-wrong-tag\":\"throw:TypeError\","
+    "\"Exception-index\":\"throw:RangeError\",\"Tag-bad\":\"throw:TypeError\",\"Tag-types\":\"true\",\"tag-import-"
+    "bad\":\"throw:LinkError\",\"tag-import-nontag\":\"throw:LinkError\",\"tag-kinds\":\"[2,function,tag]\","
+    "\"promises\":\"compile-bad:CompileError|compile:true|cstream:true|inst2:true|inst:module/"
     "instance:10:true|link:TypeError|stream:15|type:TypeError\"};\n",
     "var H = "
     "{\"num:i32.add\":\"89121a41\",\"num:i32.sub\":\"ec18b3f5\",\"num:i32.mul\":\"bab1e3f2\",\"num:i32.div_s\":"
@@ -232,6 +249,27 @@ static const char *const k_wasm_script[] = {
     "016a100f0b0300000b0c002000044041010f0b41020b0b00410520000d001a41060b4001027bfd0c0100000002000000030000000400000021"
     "01024003402000450d0120012002fdae012102200041016b21000c000b0b2002fd1b032002fd1b006a0b09002000220020006a0b1b00027f02"
     "7f027f410120000d021a41020b410a6a0b41e4006a0b0b\");\n",
+    "W[\"eh\"] = "
+    "hex("
+    "\"0061736d01000000011b0660017f0060000060027e7c0060017f017f6000027e7c6000017f02190203656e76076a737468726f7700000365"
+    "6e76026a7404000003121100030300030303040303030503030303030d0703000000010002078e011102653004010265310402066361746368"
+    "300002086361746368616c6c0003076e6f6d6174636800040772657468726f7700050864656c656761746500060c64656c65676174655f6f75"
+    "74000704706169720008026a730009056a73746167000a046a737265000b0474726170000c05756e646572000d056c6f6f7063000e0562726f"
+    "7574000f046465657000100ac502110600200008010b1100067f20001001417f070141e4006a0b0b1100067f2000044008020b41011941020b"
+    "0b0b0006402000100107020b0b1900067f067f20001001410007011a09000b070141e8076a0b0b1400067f067f200010014100180007014107"
+    "6a0b0b1300067f067f2000100141001800070241070b0b14000604420544000000000000f83f080307030b0b0f00067f2000100041001941e3"
+    "000b0b1000067f2000100041000700410a6a0b0b0e00067f2000100041001909000b0b0900067f001941010b0b160041054106067f20001001"
+    "4100070141016a0b6a6a0b2801017f024003402000450d01064020001001070120016a21010b200041016b21000c000b0b20010b1800027f06"
+    "7f200010014100070141036a0c010b0b41016a0b0b00067f2000101107010b0b15002000047f200041016b101105412a100141000b0b\");"
+    "\n",
+    "W[\"eh2\"] = "
+    "hex("
+    "\"0061736d0100000001200760017f0060000060017f017f6000027f6960017f016960016900600169017f03090802020204050600020d0502"
+    "000000010743090165040002747400000674745f616c6c00010674745f7265660002026d6b00030374687200040669736e756c6c0005076e6f"
+    "6d617463680006066e657374656400070a9c01081000027f1f7f01000000200008000b0b0b170002401f400102002000044008010b0b41010f"
+    "0b41020b22010169027f1f7f0100000002031f0301010000200008000b0b21011a20010a0b0b0b110002691f40010300200008000bd0690b0b"
+    "050020000a0b05002000d10b0f00027f1f7f0100000008010b0b1a0b2000027f1f7f0100000002401f4001000100200008000b0b41050b0b41"
+    "e4006a0b\");\n",
     "W[\"exports\"] = "
     "hex("
     "\"0061736d01000000010b0260027f7f017f6000017f030302000104040170000105030100020606017f0041030b072306036d656d02000374"
@@ -245,6 +283,10 @@ static const char *const k_wasm_script[] = {
     "6f6f7000090a700a040020000b05002000d10b08002000200126000b0600200025000b0600200024000b040023000b090020002001fc0f000b"
     "0b00200020012002fc11000b08002002200120000b2801017f02400340200220014f0d01410020002600410025002100200241016a21020c00"
     "0b0b20000b\");\n",
+    "W[\"extconst\"] = "
+    "hex("
+    "\"0061736d010000000105016000017f020a0103656e760161037f000302010005030100010618027f002300410341046c6a0b7e0042e40042"
+    "0642077e7d0b070e03016203010163030202726400000a0901070041102d00000b0b0b0100230041066a0b026869\");\n",
     "W[\"glob\"] = "
     "hex("
     "\"0061736d01000000010c036000006000017f60017f0002140203656e760167037f0003656e76026d67037f0103060500010201000639067f"
@@ -273,10 +315,41 @@ static const char *const k_wasm_script[] = {
     "0f0020002a0264bb20002b03c801a00b0b0020002802ffffffff0f0b04003f000b0600200040000b0b00200020012002fc0b000b0c00200020"
     "012002fc0a00000b0c00200020012002fc0801000b0500fc09010b090041fcff032802000b0b1d020041080b0a0102030405060708fffe010b"
     "68656c6c6f20776f726c64\");\n",
+    "W[\"mem64imp\"] = "
+    "hex(\"0061736d010000000105016000017e020b0103656e76016d020501030302010007060102737a00000a060104003f000b\");\n",
+    "W[\"memory64\"] = "
+    "hex("
+    "\"0061736d0100000001240760017e017f60027e7f006000017e60017e017e60037e7f7e0060037e7e7e006000017f030a0900010203040506"
+    "000005040105010407380a016d0200026c640000027374000102737a000202677200030466696c6c0004026370000503666172000604777261"
+    "700007036c647600080a6109070020002802000b0900200020013602100b04003f000b0600200040000b0b00200020012002fc0b000b0c0020"
+    "0020012002fc0a00000b0b004280808080102802000b100020002802ffffffffffffffffff010b0b002000fd000400fd1b010b0b0a01004208"
+    "0b0401020304\");\n",
+    "W[\"multimem\"] = "
+    "hex("
+    "\"0061736d0100000001150460017f017f60027f7f0060037f7f7f006000017f030b0a00000102000303020200050602000101020407470c01"
+    "61020001620201036c64610000036c64620001037374620002026370000303677262000403737a61000503737a6200060566696c6c62000705"
+    "696e697462000802766200090c01030a610a070020002d00000b080020002d4001000b0a00200020013a4001000b0c00200020012002fc0a00"
+    "010b0600200040010b04003f000b04003f010b0b00200020012002fc0b010b0c00200020012002fc0802010b0c002000fd00440100fd1b000b"
+    "0b16030201410a0b036265650041000b026179010378797a\");\n",
+    "W[\"relaxed\"] = "
+    "hex("
+    "\"0061736d0100000001370960037d7d7d017d60037c7c7c017c60027d7d017d60027c7c017c60017d017f60017c017f60037f7f7f017f6001"
+    "7f017f60027f7f017f030c0b000102030405060708080607510b046d6164640000056e6d616464000104666d696e000204646d617800030574"
+    "72756e630004067472756e63750005046c73656c00060373777a000703713135000803646f74000906646f74616464000a0ad2010b14002000"
+    "fd132001fd132002fd13fd8502fd1f020b14002000fd142001fd142002fd14fd8802fd21010b10002000fd132001fd13fd8d02fd1f000b1000"
+    "2000fd142001fd14fd9002fd21000b0c002000fd13fd8102fd1b030b0c002000fd14fd8402fd1b000b14002000fd112001fd112002fd11fd8b"
+    "02fd1b010b1e00fd0c0a0b0c0d0e0f101112131415161718192000fd0ffd8002fd16000b10002000fd102001fd10fd9102fd18000b10002000"
+    "fd0f2001fd0ffd9202fd18000b14002000fd0f2001fd0f2002fd11fd9302fd1b000b\");\n",
     "W[\"start\"] = "
     "hex("
     "\"0061736d01000000010c0360017f006000006000017f020c0103656e76046e6f7465000003030201020503010001070b02016d0200036765"
     "7400020801010a1c02120041011000410041cd00360200410210000b070041002802000b\");\n",
+    "W[\"tailcall\"] = "
+    "hex("
+    "\"0061736d0100000001190460027f7f017f60017f017f60017f027f7f60027f7f027f7f02090103656e760168000103070600000101020304"
+    "05017001010107170403616363000103696e6400030274680004026d7600050907010041000b01020a57061700200045044020010f0b200041"
+    "016b200120006a12010b1a00200045044020010f0b200041016b200120006a41001300000b08002000410010020b0600200012000b0b002000"
+    "200041016a12060b0600200120000b\");\n",
     "W[\"tbl\"] = "
     "hex("
     "\"0061736d01000000012b0960017f017f6000017f60027f7f017f60017f0060027f7f0060037f7f7f0060000060017f017060000170031110"
@@ -712,6 +785,92 @@ static const char *const k_wasm_script[] = {
     "T('types',function(){return [typeof WebAssembly,Object.prototype.toString.call(WebAssembly),typeof "
     "WebAssembly.Module,Object.prototype.toString.call(ex),new WebAssembly.CompileError('x').name,new "
     "WebAssembly.LinkError('y') instanceof Error,String(new WebAssembly.RuntimeError('z'))];});\n",
+    "\n",
+    "var ec = inst(\"extconst\", { env: { a: 10 } });\n",
+    "T(\"extconst\", function () { return [ec.b.value, ec.c.value, ec.rd()]; });\n",
+    "var tc = inst(\"tailcall\", { env: { h: function (x) { return x * 3; } } });\n",
+    "T(\"tail-self\", function () { return [tc.acc(10, 0), tc.acc(1000000, 0)]; });\n",
+    "T(\"tail-indirect\", function () { return [tc.ind(10), tc.ind(500000)]; });\n",
+    "T(\"tail-host\", function () { return tc.th(14); });\n",
+    "T(\"tail-multi\", function () { return tc.mv(5); });\n",
+    "var rx = inst(\"relaxed\");\n",
+    "T(\"relaxed-fp\", function () { return [rx.madd(3, 4, 5), rx.nmadd(2, 3, 10), rx.fmin(1.5, 2.5), rx.dmax(-1, "
+    "-2)]; });\n",
+    "T(\"relaxed-int\", function () { return [rx.trunc(-7.9), rx.truncu(12.7), rx.lsel(0x0f0f0f0f, 0x33333333, -1), "
+    "rx.lsel(5, 9, 0), rx.swz(3), rx.swz(200), rx.q15(16384, 16384), rx.dot(3, 5), rx.dotadd(2, 6, 100)]; });\n",
+    "var mm = inst(\"multimem\");\n",
+    "T(\"multimem\", function () { return [mm.lda(0), mm.lda(1), mm.ldb(10), mm.ldb(12), mm.sza(), mm.szb(), "
+    "mm.a.buffer.byteLength, mm.b.buffer.byteLength, mm.a === mm.b]; });\n",
+    "T(\"multimem-ops\", function () { mm.stb(100, 77); mm.cp(200, 100, 1); mm.fillb(300, 9, 4); mm.initb(400, 1, 2); "
+    "return [mm.lda(200), mm.ldb(300), mm.ldb(303), mm.ldb(304), mm.ldb(400), mm.ldb(401), mm.vb(300)]; });\n",
+    "T(\"multimem-grow\", function () { var b = mm.b.buffer, a = mm.a.buffer, r = mm.grb(1); return [r, mm.szb(), "
+    "b.byteLength, mm.b.buffer.byteLength, mm.sza(), a === mm.a.buffer]; });\n",
+    "T(\"multimem-grow-fail\", function () { return [mm.grb(10), mm.szb()]; });\n",
+    "T(\"multimem-oob\", function () { return mm.ldb(65536 * 3); });\n",
+    "T(\"multimem-copy-oob\", function () { mm.cp(0, 65530 + 65536 * 2, 100); });\n",
+    "var m64 = inst(\"memory64\");\n",
+    "T(\"mem64\", function () { m64.st(5n, 0x01020304); return [m64.ld(8n), m64.ld(21n), m64.sz(), "
+    "m64.m.buffer.byteLength]; });\n",
+    "T(\"mem64-grow\", function () { var b = m64.m.buffer; return [m64.gr(1n), m64.sz(), b.byteLength, "
+    "m64.m.buffer.byteLength, m64.gr(100n), m64.m.grow(1n), typeof m64.m.grow(0n), m64.sz()]; });\n",
+    "T(\"mem64-bulk\", function () { m64.fill(100n, 0x5a, 8n); m64.cp(200n, 100n, 8n); return [m64.ld(200n), "
+    "m64.ld(204n), m64.ldv(100n)]; });\n",
+    "T(\"mem64-oob\", function () { return m64.far(); });\n",
+    "T(\"mem64-wrap\", function () { return m64.wrap(2n); });\n",
+    "T(\"mem64-i32-arg\", function () { return m64.ld(8); });\n",
+    "T(\"mem64-js\", function () { var m = new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: \"i64\" }); "
+    "return [m.buffer.byteLength, m.grow(1n), m.buffer.byteLength, typeof m.grow(0n)]; });\n",
+    "T(\"mem64-js-num\", function () { return new WebAssembly.Memory({ initial: 1, address: \"i64\" }); });\n",
+    "T(\"mem64-import\", function () { var m = new WebAssembly.Memory({ initial: 2n, maximum: 3n, address: \"i64\" }); "
+    "return inst(\"mem64imp\", { env: { m: m } }).sz(); });\n",
+    "T(\"mem64-import-bad\", function () { return inst(\"mem64imp\", { env: { m: new WebAssembly.Memory({ initial: 2 "
+    "}) } }); });\n",
+    "var jt = new WebAssembly.Tag({ parameters: [\"i32\"] });\n",
+    "var jsErr = new Error(\"boom\");\n",
+    "function jsthrow(x) { if (x === 1) throw jsErr; if (x === 2) throw new WebAssembly.Exception(jt, [77]); if (x === "
+    "3) throw 5; }\n",
+    "var eh = inst(\"eh\", { env: { jsthrow: jsthrow, jt: jt } });\n",
+    "function caught(f) { try { f(); return \"no throw\"; } catch (e) { return e; } }\n",
+    "T(\"eh-catch\", function () { return [eh.catch0(5), eh.catchall(0), eh.catchall(1), eh.rethrow(4), "
+    "eh.delegate(3), eh.under(5), eh.loopc(3), eh.brout(4), eh.deep(5)]; });\n",
+    "T(\"eh-pair\", function () { return eh.pair(); });\n",
+    "T(\"eh-escape\", function () { var e = caught(function () { eh.nomatch(9); }); return [e instanceof "
+    "WebAssembly.Exception, e.is(eh.e0), e.is(eh.e1), e.getArg(eh.e0, 0), e instanceof Error]; });\n",
+    "T(\"eh-delegate-out\", function () { var e = caught(function () { eh.delegate_out(3); }); return [e instanceof "
+    "WebAssembly.Exception, e.getArg(eh.e0, 0)]; });\n",
+    "T(\"eh-js\", function () { return [eh.js(0), eh.js(1), eh.js(2), eh.js(3), eh.jstag(0), eh.jstag(2)]; });\n",
+    "T(\"eh-js-identity\", function () { return [caught(function () { eh.jstag(1); }) === jsErr, caught(function () { "
+    "eh.jsre(1); }) === jsErr, caught(function () { eh.jsre(3); }), caught(function () { eh.jsre(2); }) instanceof "
+    "WebAssembly.Exception]; });\n",
+    "T(\"eh-trap\", function () { return eh.trap(); });\n",
+    "T(\"eh-tags\", function () { return [eh.e0 instanceof WebAssembly.Tag, eh.e0 === eh.e0, eh.e0 === eh.e1, "
+    "Object.prototype.toString.call(eh.e0)]; });\n",
+    "var eh2 = inst(\"eh2\");\n",
+    "T(\"eh2-basic\", function () { return [eh2.tt(9), eh2.tt_all(0), eh2.tt_all(1), eh2.tt_ref(5), eh2.nested(5)]; "
+    "});\n",
+    "T(\"eh2-mk\", function () { var x = eh2.mk(7); return [x instanceof WebAssembly.Exception, x.is(eh2.e), "
+    "x.getArg(eh2.e, 0), eh2.isnull(x), eh2.isnull(null)]; });\n",
+    "T(\"eh2-throw-ref\", function () { var e = caught(function () { eh2.thr(eh2.mk(8)); }); return [e instanceof "
+    "WebAssembly.Exception, e.is(eh2.e), e.getArg(eh2.e, 0)]; });\n",
+    "T(\"eh2-throw-ref-null\", function () { eh2.thr(null); });\n",
+    "T(\"eh2-bad-exnref\", function () { eh2.thr({}); });\n",
+    "T(\"eh2-escape\", function () { var e = caught(function () { eh2.nomatch(1); }); return [e instanceof "
+    "WebAssembly.Exception, e.is(eh2.e)]; });\n",
+    "T(\"Exception\", function () { var x = new WebAssembly.Exception(jt, [3.9]); var y = new "
+    "WebAssembly.Exception(eh.e1, []); return [x.is(jt), x.is(eh.e0), x.getArg(jt, 0), y.is(eh.e1), String(x), "
+    "Object.prototype.toString.call(x)]; });\n",
+    "T(\"Exception-bad\", function () { return new WebAssembly.Exception(jt, []); });\n",
+    "T(\"Exception-wrong-tag\", function () { return new WebAssembly.Exception(jt, [1]).getArg(eh.e0, 0); });\n",
+    "T(\"Exception-index\", function () { return new WebAssembly.Exception(jt, [1]).getArg(jt, 1); });\n",
+    "T(\"Tag-bad\", function () { return new WebAssembly.Tag({}); });\n",
+    "T(\"Tag-types\", function () { return new WebAssembly.Tag({ parameters: [\"i64\", \"f32\", \"externref\"] }) "
+    "instanceof WebAssembly.Tag; });\n",
+    "T(\"tag-import-bad\", function () { return inst(\"eh\", { env: { jsthrow: jsthrow, jt: new WebAssembly.Tag({ "
+    "parameters: [] }) } }); });\n",
+    "T(\"tag-import-nontag\", function () { return inst(\"eh\", { env: { jsthrow: jsthrow, jt: {} } }); });\n",
+    "T(\"tag-kinds\", function () { return [WebAssembly.Module.exports(new WebAssembly.Module(W.eh)).filter(function "
+    "(e) { return e.kind === \"tag\"; }).length, WebAssembly.Module.imports(new WebAssembly.Module(W.eh)).map(function "
+    "(e) { return e.kind; }).join()]; });\n",
     "\n",
     "function dbl(h) { var b = new BigUint64Array(1), d = new Float64Array(b.buffer); b[0] = BigInt(\"0x\" + h); "
     "return d[0]; }\n",
