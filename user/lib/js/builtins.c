@@ -2110,7 +2110,9 @@ static js_object *as_array(js_ctx *ctx, js_value t)
         break;
     }
     gc_pop_scope();
-    return ctx->has_exc ? NULL : arr;
+    if (ctx->has_exc)
+      return NULL;
+    return (js_object *)gc_keep(arr); /* the caller's method body allocates while it holds the copy */
   }
   js_throw_type(ctx, "Array.prototype method called on null or undefined");
   return NULL;
