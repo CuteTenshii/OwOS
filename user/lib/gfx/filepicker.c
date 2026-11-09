@@ -14,8 +14,6 @@
 #define CHK_W 28 /* checkbox column of a multiple-selection list */
 #define PATH_MAX_LEN 256
 
-#define DBLCLICK_MS 400
-
 #define COL_BG 0x161d28
 #define COL_LIST 0x0d1420
 #define COL_BORDER 0x3a4658
@@ -34,13 +32,11 @@ struct picker {
   struct filelist_entry *ents;
   unsigned char *chk; /* per entry: ticked in a multiple-selection picker */
   int nents;
-  int up;           /* 1 when a ".." row leads the list */
-  int sel;          /* selected row, or -1 */
-  int focus;        /* 0 = name field, 1 = path field */
-  int drag;         /* the field a left-drag is selecting in, or -1 */
-  int hot;          /* hovered button: 0 cancel, 1 primary, or -1 */
-  int last_row;     /* row of the previous list click, for double-click detection */
-  unsigned last_ms; /* and when it happened */
+  int up;    /* 1 when a ".." row leads the list */
+  int sel;   /* selected row, or -1 */
+  int focus; /* 0 = name field, 1 = path field */
+  int drag;  /* the field a left-drag is selecting in, or -1 */
+  int hot;   /* hovered button: 0 cancel, 1 primary, or -1 */
   struct scrollview sv;
   struct select_box filter;
   char status[64];
@@ -349,21 +345,9 @@ static int on_mouse(struct picker *p, int mx, int my, char *out, int outsz, int 
   if (mx >= p->sv.x && mx < p->sv.x + scrollview_content_w(&p->sv) && my >= p->sv.y && my < p->sv.y + p->sv.h) {
     int row = (my - p->sv.y + p->sv.scroll) / ROW_H;
     if (row < row_count(p)) {
-      unsigned now = msec();
-      int dbl = row == p->last_row && now - p->last_ms <= DBLCLICK_MS;
-      p->last_row = dbl ? -1 : row;
-      p->last_ms = now;
       select_row(p, row);
       if (multi(p) && mx < p->sv.x + CHK_W)
         toggle_row(p, row);
-      else if (dbl) {
-        const struct filelist_entry *e = row_entry(p, row);
-        if (!e || e->is_dir)
-          open_row(p, row);
-        else
-          *result = accept(p, out, outsz);
-        return *result;
-      }
     }
   }
   return 0;
@@ -431,7 +415,6 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
   p->sel = -1;
   p->drag = -1;
   p->hot = -1;
-  p->last_row = -1;
   p->focus = o->mode == FILEPICK_FOLDER ? 1 : 0;
   textfield_init(&p->pathtf, p->pathbuf, sizeof p->pathbuf);
   textfield_init(&p->nametf, p->namebuf, sizeof p->namebuf);
@@ -474,6 +457,16 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
         break;
       case WEV_MOUSE:
         done = on_mouse(p, ev.a, ev.b, out, outsz, &result);
+        break;
+      case WEV_DBLCLICK:
+        if (!p->filter.open && p->sel >= 0 && ev.a >= p->sv.x && ev.a < p->sv.x + scrollview_content_w(&p->sv) &&
+            ev.b >= p->sv.y && ev.b < p->sv.y + p->sv.h && !(multi(p) && ev.a < p->sv.x + CHK_W)) {
+          const struct filelist_entry *e = row_entry(p, p->sel);
+          if (!e || e->is_dir)
+            open_row(p, p->sel);
+          else
+            done = result = accept(p, out, outsz);
+        }
         break;
       case WEV_DRAG:
         if (p->drag >= 0) {

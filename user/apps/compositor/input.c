@@ -11,6 +11,8 @@ static void deliver_client(int slot, unsigned type, int mx, int my)
   win_deliver(w->id, &ev);
 }
 
+static bool near(int a, int b) { return a - b <= DBLCLICK_SLOP && b - a <= DBLCLICK_SLOP; }
+
 /* Live-drag / resize state */
 static int drag_id = -1, resize_id = -1;
 static int drag_dx, drag_dy, drag_mx0, drag_my0;
@@ -25,6 +27,8 @@ void handle_input(int mx, int my, int buttons, int dz)
 {
   static int dbl_id = -1, dbl_x, dbl_y; /* last title-bar press, for double-click */
   static unsigned dbl_ms;
+  static int cdbl_id = -1, cdbl_x, cdbl_y; /* last client-area press */
+  static unsigned cdbl_ms;
   bool down = buttons & 1;
   bool rdown = buttons & 2;
 
@@ -232,7 +236,15 @@ void handle_input(int mx, int my, int buttons, int dz)
           dbl_y = my;
         }
       } else { /* client press */
+        unsigned t = msec();
+        bool dbl = cdbl_id == w->id && (unsigned)(t - cdbl_ms) <= DBLCLICK_MS && near(mx, cdbl_x) && near(my, cdbl_y);
         deliver_client(idx, WEV_MOUSE, mx, my);
+        if (dbl)
+          deliver_client(idx, WEV_DBLCLICK, mx, my);
+        cdbl_id = dbl ? -1 : w->id; /* a triple-click is a double plus a single */
+        cdbl_ms = t;
+        cdbl_x = mx;
+        cdbl_y = my;
         app_drag_id = w->id;
       }
     }
