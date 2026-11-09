@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "hid_desc.h"
 #include "hid_kbd.h"
+#include "hid_pad.h"
 #include "keyboard.h"
 #include "keymap.h"
 #include "kstring.h"
@@ -46,6 +47,9 @@ struct hid_dev {
   uint8_t led_id;
   uint32_t led_len;
   uint32_t led_seq;
+  enum pad_kind kind;
+  bool bt;
+  uint16_t vid, pid;
   /* Dual-rumble output report. */
   bool has_rumble;
   uint8_t rumble_id;
@@ -58,6 +62,7 @@ static uint32_t pad_seq;
 static uint32_t pad_buttons;
 static int32_t pad_axes[HID_PAD_AXES];
 static uint8_t pad_hat;
+static struct hid_dev *pad_cur; /* the pad that last reported or attached, named by js0/id */
 static int pad_devices;
 static uint32_t rumble_until;
 static bool rumble_on;
@@ -162,13 +167,22 @@ static void pointer_report(struct hid_dev *h, const struct hid_decoded *d)
   mouse_inject_rel(d->dx, d->dy, d->wheel, d->pan, (int)total_buttons());
 }
 
-static void pad_report(const struct hid_decoded *d)
+static void pad_set(struct hid_dev *h, uint32_t buttons, uint8_t hat, const int32_t *axes)
 {
-  pad_buttons = d->pad_buttons;
-  pad_hat = d->hat;
+  pad_cur = h;
+  pad_buttons = buttons;
+  pad_hat = hat;
   for (int i = 0; i < HID_PAD_AXES; i++)
-    pad_axes[i] = hid_scale_i16(d->axes[i], d->axes_min[i], d->axes_max[i]);
+    pad_axes[i] = axes[i];
   pad_seq++;
+}
+
+static void pad_report(struct hid_dev *h, const struct hid_decoded *d)
+{
+  int32_t axes[HID_PAD_AXES];
+  for (int i = 0; i < HID_PAD_AXES; i++)
+    axes[i] = hid_scale_i16(d->axes[i], d->axes_min[i], d->axes_max[i]);
+  pad_set(h, d->pad_buttons, d->hat, axes);
 }
 
 static void hid_report(void *ctx, const uint8_t *data, int len)
@@ -176,6 +190,15 @@ static void hid_report(void *ctx, const uint8_t *data, int len)
   struct hid_dev *h = ctx;
   if (len <= 0)
     return;
+  if (h->kind == PAD_DS4) {
+    uint32_t buttons;
+    uint8_t hat;
+    int32_t axes[HID_PAD_AXES] = {0};
+    if (ds4_decode_bt(data, len, &buttons, &hat, axes)) {
+      pad_set(h, buttons, hat, axes);
+      return;
+    }
+  }
   hid_decode(&h->desc, data, (size_t)len, &h->dec);
   const struct hid_decoded *d = &h->dec;
   if (!d->valid)
@@ -187,7 +210,7 @@ static void hid_report(void *ctx, const uint8_t *data, int len)
   if (d->has_rel || d->has_abs || d->has_buttons || d->has_touch)
     pointer_report(h, d);
   if (d->has_pad)
-    pad_report(d);
+    pad_report(h, d);
 }
 
 static int usb_send(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n)
@@ -223,8 +246,19 @@ static void send_leds(struct hid_dev *h)
   kfree(buf);
 }
 
+static bool can_rumble(const struct hid_dev *h)
+{
+  return (h->roles & HID_ROLE_GAMEPAD) && (h->has_rumble || h->kind == PAD_DS4);
+}
+
 static void send_rumble(struct hid_dev *h, uint16_t strong, uint16_t weak, uint32_t ms)
 {
+  if (h->kind == PAD_DS4) {
+    uint8_t out[DS4_BT_OUT_LEN];
+    int n = ds4_pack_rumble(h->bt, strong, weak, out);
+    h->send(h, out[0], out, n);
+    return;
+  }
   uint32_t n;
   uint8_t *payload, *buf = report_buf(h->rumble_id, h->rumble_len, &n, &payload);
   uint8_t id;
@@ -238,7 +272,7 @@ static void send_rumble(struct hid_dev *h, uint16_t strong, uint16_t weak, uint3
 bool hid_gamepad_can_rumble(void)
 {
   for (struct hid_dev *h = hids; h; h = h->next)
-    if (h->has_rumble && (h->roles & HID_ROLE_GAMEPAD))
+    if (can_rumble(h))
       return true;
   return false;
 }
@@ -251,7 +285,7 @@ int hid_gamepad_rumble(uint16_t strong, uint16_t weak, uint32_t ms)
   if (!strong && !weak)
     ms = 0;
   for (struct hid_dev *h = hids; h; h = h->next)
-    if (h->has_rumble && (h->roles & HID_ROLE_GAMEPAD)) {
+    if (can_rumble(h)) {
       send_rumble(h, strong, weak, ms);
       n++;
     }
@@ -345,8 +379,10 @@ static void register_dev(struct hid_dev *h, const char *how)
   con_printf(" %s (%s protocol)\n", how, h->boot ? "boot" : "report");
   h->next = hids;
   hids = h;
-  if (h->roles & HID_ROLE_GAMEPAD)
+  if (h->roles & HID_ROLE_GAMEPAD) {
     pad_devices++;
+    pad_cur = h;
+  }
   if (h->has_led)
     h->led_seq = keyboard_led_seq() - 1;
 }
@@ -362,6 +398,9 @@ static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t pr
   h->slot = d->slot;
   h->iface = iface;
   h->send = usb_send;
+  h->kind = pad_kind_usb(d->vid, d->pid);
+  h->vid = d->vid;
+  h->pid = d->pid;
   h->subclass = subclass;
   h->protocol = protocol;
 
@@ -401,6 +440,11 @@ static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t pr
   if (!usbh_open_intr(d->slot, ep, mps, interval, hid_report, h)) {
     free_hid(h);
     return;
+  }
+  for (int step = 0; h->kind == PAD_SWITCH_PRO && step < SWITCH_USB_STEPS; step++) {
+    uint8_t out[2];
+    int n = switch_usb_step(step, out);
+    usb_send(h, out[0], out, n);
   }
   char how[32];
   ksnprintf(how, sizeof how, "on slot %d if %d", d->slot, iface);
@@ -456,6 +500,8 @@ static void drop_dev(struct hid_dev *h)
     h->buttons = 0;
     mouse_inject_rel(0, 0, 0, 0, (int)total_buttons());
   }
+  if (pad_cur == h)
+    pad_cur = 0;
   if ((h->roles & HID_ROLE_GAMEPAD) && --pad_devices == 0) {
     pad_buttons = 0;
     pad_hat = 0;
@@ -480,7 +526,7 @@ void hid_unbind(int slot)
 }
 
 struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
-                           void *ctx)
+                           void *ctx, const char *name)
 {
   struct hid_dev *h = kmalloc(sizeof *h);
   if (!h)
@@ -489,6 +535,8 @@ struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, ui
   h->link = ctx;
   h->bt_send = send;
   h->send = bt_out;
+  h->bt = true;
+  h->kind = pad_kind_name(name);
   if (len <= 0 || hid_parse(rd, (size_t)len, &h->desc) != 0 || !(h->roles = hid_roles(&h->desc))) {
     hid_desc_free(&h->desc);
     kfree(h);
@@ -513,6 +561,15 @@ void hid_bt_remove(struct hid_dev *h)
       drop_dev(h);
       return;
     }
+}
+
+int hid_gamepad_id(char *buf, int max)
+{
+  if (!pad_devices)
+    return -1;
+  enum pad_kind k = pad_cur ? pad_cur->kind : PAD_GENERIC;
+  return ksnprintf(buf, (uint32_t)max, "%s %04x %04x %s\n", pad_kind_token(k), pad_cur ? pad_cur->vid : 0,
+                   pad_cur ? pad_cur->pid : 0, pad_kind_label(k));
 }
 
 int hid_gamepad_state(char *buf, int max)

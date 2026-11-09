@@ -77,7 +77,8 @@ bool hci_acl_room(const struct bt_conn *c, int frags);
 int hci_acl_send(struct bt_conn *c, const uint8_t *data, int len);
 void hci_disconnect(struct bt_conn *c);
 bool hci_find_key(const uint8_t *addr, uint8_t key[16]);
-uint32_t hci_dev_cod(const uint8_t *addr); /* class of device from inquiry, 0 if unknown */
+uint32_t hci_dev_cod(const uint8_t *addr);     /* class of device from inquiry, 0 if unknown */
+const char *hci_dev_name(const uint8_t *addr); /* "" if unknown */
 
 /* ---- l2cap */
 #define L2CAP_CID_SIGNALING 1

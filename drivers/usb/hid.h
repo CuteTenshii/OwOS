@@ -11,6 +11,10 @@
  * when no gamepad is attached. */
 int hid_gamepad_state(char *buf, int max);
 
+/* Text backing /sys/class/input/js0/id: one line "KIND VID PID LABEL\n" (VID and PID are 0000 when the pad is not on
+ * USB); KIND is generic, ds4 or switchpro. Returns the byte count, or -1 when no gamepad is attached. */
+int hid_gamepad_id(char *buf, int max);
+
 /* Longest rumble a single request may ask for. */
 #define HID_RUMBLE_MAX_MS 5000
 
@@ -21,10 +25,10 @@ bool hid_gamepad_can_rumble(void);
 int hid_gamepad_rumble(uint16_t strong, uint16_t weak, uint32_t ms);
 
 /* HID devices that are not on USB (Bluetooth): the transport parses nothing itself, it hands over the report
- * descriptor and every input report. send writes one output report (ID byte first when id != 0). */
+ * descriptor, the device name and every input report. send writes one output report (ID byte first when id != 0). */
 struct hid_dev;
 struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
-                           void *ctx);
+                           void *ctx, const char *name);
 void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len);
 void hid_bt_remove(struct hid_dev *h);
 

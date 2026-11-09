@@ -13,13 +13,15 @@ int fake_writefile(const char *name, const void *buf, int len);
 #include <string.h>
 
 static unsigned now;
-static char state_text[128], rumble_text[8] = "1\n", rumble_written[48];
+static char state_text[128], rumble_text[8] = "1\n", id_text[64] = "generic 0000 0000 Gamepad\n", rumble_written[48];
 static bool pad_attached;
 
 unsigned fake_msec(void) { return now; }
 int fake_readfile(const char *name, char *buf, int max)
 {
-  const char *src = !strcmp(name, STATE_PATH) ? (pad_attached ? state_text : 0) : rumble_text;
+  const char *src = !strcmp(name, STATE_PATH) ? (pad_attached ? state_text : 0)
+                    : !strcmp(name, ID_PATH)  ? id_text
+                                              : rumble_text;
   if (!src || (int)strlen(src) > max)
     return -1;
   memcpy(buf, src, strlen(src));
@@ -100,12 +102,31 @@ static void test_state_parsing(void)
   struct gp_state st;
   expect(gp_parse("7 5 3 -32768 32767 0 100 -100 8 0 0\n", &st));
   expect_eq(st.seq, 7);
-  expect(gp_button(&st, 0) && !gp_button(&st, 1) && gp_button(&st, 2));
-  expect(!gp_button(&st, 16) && !gp_button(&st, 17) && !gp_button(&st, 18) && gp_button(&st, 19));
-  expect(gp_axis(&st, 0) == -1 && gp_axis(&st, 1) < 1 && gp_axis(&st, 1) > 0.999);
+  expect(gp_button(GP_GENERIC, &st, 0) == 1 && gp_button(GP_GENERIC, &st, 1) == 0 &&
+         gp_button(GP_GENERIC, &st, 2) == 1);
+  expect(gp_button(GP_GENERIC, &st, 16) == 0 && gp_button(GP_GENERIC, &st, 17) == 0 &&
+         gp_button(GP_GENERIC, &st, 19) == 1);
+  expect(gp_axis(GP_GENERIC, &st, 0) == -1 && gp_axis(GP_GENERIC, &st, 1) < 1 && gp_axis(GP_GENERIC, &st, 1) > 0.999);
   expect(!gp_parse("7 5 3 1 2", &st));
   expect(!gp_parse("", &st));
   expect(!gp_parse("a b c d e f g h i j k", &st));
+}
+
+static void test_id_parsing(void)
+{
+  struct gp_id id;
+  expect(gp_parse_id("ds4 054c 09cc Wireless Controller\n", &id));
+  expect_eq(id.kind, GP_DS4);
+  expect_eq(id.vid, 0x054c);
+  expect_eq(id.pid, 0x09cc);
+  expect_string(id.label, "Wireless Controller");
+  expect(gp_parse_id("switchpro 0000 0000 Pro Controller\n", &id));
+  expect_eq(id.kind, GP_SWITCH_PRO);
+  expect_eq(id.vid, 0);
+  expect(gp_parse_id("generic 0000 0000 Gamepad\n", &id) && id.kind == GP_GENERIC);
+  expect(!gp_parse_id("ps5 054c 0ce6 DualSense\n", &id));
+  expect(!gp_parse_id("ds4 zz 09cc X\n", &id));
+  expect(!gp_parse_id("", &id));
 }
 
 static void test_hat_directions(void)
@@ -113,9 +134,38 @@ static void test_hat_directions(void)
   static const char up[9][5] = {"0000", "1000", "1001", "0001", "0101", "0100", "0110", "0010", "1010"};
   for (int hat = 0; hat < 9; hat++) {
     struct gp_state st = {0, 0, hat, {0}};
-    for (int i = 0; i < 4; i++)
-      expect_eq(gp_button(&st, GP_PAD_BUTTONS + i), up[hat][i] == '1');
+    for (int i = 0; i < 4; i++) {
+      expect_eq(gp_button(GP_GENERIC, &st, GP_RAW_PAD_BUTTONS + i), up[hat][i] == '1');
+      expect_eq(gp_button(GP_DS4, &st, 12 + i), up[hat][i] == '1');
+    }
   }
+}
+
+static void test_standard_mappings(void)
+{
+  /* DualShock 4 canonical bits: Square 0, Cross 1, Circle 2, Triangle 3, L1 4, Options 9, PS 12; L2 analog on Rx */
+  struct gp_state ds4 = {
+      1, 1u << 1 | 1u << 0 | 1u << 4 | 1u << 9 | 1u << 12, 0, {-32768, 0, 16384, 32767, -32768, -16384, 0, 0}};
+  expect_eq(gp_nbuttons(GP_DS4), 17);
+  expect_eq(gp_naxes(GP_DS4), 4);
+  expect_eq(gp_button(GP_DS4, &ds4, 0), 1); /* Cross is the bottom face button */
+  expect_eq(gp_button(GP_DS4, &ds4, 1), 0);
+  expect_eq(gp_button(GP_DS4, &ds4, 2), 1); /* Square is the left one */
+  expect_eq(gp_button(GP_DS4, &ds4, 4), 1);
+  expect_eq(gp_button(GP_DS4, &ds4, 9), 1);
+  expect_eq(gp_button(GP_DS4, &ds4, 16), 1);
+  expect(gp_button(GP_DS4, &ds4, 6) > 0.999);
+  expect(gp_button(GP_DS4, &ds4, 7) == 0);
+  expect(gp_axis(GP_DS4, &ds4, 0) == -1 && gp_axis(GP_DS4, &ds4, 2) == 0.5 && gp_axis(GP_DS4, &ds4, 3) == -0.5);
+
+  /* Switch Pro: B 0, A 1, Y 2, X 3 sit bottom, right, left, top; ZL is a button, Home 12 */
+  struct gp_state pro = {1, 1u << 0 | 1u << 3 | 1u << 6 | 1u << 12, 0, {0}};
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 0), 1);
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 1), 0);
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 3), 1);
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 6), 1);
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 7), 0);
+  expect_eq(gp_button(GP_SWITCH_PRO, &pro, 16), 1);
 }
 
 static void test_hidden_until_pressed_then_events(void)
@@ -137,6 +187,23 @@ static void test_hidden_until_pressed_then_events(void)
       "var q=navigator.getGamepads()[0]; expect(q.buttons[16].pressed && !q.buttons[17].pressed);");
   poll(0);
   run("expect(log.length===2 && log[1]==='dfalse'); expect(navigator.getGamepads()[0]===null);");
+}
+
+static void test_standard_pad_in_javascript(void)
+{
+  strcpy(id_text, "ds4 054c 09cc Wireless Controller\n");
+  poll("10 2 0 0 0 0 0 0 0 0 0");
+  run("var d=navigator.getGamepads()[0]; expect(d.mapping==='standard');"
+      "expect(d.id==='Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 09cc)');"
+      "expect(d.axes.length===4 && d.buttons.length===17 && d.buttons[0].pressed && !d.buttons[1].pressed);");
+  poll(0);
+  strcpy(id_text, "switchpro 0000 0000 Pro Controller\n");
+  poll("11 0 0 0 0 0 0 0 0 0 0");
+  poll("12 1 0 0 0 0 0 0 0 0 0");
+  run("var e=navigator.getGamepads()[0]; expect(e.id==='Pro Controller (STANDARD GAMEPAD)' && "
+      "e.mapping==='standard');");
+  poll(0);
+  strcpy(id_text, "generic 0000 0000 Gamepad\n");
 }
 
 static void test_rumble(void)
@@ -180,8 +247,11 @@ int main(void)
   gamepad_install(g_ctx, navigator);
 
   test("state line parsing", test_state_parsing);
+  test("id line parsing", test_id_parsing);
   test("hat to d-pad buttons", test_hat_directions);
+  test("standard layouts of the DualShock 4 and Switch Pro", test_standard_mappings);
   test("pad is hidden until pressed, connect and disconnect events", test_hidden_until_pressed_then_events);
+  test("standard pads in JavaScript", test_standard_pad_in_javascript);
   test("rumble through the actuator", test_rumble);
   test("teardown stops a running rumble", test_teardown_stops_rumble);
 

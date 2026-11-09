@@ -330,6 +330,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return S_FILE_RO;
       if (n == 4 && eq(seg[2], "js0") && eq(seg[3], "rumble") && gamepad_present())
         return S_FILE_RW;
+      if (n == 4 && eq(seg[2], "js0") && eq(seg[3], "id") && gamepad_present())
+        return S_FILE_RO;
       return S_NONE;
     }
     if (eq(seg[1], "net")) {
@@ -450,6 +452,12 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
       }
       if (eq(seg[2], "js0") && eq(seg[3], "rumble")) {
         ps(b, hid_gamepad_can_rumble() ? "1\n" : "0\n");
+        return;
+      }
+      if (eq(seg[2], "js0") && eq(seg[3], "id")) {
+        char id[64];
+        if (hid_gamepad_id(id, sizeof id) >= 0)
+          ps(b, id);
         return;
       }
       if (eq(seg[2], "js0") && eq(seg[3], "state")) {
@@ -990,8 +998,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "input") && eq(seg[2], "js0") && gamepad_present()) {
-    static const char *const k[] = {"state", "rumble"};
-    hit = from_list(idx, name, max, k, 2);
+    static const char *const k[] = {"state", "rumble", "id"};
+    hit = from_list(idx, name, max, k, 3);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

@@ -276,7 +276,7 @@ static void intr_state(struct l2cap_chan *ch)
 {
   struct pad *p = ch->user;
   if (ch->open) {
-    p->hid = hid_bt_add(p->desc, p->desc_len, send_output, p);
+    p->hid = hid_bt_add(p->desc, p->desc_len, send_output, p, hci_dev_name(p->conn->addr));
     pad_free_buffers(p);
     if (!p->hid)
       pad_fail(p, "unusable HID report descriptor");

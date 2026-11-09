@@ -762,9 +762,10 @@ static int (*hid_send_fn)(void *ctx, uint8_t id, const uint8_t *buf, int n);
 static void *hid_send_ctx;
 
 struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
-                           void *ctx)
+                           void *ctx, const char *name)
 {
   hid_adds++;
+  (void)name;
   hid_desc_len = len;
   memcpy(hid_desc_seen, rd, (size_t)len);
   hid_send_fn = send;

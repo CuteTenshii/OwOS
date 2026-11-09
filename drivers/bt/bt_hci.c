@@ -419,6 +419,14 @@ uint32_t hci_dev_cod(const uint8_t *addr)
   return 0;
 }
 
+const char *hci_dev_name(const uint8_t *addr)
+{
+  for (int i = 0; i < BT_MAX_DEV; i++)
+    if (h.devs[i].used && !h.devs[i].le && !memcmp(h.devs[i].addr, addr, 6))
+      return h.devs[i].name;
+  return "";
+}
+
 static void key_store(const uint8_t *addr, const uint8_t *key)
 {
   int slot = -1;

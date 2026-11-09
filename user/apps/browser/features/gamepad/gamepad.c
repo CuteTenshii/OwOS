@@ -4,12 +4,15 @@
 
 #define STATE_PATH "/sys/class/input/js0/state"
 #define RUMBLE_PATH "/sys/class/input/js0/rumble"
+#define ID_PATH "/sys/class/input/js0/id"
 #define POLL_MS 8
 #define SLOTS 4
+#define PRESS_THRESHOLD 0.5
 
 static js_ctx *ctx;
 static js_object *actuator;
 static struct gp_state cur;
+static struct gp_id pad_id;
 static bool present, visible, can_rumble, rumbling;
 static unsigned last_poll;
 
@@ -54,20 +57,29 @@ static js_value snapshot(bool connected)
   js_object *pad = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_object *axes = (js_object *)gc_keep(js_new_array(ctx, 0));
   js_object *buttons = (js_object *)gc_keep(js_new_array(ctx, 0));
-  for (int i = 0; i < GP_AXES; i++)
-    js_array_push(ctx, axes, js_number(gp_axis(&cur, i)));
-  for (int i = 0; i < GP_BUTTONS; i++) {
+  enum gp_kind kind = pad_id.kind;
+  char name[96];
+  for (int i = 0; i < gp_naxes(kind); i++)
+    js_array_push(ctx, axes, js_number(gp_axis(kind, &cur, i)));
+  for (int i = 0; i < gp_nbuttons(kind); i++) {
     js_object *b = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-    bool down = gp_button(&cur, i);
-    js_def(b, "pressed", js_bool(down), P_ENUMERABLE);
-    js_def(b, "touched", js_bool(down), P_ENUMERABLE);
-    js_def(b, "value", js_number(down), P_ENUMERABLE);
+    double value = gp_button(kind, &cur, i);
+    js_def(b, "pressed", js_bool(value > PRESS_THRESHOLD), P_ENUMERABLE);
+    js_def(b, "touched", js_bool(value > 0), P_ENUMERABLE);
+    js_def(b, "value", js_number(value), P_ENUMERABLE);
     js_array_push(ctx, buttons, js_obj_value(b));
   }
-  js_def(pad, "id", js_mk_cstring(ctx, "OwOS Gamepad"), P_ENUMERABLE);
+  if (kind == GP_GENERIC)
+    snprintf(name, sizeof name, "OwOS Gamepad");
+  else if (pad_id.vid)
+    snprintf(name, sizeof name, "%s (STANDARD GAMEPAD Vendor: %04x Product: %04x)", pad_id.label, pad_id.vid,
+             pad_id.pid);
+  else
+    snprintf(name, sizeof name, "%s (STANDARD GAMEPAD)", pad_id.label);
+  js_def(pad, "id", js_mk_cstring(ctx, name), P_ENUMERABLE);
   js_def(pad, "index", js_number(0), P_ENUMERABLE);
   js_def(pad, "connected", js_bool(connected), P_ENUMERABLE);
-  js_def(pad, "mapping", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(pad, "mapping", js_mk_cstring(ctx, gp_standard(kind) ? "standard" : ""), P_ENUMERABLE);
   js_def(pad, "timestamp", js_number(msec()), P_ENUMERABLE);
   js_def(pad, "axes", js_obj_value(axes), P_ENUMERABLE);
   js_def(pad, "buttons", js_obj_value(buttons), P_ENUMERABLE);
@@ -138,8 +150,13 @@ void gamepad_tick(void)
     return;
   }
   if (!present) {
-    char r[4];
+    char r[4], id[64];
+    int len = readfile(ID_PATH, id, sizeof id - 1);
     present = true;
+    if (len > 0)
+      id[len] = 0;
+    if (len <= 0 || !gp_parse_id(id, &pad_id))
+      pad_id.kind = GP_GENERIC;
     can_rumble = readfile(RUMBLE_PATH, r, sizeof r) > 0 && r[0] == '1';
   }
   if (!visible && gp_active(&cur)) {
