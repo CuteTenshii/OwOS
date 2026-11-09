@@ -627,7 +627,7 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
       return;
     }
     if (eq(seg[1], "sound")) {
-      char nm[24];
+      char nm[48];
       if (eq(seg[3], "volume")) { /* 0..100 */
         pu(b, (uint32_t)((snd_level() * 100 + SB_VOL_MAX / 2) / SB_VOL_MAX));
         pc(b, '\n');
@@ -737,7 +737,7 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
       for (const char *p = arg; *p >= '0' && *p <= '9'; p++)
         idx = idx * 10 + (*p - '0');
     } else {
-      char nm[24];
+      char nm[48];
       for (int i = 0, cnt = hda_output_count(); i < cnt; i++)
         if (hda_output_name(i, nm, (int)sizeof nm) && eq(nm, arg)) {
           idx = i;

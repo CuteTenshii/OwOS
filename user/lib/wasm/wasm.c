@@ -964,6 +964,7 @@ static int is_ref(int t) { return t == WASM_FUNCREF || t == WASM_EXTERNREF || t 
 typedef struct {
   uint32_t mem;
   uint64_t off;
+  uint32_t align;
   int addr; /* the memory's address type */
 } memarg;
 
@@ -982,6 +983,7 @@ static memarg rd_memarg(C *c, uint32_t max_align)
     fail(c, "unknown memory");
   if (align > max_align)
     fail(c, "alignment must not be larger than natural");
+  a.align = align;
   a.addr = mem_addr_type(c, a.mem);
   a.off = a.addr == WASM_I64 ? rd_u64(c) : rd_u32(c);
   return a;
@@ -1256,6 +1258,53 @@ static void compile_simd(C *c, unsigned s)
   }
   if (live)
     emit(c, OP_FD(s));
+}
+
+/* Atomic operators (0xFE prefix): wait/notify, fence, and loads, stores and read-modify-writes of 8 to 64 bits */
+static void compile_atomic(C *c, unsigned s)
+{
+  static const uint8_t LOG[7] = {2, 3, 0, 1, 0, 1, 2};
+  static const uint8_t TY[7] = {WASM_I32, WASM_I64, WASM_I32, WASM_I32, WASM_I64, WASM_I64, WASM_I64};
+  int live = alive(c);
+  memarg ma;
+  if (s == 0x03) {
+    if (rd_u8(c) != 0)
+      fail(c, "zero byte expected");
+    if (live)
+      emit(c, OP_FE(s));
+    return;
+  }
+  if (s <= 0x02) {
+    ma = rd_memarg(c, s == 2 ? 3 : 2);
+    if (ma.align != (s == 2 ? 3u : 2u))
+      fail(c, "atomic alignment must be natural");
+    if (s == 0) {
+      pop_t(c, WASM_I32);
+    } else {
+      pop_t(c, WASM_I64);
+      pop_t(c, s == 1 ? WASM_I32 : WASM_I64);
+    }
+    pop_t(c, ma.addr);
+    push(c, WASM_I32);
+  } else if (s >= 0x10 && s <= 0x4e) {
+    unsigned g = (s - 0x10) / 7, v = (s - 0x10) % 7;
+    int t = TY[v];
+    ma = rd_memarg(c, LOG[v]);
+    if (ma.align != LOG[v])
+      fail(c, "atomic alignment must be natural");
+    if (g == 8)
+      pop_t(c, t);
+    if (g >= 1)
+      pop_t(c, t);
+    pop_t(c, ma.addr);
+    if (g != 1)
+      push(c, t);
+  } else
+    fail(c, "unknown atomic opcode");
+  if (live) {
+    emit(c, OP_FE(s));
+    emit_memarg(c, &ma);
+  }
 }
 
 static void compile_fc(C *c, unsigned s)
@@ -2033,6 +2082,9 @@ static void compile_body(C *c, uint32_t def, const uint8_t *body, uint32_t size)
     case 0xfd:
       compile_simd(c, rd_u32(c));
       break;
+    case 0xfe:
+      compile_atomic(c, rd_u32(c));
+      break;
     default:
       if (op >= 0x28 && op <= 0x3e) {
         memarg ma = rd_memarg(c, MEM_ALIGN[op - 0x28]);
@@ -2222,6 +2274,7 @@ wasm_module *wasm_module_new(const uint8_t *bytes, size_t len, char *err, size_t
     return NULL;
   }
   c->m = m;
+  m->refs = 1;
   c->base = c->p = bytes;
   c->end = bytes + len;
   c->err = err;
@@ -2247,16 +2300,19 @@ wasm_module *wasm_module_new(const uint8_t *bytes, size_t len, char *err, size_t
   return m;
 }
 
+void wasm_module_retain(wasm_module *m) { __atomic_fetch_add(&m->refs, 1, __ATOMIC_RELAXED); }
+
 void wasm_module_free(wasm_module *m)
 {
-  blk *b = m ? (blk *)m->arena : NULL;
+  blk *b;
+  if (!m || __atomic_fetch_sub(&m->refs, 1, __ATOMIC_ACQ_REL) != 1)
+    return;
+  b = (blk *)m->arena;
   while (b) {
     blk *n = b->next;
     free(b);
     b = n;
   }
-  if (m) {
-    free(m->custom);
-    free(m);
-  }
+  free(m->custom);
+  free(m);
 }

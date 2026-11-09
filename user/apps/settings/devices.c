@@ -24,7 +24,7 @@ static const char *kbd_opt_lbl[NKBD]; /* select_box wants a char* array */
 static struct select_box kbd_sel;
 
 #define MAX_OUTS 6
-static char sound_name[MAX_OUTS][20];    /* audio output device names */
+static char sound_name[MAX_OUTS][48];    /* audio output device names */
 static const char *sound_opts[MAX_OUTS]; /* select_box array (-> sound_name) */
 static int sound_n;                      /* how many outputs the codec exposes */
 static int sound_cur;                    /* index of the active output */
@@ -90,7 +90,7 @@ static void load_kbd(void)
 
 static void load_sound(void)
 {
-  char buf[256];
+  char buf[512];
   sound_n = 0;
   sound_cur = 0;
 
@@ -113,7 +113,7 @@ static void load_sound(void)
     }
   }
 
-  char cur[24];
+  char cur[48];
   if (read_proc("/sys/class/sound/card0/output", cur, sizeof cur) > 0)
     for (int i = 0; i < sound_n; i++)
       if (streq(sound_name[i], cur)) {

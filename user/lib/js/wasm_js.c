@@ -10,6 +10,7 @@
  * the instance. Hidden "@" properties on the global object hold the namespace and the execution context. */
 #include "gc.h"
 #include "interp.h"
+#include "mutex.h"
 #include "owos.h"
 #include "value.h"
 #include "wasm.h"
@@ -31,7 +32,8 @@ typedef struct {
 typedef struct {
   int tag;
   wasm_memory *mem;
-  js_object *buf; /* the current ArrayBuffer, NULL until asked for or after the memory moved */
+  js_object *buf;     /* the current ArrayBuffer, NULL until asked for or after the memory moved */
+  uint32_t buf_pages; /* a shared memory's buffer is as long as the memory was when it was made */
 } wmemory;
 typedef struct {
   int tag;
@@ -510,6 +512,47 @@ static int exn_catch(void *ud, wasm_exn **out)
   return 1;
 }
 
+static int atomic_wait_hook(void *ud, uint8_t *addr, int is64, uint64_t expected, int64_t timeout)
+{
+  wexec *wx = (wexec *)ud;
+  js_ctx *ctx = wx->ctx;
+  unsigned *word = (unsigned *)addr, waited = 0, limit;
+  js_irq *irq = ctx->irq;
+  uint64_t now =
+      is64 ? __atomic_load_n((uint64_t *)addr, __ATOMIC_SEQ_CST) : __atomic_load_n((uint32_t *)addr, __ATOMIC_SEQ_CST);
+  if (!ctx->can_block)
+    return -1;
+  if (now != (is64 ? expected : (uint32_t)expected))
+    return 1;
+  if (timeout == 0)
+    return 2;
+  /* 0 means no limit; whole milliseconds, rounded up */
+  limit = timeout < 0 || timeout > 4294967294000000ll ? 0 : (unsigned)((timeout + 999999) / 1000000);
+  if (!irq)
+    return futex_wait(word, (unsigned)expected, limit) ? 2 : 0;
+  __atomic_store_n(&irq->waiting, word, __ATOMIC_RELEASE);
+  for (;;) {
+    unsigned slice = 50;
+    if (js_irq_stopped(irq) || (limit && waited >= limit))
+      break;
+    if (limit && limit - waited < slice)
+      slice = limit - waited;
+    if (!futex_wait(word, (unsigned)expected, slice)) {
+      __atomic_store_n(&irq->waiting, (unsigned *)0, __ATOMIC_RELEASE);
+      return 0;
+    }
+    waited += slice;
+  }
+  __atomic_store_n(&irq->waiting, (unsigned *)0, __ATOMIC_RELEASE);
+  return 2;
+}
+
+static uint32_t atomic_notify_hook(void *ud, uint8_t *addr, uint32_t count)
+{
+  (void)ud;
+  return (uint32_t)futex_wake((unsigned *)addr, count > 2147483647u ? 2147483647 : (int)count);
+}
+
 static wexec *get_exec(js_ctx *ctx)
 {
   pentry *e = pmap_find_pub(ctx->global, "@wasmx");
@@ -535,6 +578,8 @@ static wexec *get_exec(js_ctx *ctx)
   wx->x->xr_intern = xr_intern;
   wx->x->xr_value = xr_value;
   wx->x->exn_catch = exn_catch;
+  wx->x->atomic_wait = atomic_wait_hook;
+  wx->x->atomic_notify = atomic_notify_hook;
   o = new_wasm(ctx, "@Exec", wx);
   js_def(ctx->global, "@wasmx", js_obj_value(o), 0);
   return wx;
@@ -795,12 +840,12 @@ static js_value module_custom_sections(js_ctx *ctx, js_value t, js_value *a, int
 static void mem_on_grow(wasm_memory *m)
 {
   wmemory *wm = m->self ? (wmemory *)((js_object *)m->self)->host : NULL;
-  if (wm && wm->buf) {
+  if (wm && wm->buf && !m->shared) {
     js_arraybuffer_detach(wm->buf);
     wm->buf = NULL;
   }
   if (m->self)
-    gc_set_external(m->self, (unsigned)m->size);
+    gc_set_external(m->self, (unsigned)wasm_memory_size(m));
 }
 
 static js_object *wrap_memory(js_ctx *ctx, wasm_memory *m)
@@ -814,7 +859,7 @@ static js_object *wrap_memory(js_ctx *ctx, wasm_memory *m)
   m->on_grow = mem_on_grow;
   o = new_wasm(ctx, "@Memory", wm);
   m->self = o;
-  gc_set_external(o, (unsigned)m->size);
+  gc_set_external(o, (unsigned)wasm_memory_size(m));
   return o;
 }
 
@@ -898,15 +943,13 @@ static js_value memory_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   const char *api = "WebAssembly.Memory()";
   uint32_t init = 0, max = 0;
   uint64_t init64 = 0, max64 = 0;
-  int r, has_max, is64 = 0;
+  int r, has_max, is64 = 0, shared;
   js_value av;
   wasm_memory *m;
   (void)t;
   if (ARG(0).type != JV_OBJ)
     return js_throw_type(ctx, "WebAssembly.Memory(): Argument 0 must be a memory descriptor");
-  if (js_to_boolean(js_get(ctx, a[0], "shared"))) {
-    return js_throw_type(ctx, "WebAssembly.Memory(): shared memory is not supported");
-  }
+  shared = js_to_boolean(js_get(ctx, a[0], "shared"));
   av = js_get(ctx, a[0], "address");
   if (av.type != JV_UNDEF) {
     av = js_to_string(ctx, av);
@@ -946,14 +989,19 @@ static js_value memory_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   if (has_max && max > WASM_MAX_PAGES)
     max = WASM_MAX_PAGES;
 limits_done:
+  if (shared && !has_max)
+    return js_throw_type(ctx, "WebAssembly.Memory(): Property 'maximum' is required for shared memory");
   m = (wasm_memory *)calloc(1, sizeof *m);
-  if (!m || wasm_memory_alloc(m, init)) {
+  if (m)
+    m->is64 = (uint8_t)is64;
+  if (!m || (shared ? wasm_memory_alloc_shared(m, init, max) : wasm_memory_alloc(m, init))) {
     free(m);
     return js_throw_range(ctx, "WebAssembly.Memory(): could not allocate memory");
   }
-  m->has_max = (uint8_t)has_max;
-  m->max = max;
-  m->is64 = (uint8_t)is64;
+  if (!shared) {
+    m->has_max = (uint8_t)has_max;
+    m->max = max;
+  }
   return js_obj_value(wrap_memory(ctx, m));
 }
 
@@ -965,9 +1013,19 @@ static js_value memory_buffer(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)n;
   if (!wm)
     return js_throw_type(ctx, "WebAssembly.Memory.buffer: Receiver is not a WebAssembly.Memory");
-  if (!wm->buf) {
+  if (wm->mem->shared) {
+    uint32_t pages = wasm_memory_pages(wm->mem);
+    if (!wm->buf || wm->buf_pages != pages) {
+      js_value b = js_sab_wrap(ctx, wm->mem->data, (int)(pages * WASM_PAGE));
+      if (ctx->has_exc)
+        return js_undef();
+      wm->buf = b.u.obj;
+      wm->buf_pages = pages;
+    }
+  } else if (!wm->buf) {
     wasm_memory *m = wm->mem;
-    js_value b = js_arraybuffer_external(ctx, m->data ? m->data : empty, (int)m->size, (js_object *)m->self);
+    js_value b =
+        js_arraybuffer_external(ctx, m->data ? m->data : empty, (int)wasm_memory_size(m), (js_object *)m->self);
     if (ctx->has_exc)
       return js_undef();
     wm->buf = b.u.obj;
@@ -1563,7 +1621,11 @@ static int resolve_import(js_ctx *ctx, wasm_instance *in, const wasm_module *m, 
       link_error(ctx, api, k, im, 1, "memory import has a different address type than declared");
       return 0;
     }
-    if (!wasm_limits_match(wm->mem->pages, wm->mem->has_max, wm->mem->max, &im->mem)) {
+    if (wm->mem->shared != im->mem.shared) {
+      link_error(ctx, api, k, im, 1, "memory import has a different sharedness than declared");
+      return 0;
+    }
+    if (!wasm_limits_match(wasm_memory_pages(wm->mem), wm->mem->has_max, wm->mem->max, &im->mem)) {
       link_error(ctx, api, k, im, 1, "memory import has fewer pages or a larger maximum than declared");
       return 0;
     }
@@ -1849,6 +1911,75 @@ void js_wasm_block(js_ctx *ctx)
   }
 }
 
+/* structured clone: a Module and a shared Memory can move between heaps; each message holds a reference */
+typedef struct {
+  uint8_t *store;
+  uint32_t maxpages;
+} clone_mem;
+
+static void clone_mem_release(void *p)
+{
+  js_sab_release(((clone_mem *)p)->store);
+  free(p);
+}
+
+static void clone_module_release(void *p) { wasm_module_free((wasm_module *)p); }
+
+static int wasm_clone_write(js_ctx *ctx, js_object *o, void **ptr, void (**release)(void *), int *kind)
+{
+  (void)ctx;
+  if (!o->host)
+    return 0;
+  if (*(int *)o->host == WT_MODULE) {
+    wasm_module *m = ((wmodule *)o->host)->m;
+    wasm_module_retain(m);
+    *ptr = m;
+    *release = clone_module_release;
+    *kind = WT_MODULE;
+    return 1;
+  }
+  if (*(int *)o->host == WT_MEMORY && ((wmemory *)o->host)->mem->shared) {
+    wasm_memory *m = ((wmemory *)o->host)->mem;
+    clone_mem *c = (clone_mem *)malloc(sizeof *c);
+    if (!c)
+      return 0;
+    js_sab_retain(m->data);
+    c->store = m->data;
+    c->maxpages = m->max;
+    *ptr = c;
+    *release = clone_mem_release;
+    *kind = WT_MEMORY;
+    return 1;
+  }
+  return 0;
+}
+
+static js_value wasm_clone_read(js_ctx *ctx, int kind, void *ptr)
+{
+  if (kind == WT_MODULE) {
+    wmodule *wm = (wmodule *)calloc(1, sizeof *wm);
+    if (!wm)
+      gc_oom();
+    wm->tag = WT_MODULE;
+    wm->m = (wasm_module *)ptr;
+    wasm_module_retain(wm->m);
+    return js_obj_value(new_wasm(ctx, "@Module", wm));
+  }
+  if (kind == WT_MEMORY) {
+    clone_mem *c = (clone_mem *)ptr;
+    wasm_memory *m = (wasm_memory *)calloc(1, sizeof *m);
+    if (!m)
+      gc_oom();
+    wasm_memory_attach(m, c->store, c->maxpages);
+    return js_obj_value(wrap_memory(ctx, m));
+  }
+  return js_undef();
+}
+
+static void shared_retain(void *p) { js_sab_retain((unsigned char *)p); }
+static void shared_release(void *p) { js_sab_release((unsigned char *)p); }
+static void *shared_alloc(size_t n) { return n > 2147483647u ? NULL : js_sab_alloc((int)n); }
+
 static const char k_streaming_js[] =
     "return Promise.resolve(src).then(function (r) { return r.arrayBuffer(); }).then(function (b) {"
     " return inst ? WebAssembly.instantiate(b, imp) : WebAssembly.compile(b); });";
@@ -1957,6 +2088,11 @@ void js_setup_wasm(js_ctx *ctx)
   gc_push_scope();
   js_wasm_trace = wasm_trace;
   js_wasm_finalizer = wasm_finalize;
+  js_wasm_clone_write = wasm_clone_write;
+  js_wasm_clone_read = wasm_clone_read;
+  wasm_shared_alloc = shared_alloc;
+  wasm_shared_retain = shared_retain;
+  wasm_shared_release = shared_release;
   ns = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(ctx->global, "WebAssembly", js_obj_value(ns), P_WRITABLE | P_CONFIGURABLE);
   state = (js_object *)gc_keep(js_new_object(ctx, NULL));

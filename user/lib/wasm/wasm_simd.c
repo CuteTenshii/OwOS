@@ -113,7 +113,7 @@ const char *wasm_simd_exec(unsigned sub, uint64_t **spp, const uint32_t **pcp, w
   ea = mem->is64 ? sp[-1] : (uint64_t)(uint32_t)sp[-1];                                                                \
   eo = ea + (((uint64_t)pc[1] << 32) | pc[0]);                                                                         \
   pc += 3;                                                                                                             \
-  if (eo < ea || eo + (sz) < eo || eo + (sz) > mem->size)                                                              \
+  if (eo < ea || eo + (sz) < eo || eo + (sz) > wasm_memory_size(mem))                                                  \
     return "memory access out of bounds";                                                                              \
   ea = eo
 

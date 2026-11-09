@@ -63,9 +63,20 @@ static const char *const k_wasm_script[] = {
     "true,false]\",\"Exception\":\"[true,false,3,true,[object WebAssembly.Exception],[object "
     "WebAssembly.Exception]]\",\"Exception-bad\":\"throw:TypeError\",\"Exception-wrong-tag\":\"throw:TypeError\","
     "\"Exception-index\":\"throw:RangeError\",\"Tag-bad\":\"throw:TypeError\",\"Tag-types\":\"true\",\"tag-import-"
-    "bad\":\"throw:LinkError\",\"tag-import-nontag\":\"throw:LinkError\",\"tag-kinds\":\"[2,function,tag]\","
-    "\"promises\":\"compile-bad:CompileError|compile:true|cstream:true|inst2:true|inst:module/"
-    "instance:10:true|link:TypeError|stream:15|type:TypeError\"};\n",
+    "bad\":\"throw:LinkError\",\"tag-import-nontag\":\"throw:LinkError\",\"tag-kinds\":\"[2,function,tag]\",\"atomic-"
+    "mem\":\"[true,65536,1,true,[object "
+    "WebAssembly.Memory]]\",\"atomic-ldst\":\"[287454020,68,13124,255,52719,72623859790382856n,84281096n,4294967295n,"
+    "4294967295n]\",\"atomic-rmw\":\"[10,15,255,509,61680,-252645376,5n,245n,1n,-4294967042n,7,99,30600n,"
+    "1234605616436521933n]\",\"atomic-cas\":\"[5,6,6,6,9n,10n,10n,0,375,119,375]\",\"atomic-js-view\":\"[1234,55,1234,"
+    "1235,55]\",\"atomic-notify\":\"[0,0]\",\"atomic-wait\":\"[1,2,1,2]\",\"atomic-fence\":\"ok\",\"atomic-unaligned\":"
+    "\"throw:RuntimeError\",\"atomic-unaligned64\":\"throw:RuntimeError\",\"atomic-oob\":\"throw:RuntimeError\","
+    "\"atomic-grow\":\"[1,2,65536,131072,false,true,-1,2,196608]\",\"atomic-grow-visible\":\"[196608,5,5]\",\"atomic-"
+    "private\":\"[0,3,7,0]\",\"atomic-private-wait\":\"throw:RuntimeError\",\"shared-memory-js\":\"[true,65536,1,"
+    "131072,true]\",\"shared-memory-nomax\":\"throw:TypeError\",\"shared-import\":\"[5,5,1]\",\"shared-import-"
+    "private\":\"throw:LinkError\",\"shared-import-private2\":\"65536\",\"clone-module\":\"[true,true,10]\",\"clone-"
+    "shared-memory\":\"[true,true,42,true,1,131072]\",\"clone-private-memory\":\"throw:DataCloneError\",\"clone-"
+    "instance\":\"throw:DataCloneError\",\"promises\":\"compile-bad:CompileError|compile:true|cstream:true|inst2:true|"
+    "inst:module/instance:10:true|link:TypeError|stream:15|type:TypeError\"};\n",
     "var H = "
     "{\"num:i32.add\":\"89121a41\",\"num:i32.sub\":\"ec18b3f5\",\"num:i32.mul\":\"bab1e3f2\",\"num:i32.div_s\":"
     "\"f4e1909e\",\"num:i32.div_u\":\"bf980f80\",\"num:i32.rem_s\":\"7e82ed56\",\"num:i32.rem_u\":\"58202efe\",\"num:"
@@ -234,7 +245,17 @@ static const char *const k_wasm_script[] = {
     "var W = {};\n",
     "function hex(s) { var u = new Uint8Array(s.length / 2); for (var i = 0; i < u.length; i++) u[i] = "
     "parseInt(s.substr(i * 2, 2), 16); return u; }\n",
+    "W[\"atomicpriv\"] = "
+    "hex("
+    "\"0061736d0100000001100360027f7f017f60017f017f6000017f030504000102020503010001071c04036164640000026c64000104776169"
+    "740002066e6f7469667900030a2d040a0020002001fe1e02000b08002000fe1002000b0c00410041004200fe0102000b0a0041004101fe0002"
+    "000b\");\n",
     "W[\"badseg\"] = hex(\"0061736d0100000005030100010b0a010041ffff030b026162\");\n",
+    "W[\"counter\"] = "
+    "hex("
+    "\"0061736d010000000108026000006000017f020d0103656e76036d656d0203010103040300010007170303696e6300000477616974000106"
+    "7369676e616c00020a2f030b0041004101fe1e02001a0b0c0041044100427ffe0102000b140041044101fe170200410441e400fe0002001a0b"
+    "\");\n",
     "W[\"ctl\"] = "
     "hex("
     "\"0061736d0100000001260760017f017f60027f7f027f7f60027f7f017f6000017f60017f017e60037e7f7c017c6000000317160000010200"
@@ -340,6 +361,10 @@ static const char *const k_wasm_script[] = {
     "2000fd142001fd14fd9002fd21000b0c002000fd13fd8102fd1b030b0c002000fd14fd8402fd1b000b14002000fd112001fd112002fd11fd8b"
     "02fd1b010b1e00fd0c0a0b0c0d0e0f101112131415161718192000fd0ffd8002fd16000b10002000fd102001fd10fd9102fd18000b10002000"
     "fd0f2001fd0ffd9202fd18000b14002000fd0f2001fd0f2002fd11fd9302fd1b000b\");\n",
+    "W[\"sharedimp\"] = "
+    "hex("
+    "\"0061736d0100000001100360017f017f60027f7f017f6000017f020b0103656e76016d02030102030403000102071303026c640000036164"
+    "6400010473697a6500020a1a0308002000fe1002000b0a0020002001fe1e02000b04003f000b\");\n",
     "W[\"start\"] = "
     "hex("
     "\"0061736d01000000010c0360017f006000006000017f020c0103656e76046e6f7465000003030201020503010001070b02016d0200036765"
@@ -359,6 +384,20 @@ static const char *const k_wasm_script[] = {
     "016a0b0700200041026c0b040041070b0900200120001100000b070020001101000b0500fc10000b0900d0702000fc0f000b070020002500d1"
     "0b08002000d20026000b08002000d07026000b0b002000d2012001fc11000b0c00200020012002fc0c01000b0c00200020012002fc0e00000b"
     "0500fc0d010b0600200025000b0400d2020b\");\n",
+    "W[\"threads\"] = "
+    "hex("
+    "\"0061736d0100000001480d60017f017f60017f017e60027f7f0060027f7e0060027f7f017f60027f7e017e60037f7f7f017f60037f7e7e01"
+    "7e60037f7f7e017f60037f7e7e017f6000006000017f6000017e031e1d00000001010202020303040404050504050607060408090a000b0b0c"
+    "0b05040103010407eb011e036d656d0200046c6433320000036c64380001046c6431360002046c6436340003076c6436345f33320004047374"
+    "33320005037374380006047374313600070473743634000807737436345f33320009056164643332000a0473756238000b05616e643136000c"
+    "046f723634000d08786f7236345f3332000e06786368673332000f097863686736345f31360010056361733332001105636173363400120463"
+    "6173380013066e6f7469667900140677616974333200150677616974363400160566656e636500170467726f7700180473697a650019036f64"
+    "64001a056f64643634001b036f6f62001c0aad021d08002000fe1002000b08002000fe1200000b08002000fe1301000b08002000fe1103000b"
+    "08002000fe1602000b0a0020002001fe1702000b0a0020002001fe1900000b0a0020002001fe1a01000b0a0020002001fe1803000b0a002000"
+    "2001fe1d02000b0a0020002001fe1e02000b0a0020002001fe2700000b0a0020002001fe2f01000b0a0020002001fe3403000b0a0020002001"
+    "fe4002000b0a0020002001fe4102000b0a0020002001fe4601000b0c00200020012002fe4802000b0c00200020012002fe4903000b0c002000"
+    "20012002fe4a00000b0a0020002001fe0002000b0c00200020012002fe0102000b0c00200020012002fe0203000b0500fe03000b0600200040"
+    "000b04003f000b08004101fe1002000b08004104fe1103000b0a0041808004fe1002000b\");\n",
     "W[\"trapstart\"] = hex(\"0061736d01000000010401600000030201000801000a05010300000b\");\n",
     "W[\"num\"] = "
     "hex("
@@ -871,6 +910,57 @@ static const char *const k_wasm_script[] = {
     "T(\"tag-kinds\", function () { return [WebAssembly.Module.exports(new WebAssembly.Module(W.eh)).filter(function "
     "(e) { return e.kind === \"tag\"; }).length, WebAssembly.Module.imports(new WebAssembly.Module(W.eh)).map(function "
     "(e) { return e.kind; }).join()]; });\n",
+    "var th = inst(\"threads\");\n",
+    "T(\"atomic-mem\", function () { var b = th.mem.buffer; return [b instanceof SharedArrayBuffer, b.byteLength, "
+    "th.size(), th.mem.buffer === th.mem.buffer, Object.prototype.toString.call(th.mem)]; });\n",
+    "T(\"atomic-ldst\", function () { th.st32(0, 0x11223344); th.st8(8, 0x1ff); th.st16(10, 0xabcdef); th.st64(16, "
+    "0x0102030405060708n); th.st64_32(24, 0x1ffffffffn); return [th.ld32(0), th.ld8(0), th.ld16(0), th.ld8(8), "
+    "th.ld16(10), th.ld64(16), th.ld64_32(16), th.ld64_32(24), th.ld64(24)]; });\n",
+    "T(\"atomic-rmw\", function () { th.st32(32, 10); th.st32(36, 0x1ff); th.st32(40, 0xf0f0f0f0); th.st64(48, 5n); "
+    "th.st64(56, 0xffffffff00000001n); th.st32(64, 7); th.st64(72, 0x1122334455667788n); return [th.add32(32, 5), "
+    "th.ld32(32), th.sub8(36, 2), th.ld32(36), th.and16(40, 0xff00), th.ld32(40), th.or64(48, 0xf0n), th.ld64(48), "
+    "th.xor64_32(56, 0xffn), th.ld64(56), th.xchg32(64, 99), th.ld32(64), th.xchg64_16(72, 0xabcdn), th.ld64(72)]; "
+    "});\n",
+    "T(\"atomic-cas\", function () { th.st32(80, 5); th.st64(88, 9n); th.st32(96, 0x100); return [th.cas32(80, 5, 6), "
+    "th.ld32(80), th.cas32(80, 5, 7), th.ld32(80), th.cas64(88, 9n, 10n), th.ld64(88), th.cas64(88, 9n, 11n), "
+    "th.cas8(96, 0x100, 0x77), th.ld32(96), th.cas8(96, 0, 0x77), th.ld32(96)]; });\n",
+    "T(\"atomic-js-view\", function () { var i32 = new Int32Array(th.mem.buffer); Atomics.store(i32, 30, 1234); "
+    "th.st32(124, 55); return [th.ld32(120), i32[31], Atomics.add(i32, 30, 1), th.ld32(120), Atomics.load(i32, 31)]; "
+    "});\n",
+    "T(\"atomic-notify\", function () { return [th.notify(0, 10), th.notify(4, 0)]; });\n",
+    "T(\"atomic-wait\", function () { th.st32(200, 3); th.st64(208, 4n); return [th.wait32(200, 9, 0n), th.wait32(200, "
+    "3, 1000000n), th.wait64(208, 5n, 0n), th.wait64(208, 4n, 1000000n)]; });\n",
+    "T(\"atomic-fence\", function () { th.fence(); return \"ok\"; });\n",
+    "T(\"atomic-unaligned\", function () { return th.odd(); });\n",
+    "T(\"atomic-unaligned64\", function () { return th.odd64(); });\n",
+    "T(\"atomic-oob\", function () { return th.oob(); });\n",
+    "T(\"atomic-grow\", function () { var b = th.mem.buffer, r = th.grow(1); var b2 = th.mem.buffer; return [r, "
+    "th.size(), b.byteLength, b2.byteLength, b === b2, b2 instanceof SharedArrayBuffer, th.grow(10), th.mem.grow(1), "
+    "th.mem.buffer.byteLength]; });\n",
+    "T(\"atomic-grow-visible\", function () { var i32 = new Int32Array(th.mem.buffer); th.st32(70000, 5); return "
+    "[i32.length * 4, i32[70000 / 4], th.ld32(70000)]; });\n",
+    "var ap = inst(\"atomicpriv\");\n",
+    "T(\"atomic-private\", function () { return [ap.add(0, 3), ap.add(0, 4), ap.ld(0), ap.notify()]; });\n",
+    "T(\"atomic-private-wait\", function () { return ap.wait(); });\n",
+    "T(\"shared-memory-js\", function () { var m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true }); "
+    "var b = m.buffer; var g = m.grow(1); return [b instanceof SharedArrayBuffer, b.byteLength, g, "
+    "m.buffer.byteLength, m.buffer !== b]; });\n",
+    "T(\"shared-memory-nomax\", function () { return new WebAssembly.Memory({ initial: 1, shared: true }); });\n",
+    "T(\"shared-import\", function () { var m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true }); var "
+    "s = inst(\"sharedimp\", { env: { m: m } }); s.add(0, 5); return [s.ld(0), new Int32Array(m.buffer)[0], s.size()]; "
+    "});\n",
+    "T(\"shared-import-private\", function () { return inst(\"sharedimp\", { env: { m: new WebAssembly.Memory({ "
+    "initial: 1, maximum: 2 }) } }); });\n",
+    "T(\"shared-import-private2\", function () { return inst(\"sharedimp\", { env: { m: new WebAssembly.Memory({ "
+    "initial: 1, maximum: 2, shared: true }) } }) && inst(\"threads\").mem.buffer.byteLength; });\n",
+    "T(\"clone-module\", function () { var m = new WebAssembly.Module(W.ctl); var c = structuredClone(m); return [c "
+    "instanceof WebAssembly.Module, c !== m, new WebAssembly.Instance(c).exports.sum(4)]; });\n",
+    "T(\"clone-shared-memory\", function () { var m = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true "
+    "}); var c = structuredClone(m); new Int32Array(m.buffer)[3] = 42; return [c instanceof WebAssembly.Memory, c !== "
+    "m, new Int32Array(c.buffer)[3], c.buffer instanceof SharedArrayBuffer, c.grow(1), m.buffer.byteLength]; });\n",
+    "T(\"clone-private-memory\", function () { return structuredClone(new WebAssembly.Memory({ initial: 1 })); });\n",
+    "T(\"clone-instance\", function () { return structuredClone(new WebAssembly.Instance(new "
+    "WebAssembly.Module(W.ctl))); });\n",
     "\n",
     "function dbl(h) { var b = new BigUint64Array(1), d = new Float64Array(b.buffer); b[0] = BigInt(\"0x\" + h); "
     "return d[0]; }\n",
@@ -1151,5 +1241,13 @@ static const char *const k_wasm_script[] = {
     "  __result = failures.join(\"\\n\");\n",
     "});\n",
     0};
+
+/* tests/wasm/counter.wat, for the threads test */
+static const unsigned char k_wasm_counter[] = {
+    0,   97,  115, 109, 1,   0,   0,   0,  1,  8,  2,   96,  0,   0,   96, 0,   1,  127, 2,   13, 1,   3,   101,
+    110, 118, 3,   109, 101, 109, 2,   3,  1,  1,  3,   4,   3,   0,   1,  0,   7,  23,  3,   3,  105, 110, 99,
+    0,   0,   4,   119, 97,  105, 116, 0,  1,  6,  115, 105, 103, 110, 97, 108, 0,  2,   10,  47, 3,   11,  0,
+    65,  0,   65,  1,   254, 30,  2,   0,  26, 11, 12,  0,   65,  4,   65, 0,   66, 127, 254, 1,  2,   0,   11,
+    20,  0,   65,  4,   65,  1,   254, 23, 2,  0,  65,  4,   65,  228, 0,  254, 0,  2,   0,   26, 11};
 
 #endif

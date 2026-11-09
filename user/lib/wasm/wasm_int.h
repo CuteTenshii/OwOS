@@ -30,7 +30,8 @@ enum {
 
 #define OP_FC(n) (0x200 + (n))
 #define OP_FD(n) (0x300 + (n))
-#define WASM_OP_LIMIT 0x400
+#define OP_FE(n) (0x500 + (n))
+#define WASM_OP_LIMIT 0x600
 
 #include "math.h"
 #include "wasm.h"

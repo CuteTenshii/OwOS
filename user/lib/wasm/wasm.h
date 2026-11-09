@@ -2,7 +2,8 @@
  *
  * Independent of the JS engine. Supported: the MVP plus sign extension, saturating float-to-int, multi-value,
  * bulk memory, mutable globals, reference types (funcref and externref, several tables) and 128-bit SIMD.
- * Not supported: threads/shared memory, exceptions, tail calls, memory64, multiple memories, relaxed SIMD.
+ * Also: shared memory with atomics, exception handling, tail calls, memory64, multiple memories, relaxed SIMD,
+ * extended constant expressions.
  *
  * Values live in 64-bit stack slots (a v128 takes two). funcref is a wasm_func pointer and externref an
  * interned handle (0 = null); the embedder maps handles to its own values through the wasm_exec callbacks.
@@ -164,6 +165,7 @@ struct wasm_module {
   uint32_t ncustom;
   wasm_custom *custom;
   wasm_code *code; /* per defined function */
+  uint32_t refs;
   void *arena;
 };
 
@@ -201,12 +203,26 @@ struct wasm_table {
 
 struct wasm_memory {
   uint8_t *data;
-  uint64_t size;
   uint32_t pages, max;
-  uint8_t has_max, is64;
+  uint32_t *ppages; /* the live page count: &pages, or the counter in a shared store */
+  uint8_t has_max, is64, shared;
   void (*on_grow)(wasm_memory *m); /* called after the bytes moved or grew */
   void *self;                      /* embedder object that owns this memory */
 };
+
+/* A shared memory reserves its maximum up front; this counter sits right after the bytes, so every thread that
+ * attaches to the store sees the same size */
+typedef struct {
+  uint32_t pages, maxpages, is64, pad;
+} wasm_shared_ctl;
+
+static inline uint32_t wasm_memory_pages(const wasm_memory *m) { return __atomic_load_n(m->ppages, __ATOMIC_ACQUIRE); }
+static inline uint64_t wasm_memory_size(const wasm_memory *m) { return (uint64_t)wasm_memory_pages(m) * WASM_PAGE; }
+
+/* Where shared stores come from; the embedder swaps in a reference counted allocator (zeroed bytes, one reference) */
+extern void *(*wasm_shared_alloc)(size_t n);
+extern void (*wasm_shared_retain)(void *p);
+extern void (*wasm_shared_release)(void *p);
 
 struct wasm_global {
   uint8_t type, mut;
@@ -250,13 +266,18 @@ struct wasm_exec {
   /* After a host call failed: turn the pending exception into a record (wasm_exn_new), clearing it, and return 1;
    * 0 leaves it pending and aborts the call. */
   int (*exn_catch)(void *ud, wasm_exn **out);
+  /* Atomic wait on the word at addr: 0 woken, 1 value differs, 2 timed out (timeout in ns, negative for none), -1
+   * cannot block here. Notify wakes up to count waiters and returns how many. */
+  int (*atomic_wait)(void *ud, uint8_t *addr, int is64, uint64_t expected, int64_t timeout);
+  uint32_t (*atomic_notify)(void *ud, uint8_t *addr, uint32_t count);
   /* externref <-> handle (handle 0 is null; the same value may intern to different handles) */
   uint64_t (*xr_intern)(void *ud, const wasm_extern *v);
   void (*xr_value)(void *ud, uint64_t handle, wasm_extern *out);
 };
 
 wasm_module *wasm_module_new(const uint8_t *bytes, size_t len, char *err, size_t errn);
-void wasm_module_free(wasm_module *m);
+void wasm_module_retain(wasm_module *m);
+void wasm_module_free(wasm_module *m); /* drops a reference */
 int wasm_functype_eq(const wasm_functype *a, const wasm_functype *b);
 
 wasm_instance *wasm_instance_new(const wasm_module *m);
@@ -269,6 +290,8 @@ void wasm_eval_const(const wasm_instance *i, const wasm_constexpr *e, uint64_t o
 
 /* Memory: grow returns the old page count or -1 */
 int wasm_memory_alloc(wasm_memory *m, uint32_t pages); /* 0 or -1 */
+int wasm_memory_alloc_shared(wasm_memory *m, uint32_t pages, uint32_t maxpages);
+void wasm_memory_attach(wasm_memory *m, uint8_t *store, uint32_t maxpages); /* retains the store */
 int64_t wasm_memory_grow(wasm_memory *m, uint32_t delta);
 void wasm_memory_free(wasm_memory *m);
 int wasm_table_alloc(wasm_table *t, uint32_t n);

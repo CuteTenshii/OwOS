@@ -649,6 +649,18 @@ static js_value sclone(js_ctx *ctx, js_value v, js_object **ss, js_object **sd, 
   for (i = 0; i < *ns; i++)
     if (ss[i] == o)
       return js_obj_value(sd[i]);
+  if (o->kind == OBJ_WASM) {
+    void *ptr;
+    void (*release)(void *);
+    int kind;
+    if (js_wasm_clone_write && js_wasm_clone_write(ctx, o, &ptr, &release, &kind)) {
+      js_value r = js_wasm_clone_read(ctx, kind, ptr);
+      release(ptr);
+      return r;
+    }
+    js_throw_error(ctx, ctx->error_proto, "DataCloneError", "The value could not be cloned");
+    return js_undef();
+  }
   if (depth > 200 || o->kind == OBJ_FUNCTION)
     return v;
   if (o->kind == OBJ_ARRAY || o->kind == OBJ_PLAIN) {
@@ -9349,7 +9361,8 @@ enum {
   CL_SET,
   CL_REGEXP,
   CL_ABUF_MOVE,
-  CL_EXT
+  CL_EXT,
+  CL_WASM
 };
 #define CLONE_DEPTH 200
 
@@ -9357,9 +9370,15 @@ typedef struct {
   unsigned char *data;
   int len;
 } clone_sab;
+typedef struct {
+  void *ptr;
+  void (*release)(void *);
+} clone_ref;
 struct js_clone {
   unsigned char *buf;
   int len, cap;
+  clone_ref *refs; /* retained wasm objects the message carries */
+  int nrefs;
   clone_sab *sabs;
   int nsabs;
   clone_sab *moved; /* transferred ArrayBuffers: their bytes now belong to the message */
@@ -9512,6 +9531,28 @@ static void clone_value(clone_w *w, js_value v, int depth)
       clone_str(w, (const char *)bytes, len);
       free(bytes);
       free(meta);
+      return;
+    }
+  }
+  if (o->kind == OBJ_WASM && js_wasm_clone_write) {
+    void *ptr;
+    void (*release)(void *);
+    int kind;
+    if (js_wasm_clone_write(w->ctx, o, &ptr, &release, &kind)) {
+      clone_ref *nr = (clone_ref *)realloc(w->c->refs, (unsigned)(w->c->nrefs + 1) * sizeof *nr);
+      if (!nr || !clone_note(w, o)) {
+        release(ptr);
+        w->failed = 1;
+        if (nr)
+          w->c->refs = nr;
+        return;
+      }
+      w->c->refs = nr;
+      nr[w->c->nrefs].ptr = ptr;
+      nr[w->c->nrefs].release = release;
+      clone_tag(w, CL_WASM);
+      clone_u32(w, (unsigned)kind);
+      clone_u32(w, (unsigned)w->c->nrefs++);
       return;
     }
   }
@@ -9678,6 +9719,9 @@ void js_clone_free(js_clone *c)
     js_sab_release(c->sabs[i].data);
   for (i = 0; i < c->nmoved; i++)
     free(c->moved[i].data);
+  for (i = 0; i < c->nrefs; i++)
+    c->refs[i].release(c->refs[i].ptr);
+  free(c->refs);
   free(c->moved);
   free(c->sabs);
   free(c->buf);
@@ -9954,6 +9998,21 @@ static js_value clone_read_value(clone_r *r, int depth)
     meta[ml] = 0;
     ov = ctx->clone_read_ext(ctx, kind, bp, bl, meta);
     free(meta);
+    if (ov.type != JV_OBJ) {
+      r->failed = 1;
+      return js_undef();
+    }
+    clone_made(r, ov.u.obj);
+    return ov;
+  }
+  case CL_WASM: {
+    unsigned kind = clone_get_u32(r), i = clone_get_u32(r);
+    js_value ov;
+    if (i >= (unsigned)r->c->nrefs || !js_wasm_clone_read) {
+      r->failed = 1;
+      return js_undef();
+    }
+    ov = js_wasm_clone_read(ctx, (int)kind, r->c->refs[i].ptr);
     if (ov.type != JV_OBJ) {
       r->failed = 1;
       return js_undef();

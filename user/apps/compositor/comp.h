@@ -120,7 +120,7 @@ struct tunable {
   const char *file;
   const char *key;
   const char *node;
-  char cur[32];
+  char cur[64];
   bool known; /* cur holds a real value */
 };
 #define NTUN ((int)(sizeof tun / sizeof tun[0]))

@@ -26,11 +26,17 @@ static void fpu_set(unsigned short cw) { (void)cw; }
 
 /* ---- memories and tables ------------------------------------------------- */
 
+void *(*wasm_shared_alloc)(size_t n);
+void (*wasm_shared_retain)(void *p);
+void (*wasm_shared_release)(void *p);
+
+static void *shared_alloc(size_t n) { return wasm_shared_alloc ? wasm_shared_alloc(n) : calloc(1, (unsigned)n); }
+
 int wasm_memory_alloc(wasm_memory *m, uint32_t pages)
 {
   m->data = NULL;
-  m->size = 0;
   m->pages = 0;
+  m->ppages = &m->pages;
   if (pages > WASM_MAX_PAGES)
     return -1;
   if (pages) {
@@ -39,26 +45,65 @@ int wasm_memory_alloc(wasm_memory *m, uint32_t pages)
       return -1;
   }
   m->pages = pages;
-  m->size = (uint64_t)pages * WASM_PAGE;
   return 0;
+}
+
+int wasm_memory_alloc_shared(wasm_memory *m, uint32_t pages, uint32_t maxpages)
+{
+  wasm_shared_ctl *ctl;
+  if (maxpages > WASM_MAX_PAGES || pages > maxpages)
+    return -1;
+  m->data = (uint8_t *)shared_alloc((size_t)maxpages * WASM_PAGE + sizeof *ctl);
+  if (!m->data)
+    return -1;
+  ctl = (wasm_shared_ctl *)(m->data + (size_t)maxpages * WASM_PAGE);
+  ctl->pages = pages;
+  ctl->maxpages = maxpages;
+  ctl->is64 = m->is64;
+  m->ppages = &ctl->pages;
+  m->shared = 1;
+  m->has_max = 1;
+  m->max = maxpages;
+  return 0;
+}
+
+void wasm_memory_attach(wasm_memory *m, uint8_t *store, uint32_t maxpages)
+{
+  wasm_shared_ctl *ctl = (wasm_shared_ctl *)(store + (size_t)maxpages * WASM_PAGE);
+  if (wasm_shared_retain)
+    wasm_shared_retain(store);
+  m->data = store;
+  m->ppages = &ctl->pages;
+  m->shared = 1;
+  m->has_max = 1;
+  m->max = maxpages;
+  m->is64 = (uint8_t)ctl->is64;
 }
 
 int64_t wasm_memory_grow(wasm_memory *m, uint32_t delta)
 {
-  uint32_t old = m->pages, limit = m->has_max ? m->max : WASM_MAX_PAGES;
-  uint8_t *nd;
+  uint32_t old = wasm_memory_pages(m), limit = m->has_max ? m->max : WASM_MAX_PAGES;
   if (limit > WASM_MAX_PAGES)
     limit = WASM_MAX_PAGES;
-  if (delta > limit || old + delta > limit)
-    return -1;
-  if (delta) {
-    nd = (uint8_t *)realloc(m->data, (unsigned)((old + delta) * WASM_PAGE));
-    if (!nd)
+  if (m->shared) {
+    /* the bytes are already there and zeroed: claim them */
+    while (1) {
+      if (delta > limit || old + delta > limit)
+        return -1;
+      if (__atomic_compare_exchange_n(m->ppages, &old, old + delta, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        break;
+    }
+  } else {
+    if (delta > limit || old + delta > limit)
       return -1;
-    memset(nd + (size_t)old * WASM_PAGE, 0, (size_t)delta * WASM_PAGE);
-    m->data = nd;
-    m->pages = old + delta;
-    m->size = (uint64_t)m->pages * WASM_PAGE;
+    if (delta) {
+      uint8_t *nd = (uint8_t *)realloc(m->data, (unsigned)((old + delta) * WASM_PAGE));
+      if (!nd)
+        return -1;
+      memset(nd + (size_t)old * WASM_PAGE, 0, (size_t)delta * WASM_PAGE);
+      m->data = nd;
+      m->pages = old + delta;
+    }
   }
   if (m->on_grow)
     m->on_grow(m);
@@ -67,9 +112,14 @@ int64_t wasm_memory_grow(wasm_memory *m, uint32_t delta)
 
 void wasm_memory_free(wasm_memory *m)
 {
-  free(m->data);
+  if (m->shared) {
+    if (wasm_shared_release)
+      wasm_shared_release(m->data);
+    else
+      free(m->data);
+  } else
+    free(m->data);
   m->data = NULL;
-  m->size = 0;
 }
 
 int wasm_table_alloc(wasm_table *t, uint32_t n)
@@ -264,7 +314,10 @@ int wasm_instance_define(wasm_instance *i)
     mem->has_max = m->mems[k].has_max;
     mem->is64 = m->mems[k].is64;
     mem->max = m->mems[k].max > WASM_MAX_PAGES ? WASM_MAX_PAGES : (uint32_t)m->mems[k].max;
-    if (m->mems[k].min > WASM_MAX_PAGES || wasm_memory_alloc(mem, (uint32_t)m->mems[k].min))
+    if (m->mems[k].min > WASM_MAX_PAGES)
+      return -1;
+    if (m->mems[k].shared ? wasm_memory_alloc_shared(mem, (uint32_t)m->mems[k].min, mem->max)
+                          : wasm_memory_alloc(mem, (uint32_t)m->mems[k].min))
       return -1;
   }
   for (k = m->nglobal_imports; k < m->nglobals; k++) {
@@ -326,7 +379,7 @@ const char *wasm_instance_apply_segments(wasm_instance *i)
     {
       wasm_memory *mm = i->mems[d->mem];
       uint64_t at = mm->is64 ? off[0] : (uint32_t)off[0];
-      if (at + d->len < at || at + d->len > mm->size)
+      if (at + d->len < at || at + d->len > wasm_memory_size(mm))
         return "data segment is out of bounds";
       memcpy(mm->data + at, d->bytes, d->len);
     }
@@ -415,6 +468,152 @@ static uint32_t popcnt32(uint32_t v)
   v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
   v = (v + (v >> 4)) & 0x0f0f0f0fu;
   return (v * 0x01010101u) >> 24;
+}
+
+static uint64_t atomic_load(const uint8_t *p, unsigned w)
+{
+  switch (w) {
+  case 1:
+    return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+  case 2:
+    return __atomic_load_n((const uint16_t *)p, __ATOMIC_SEQ_CST);
+  case 4:
+    return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
+  }
+  return __atomic_load_n((const uint64_t *)p, __ATOMIC_SEQ_CST);
+}
+
+static void atomic_store(uint8_t *p, unsigned w, uint64_t v)
+{
+  switch (w) {
+  case 1:
+    __atomic_store_n(p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    break;
+  case 2:
+    __atomic_store_n((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    break;
+  case 4:
+    __atomic_store_n((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST);
+    break;
+  default:
+    __atomic_store_n((uint64_t *)p, v, __ATOMIC_SEQ_CST);
+  }
+}
+
+/* op: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 xchg; returns the old value */
+#define RMW(T)                                                                                                         \
+  {                                                                                                                    \
+    T *q = (T *)p;                                                                                                     \
+    switch (op) {                                                                                                      \
+    case 0:                                                                                                            \
+      return __atomic_fetch_add(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case 1:                                                                                                            \
+      return __atomic_fetch_sub(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case 2:                                                                                                            \
+      return __atomic_fetch_and(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case 3:                                                                                                            \
+      return __atomic_fetch_or(q, (T)v, __ATOMIC_SEQ_CST);                                                             \
+    case 4:                                                                                                            \
+      return __atomic_fetch_xor(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    }                                                                                                                  \
+    return __atomic_exchange_n(q, (T)v, __ATOMIC_SEQ_CST);                                                             \
+  }
+static uint64_t atomic_rmw(unsigned op, uint8_t *p, unsigned w, uint64_t v)
+{
+  switch (w) {
+  case 1:
+    RMW(uint8_t)
+  case 2:
+    RMW(uint16_t)
+  case 4:
+    RMW(uint32_t)
+  }
+  RMW(uint64_t)
+}
+
+#define CAS(T)                                                                                                         \
+  {                                                                                                                    \
+    T e = (T)exp;                                                                                                      \
+    __atomic_compare_exchange_n((T *)p, &e, (T)repl, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                           \
+    return e;                                                                                                          \
+  }
+static uint64_t atomic_cas(uint8_t *p, unsigned w, uint64_t exp, uint64_t repl)
+{
+  switch (w) {
+  case 1:
+    CAS(uint8_t)
+  case 2:
+    CAS(uint16_t)
+  case 4:
+    CAS(uint32_t)
+  }
+  CAS(uint64_t)
+}
+
+/* One 0xFE operator; returns a trap message or NULL */
+static const char *atomic_exec(wasm_exec *x, wasm_instance *inst, unsigned sub, uint64_t **spp, const uint32_t **pcp)
+{
+  static const uint8_t W[7] = {4, 8, 1, 2, 1, 2, 4};
+  uint64_t *sp = *spp;
+  const uint32_t *pc = *pcp;
+  unsigned g = 0, v = 0, w, nops;
+  wasm_memory *mm;
+  uint64_t ea, eo;
+  uint8_t *p;
+  if (sub == 3) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return NULL;
+  }
+  if (sub <= 2) {
+    w = sub == 2 ? 8 : 4;
+    nops = sub == 0 ? 1 : 2;
+  } else {
+    g = (sub - 0x10) / 7;
+    v = (sub - 0x10) % 7;
+    w = W[v];
+    nops = g == 0 ? 0 : g == 8 ? 2 : 1;
+  }
+  mm = inst->mems[pc[2]];
+  ea = mm->is64 ? sp[-1 - (int)nops] : (uint64_t)(uint32_t)sp[-1 - (int)nops];
+  eo = ea + (((uint64_t)pc[1] << 32) | pc[0]);
+  pc += 3;
+  if (eo < ea || eo + w < eo || eo + w > wasm_memory_size(mm))
+    return OOB;
+  if (eo & (w - 1))
+    return "unaligned atomic";
+  p = mm->data + eo;
+  if (sub <= 2) {
+    if (sub == 0) {
+      uint32_t n = (uint32_t)sp[-1];
+      sp[-2] = mm->shared && x->atomic_notify ? x->atomic_notify(x->ud, p, n) : 0;
+      sp--;
+    } else {
+      int r;
+      if (!mm->shared)
+        return "atomic wait on non-shared memory";
+      r = x->atomic_wait ? x->atomic_wait(x->ud, p, sub == 2, sp[-2], (int64_t)sp[-1]) : -1;
+      if (r < 0)
+        return "atomic wait cannot block here";
+      sp -= 2;
+      sp[-1] = (uint32_t)r;
+    }
+  } else if (g == 0) {
+    sp[-1] = atomic_load(p, w);
+  } else if (g == 1) {
+    atomic_store(p, w, sp[-1]);
+    sp -= 2;
+  } else if (g == 8) {
+    uint64_t old = atomic_cas(p, w, sp[-2], sp[-1]);
+    sp -= 2;
+    sp[-1] = old;
+  } else {
+    uint64_t old = atomic_rmw(g - 2, p, w, sp[-1]);
+    sp--;
+    sp[-1] = old;
+  }
+  *spp = sp;
+  *pcp = pc;
+  return NULL;
 }
 
 static int run(wasm_exec *x, wasm_func *entry, uint64_t *base)
@@ -727,7 +926,7 @@ resume:
   uint64_t ea = mm->is64 ? sp[-1] : (uint64_t)(uint32_t)sp[-1];                                                        \
   uint64_t eo = ea + (((uint64_t)pc[1] << 32) | pc[0]);                                                                \
   pc += 3;                                                                                                             \
-  if (eo < ea || eo + (sz) < eo || eo + (sz) > mm->size)                                                               \
+  if (eo < ea || eo + (sz) < eo || eo + (sz) > wasm_memory_size(mm))                                                   \
     TRAP(OOB);                                                                                                         \
   ea = eo;
 #define LOAD(T, conv)                                                                                                  \
@@ -795,7 +994,7 @@ resume:
     case 0x3e:
       STORE(uint32_t)
     case 0x3f:
-      *sp++ = MEMSEL(pc[0])->pages;
+      *sp++ = wasm_memory_pages(MEMSEL(pc[0]));
       pc++;
       break;
     case 0x40: {
@@ -1267,7 +1466,7 @@ resume:
       uint32_t len = inst->data_dropped[seg] ? 0 : inst->module->datas[seg].len;
       pc += 2;
       sp -= 3;
-      if ((uint64_t)s + n > len || d + n < d || d + n > mm->size)
+      if ((uint64_t)s + n > len || d + n < d || d + n > wasm_memory_size(mm))
         TRAP(OOB);
       memcpy(mm->data + d, inst->module->datas[seg].bytes + s, n);
       break;
@@ -1282,7 +1481,7 @@ resume:
       uint64_t d = dm->is64 ? sp[-3] : (uint32_t)sp[-3];
       pc += 2;
       sp -= 3;
-      if (s + n < s || d + n < d || s + n > sm->size || d + n > dm->size)
+      if (s + n < s || d + n < d || s + n > wasm_memory_size(sm) || d + n > wasm_memory_size(dm))
         TRAP(OOB);
       memmove(dm->data + d, sm->data + s, n);
       break;
@@ -1294,7 +1493,7 @@ resume:
       uint32_t v = (uint32_t)sp[-2];
       uint64_t d = mm->is64 ? sp[-3] : (uint32_t)sp[-3];
       sp -= 3;
-      if (d + n < d || d + n > mm->size)
+      if (d + n < d || d + n > wasm_memory_size(mm))
         TRAP(OOB);
       memset(mm->data + d, (int)(v & 0xff), n);
       break;
@@ -1369,6 +1568,12 @@ resume:
     }
 
     default:
+      if (op >= OP_FE(0) && op <= OP_FE(0x4e)) {
+        trap = atomic_exec(x, inst, op - OP_FE(0), &sp, &pc);
+        if (trap)
+          goto do_trap;
+        break;
+      }
       if (op >= OP_FD(0) && op <= OP_FD(0x113)) {
         trap = wasm_simd_exec(op - OP_FD(0), &sp, &pc, inst);
         if (trap)

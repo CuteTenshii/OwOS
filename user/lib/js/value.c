@@ -305,6 +305,8 @@ static void trace(void *obj, int kind)
       gc_mark(((js_arraybuffer *)o->host)->owner);
     if (o->kind == OBJ_WASM && o->host && js_wasm_trace)
       js_wasm_trace(o);
+    if (o->kind == OBJ_HOST && o->host && js_host_trace)
+      js_host_trace(o);
     if (o->kind == OBJ_GENERATOR && o->host) {
       js_generator *g = (js_generator *)o->host;
       gc_mark(g->env);
@@ -315,8 +317,11 @@ static void trace(void *obj, int kind)
 }
 
 void (*js_host_finalizer)(js_object *o);
+void (*js_host_trace)(js_object *o);
 void (*js_wasm_trace)(js_object *o);
 void (*js_wasm_finalizer)(js_object *o);
+int (*js_wasm_clone_write)(js_ctx *ctx, js_object *o, void **ptr, void (**release)(void *), int *kind);
+js_value (*js_wasm_clone_read)(js_ctx *ctx, int kind, void *ptr);
 
 static void finalize(void *obj, int kind)
 {

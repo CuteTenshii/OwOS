@@ -101,10 +101,17 @@ typedef struct js_generator {
 
 /* Called when an OBJ_HOST object is collected; release o->host here. */
 extern void (*js_host_finalizer)(js_object *o);
+/* Called when an OBJ_HOST object is traced; gc_mark the JS values o->host holds. */
+extern void (*js_host_trace)(js_object *o);
 
 /* OBJ_WASM objects: trace marks the GC objects `o->host` refers to (gc_mark), finalize releases it */
 extern void (*js_wasm_trace)(js_object *o);
 extern void (*js_wasm_finalizer)(js_object *o);
+/* Structured clone of a WebAssembly object: write retains what the message carries and hands back a pointer and a
+ * release function (0 when the object cannot be cloned); read builds the object from that pointer in the reader's
+ * heap, taking its own reference */
+extern int (*js_wasm_clone_write)(js_ctx *ctx, js_object *o, void **ptr, void (**release)(void *), int *kind);
+extern js_value (*js_wasm_clone_read)(js_ctx *ctx, int kind, void *ptr);
 
 /* property entry flags */
 enum { P_ENUMERABLE = 1, P_WRITABLE = 2, P_CONFIGURABLE = 4, P_ACCESSOR = 8 };
