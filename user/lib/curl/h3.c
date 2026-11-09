@@ -379,7 +379,7 @@ static void enc_str(uint8_t *b, uint32_t *p, const char *s, int n)
 /* --------------------------------------------------- response header sink */
 
 static int h3_status;
-static char h3_lines[4096]; /* decoded "name: value\r\n" block */
+static char h3_lines[16384]; /* decoded "name: value\r\n" block */
 static int h3_lines_len;
 static http_body_fn h3_body;
 static void *h3_ctx;
@@ -415,10 +415,10 @@ static void qpack_decode(const uint8_t *b, uint32_t len)
   uint32_t o = 0;
   uint64_t ric, base;
   if (!dec_int(b, &o, len, 8, &ric) || !dec_int(b, &o, len, 7, &base))
-    return; /* prefix: insert count + base */
+    return;                         /* prefix: insert count + base */
+  static char val[sizeof h3_lines]; /* a decoded value larger than this aborts the rest of the block */
   while (o < len) {
     uint8_t c = b[o];
-    char val[2048];
     int vl = 0;
     if (c & 0x80) { /* Indexed Field Line */
       int T = c & 0x40;
@@ -456,7 +456,7 @@ static uint8_t h3_acc[16384];
 static uint32_t h3_acclen;
 static int h3_state; /* 0 = expect frame header, 1 = in payload */
 static uint64_t h3_ftype, h3_frem;
-static uint8_t h3_hb[8192]; /* HEADERS payload accumulator */
+static uint8_t h3_hb[16384]; /* HEADERS payload accumulator */
 static uint32_t h3_hblen;
 
 static void acc_consume(uint32_t k)
@@ -494,8 +494,13 @@ static void feed_stream0(const uint8_t *data, uint32_t n)
       h3_ftype = ty;
       h3_frem = ln;
       h3_state = 1;
-      if (ty == 0x01)
+      if (ty == 0x01) {
         h3_hblen = 0; /* HEADERS: start accumulating */
+        if (h3_status >= 100 && h3_status < 200) {
+          h3_status = 0; /* the final response replaces an interim one */
+          h3_lines_len = 0;
+        }
+      }
     } else {
       if (h3_acclen == 0)
         break;
