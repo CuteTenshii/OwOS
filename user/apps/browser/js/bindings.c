@@ -2568,10 +2568,10 @@ void setup_dom(js_ctx *ctx, const char *page_url)
       gc_add_root((void **)&g_html_ifaces[i].proto);
       gc_pop_scope();
     }
-    /* Image is a global alias constructing an <img> */
     for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++)
       if (streq(g_html_ifaces[i].name, "HTMLInputElement"))
         def_acc(g_html_ifaces[i].proto, "files", input_get_files, 0);
+    /* Image is a global alias constructing an <img> */
     for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++) {
       if (!streq(g_html_ifaces[i].name, "HTMLImageElement"))
         continue;
@@ -2702,7 +2702,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "Blob", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-
   /* File (a named Blob) and the FileList of <input type=file> */
   def_method(g_filelist_proto, "item", filelist_item, 1);
   {
@@ -2714,6 +2713,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "File", js_obj_value(fc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
+
   canvas_js_setup(ctx, win);
 
   /* AbortController / AbortSignal (used by fetch() and event listeners). */
