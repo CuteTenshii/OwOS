@@ -1,20 +1,25 @@
 /* player.c, a graphical media player for audio and H.264 video. `player <file>` opens a window
  * with a seekable progress bar and Restart / Play-Pause / Stop buttons */
 #include "gfx.h"
+#include "jpeg.h"
 #include "media.h"
 #include "mediactl.h"
 #include "owos.h"
+#include "png.h"
 #include "tray.h"
+#include "webp.h"
 #include <stdbool.h>
 
-/* audio-window geometry */
+/* audio-window geometry; g_ext shifts everything below the header down to make room for cover art */
+#define COVER_SZ 96
+static int g_ext;
 #define CW 440
 #define CH 180
 #define HDR_H 40
 #define BAR_X 24
-#define BAR_Y 80
+#define BAR_Y (80 + g_ext)
 #define TIME_Y (BAR_Y + GUI_PROGRESS_H + 6)
-#define BTN_Y 128
+#define BTN_Y (128 + g_ext)
 
 /* video display limits */
 #define VID_MAXW 900
@@ -34,6 +39,9 @@ static int g_bx[3], g_bw[3];
 static const char *g_blabel[3];
 
 static char g_fn[256];
+static struct media_tags g_tags;
+static unsigned g_cov[COVER_SZ * COVER_SZ]; /* embedded cover, scaled to fit COVER_SZ */
+static int g_cov_w, g_cov_h;
 
 /* audio source */
 static media_decoder *g_dec;
@@ -61,6 +69,8 @@ static const char *basename_of(const char *p)
       b = q + 1;
   return b;
 }
+
+static const char *display_title(void) { return g_tags.title[0] ? g_tags.title : basename_of(g_fn); }
 
 static void fmt_time(unsigned sec, char *buf)
 {
@@ -150,6 +160,110 @@ static int video_reopen(void)
   return 0;
 }
 
+/* Box-filters source rows into the cover thumbnail */
+struct thumb {
+  unsigned sw, sh;
+  int tw, th;
+  unsigned *acc; /* r, g, b, count per thumbnail pixel */
+};
+
+static int thumb_begin(struct thumb *t, unsigned sw, unsigned sh)
+{
+  if (!sw || !sh || sw > 16384 || sh > 16384)
+    return -1;
+  t->sw = sw;
+  t->sh = sh;
+  t->tw = sw >= sh ? COVER_SZ : (int)(sw * COVER_SZ / sh);
+  t->th = sh >= sw ? COVER_SZ : (int)(sh * COVER_SZ / sw);
+  if (sw < COVER_SZ && sh < COVER_SZ) {
+    t->tw = (int)sw;
+    t->th = (int)sh;
+  }
+  if (t->tw < 1)
+    t->tw = 1;
+  if (t->th < 1)
+    t->th = 1;
+  t->acc = calloc((unsigned)t->tw * t->th * 4, sizeof(unsigned));
+  return t->acc ? 0 : -1;
+}
+
+static void thumb_row(struct thumb *t, unsigned y, const unsigned char *rgba)
+{
+  if (y >= t->sh)
+    return;
+  unsigned *row = t->acc + (unsigned)((unsigned long long)y * t->th / t->sh) * t->tw * 4;
+  for (unsigned x = 0; x < t->sw; x++) {
+    unsigned *a = row + (unsigned)((unsigned long long)x * t->tw / t->sw) * 4;
+    a[0] += rgba[x * 4];
+    a[1] += rgba[x * 4 + 1];
+    a[2] += rgba[x * 4 + 2];
+    a[3]++;
+  }
+}
+
+static void thumb_end(struct thumb *t)
+{
+  for (int i = 0; i < t->tw * t->th; i++) {
+    const unsigned *a = t->acc + i * 4;
+    unsigned n = a[3] ? a[3] : 1;
+    g_cov[i] = 0xFF000000u | (a[0] / n) << 16 | (a[1] / n) << 8 | a[2] / n;
+  }
+  g_cov_w = t->tw;
+  g_cov_h = t->th;
+  free(t->acc);
+}
+
+struct membuf {
+  const unsigned char *d;
+  unsigned len, pos;
+};
+
+static int membuf_get(void *c)
+{
+  struct membuf *m = c;
+  return m->pos < m->len ? m->d[m->pos++] : -1;
+}
+
+static int png_thumb_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+  struct thumb *t = c;
+  if (w == t->sw)
+    thumb_row(t, y, rgba);
+  return 0;
+}
+
+static void load_cover(const char *fn)
+{
+  unsigned len, w = 0, h = 0;
+  unsigned char *img = media_cover_read(fn, &len), *rgba = 0;
+  struct thumb t;
+  g_cov_w = g_cov_h = g_ext = 0;
+  if (!img)
+    return;
+  if (len > 8 && memcmp(img, "\x89PNG", 4) == 0) {
+    struct membuf m = {img, len, 0};
+    if (png_dimensions(membuf_get, &m, &w, &h) == PNG_OK && thumb_begin(&t, w, h) == 0) {
+      m.pos = 0;
+      png_decode(membuf_get, &m, png_thumb_row, &t, 0, 0);
+      thumb_end(&t);
+    }
+  } else {
+    if (len > 3 && img[0] == 0xFF && img[1] == 0xD8)
+      jpeg_decode(img, (int)len, COVER_SZ, &rgba, &w, &h);
+    else if (len > 12 && memcmp(img, "RIFF", 4) == 0 && memcmp(img + 8, "WEBP", 4) == 0)
+      webp_decode(img, (int)len, &rgba, &w, &h);
+    if (rgba && thumb_begin(&t, w, h) == 0) {
+      for (unsigned y = 0; y < h; y++)
+        thumb_row(&t, y, rgba + (unsigned long long)y * w * 4);
+      thumb_end(&t);
+    }
+  }
+  free(rgba);
+  free(img);
+  if (g_cov_w)
+    g_ext = COVER_SZ + 8;
+}
+
 static int load_audio(const char *fn)
 {
   media_decoder *d = media_open(fn);
@@ -159,6 +273,8 @@ static int load_audio(const char *fn)
     media_close(g_dec);
   g_dec = d;
   copy_name(fn);
+  media_tags_read(fn, &g_tags);
+  load_cover(fn);
   g_is_video = false;
   g_state = ST_STOPPED;
   return 0;
@@ -178,6 +294,7 @@ static int load_video(const char *fn)
   if (!g_rgb)
     return -1;
   copy_name(fn);
+  media_tags_read(fn, &g_tags);
   g_is_video = true;
   layout_video();
   if (video_reopen() != 0)
@@ -342,7 +459,9 @@ static void session_sync(void)
   }
   struct media_info in = {0};
   strlcpy(in.app, "Player", sizeof in.app);
-  strlcpy(in.title, basename_of(g_fn), sizeof in.title);
+  strlcpy(in.title, display_title(), sizeof in.title);
+  strlcpy(in.artist, g_tags.artist, sizeof in.artist);
+  strlcpy(in.album, g_tags.album, sizeof in.album);
   in.state = g_state == ST_PLAYING ? MEDIA_PLAYING : g_state == ST_PAUSED ? MEDIA_PAUSED : MEDIA_STOPPED;
   in.pos_ms = session_pos_ms();
   in.dur_ms = g_is_video ? media_video_duration_ms(g_vid) : media_duration_ms(g_dec);
@@ -453,8 +572,10 @@ static void render_audio(void)
   int have = (g_state != ST_EMPTY);
   gfx_clear(COL_BG);
   gfx_fill_rect(0, 0, g_W, HDR_H, COL_HDR);
-  const char *title = have ? basename_of(g_fn) : "No file loaded";
-  gfx_ui_text((g_W - gfx_ui_width(title)) / 2, (HDR_H - UIFONT_H) / 2, title, COL_TITLE);
+  const char *title = have ? display_title() : "No file loaded";
+  int tw = g_W - 2 * BAR_X;
+  gfx_ui_text_clip(g_W / 2 - (gfx_ui_width(title) < tw ? gfx_ui_width(title) : tw) / 2, (HDR_H - UIFONT_H) / 2, title,
+                   COL_TITLE, tw);
 
   if (!have) {
     const char *h1 = "Open a song or video from the terminal:";
@@ -469,6 +590,24 @@ static void render_audio(void)
   unsigned pos = media_position_ms(g_dec), dur = media_duration_ms(g_dec);
   int bar_y = BAR_Y;
   gfx_fill_rect(0, HDR_H, g_W, g_H - HDR_H, COL_BG);
+  if (g_cov_w) {
+    unsigned *fb = win_fb();
+    int cx = (g_W - g_cov_w) / 2, cy = HDR_H + 8 + (COVER_SZ - g_cov_h) / 2;
+    for (int y = 0; y < g_cov_h; y++)
+      memcpy(fb + (unsigned)(cy + y) * g_W + cx, g_cov + y * g_cov_w, (unsigned)g_cov_w * 4);
+  }
+  if (g_tags.artist[0] || g_tags.album[0]) {
+    char sub[2 * MEDIA_TAG_MAX + 4];
+    int n = strlen(g_tags.artist);
+    strlcpy(sub, g_tags.artist, sizeof sub);
+    if (n && g_tags.album[0]) {
+      strlcpy(sub + n, " - ", 4);
+      n += 3;
+    }
+    strlcpy(sub + n, g_tags.album, sizeof sub - n);
+    int sw = gfx_ui_width(sub) < tw ? gfx_ui_width(sub) : tw;
+    gfx_ui_text_clip(g_W / 2 - sw / 2, HDR_H + 14 + g_ext, sub, COL_DIM, tw);
+  }
   progress_draw(BAR_X, bar_y, g_W - 2 * BAR_X, GUI_PROGRESS_H, (int)(dur && pos > dur ? dur : pos),
                 (int)(dur ? dur : 1), 0);
   char el[8], tt[8];
@@ -566,7 +705,7 @@ int main(int argc, char **argv)
     /* window sized to the video below */
   } else if (argc >= 2 && load_audio(argv[1]) == 0) {
     g_W = CW;
-    g_H = CH;
+    g_H = CH + g_ext;
   } else {
     g_W = CW;
     g_H = CH;

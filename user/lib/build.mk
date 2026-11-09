@@ -87,7 +87,7 @@ OGG     := user/lib/ogg/ogg.o user/lib/ogg/vorbis.o user/lib/ogg/oggplay.o
 # and Vorbis use pow/sqrt/trig). Its .m4a/.mp4 path also calls the MP4 demuxer, so a consumer
 # that plays AAC-in-MP4 must link $(MP4) + $(MATH) too (both media consumers
 # already do via $(VIDEO) / their own $(MATH)).
-MEDIA   := user/lib/media/media.o $(MP3) $(ALAC) $(AAC) $(OGG)
+MEDIA   := user/lib/media/media.o user/lib/media/tags.o $(MP3) $(ALAC) $(AAC) $(OGG)
 # video: the media engine's H.264 picture path (media.h media_video_*). A thin
 # front end over $(H264) + $(MP4) that decodes a local .264/.mp4 to timed RGB
 # frames. Linked only by video consumers so audio-only programs skip the decoder.

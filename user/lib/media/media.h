@@ -53,6 +53,19 @@ unsigned media_duration_ms(const media_decoder *d);
  * MPEG seeks by byte offset (the decoder resyncs on the next frame). */
 void media_seek_ms(media_decoder *d, unsigned ms);
 
+/* ---- tags: title/artist/album read from a file's metadata ------------------
+ * ID3v2/ID3v1 (MP3, ADTS), MP4 ilst (.m4a/.mp4), FLAC, Ogg Vorbis/Opus and RIFF INFO (WAV), as UTF-8.
+ * Fields the file doesn't carry are empty. Returns 1 if any field was found. */
+#define MEDIA_TAG_MAX 96
+struct media_tags {
+  char title[MEDIA_TAG_MAX], artist[MEDIA_TAG_MAX], album[MEDIA_TAG_MAX];
+};
+int media_tags_read(const char *path, struct media_tags *t);
+
+/* The embedded cover image (JPEG/PNG/..., front cover preferred) as a malloc'd buffer, or NULL with *len 0 if
+ * the file has none or it exceeds 8 MiB. Same formats as above except WAV. */
+unsigned char *media_cover_read(const char *path, unsigned *len);
+
 /* ---- software mixer + one playback thread -------------------------------- */
 typedef struct media_source media_source;
 
