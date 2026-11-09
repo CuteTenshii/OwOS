@@ -1902,6 +1902,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_document_proto, "createTextNode", doc_create_text, 1);
   def_method(g_document_proto, "createDocumentFragment", doc_create_frag, 0);
   def_method(g_document_proto, "createComment", doc_create_comment, 1);
+  def_method(g_document_proto, "createTreeWalker", doc_create_tree_walker, 3);
+  def_method(g_document_proto, "createNodeIterator", doc_create_node_iterator, 3);
   def_method(g_document_proto, "createEvent", doc_create_event, 1);
   def_method(g_document_proto, "importNode", doc_import_node, 2);
   def_method(g_document_proto, "adoptNode", doc_adopt_node, 1);
@@ -2259,6 +2261,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "Node", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
+  treewalker_install(ctx, win);
   {
     js_object *he = js_new_native(ctx, htmlelement_ctor, "HTMLElement", 0);
     js_object *ce = js_new_object(ctx, ctx->object_proto);

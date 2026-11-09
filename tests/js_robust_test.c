@@ -389,6 +389,56 @@ static void check_generator_stack_guard(void)
              0));
 }
 
+static void check_date(void)
+{
+  expect(run(
+      "function p(s){ return Date.parse(s); }\n"
+      "expect(p('2024-01-02')===1704153600000 && p('2024-01-02T03:04:05.678+01:00')===1704161045678, 'ISO forms');\n"
+      "expect(p('2024')===1704067200000 && p('2024-01-02T03:04')===1704164640000, 'partial ISO forms');\n"
+      "expect(p('Tue, 02 Jan 2024 15:04:05 GMT')===1704207845000, 'RFC 1123');\n"
+      "expect(p('January 2, 2024 3:04:05 PM')===1704207845000 && p('Jan 2, 2024')===1704153600000, 'month names');\n"
+      "expect(p('2 Jan 2024 10:00 GMT+0100')===1704186000000 && p('Jan 2 2024 12:00 AM EST')===1704171600000, "
+      "'zones');\n"
+      "expect(p('1/2/2024')===1704153600000 && p('2024/01/02')===1704153600000, 'numeric dates');\n"
+      "expect(p(new Date(5).toString())===0, 'toString output parses back to the second');\n"
+      "expect(isNaN(p('garbage')) && isNaN(p('')) && isNaN(p('2024-13-01')) && isNaN(p()), 'invalid input is NaN');\n"
+      "expect(new Date('2024-01-02T03:04:05Z').getTime()===1704164645000, 'constructor parses strings');\n"
+      "expect(new Date(new Date(5)).getTime()===5 && isNaN(new Date(8.64e15+1)), 'copy and range');\n"
+      "expect(Date.UTC(2020,11,31,23,59,59,999)===1609459199999 && Date.UTC(99)===915148800000 && isNaN(Date.UTC()), "
+      "'UTC');\n"
+      "expect(new Date(2020,12,1).toISOString()==='2021-01-01T00:00:00.000Z', 'month overflow rolls the year');\n"
+      "var d=new Date(2024,0,31,10);\n"
+      "d.setMonth(1); expect(d.toISOString()==='2024-03-02T10:00:00.000Z', 'setMonth overflows the day');\n"
+      "d.setDate(0); expect(d.toISOString()==='2024-02-29T10:00:00.000Z', 'setDate(0)');\n"
+      "d.setUTCHours(25,61,61,1001); expect(d.toISOString()==='2024-03-01T02:02:02.001Z', 'setHours carries');\n"
+      "expect(d.setFullYear(2020,1,29)===d.getTime() && d.getUTCDate()===29, 'setFullYear returns the time');\n"
+      "expect(d.setTime(5)===5 && d.getTime()===5, 'setTime');\n"
+      "var s=new Date(0);\n"
+      "expect(s.toUTCString()==='Thu, 01 Jan 1970 00:00:00 GMT' && s.toDateString()==='Thu Jan 01 1970', 'UTC and date "
+      "strings');\n"
+      "expect(s.toString()==='Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)', 'toString');\n"
+      "var bad=new Date('x'), thrown=false;\n"
+      "expect(String(bad)==='Invalid Date' && isNaN(bad.getFullYear()) && JSON.stringify({a:bad})==='{\"a\":null}', "
+      "'invalid dates');\n"
+      "expect(isNaN(bad.setHours(1)) && isNaN(bad.getTime()), 'setters keep an invalid date invalid');\n"
+      "try { bad.toISOString(); } catch (e) { thrown=e instanceof RangeError; }\n"
+      "expect(thrown, 'toISOString throws RangeError');\n"
+      "expect(new Date(-62198755200000).toISOString()==='-000001-01-01T00:00:00.000Z', 'expanded years');\n",
+      0));
+}
+
+static void check_intl_supported_locales(void)
+{
+  expect(run("var names=['DateTimeFormat','NumberFormat','Collator','PluralRules','RelativeTimeFormat','ListFormat',"
+             "'Segmenter'];\n"
+             "names.forEach(function(n){ var r=Intl[n].supportedLocalesOf(['en-US','fr']);\n"
+             "  expect(r.length===2 && r[0]==='en-US' && r[1]==='fr', n+'.supportedLocalesOf'); });\n"
+             "expect(Intl.NumberFormat.supportedLocalesOf('de')[0]==='de' && "
+             "Intl.PluralRules.supportedLocalesOf().length===0, "
+             "'string and missing argument');\n",
+             0));
+}
+
 int main(void)
 {
   test("regexp matches whole code points, not bytes", check_regexp_code_points);
@@ -407,5 +457,7 @@ int main(void)
   test("async generators and for await", check_async_generators);
   test("generator state survives collection", check_generator_gc);
   test("generator bodies are stack-guarded", check_generator_stack_guard);
+  test("Date parsing, UTC, setters and string forms", check_date);
+  test("Intl supportedLocalesOf", check_intl_supported_locales);
   return 0;
 }

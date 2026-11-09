@@ -7115,16 +7115,44 @@ static void date_civil(double ms, int *Y, int *Mo, int *D, int *h, int *mi, int 
   *Mo = m - 1;
   *D = d;
 }
-static double date_from_civil(int Y, int Mo, int D, int h, int mi, int s, int ms)
+#define DATE_NAN (0.0 / 0.0)
+static int date_finite(double x) { return x == x && x - x == 0 && x > -1e15 && x < 1e15; }
+static double date_trunc(double x) { return (double)(long long)x; }
+static double date_floor(double x)
 {
-  int m = Mo + 1;
-  long long yy = Y - (m <= 2);
-  long long era = (yy >= 0 ? yy : yy - 399) / 400;
-  long long yoe = yy - era * 400;
-  long long doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + D - 1;
-  long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  long long days = era * 146097 + doe - 719468;
-  return (double)(days * 86400LL + (long long)h * 3600 + mi * 60 + s) * 1000.0 + ms;
+  double t = date_trunc(x);
+  return t > x ? t - 1 : t;
+}
+static double date_clip(double t) { return t >= -8.64e15 && t <= 8.64e15 ? date_trunc(t) + 0.0 : DATE_NAN; }
+static int date_dim(long long y, int mo)
+{
+  static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  return mo == 1 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 29 : d[mo];
+}
+/* Fields may be out of range (month 12 rolls into the next year); NaN when any is not finite */
+static double date_make(double Y, double Mo, double D, double h, double mi, double s, double ms)
+{
+  double ym, mn, days;
+  long long yy, era, yoe, doy, doe;
+  int m;
+  if (!date_finite(Y) || !date_finite(Mo) || !date_finite(D) || !date_finite(h) || !date_finite(mi) ||
+      !date_finite(s) || !date_finite(ms))
+    return DATE_NAN;
+  Y = date_trunc(Y);
+  Mo = date_trunc(Mo);
+  ym = Y + date_floor(Mo / 12);
+  mn = Mo - date_floor(Mo / 12) * 12;
+  if (ym > 400000 || ym < -400000)
+    return DATE_NAN;
+  m = (int)mn + 1;
+  yy = (long long)ym - (m <= 2);
+  era = (yy >= 0 ? yy : yy - 399) / 400;
+  yoe = yy - era * 400;
+  doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5;
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  days = (double)(era * 146097 + doe - 719468) + date_trunc(D) - 1;
+  return date_clip(days * 86400000.0 + date_trunc(h) * 3600000.0 + date_trunc(mi) * 60000.0 + date_trunc(s) * 1000.0 +
+                   date_trunc(ms));
 }
 static int date_pad(char *out, int v, int w)
 {
@@ -7143,24 +7171,294 @@ static js_value date_now(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)n;
   return js_number(ctx->now_ms ? (double)ctx->now_ms() : 0);
 }
+static const char *const k_mon_names = "JanFebMarAprMayJunJulAugSepOctNovDec";
+static const char *const k_day_names = "SunMonTueWedThuFriSat";
+
+static int date_digits(const char **p, int max, int *len)
+{
+  int v = 0, n = 0;
+  while (n < max && **p >= '0' && **p <= '9') {
+    v = v * 10 + (**p - '0');
+    (*p)++;
+    n++;
+  }
+  *len = n;
+  return v;
+}
+
+/* ISO 8601 subset of the spec; NaN when `s` is not in that form */
+static double date_parse_iso(const char *s)
+{
+  int Y, Mo = 1, D = 1, h = 0, mi = 0, sec = 0, len, sign = 1, tz = 0;
+  double ms = 0;
+  if (*s == '+' || *s == '-') {
+    sign = *s == '-' ? -1 : 1;
+    s++;
+    Y = date_digits(&s, 6, &len);
+    if (len != 6 || (sign < 0 && Y == 0))
+      return DATE_NAN;
+  } else {
+    Y = date_digits(&s, 4, &len);
+    if (len != 4)
+      return DATE_NAN;
+  }
+  Y *= sign;
+  if (*s == '-') {
+    s++;
+    Mo = date_digits(&s, 2, &len);
+    if (len != 2)
+      return DATE_NAN;
+    if (*s == '-') {
+      s++;
+      D = date_digits(&s, 2, &len);
+      if (len != 2)
+        return DATE_NAN;
+    }
+  }
+  if (Mo < 1 || Mo > 12 || D < 1 || D > date_dim(Y, Mo - 1))
+    return DATE_NAN;
+  if (*s == 'T' || *s == 't' || *s == ' ') {
+    s++;
+    h = date_digits(&s, 2, &len);
+    if (len != 2 || *s++ != ':')
+      return DATE_NAN;
+    mi = date_digits(&s, 2, &len);
+    if (len != 2)
+      return DATE_NAN;
+    if (*s == ':') {
+      s++;
+      sec = date_digits(&s, 2, &len);
+      if (len != 2)
+        return DATE_NAN;
+      if (*s == '.' || *s == ',') {
+        double scale = 100;
+        s++;
+        if (*s < '0' || *s > '9')
+          return DATE_NAN;
+        for (; *s >= '0' && *s <= '9'; s++, scale /= 10)
+          ms += (*s - '0') * scale;
+      }
+    }
+    if (h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi || sec || ms)))
+      return DATE_NAN;
+    if (*s == 'Z' || *s == 'z') {
+      s++;
+    } else if (*s == '+' || *s == '-') {
+      int oh, om;
+      sign = *s++ == '-' ? -1 : 1;
+      oh = date_digits(&s, 2, &len);
+      if (len != 2)
+        return DATE_NAN;
+      if (*s == ':')
+        s++;
+      om = date_digits(&s, 2, &len);
+      if (len != 2 || oh > 23 || om > 59)
+        return DATE_NAN;
+      tz = sign * (oh * 60 + om);
+    }
+  }
+  if (*s)
+    return DATE_NAN;
+  return date_make(Y, Mo - 1, D, h, mi, sec, 0) + date_trunc(ms) - tz * 60000.0;
+}
+
+static int date_word_is(const char *w, int wl, const char *lit)
+{
+  int i;
+  for (i = 0; i < wl; i++)
+    if (!lit[i] || (w[i] | 0x20) != lit[i])
+      return 0;
+  return !lit[wl];
+}
+
+/* Index of the 3-letter abbreviation packed in `names` that the word starts with, or -1 */
+static int date_name_idx(const char *w, int wl, const char *names, int count)
+{
+  int i;
+  if (wl < 3)
+    return -1;
+  for (i = 0; i < count; i++)
+    if ((w[0] | 0x20) == (names[i * 3] | 0x20) && (w[1] | 0x20) == (names[i * 3 + 1] | 0x20) &&
+        (w[2] | 0x20) == (names[i * 3 + 2] | 0x20))
+      return i;
+  return -1;
+}
+
+/* Free-form dates: "Jan 2, 2006 15:04:05 GMT+0100", "Mon, 02 Jan 2006 15:04:05 GMT", "1/2/2006 3:04 PM", ... */
+static double date_parse_legacy(const char *s)
+{
+  int year = -1, mon = -1, day = -1, h = -1, mi = 0, sec = 0, ms = 0, pm = -1, tz = 0, len, i;
+  while (*s) {
+    unsigned char c = (unsigned char)*s;
+    if (c == ' ' || c == ',' || c == '\t' || c == '\n' || c == '.') {
+      s++;
+    } else if (c == '(') {
+      while (*s && *s != ')')
+        s++;
+      if (*s)
+        s++;
+    } else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') {
+      const char *w = s;
+      int wl;
+      while (((unsigned char)*s | 0x20) >= 'a' && ((unsigned char)*s | 0x20) <= 'z')
+        s++;
+      wl = (int)(s - w);
+      if (date_word_is(w, wl, "am") || date_word_is(w, wl, "pm")) {
+        pm = (w[0] | 0x20) == 'p';
+        continue;
+      }
+      if (date_word_is(w, wl, "gmt") || date_word_is(w, wl, "utc") || date_word_is(w, wl, "ut") ||
+          date_word_is(w, wl, "z"))
+        continue;
+      if (date_word_is(w, wl, "st") || date_word_is(w, wl, "nd") || date_word_is(w, wl, "rd") ||
+          date_word_is(w, wl, "th") || date_word_is(w, wl, "t") || date_word_is(w, wl, "at"))
+        continue;
+      {
+        static const struct {
+          const char *name;
+          int min;
+        } zones[] = {{"est", -300}, {"edt", -240}, {"cst", -360}, {"cdt", -300},
+                     {"mst", -420}, {"mdt", -360}, {"pst", -480}, {"pdt", -420}};
+        for (i = 0; i < 8; i++)
+          if (date_word_is(w, wl, zones[i].name)) {
+            tz = zones[i].min;
+            break;
+          }
+        if (i < 8)
+          continue;
+      }
+      if ((i = date_name_idx(w, wl, k_mon_names, 12)) >= 0) {
+        mon = i;
+        continue;
+      }
+      if (date_name_idx(w, wl, k_day_names, 7) >= 0)
+        continue;
+      return DATE_NAN;
+    } else if ((c == '+' || c == '-') && (h >= 0 || tz) && s[1] >= '0' && s[1] <= '9') {
+      int oh, om = 0, sign = c == '-' ? -1 : 1;
+      s++;
+      oh = date_digits(&s, 4, &len);
+      if (len > 2) {
+        om = oh % 100;
+        oh /= 100;
+      } else if (*s == ':') {
+        s++;
+        om = date_digits(&s, 2, &len);
+      }
+      if (oh > 23 || om > 59)
+        return DATE_NAN;
+      tz = sign * (oh * 60 + om);
+    } else if (c == '-' || c == '/') {
+      s++;
+    } else if (c >= '0' && c <= '9') {
+      int v = date_digits(&s, 9, &len);
+      if (*s == ':') {
+        h = v;
+        s++;
+        mi = date_digits(&s, 2, &len);
+        if (*s == ':') {
+          s++;
+          sec = date_digits(&s, 2, &len);
+          if (*s == '.') {
+            int scale = 100;
+            s++;
+            for (; *s >= '0' && *s <= '9'; s++, scale /= 10)
+              ms += (*s - '0') * scale;
+          }
+        }
+      } else if ((*s == '/' || (*s == '-' && s[1] >= '0' && s[1] <= '9' && mon < 0)) && mon < 0) {
+        int b, cc = -1, bl, cl = 0;
+        s++;
+        b = date_digits(&s, 9, &bl);
+        if (*s == '/' || *s == '-') {
+          s++;
+          cc = date_digits(&s, 9, &cl);
+        }
+        if (len >= 3) {
+          year = v;
+          mon = b - 1;
+          day = cc < 0 ? 1 : cc;
+        } else {
+          mon = v - 1;
+          day = b;
+          if (cc < 0)
+            return DATE_NAN;
+          year = cl <= 2 ? (cc < 50 ? 2000 + cc : 1900 + cc) : cc;
+        }
+      } else if (len >= 3 || v > 31 || day >= 0) {
+        if (year >= 0)
+          return DATE_NAN;
+        year = len <= 2 ? (v < 50 ? 2000 + v : 1900 + v) : v;
+      } else {
+        day = v;
+      }
+    } else {
+      return DATE_NAN;
+    }
+  }
+  if (year < 0 || mon < 0 || mon > 11 || (day != -1 && (day < 1 || day > 31)))
+    return DATE_NAN;
+  if (h < 0)
+    h = 0;
+  if (pm >= 0) {
+    if (h < 1 || h > 12)
+      return DATE_NAN;
+    h = h % 12 + (pm ? 12 : 0);
+  }
+  if (h > 24 || mi > 59 || sec > 59)
+    return DATE_NAN;
+  return date_make(year, mon, day < 0 ? 1 : day, h, mi, sec, ms) - tz * 60000.0;
+}
+
+static double date_parse_str(const char *s)
+{
+  double t;
+  while (*s == ' ' || *s == '\t' || *s == '\n')
+    s++;
+  t = date_parse_iso(s);
+  return t == t ? t : date_parse_legacy(s);
+}
+
+static double date_from_args(js_ctx *ctx, js_value *a, int n)
+{
+  double f[7] = {0, 0, 1, 0, 0, 0, 0};
+  int i;
+  for (i = 0; i < n && i < 7; i++)
+    f[i] = js_to_number(ctx, a[i]);
+  if (f[0] == f[0] && date_trunc(f[0]) >= 0 && date_trunc(f[0]) <= 99)
+    f[0] = 1900 + date_trunc(f[0]);
+  return date_make(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+}
+static js_value date_utc(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)t;
+  return js_number(n ? date_from_args(ctx, a, n) : DATE_NAN);
+}
+static js_value date_parse(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value str = js_to_string(ctx, n ? a[0] : js_undef());
+  (void)t;
+  return js_number(str.type == JV_STR ? date_parse_str(str.u.str->data) : DATE_NAN);
+}
 static js_value date_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n)
 {
   double ms;
   js_object *o;
   (void)thisv;
-  if (n == 0)
+  if (n == 0) {
     ms = ctx->now_ms ? (double)ctx->now_ms() : 0;
-  else if (n == 1)
-    ms = js_to_number(ctx, a[0]); /* new Date(ms) */
-  else {                          /* new Date(y, mo, d, ...) — UTC */
-    int y = js_to_int_sat(ctx, a[0]);
-    int mo = js_to_int_sat(ctx, a[1]);
-    int d = n > 2 ? js_to_int_sat(ctx, a[2]) : 1;
-    int h = n > 3 ? js_to_int_sat(ctx, a[3]) : 0;
-    int mi = n > 4 ? js_to_int_sat(ctx, a[4]) : 0;
-    int s = n > 5 ? js_to_int_sat(ctx, a[5]) : 0;
-    int milc = n > 6 ? js_to_int_sat(ctx, a[6]) : 0;
-    ms = date_from_civil(y, mo, d, h, mi, s, milc);
+  } else if (n == 1) {
+    js_value v = a[0];
+    if (v.type == JV_OBJ && v.u.obj->proto == ctx->date_proto)
+      ms = date_t(ctx, v);
+    else {
+      v = js_to_primitive(ctx, v, 1);
+      if (ctx->has_exc)
+        return js_undef();
+      ms = v.type == JV_STR ? date_parse_str(v.u.str->data) : date_clip(js_to_number(ctx, v));
+    }
+  } else {
+    ms = date_from_args(ctx, a, n);
   }
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, ctx->date_proto));
@@ -7178,9 +7476,12 @@ static js_value date_getTime(js_ctx *ctx, js_value t, js_value *a, int n)
   static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
   {                                                                                                                    \
     int c[8];                                                                                                          \
+    double tv = date_t(ctx, t);                                                                                        \
     (void)a;                                                                                                           \
     (void)n;                                                                                                           \
-    date_civil(date_t(ctx, t), &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);                                \
+    if (tv != tv)                                                                                                      \
+      return js_number(DATE_NAN);                                                                                      \
+    date_civil(tv, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);                                            \
     return js_number(c[idx]);                                                                                          \
   }
 DATE_GET(date_getFullYear, 0)
@@ -7203,12 +7504,20 @@ static js_value date_tzoff(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value date_iso(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   int Y, Mo, D, h, mi, s, ms, dw;
+  double tv = date_t(ctx, t);
   char b[40];
   int i = 0;
   (void)a;
   (void)n;
-  date_civil(date_t(ctx, t), &Y, &Mo, &D, &h, &mi, &s, &ms, &dw);
-  i += date_pad(b + i, Y, 4);
+  if (tv != tv)
+    return js_throw_range(ctx, "Invalid time value");
+  date_civil(tv, &Y, &Mo, &D, &h, &mi, &s, &ms, &dw);
+  if (Y < 0 || Y > 9999) {
+    b[i++] = Y < 0 ? '-' : '+';
+    i += date_pad(b + i, Y < 0 ? -Y : Y, 6);
+  } else {
+    i += date_pad(b + i, Y, 4);
+  }
   b[i++] = '-';
   i += date_pad(b + i, Mo + 1, 2);
   b[i++] = '-';
@@ -7224,6 +7533,117 @@ static js_value date_iso(js_ctx *ctx, js_value t, js_value *a, int n)
   b[i++] = 'Z';
   b[i] = '\0';
   return js_mk_string(ctx, b, i);
+}
+static js_value date_tojson(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  double tv = date_t(ctx, t);
+  return tv != tv ? js_null() : date_iso(ctx, t, a, n);
+}
+
+/* style 0: "Tue Jan 02 2024 15:04:05 GMT+0000 (Coordinated Universal Time)", 1: date part, 2: time part,
+ * 3: "Tue, 02 Jan 2024 15:04:05 GMT" */
+static js_value date_format(js_ctx *ctx, js_value t, int style)
+{
+  int Y, Mo, D, h, mi, s, ms, dw, i = 0;
+  double tv = date_t(ctx, t);
+  char b[96];
+  if (tv != tv)
+    return js_mk_cstring(ctx, "Invalid Date");
+  date_civil(tv, &Y, &Mo, &D, &h, &mi, &s, &ms, &dw);
+#define PUT3(names, k)                                                                                                 \
+  do {                                                                                                                 \
+    memcpy(b + i, (names) + (k) * 3, 3);                                                                               \
+    i += 3;                                                                                                            \
+  } while (0)
+  if (style == 3) {
+    PUT3(k_day_names, dw);
+    b[i++] = ',';
+    b[i++] = ' ';
+    i += date_pad(b + i, D, 2);
+    b[i++] = ' ';
+    PUT3(k_mon_names, Mo);
+    b[i++] = ' ';
+  } else if (style != 2) {
+    PUT3(k_day_names, dw);
+    b[i++] = ' ';
+    PUT3(k_mon_names, Mo);
+    b[i++] = ' ';
+    i += date_pad(b + i, D, 2);
+    b[i++] = ' ';
+  }
+#undef PUT3
+  if (style != 2)
+    i += date_pad(b + i, Y < 0 ? -Y : Y, 4);
+  if (style != 1) {
+    if (style != 2)
+      b[i++] = ' ';
+    i += date_pad(b + i, h, 2);
+    b[i++] = ':';
+    i += date_pad(b + i, mi, 2);
+    b[i++] = ':';
+    i += date_pad(b + i, s, 2);
+    memcpy(b + i, style == 3 ? " GMT" : " GMT+0000", style == 3 ? 4 : 9);
+    i += style == 3 ? 4 : 9;
+    if (style != 3) {
+      static const char zone[] = " (Coordinated Universal Time)";
+      memcpy(b + i, zone, sizeof zone - 1);
+      i += (int)sizeof zone - 1;
+    }
+  }
+  return js_mk_string(ctx, b, i);
+}
+#define DATE_FORMAT(fn, style)                                                                                         \
+  static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
+  {                                                                                                                    \
+    (void)a;                                                                                                           \
+    (void)n;                                                                                                           \
+    return date_format(ctx, t, style);                                                                                 \
+  }
+DATE_FORMAT(date_tostring, 0)
+DATE_FORMAT(date_todatestring, 1)
+DATE_FORMAT(date_totimestring, 2)
+DATE_FORMAT(date_toutcstring, 3)
+#undef DATE_FORMAT
+
+static js_value date_setTime(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  double v = date_clip(js_to_number(ctx, n ? a[0] : js_undef()));
+  if (t.type == JV_OBJ)
+    js_def(t.u.obj, "@t", js_number(v), 0);
+  return js_number(v);
+}
+/* setFullYear, setMonth, ... : the native's data is first_field * 8 + max_args over [Y, Mo, D, h, mi, s, ms] */
+static js_value date_set(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  int spec = (int)ctx->native_data.u.num, first = spec / 8, max = spec % 8, i;
+  double f[7], tv = date_t(ctx, t), v;
+  int c[8];
+  if (tv != tv) {
+    if (first != 0)
+      return js_number(DATE_NAN);
+    tv = 0;
+  }
+  date_civil(tv, &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+  for (i = 0; i < 7; i++)
+    f[i] = c[i];
+  for (i = 0; i < max && i < n; i++)
+    f[first + i] = js_to_number(ctx, a[i]);
+  if (n == 0)
+    f[first] = DATE_NAN;
+  v = date_make(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+  if (t.type == JV_OBJ)
+    js_def(t.u.obj, "@t", js_number(v), 0);
+  return js_number(v);
+}
+static void def_date_setter(js_ctx *ctx, const char *name, int first, int max)
+{
+  js_object *f;
+  gc_push_scope();
+  f = (js_object *)gc_keep(js_new_native(ctx, date_set, name, max));
+  f->fn->data = js_number(first * 8 + max);
+  gc_write_barrier(f);
+  js_def(ctx->date_proto, name, js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
 }
 
 /* ------------------------------------------------------- base64 ----------- *
@@ -9516,6 +9936,8 @@ static js_value date_tolocale(js_ctx *ctx, js_value t, js_value *a, int n, int m
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
+  if (date_t(ctx, t) != date_t(ctx, t))
+    return js_mk_cstring(ctx, "Invalid Date");
   date_civil(date_t(ctx, t), &Y, &Mo, &D, &h, &mi, &s, &mil, &dow);
   if (mode != 2) {
     intl_app_int(&sb, Mo + 1);
@@ -9622,6 +10044,8 @@ static js_object *intl_sub(js_ctx *ctx, js_object *intl, const char *name, js_na
   js_def(c, "prototype", js_obj_value(proto), 0);
   js_def(proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
   js_def(intl, name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+  if (!streq(name, "Locale"))
+    js_def_native(ctx, c, "supportedLocalesOf", intl_canonical, 1);
   gc_pop_scope();
   if (proto_out)
     *proto_out = proto;
@@ -10108,11 +10532,35 @@ void js_setup_builtins(js_ctx *ctx)
   js_def_native(ctx, ctx->date_proto, "getUTCMilliseconds", date_getMilliseconds, 0);
   js_def_native(ctx, ctx->date_proto, "getTimezoneOffset", date_tzoff, 0);
   js_def_native(ctx, ctx->date_proto, "toISOString", date_iso, 0);
-  js_def_native(ctx, ctx->date_proto, "toJSON", date_iso, 0);
-  js_def_native(ctx, ctx->date_proto, "toString", date_iso, 0);
+  js_def_native(ctx, ctx->date_proto, "toJSON", date_tojson, 1);
+  js_def_native(ctx, ctx->date_proto, "toString", date_tostring, 0);
+  js_def_native(ctx, ctx->date_proto, "toDateString", date_todatestring, 0);
+  js_def_native(ctx, ctx->date_proto, "toTimeString", date_totimestring, 0);
+  js_def_native(ctx, ctx->date_proto, "toUTCString", date_toutcstring, 0);
+  js_def_native(ctx, ctx->date_proto, "toGMTString", date_toutcstring, 0);
+  js_def_native(ctx, ctx->date_proto, "setTime", date_setTime, 1);
+  {
+    static const struct {
+      const char *name, *utc_name;
+      int first, max;
+    } setters[] = {{"setFullYear", "setUTCFullYear", 0, 3},
+                   {"setMonth", "setUTCMonth", 1, 2},
+                   {"setDate", "setUTCDate", 2, 1},
+                   {"setHours", "setUTCHours", 3, 4},
+                   {"setMinutes", "setUTCMinutes", 4, 3},
+                   {"setSeconds", "setUTCSeconds", 5, 2},
+                   {"setMilliseconds", "setUTCMilliseconds", 6, 1}};
+    unsigned i;
+    for (i = 0; i < sizeof setters / sizeof setters[0]; i++) {
+      def_date_setter(ctx, setters[i].name, setters[i].first, setters[i].max);
+      def_date_setter(ctx, setters[i].utc_name, setters[i].first, setters[i].max);
+    }
+  }
   {
     js_object *dc = make_ctor(ctx, "Date", date_ctor, ctx->date_proto);
     js_def_native(ctx, dc, "now", date_now, 0);
+    js_def_native(ctx, dc, "parse", date_parse, 1);
+    js_def_native(ctx, dc, "UTC", date_utc, 7);
   }
 
   /* RegExp: prototype methods + the constructor (also reachable as the type of

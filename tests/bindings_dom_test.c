@@ -568,6 +568,45 @@ static void test_attribute_selectors_in_script(void)
              "':not([attr])');\n");
 }
 
+static void test_tree_walker_and_node_iterator(void)
+{
+  run_script(
+      "var d=document, host=d.createElement('section'); host.innerHTML='<div id=tw>hi<span>s</span></div><p></p>';\n"
+      "var a=host.firstChild;\n"
+      "expect(NodeFilter.SHOW_ALL===0xFFFFFFFF && NodeFilter.SHOW_TEXT===4 && NodeFilter.FILTER_SKIP===3, 'consts');\n"
+      "var w=d.createTreeWalker(a, NodeFilter.SHOW_ELEMENT);\n"
+      "expect(w.root===a && w.currentNode===a && w.whatToShow===1 && w.filter===null, 'walker state');\n"
+      "expect(w.nextNode().tagName==='SPAN' && w.nextNode()===null && w.currentNode.tagName==='SPAN', 'nextNode');\n"
+      "expect(w.previousNode()===a && w.previousNode()===null, 'previousNode stops at root');\n"
+      "var t=d.createTreeWalker(a, NodeFilter.SHOW_TEXT), s='';\n"
+      "while (t.nextNode()) s+=t.currentNode.data;\n"
+      "expect(s==='his', 'text nodes: '+s);\n"
+      "var all=d.createTreeWalker(host), n=0;\n"
+      "while (all.nextNode()) n++;\n"
+      "expect(n===5, 'SHOW_ALL count: '+n);\n"
+      "var f=d.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, {acceptNode: function(x){ return x.id==='tw' ? "
+      "NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT; }});\n"
+      "var fc=f.firstChild();\n"
+      "expect(fc.tagName==='P' && f.nextSibling()===null, 'REJECT skips the subtree');\n"
+      "var g=d.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, function(x){ return x.id==='tw' ? "
+      "NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT; });\n"
+      "var gc=g.firstChild();\n"
+      "expect(gc.tagName==='SPAN' && g.parentNode()===host, 'SKIP descends, parentNode may return root');\n"
+      "var p=d.createTreeWalker(host); p.currentNode=a.firstChild;\n"
+      "expect(p.parentNode()===a && p.lastChild().tagName==='SPAN' && p.previousSibling().nodeType===3, "
+      "'currentNode assignment and siblings');\n"
+      "var it=d.createNodeIterator(a, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT), seen=[];\n"
+      "expect(it.referenceNode===a && it.pointerBeforeReferenceNode===true, 'iterator state');\n"
+      "for (var x; x=it.nextNode();) seen.push(x.nodeType);\n"
+      "expect(seen.join()==='1,3,1,3', 'iterator order: '+seen.join());\n"
+      "expect(it.previousNode().nodeType===3 && it.previousNode().tagName==='SPAN', 'iterator backwards');\n"
+      "var threw=false; try { d.createTreeWalker(a,1,function(){ throw new Error('x'); }).nextNode(); } "
+      "catch (e) { threw=e.message==='x'; }\n"
+      "expect(threw, 'filter exceptions propagate');\n"
+      "var bad=false; try { d.createTreeWalker(null); } catch (e) { bad=e instanceof TypeError; }\n"
+      "expect(bad, 'root must be a node');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -595,6 +634,7 @@ int main(void)
   test("attribute selectors in querySelector, matches and closest", test_attribute_selectors_in_script);
   test("slotchange fires asynchronously for the affected slots", test_slotchange);
   test("template.content and declarative shadow roots", test_template_content_and_declarative_shadow);
+  test("TreeWalker, NodeIterator and NodeFilter", test_tree_walker_and_node_iterator);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;
