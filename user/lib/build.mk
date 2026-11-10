@@ -123,6 +123,13 @@ PROTOBUF := user/lib/protobuf/protobuf.o
 # Receiver control). Bare .o; a consumer also links $(PROTOBUF) $(JSON) $(MATH)
 # $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
 CAST    := user/lib/cast/cast.o
+# uuid: RFC 9562 UUIDs (v4, v5, v7), parse and format. Bare .o; a consumer also links $(CRYPTO).
+UUID    := user/lib/uuid/uuid.o
+# plist: Apple property lists (XML and binary) as a value tree. Bare .o; a consumer also links $(BASE64) $(MATH).
+PLIST   := user/lib/plist/plist.o
+# airplay: AirPlay 1 video sender - mDNS discovery + plain HTTP on port 7000 (/play, /rate, /scrub).
+# Bare .o; a consumer also links $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
+AIRPLAY := user/lib/airplay/airplay.o
 NOTIFY  := user/lib/notify/notify.o   # notifyd client (desktop notifications)
 TRAY    := user/lib/tray/tray.o       # compositor system tray client
 # mediactl: client for the mediad media session service; session.o is the shared codec + policy.
