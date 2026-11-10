@@ -1,12 +1,38 @@
 #include "main_int.h"
+#include "mutex.h"
 
 struct tab **tabs;
 int n_tabs;
 int active_tab = 0;
 struct tabbar tab_strip;
 static int tabs_cap;
+/* Guards the tabs array itself; CDP discovery threads list tabs while the UI adds and closes them */
+static mutex_t tabs_lk = MUTEX_INIT;
 
-static struct tab *tab_alloc(void) { return calloc(1, sizeof(struct tab)); }
+void make_unique_id(char out[33])
+{
+  static const char hex[] = "0123456789ABCDEF";
+  static unsigned fallback;
+  unsigned char r[16];
+  if (getrandom(r, sizeof r) != (int)sizeof r) /* uniqueness only needs to hold within this process */
+    for (int i = 0; i < (int)sizeof r; i++)
+      r[i] = (unsigned char)((++fallback * 2654435761u) >> 24);
+  for (int i = 0; i < (int)sizeof r; i++) {
+    out[2 * i] = hex[r[i] >> 4];
+    out[2 * i + 1] = hex[r[i] & 15];
+  }
+  out[32] = '\0';
+}
+
+static struct tab *tab_alloc(void)
+{
+  struct tab *t = calloc(1, sizeof *t);
+  if (t) {
+    make_unique_id(t->page.target_id);
+    make_unique_id(t->page.loader_id);
+  }
+  return t;
+}
 
 /* Room for `n` tabs; only called with the worker parked, as it indexes tabs too */
 static bool tabs_reserve(int n)
@@ -16,11 +42,13 @@ static bool tabs_reserve(int n)
   int cap = tabs_cap ? tabs_cap * 2 : 4;
   while (cap < n)
     cap *= 2;
+  mutex_lock(&tabs_lk);
   struct tab **nt = realloc(tabs, (unsigned)cap * sizeof *nt);
   if (nt) {
     tabs = nt;
     tabs_cap = cap;
   }
+  mutex_unlock(&tabs_lk);
   return nt != 0;
 }
 
@@ -34,6 +62,24 @@ int tabs_init(void)
   tabs[0] = t;
   n_tabs = 1;
   return 0;
+}
+
+void tabs_each_page(void (*fn)(const struct page *pg, bool active, void *ctx), void *ctx)
+{
+  mutex_lock(&tabs_lk);
+  for (int i = 0; i < n_tabs; i++)
+    fn(&tabs[i]->page, i == active_tab, ctx);
+  mutex_unlock(&tabs_lk);
+}
+
+bool tabs_has_target(const char *id)
+{
+  bool found = false;
+  mutex_lock(&tabs_lk);
+  for (int i = 0; i < n_tabs && !found; i++)
+    found = streq(tabs[i]->page.target_id, id);
+  mutex_unlock(&tabs_lk);
+  return found;
 }
 
 /* Free every heap buffer a page owns and zero it */
@@ -383,8 +429,10 @@ void new_tab(void)
     return;
   }
   tab_leave(active_tab);
+  mutex_lock(&tabs_lk);
   tabs[n_tabs] = t;
   active_tab = n_tabs++;
+  mutex_unlock(&tabs_lk);
   B->pg = &t->page; /* swap to the fresh page */
   devtools_view_load(&t->dt);
   strlcpy(t->label, "New Tab", sizeof t->label);
@@ -405,12 +453,14 @@ void close_tab(int i)
   if (was_active)
     devtools_reset_live(); /* its live devtools capture isn't in .cap */
   struct tab *gone = tabs[i];
+  mutex_lock(&tabs_lk);
   memmove(&tabs[i], &tabs[i + 1], (unsigned)(n_tabs - i - 1) * sizeof *tabs);
   n_tabs--;
   if (active_tab > i)
     active_tab--;
   else if (active_tab >= n_tabs)
     active_tab = n_tabs - 1;
+  mutex_unlock(&tabs_lk);
   page_free(&gone->page);
   devtools_view_free(&gone->dt);
   hist_clear(gone);

@@ -132,8 +132,17 @@ struct inl_img {
   signed char fgray, finvert; /* filter grayscale / invert percent */
 };
 
+/* 32 random hex digits, the shape Chrome gives target and frame ids */
+void make_unique_id(char out[33]);
+struct page;
+/* For threads other than the UI: visit every tab's page, or test an id, with the tab table locked */
+void tabs_each_page(void (*fn)(const struct page *pg, bool active, void *ctx), void *ctx);
+bool tabs_has_target(const char *id);
+
 /* One tab's rendered document; B->pg points at the active tab's. */
 struct page {
+  char target_id[33]; /* CDP target and main-frame id, fixed for the tab's life */
+  char loader_id[33];
   char doc_title[128];
   char ctype[80]; /* lowercased response Content-Type      */
   int mode;       /* enum render_mode for the current body */

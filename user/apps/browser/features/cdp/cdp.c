@@ -22,10 +22,8 @@
 double strtod(const char *s, char **end); /* $(MATH), for a numeric eval result */
 
 #define CDP_PORT 9222
-#define TARGET_ID "owos-page-1"
-#define FRAME_ID "owos-frame-1"
-#define LOADER_ID "owos-loader-1"
-#define WS_PATH "/devtools/page/" TARGET_ID
+#define PAGE_WS_PREFIX "/devtools/page/"
+#define BROWSER_WS_PREFIX "/devtools/browser/"
 #define CDP_WS_MAX (8u << 20) /* reject a single WS message larger than this */
 
 /* --- sessions (one WebSocket client = one session) ------------------------- *
@@ -41,6 +39,7 @@ double strtod(const char *s, char **end); /* $(MATH), for a numeric eval result 
 
 struct cdp_session {
   volatile int used;
+  char target[33]; /* the tab it attached to; "" for the browser endpoint, which follows the active tab */
   volatile int rt_enabled, page_enabled, dom_enabled, net_enabled, log_enabled, css_enabled;
   char *inq[INQ_MAX];
   int in_head, in_count;
@@ -48,6 +47,7 @@ struct cdp_session {
   int out_head, out_count;
 };
 static struct cdp_session sessions[CDP_MAX_SESSIONS];
+static char g_browser_id[33];
 static mutex_t sess_lk = MUTEX_INIT;
 static volatile int cdp_nsessions; /* # attached sessions (event hooks fast-skip on 0) */
 
@@ -179,6 +179,7 @@ static struct cdp_session *sess_alloc(void)
       s = &sessions[i];
       s->in_head = s->in_count = s->out_head = s->out_count = 0;
       s->rt_enabled = s->page_enabled = s->dom_enabled = s->net_enabled = s->log_enabled = s->css_enabled = 0;
+      s->target[0] = '\0';
       s->used = 1;
       cdp_nsessions++;
       break;
@@ -201,6 +202,9 @@ static void sess_free(struct cdp_session *s)
   }
   mutex_unlock(&sess_lk);
 }
+
+/* Commands and events reach a page session only while its tab is the one with a live DOM */
+static int sess_on_active(const struct cdp_session *s) { return !s->target[0] || streq(s->target, B->pg->target_id); }
 
 /* Set by a command handler (worker thread only) to answer with a CDP error instead of its result */
 static const char *g_cmd_error;
@@ -285,7 +289,7 @@ static void broadcast_event(int dom, const char *method, json_value *params)
     return;
   mutex_lock(&sess_lk);
   for (int i = 0; i < CDP_MAX_SESSIONS; i++)
-    if (sessions[i].used && sess_wants(&sessions[i], dom))
+    if (sessions[i].used && sess_wants(&sessions[i], dom) && sess_on_active(&sessions[i]))
       sess_out_push_l(&sessions[i], cdp_sdup(str));
   mutex_unlock(&sess_lk);
   free(str);
@@ -539,25 +543,27 @@ static void http_send(int fd, const char *status, const char *ctype, const char 
    * (tcp.c) flushes the response before the socket goes away, so no drain here. */
 }
 
-/* Build one CDP target-info object for the single page. `host` is the client's
+/* Build one CDP target-info object for a tab's page. `host` is the client's
  * Host: header, so the ws/frontend URLs point back at wherever it connected. */
-static json_value *target_json(const char *host)
+static json_value *target_json(const char *host, const struct page *pg)
 {
   char ws[URL_MAX], fe[URL_MAX];
   int n;
   n = 0;
   sapp(ws, &n, sizeof ws, "ws://");
   sapp(ws, &n, sizeof ws, host);
-  sapp(ws, &n, sizeof ws, WS_PATH);
+  sapp(ws, &n, sizeof ws, PAGE_WS_PREFIX);
+  sapp(ws, &n, sizeof ws, pg->target_id);
   n = 0;
   sapp(fe, &n, sizeof fe, host);
-  sapp(fe, &n, sizeof fe, WS_PATH);
+  sapp(fe, &n, sizeof fe, PAGE_WS_PREFIX);
+  sapp(fe, &n, sizeof fe, pg->target_id);
 
   json_value *o = json_new_object();
-  json_object_put(o, "id", json_new_string(TARGET_ID));
+  json_object_put(o, "id", json_new_string(pg->target_id));
   json_object_put(o, "type", json_new_string("page"));
-  json_object_put(o, "title", json_new_string(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
-  json_object_put(o, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  json_object_put(o, "title", json_new_string(pg->doc_title[0] ? pg->doc_title : "OwOS"));
+  json_object_put(o, "url", json_new_string(pg->cur_url[0] ? pg->cur_url : "about:blank"));
   json_object_put(o, "description", json_new_string(""));
   json_object_put(o, "webSocketDebuggerUrl", json_new_string(ws));
   {
@@ -568,6 +574,19 @@ static json_value *target_json(const char *host)
     json_object_put(o, "devtoolsFrontendUrl", json_new_string(d));
   }
   return o;
+}
+
+struct target_list {
+  const char *host;
+  json_value *arr;
+};
+static void list_target(const struct page *pg, bool active, void *ctx)
+{
+  struct target_list *tl = ctx;
+  json_value *o = target_json(tl->host, pg);
+  (void)active;
+  if (json_array_push(tl->arr, o) != 0)
+    json_free(o);
 }
 
 static void serve_http(int fd, const char *req)
@@ -590,16 +609,25 @@ static void serve_http(int fd, const char *req)
     sapp(host, &k, sizeof host, "localhost:9222");
   }
 
-  /* WebSocket upgrade on any /devtools/ path (page- or browser-level endpoint). */
   char upg[64], key[128];
   int is_ws = http_header(req, "Upgrade", upg, sizeof upg) && contains_ci(upg, "websocket") &&
               http_header(req, "Sec-WebSocket-Key", key, sizeof key) && key[0];
-  if (is_ws && starts_ci(path, "/devtools/")) { /* page- or browser-level endpoint */
+  if (is_ws && starts_ci(path, "/devtools/")) {
+    const char *page_id = 0;
+    if (starts_ci(path, PAGE_WS_PREFIX))
+      page_id = path + sizeof PAGE_WS_PREFIX - 1;
+    if (page_id ? !tabs_has_target(page_id)
+                : !(starts_ci(path, BROWSER_WS_PREFIX) && streq(path + sizeof BROWSER_WS_PREFIX - 1, g_browser_id))) {
+      http_send(fd, "404 Not Found", "text/plain", "cdp: no such target\n");
+      return;
+    }
     struct cdp_session *s = sess_alloc();
     if (!s) {
       http_send(fd, "503 Service Unavailable", "text/plain", "cdp: too many sessions\n");
       return;
     }
+    if (page_id)
+      strlcpy(s->target, page_id, sizeof s->target);
 
     char cat[192];
     int k = 0;
@@ -633,7 +661,8 @@ static void serve_http(int fd, const char *req)
     int k = 0;
     sapp(wsurl, &k, sizeof wsurl, "ws://");
     sapp(wsurl, &k, sizeof wsurl, host);
-    sapp(wsurl, &k, sizeof wsurl, "/devtools/browser/" TARGET_ID);
+    sapp(wsurl, &k, sizeof wsurl, BROWSER_WS_PREFIX);
+    sapp(wsurl, &k, sizeof wsurl, g_browser_id);
     json_object_put(o, "webSocketDebuggerUrl", json_new_string(wsurl));
     char *body = json_encode(o, 0, 0);
     json_free(o);
@@ -642,8 +671,9 @@ static void serve_http(int fd, const char *req)
     return;
   }
   if (starts_ci(path, "/json")) { /* /json and /json/list both list targets */
-    json_value *arr = json_new_array();
-    json_array_push(arr, target_json(host));
+    struct target_list tl = {host, json_new_array()};
+    tabs_each_page(list_target, &tl);
+    json_value *arr = tl.arr;
     char *body = json_encode(arr, 0, 0);
     json_free(arr);
     http_send(fd, "200 OK", "application/json; charset=UTF-8", body ? body : "[]");
@@ -776,8 +806,8 @@ static json_value *build_frame(void)
   json_value *f = json_new_object();
   char origin[URL_MAX];
   origin_of(B->pg->cur_url, origin, sizeof origin);
-  json_object_put(f, "id", json_new_string(FRAME_ID));
-  json_object_put(f, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(f, "id", json_new_string(B->pg->target_id)); /* a main frame shares its target's id, as in Chrome */
+  json_object_put(f, "loaderId", json_new_string(B->pg->loader_id));
   json_object_put(f, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
   json_object_put(f, "securityOrigin", json_new_string(origin));
   json_object_put(f, "mimeType", json_new_string("text/html"));
@@ -795,7 +825,7 @@ static json_value *build_context(void)
   json_value *aux = json_new_object();
   json_object_put(aux, "isDefault", json_new_bool(1));
   json_object_put(aux, "type", json_new_string("default"));
-  json_object_put(aux, "frameId", json_new_string(FRAME_ID));
+  json_object_put(aux, "frameId", json_new_string(B->pg->target_id));
   json_object_put(c, "auxData", aux);
   return c;
 }
@@ -1236,6 +1266,33 @@ static json_value *quad(int x, int y, int w, int h)
 /* Dispatch one method; returns the `result` object to wrap (never NULL; an empty
  * object is the permissive answer for anything we don't specifically model, so a
  * DevTools frontend keeps initializing instead of stalling on an error). */
+/* Target.TargetInfo for one tab's page */
+struct target_infos {
+  const char *only; /* fill `one` with just this target, or push every tab onto `arr` */
+  json_value *arr, *one;
+};
+static void add_target_info(const struct page *pg, bool active, void *ctx)
+{
+  struct target_infos *ti = ctx;
+  if (ti->only && !streq(ti->only, pg->target_id))
+    return;
+  int attached = 0;
+  for (int i = 0; i < CDP_MAX_SESSIONS; i++)
+    if (sessions[i].used && (streq(sessions[i].target, pg->target_id) || (!sessions[i].target[0] && active)))
+      attached = 1;
+  json_value *o = json_new_object();
+  json_object_put(o, "targetId", json_new_string(pg->target_id));
+  json_object_put(o, "type", json_new_string("page"));
+  json_object_put(o, "title", json_new_string(pg->doc_title[0] ? pg->doc_title : "OwOS"));
+  json_object_put(o, "url", json_new_string(pg->cur_url[0] ? pg->cur_url : "about:blank"));
+  json_object_put(o, "attached", json_new_bool(attached));
+  json_object_put(o, "browserContextId", json_new_string("owos-ctx"));
+  if (ti->only)
+    ti->one = o;
+  else if (json_array_push(ti->arr, o) != 0)
+    json_free(o);
+}
+
 static json_value *handle_method(struct cdp_session *sess, const char *m, json_value *params)
 {
   json_value *r = json_new_object();
@@ -1316,8 +1373,8 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
   if (streq(m, "Page.navigate")) {
     const char *url = json_as_string(json_object_get(params, "url"));
     cdp_navigate(url);
-    json_object_put(r, "frameId", json_new_string(FRAME_ID));
-    json_object_put(r, "loaderId", json_new_string(LOADER_ID));
+    json_object_put(r, "frameId", json_new_string(B->pg->target_id));
+    json_object_put(r, "loaderId", json_new_string(B->pg->loader_id));
     return r;
   }
   if (streq(m, "Page.reload")) {
@@ -1583,20 +1640,20 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     return r;
   }
 
-  if (streq(m, "Target.getTargetInfo") || streq(m, "Target.getTargets")) {
-    json_value *ti = json_new_object();
-    json_object_put(ti, "targetId", json_new_string(TARGET_ID));
-    json_object_put(ti, "type", json_new_string("page"));
-    json_object_put(ti, "title", json_new_string(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
-    json_object_put(ti, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
-    json_object_put(ti, "attached", json_new_bool(1));
-    json_object_put(ti, "browserContextId", json_new_string("owos-ctx"));
-    if (streq(m, "Target.getTargets")) {
-      json_value *a = json_new_array();
-      json_array_push(a, ti);
-      json_object_put(r, "targetInfos", a);
-    } else
-      json_object_put(r, "targetInfo", ti);
+  if (streq(m, "Target.getTargets")) {
+    struct target_infos ti = {0, json_new_array(), 0};
+    tabs_each_page(add_target_info, &ti);
+    json_object_put(r, "targetInfos", ti.arr);
+    return r;
+  }
+  if (streq(m, "Target.getTargetInfo")) {
+    const char *want = json_as_string(json_object_get(params, "targetId"));
+    struct target_infos ti = {want ? want : sess->target[0] ? sess->target : B->pg->target_id, 0, 0};
+    tabs_each_page(add_target_info, &ti);
+    if (ti.one)
+      json_object_put(r, "targetInfo", ti.one);
+    else
+      g_cmd_error = "No target with given id found";
     return r;
   }
   if (streq(m, "Target.getBrowserContexts")) {
@@ -1631,7 +1688,10 @@ static void dispatch_one(struct cdp_session *sess, const char *text)
   json_value *params = json_object_get(req, "params");
   int has_id = jid && json_typeof(jid) == JSON_NUMBER;
   double id = json_as_number(jid, -1);
-  if (method) {
+  if (method && !sess_on_active(sess) && !starts_ci(method, "Target.") && !starts_ci(method, "Browser.")) {
+    if (has_id) /* a background tab has no live DOM or JS to inspect */
+      reply_error(sess, id, "Target is not the active tab");
+  } else if (method) {
     g_cmd_error = 0;
     json_value *result = handle_method(sess, method, params);
     if (has_id && g_cmd_error) {
@@ -1856,7 +1916,7 @@ void cdp_net_begin(int id, const char *method, const char *url, const char *ctyp
   cdp_ts_set(id, t0);
   json_value *p = json_new_object();
   json_object_put(p, "requestId", json_new_string(rid));
-  json_object_put(p, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(p, "loaderId", json_new_string(B->pg->loader_id));
   json_object_put(p, "documentURL", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
   json_value *rq = json_new_object();
   json_object_put(rq, "url", json_new_string(url ? url : ""));
@@ -1922,7 +1982,7 @@ void cdp_net_finish(int id, const struct net_log *e)
 
   json_value *p = json_new_object();
   json_object_put(p, "requestId", json_new_string(rid));
-  json_object_put(p, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(p, "loaderId", json_new_string(B->pg->loader_id));
   json_object_put(p, "timestamp", json_new_number(tend));
   json_object_put(p, "type", json_new_string(res_type(e->ctype)));
   json_value *resp = json_new_object();
@@ -1956,5 +2016,6 @@ void cdp_init(void)
   if (cdp_started)
     return;
   cdp_started = 1;
+  make_unique_id(g_browser_id);
   thread_create(cdp_io_fn, &cdp_stack[sizeof cdp_stack]);
 }
