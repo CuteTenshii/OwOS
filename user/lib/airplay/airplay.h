@@ -9,7 +9,7 @@
  * This is the unauthenticated legacy protocol: it works with receivers that accept "anyone on the network"
  * (Apple TV 2/3, AirPort Express, most AirPlay smart TVs). A receiver that demands pairing (a tvOS device set to
  * require a code, or any FairPlay-only target) refuses /play and airplay_load returns -1. There is no receiver
- * volume control in this protocol. Link with $(AIRPLAY) $(PLIST) $(BASE64) $(MATH) plus $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE). */
+ * volume control in this protocol. Link with $(AIRPLAY) $(PLIST) $(UUID) $(BASE64) $(MATH) plus $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE). */
 #ifndef OWOS_AIRPLAY_H
 #define OWOS_AIRPLAY_H
 

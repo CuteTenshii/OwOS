@@ -10,8 +10,8 @@ const uuid_t UUID_NS_X500 = {0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x8
 
 static void stamp(uuid_t u, int version)
 {
-  u[6] = (unsigned char)(u[6] & 0x0F | version << 4);
-  u[8] = (unsigned char)(u[8] & 0x3F | 0x80);
+  u[6] = (unsigned char)((u[6] & 0x0F) | (version << 4));
+  u[8] = (unsigned char)((u[8] & 0x3F) | 0x80);
 }
 
 void uuid_v4_from(uuid_t out, const unsigned char rnd[16])
@@ -98,7 +98,7 @@ int uuid_parse(const char *s, uuid_t out)
     lo = hi < 0 ? -1 : hexval(s[i + 1]);
     if (lo < 0)
       return -1;
-    u[n] = (unsigned char)(hi << 4 | lo);
+    u[n] = (unsigned char)((hi << 4) | lo);
     i += 2;
   }
   memcpy(out, u, 16);

@@ -3,6 +3,7 @@
  * by hand. */
 #define OWOS_SUITE_TEST
 #define rng_bytes airplay_test_rng_bytes
+#define now_ms airplay_test_now_ms
 #define msleep airplay_test_msleep
 #define thread_stack_alloc airplay_test_stack_alloc
 #define thread_stack_free airplay_test_stack_free
@@ -22,6 +23,7 @@ int thread_create(void (*fn)(void), void *top);
 int thread_create_arg(void (*fn)(void *), void *arg, void *top);
 int thread_join(int tid);
 void rng_bytes(void *buf, int len);
+#include "../user/lib/uuid/uuid.c"
 #include "../user/lib/airplay/airplay.c"
 #include "test.h"
 #include <stdio.h>
@@ -55,6 +57,7 @@ int thread_join(int tid)
   return 0;
 }
 void rng_bytes(void *buf, int len) { memset(buf, 0x5a, (size_t)len); }
+long long now_ms(void) { return 0; }
 
 int mdns_browse(const char *service, struct mdns_service *out, int max, int timeout_ms)
 {
@@ -137,7 +140,7 @@ static void test_connect_requires_server_info(void)
   s = airplay_connect(&d, 1000);
   expect(s != 0);
   expect(strstr(g_req, "GET /server-info HTTP/1.1") != 0);
-  expect(strstr(g_req, "X-Apple-Session-ID: ") != 0);
+  expect(strstr(g_req, "X-Apple-Session-ID: 5A5A5A5A-5A5A-4A5A-9A5A-5A5A5A5A5A5A\r\n") != 0);
   airplay_close(s);
 }
 

@@ -4,6 +4,7 @@
 #include "netconn.h"
 #include "owos.h"
 #include "plist.h"
+#include "uuid.h"
 
 #define AIRPLAY_PORT 7000
 #define POLL_MS 1000
@@ -165,7 +166,7 @@ struct airplay_session {
   netconn *nc;
   char host[16];
   int port;
-  char sid[40]; /* X-Apple-Session-ID */
+  char sid[UUID_STR_LEN]; /* X-Apple-Session-ID */
   volatile int lock;
   volatile int quit;
   volatile int conn;
@@ -324,7 +325,7 @@ airplay_session *airplay_connect(const struct airplay_device *dev, int timeout_m
 {
   airplay_session *s;
   char info[512];
-  unsigned r;
+  uuid_t id;
   (void)timeout_ms;
   if (!dev)
     return 0;
@@ -334,12 +335,8 @@ airplay_session *airplay_connect(const struct airplay_device *dev, int timeout_m
   memset(s, 0, sizeof *s);
   snprintf(s->host, sizeof s->host, "%u.%u.%u.%u", dev->ip[0], dev->ip[1], dev->ip[2], dev->ip[3]);
   s->port = dev->port ? dev->port : AIRPLAY_PORT;
-  rng_bytes(&r, sizeof r);
-  { /* a stable per-session id, UUID-shaped */
-    unsigned a = r, b = r * 2654435761u, c = (r ^ 0x9e3779b9u) * 40503u;
-    snprintf(s->sid, sizeof s->sid, "%08x-%04x-4%03x-a%03x-%08x%04x", a, b & 0xffff, (b >> 16) & 0xfff, c & 0xfff,
-             a ^ c, b >> 16);
-  }
+  uuid_generate_v4(id);
+  uuid_to_string(id, s->sid, 1);
   s->nc = nc_open(s->host, s->port, 0, 0);
   if (!s->nc || http(s, "GET", "/server-info", 0, 0, info, sizeof info) != 200) {
     if (s->nc)
