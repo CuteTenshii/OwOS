@@ -91,6 +91,8 @@ void refresh_maps(void)
         continue;
       found = ncmap++;
       cmap[found].id = id;
+      /* The slot may hold a stale copy left by the swap-remove above; a same-sized one would skip win_map */
+      cmap[found].valid = false;
     }
     if (!cmap[found].valid || cmap[found].m.w != cur[s].buf_w || cmap[found].m.h != cur[s].buf_h)
       cmap[found].valid = (win_map(id, &cmap[found].m) == 0);
