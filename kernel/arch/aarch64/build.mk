@@ -13,6 +13,12 @@ ifeq ($(HOST_OS),Darwin)
 else
   CROSS ?=
 endif
+DEVKITA64 := /opt/devkitpro/devkitA64/bin/
+ifeq ($(shell command -v $(CROSS)gcc >/dev/null 2>&1 && echo y),)
+  ifneq ($(wildcard $(DEVKITA64)aarch64-none-elf-gcc),)
+    CROSS := $(DEVKITA64)aarch64-none-elf-
+  endif
+endif
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
