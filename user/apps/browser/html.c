@@ -630,8 +630,10 @@ static void layout_dom(void)
     g_base_url[0] = '\0';
     sapp(g_base_url, &k, sizeof g_base_url, g_cur_page_url);
   }
+  title_walk_begin();
   if (g_live_dom)
     walk(g_live_dom);
+  title_walk_publish(); /* also clears it when a script removed the <title> */
   img_carry_end(&g_carry);
   B->img_pool_len = img_carry_pool_len(B->pg->imgs, B->pg->n_imgs, B->img_pool_len);
   B->pg->text_len = W_n;

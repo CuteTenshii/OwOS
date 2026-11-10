@@ -235,11 +235,22 @@ void block_break(void)
   }
 }
 
+/* Collected during a walk and published whole, since the UI thread reads doc_title at any time */
+static char g_walk_title[sizeof B->pg->doc_title];
+
+void title_walk_begin(void) { g_walk_title[0] = '\0'; }
+
+void title_walk_publish(void)
+{
+  if (strcmp(g_walk_title, B->pg->doc_title) != 0)
+    strlcpy(B->pg->doc_title, g_walk_title, sizeof B->pg->doc_title);
+}
+
 void capture_title(struct dom_node *el)
 {
   int tl = 0;
   bool t_pend = false;
-  B->pg->doc_title[0] = '\0';
+  g_walk_title[0] = '\0';
   for (struct dom_node *c = el->first_child; c; c = c->next) {
     if (c->type != DOM_TEXT || !c->text)
       continue;
@@ -265,12 +276,12 @@ void capture_title(struct dom_node *el)
       }
       if (ch < 0x20 || ch >= 0x7f)
         continue;
-      if (t_pend && tl > 0 && tl < (int)sizeof B->pg->doc_title - 1)
-        B->pg->doc_title[tl++] = ' ';
+      if (t_pend && tl > 0 && tl < (int)sizeof g_walk_title - 1)
+        g_walk_title[tl++] = ' ';
       t_pend = false;
-      if (tl < (int)sizeof B->pg->doc_title - 1)
-        B->pg->doc_title[tl++] = (char)ch;
-      B->pg->doc_title[tl] = '\0';
+      if (tl < (int)sizeof g_walk_title - 1)
+        g_walk_title[tl++] = (char)ch;
+      g_walk_title[tl] = '\0';
     }
   }
 }

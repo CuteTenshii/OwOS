@@ -202,6 +202,7 @@ int main(int argc, char **argv)
 
   unsigned last = B->seq - 1;
   int prev_loading = 0;
+  char shown_title[sizeof B->pg->doc_title] = "";
   unsigned nav_wait_ms = 0;
 #define NAV_STUCK_MS 1500
   /* Repaint coalescing while a page loads */
@@ -366,6 +367,16 @@ int main(int argc, char **argv)
         bookmark_set_icon(B->pg->cur_url, B->pg->favicon);
     }
     prev_loading = B->loading;
+
+    /* Scripts retitle the page after load, which only the worker sees */
+    if (strcmp(shown_title, B->pg->doc_title) != 0) {
+      strlcpy(shown_title, B->pg->doc_title, sizeof shown_title);
+      if (!B->loading) {
+        tab_sync_active();
+        update_title(id);
+        B->seq++;
+      }
+    }
 
     /* While audio plays, nudge a repaint a few times a second so the seek bar and time advance */
     if (media_active() && (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES)

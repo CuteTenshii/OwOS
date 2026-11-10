@@ -110,6 +110,8 @@ bool cp_drop(unsigned cp);
 void emit_text(const char *s);
 void block_break(void);
 void capture_title(struct dom_node *el);
+void title_walk_begin(void);
+void title_walk_publish(void);
 int open_link(struct dom_node *el);
 void close_link(void);
 void handle_svg(struct dom_node *el, const struct css_style *cs);
