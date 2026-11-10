@@ -89,6 +89,52 @@ static void test_user(void)
   check("task frames released", free_frames() == free_before);
 }
 
+extern const char hello_elf_start[], hello_elf_end[], segv_elf_start[], segv_elf_end[], nx_elf_start[], nx_elf_end[];
+
+#define ELF(n) n##_elf_start, (uint64_t)(n##_elf_end - n##_elf_start)
+
+static void patch(uint8_t *buf, uint64_t off, uint64_t val, int width) { memcpy(buf + off, &val, (uint32_t)width); }
+
+/* Loads a copy of hello.elf with one field overwritten; true if the loader refused it and freed everything. */
+static bool rejected(uint64_t off, uint64_t val, int width, uint64_t size)
+{
+  uint64_t full = (uint64_t)(hello_elf_end - hello_elf_start);
+  uint8_t *buf = kmalloc((size_t)full);
+  struct user_image img;
+  uint32_t before = free_frames();
+  memcpy(buf, hello_elf_start, (uint32_t)full);
+  if (width)
+    patch(buf, off, val, width);
+  bool ok = elf_load(&img, buf, size ? size : full) != 0 && free_frames() == before;
+  kfree(buf);
+  return ok;
+}
+
+static void test_elf(void)
+{
+  uint32_t frames = free_frames();
+  int code = -99;
+  check("ELF: hello loads, runs and its self-checks pass", task_run_elf(ELF(hello), &code) == 0 && code == 0);
+  code = -99;
+  check("ELF: write to .rodata kills the task", task_run_elf(ELF(segv), &code) == 0 && code == -1);
+  code = -99;
+  check("ELF: executing .data kills the task", task_run_elf(ELF(nx), &code) == 0 && code == -1);
+  check("ELF: task frames released", free_frames() == frames);
+
+  uint64_t ph0;
+  memcpy(&ph0, hello_elf_start + 32, sizeof ph0); /* e_phoff */
+  check("ELF: bad magic rejected", rejected(0, 0, 1, 0));
+  check("ELF: wrong machine rejected", rejected(18, 62, 2, 0));
+  check("ELF: truncated file rejected", rejected(0, 0, 0, 100));
+  check("ELF: program headers past EOF rejected", rejected(32, 1ULL << 40, 8, 0));
+  check("ELF: writable+executable segment rejected", rejected(ph0 + 4, 7, 4, 0));
+  check("ELF: segment below the user window rejected", rejected(ph0 + 16, 0x1000, 8, 0));
+  check("ELF: filesz > memsz rejected", rejected(ph0 + 32, 1ULL << 20, 8, 0));
+  check("ELF: segment reaching the stack rejected", rejected(ph0 + 40, 1ULL << 28, 8, 0));
+  check("ELF: entry outside executable segments rejected", rejected(24, USER_BASE + 0x80000, 8, 0));
+  check("ELF: rejects leave no frames behind", free_frames() == frames);
+}
+
 #define LOCK_ROUNDS 500
 #define ALLOC_ROUNDS 300
 #define MANY_THREADS 400
@@ -203,11 +249,15 @@ static void test_sched(void)
   run_all(allocator, cpus);
   check("concurrent pmm and heap use stays consistent", alloc_errors == 0);
 
-  int a = thread_create_user("hello1", user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
-  int b = thread_create_user("fault", user_fault_start, (uint32_t)(user_fault_end - user_fault_start));
-  int c = thread_create_user("hello2", user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
-  int ra = thread_join(a), rb = thread_join(b), rc = thread_join(c);
-  check("concurrent EL0 tasks keep separate address spaces and exit codes", ra == 42 && rb == -1 && rc == 42);
+  struct user_image ia, ib, ic, id;
+  int loaded = !user_image_code(&ia, user_hello_start, (uint32_t)(user_hello_end - user_hello_start)) &&
+               !user_image_code(&ib, user_fault_start, (uint32_t)(user_fault_end - user_fault_start)) &&
+               !elf_load(&ic, ELF(hello)) && !elf_load(&id, ELF(hello));
+  check("user images built", loaded);
+  int a = thread_create_user("hello1", &ia), b = thread_create_user("fault", &ib);
+  int c = thread_create_user("elf1", &ic), d = thread_create_user("elf2", &id);
+  int ra = thread_join(a), rb = thread_join(b), rc = thread_join(c), rd = thread_join(d);
+  check("concurrent EL0 tasks keep separate address spaces and exit codes", ra == 42 && rb == -1 && rc == 0 && rd == 0);
 
   check("scheduler releases frames and stacks", pmm_free_kib() == frames && heap_free_bytes() == heap);
 }
@@ -240,6 +290,7 @@ void arch_main(void)
   check("timer interrupts via GIC", timer_ticks() >= 10);
 
   test_user();
+  test_elf();
 
   smp_start();
   test_sched();

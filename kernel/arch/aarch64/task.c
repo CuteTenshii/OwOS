@@ -13,4 +13,19 @@ void task_fault(struct trap_frame *tf)
   thread_exit(-1);
 }
 
-int task_run(const void *code, uint32_t len) { return thread_join(thread_create_user("task", code, len)); }
+static int run_image(const struct user_image *img) { return thread_join(thread_create_user("task", img)); }
+
+int task_run(const void *code, uint32_t len)
+{
+  struct user_image img;
+  return user_image_code(&img, code, len) ? -1 : run_image(&img);
+}
+
+int task_run_elf(const void *file, uint64_t size, int *code)
+{
+  struct user_image img;
+  if (elf_load(&img, file, size))
+    return -1;
+  *code = run_image(&img);
+  return 0;
+}

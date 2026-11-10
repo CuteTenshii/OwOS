@@ -36,7 +36,13 @@ ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
 endif
 
-OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o smp.o task.o syscall.o user.o console.o mem.o kstring.o pmm.o heap.o)
+A64USER := user/aarch64
+A64UFLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
+             -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -Icommon -I$(A64USER)
+A64PROGS := hello segv nx
+A64UELFS := $(addprefix $(A64USER)/,$(addsuffix .elf,$(A64PROGS)))
+
+OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o smp.o elf.o task.o syscall.o user.o console.o mem.o kstring.o pmm.o heap.o userprogs.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@
@@ -45,6 +51,18 @@ $(A64DIR)/%.o: $(A64DIR)/%.c $(A64DIR)/arch.h
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(A64DIR)/%.o: kernel/%.c
+	$(CC) $(A64FLAGS) -c $< -o $@
+
+$(A64USER)/%.o: $(A64USER)/%.c $(A64USER)/rt.h
+	$(CC) $(A64UFLAGS) -c $< -o $@
+
+$(A64USER)/%.o: $(A64USER)/%.S
+	$(CC) $(A64UFLAGS) -c $< -o $@
+
+$(A64USER)/%.elf: $(A64USER)/%.o $(A64USER)/start.o $(A64USER)/rt.o $(A64USER)/user.ld
+	$(LD) --no-warn-rwx-segments -nostdlib -z max-page-size=4096 -T $(A64USER)/user.ld -o $@ $< $(A64USER)/start.o $(A64USER)/rt.o
+
+$(A64DIR)/userprogs.o: $(A64DIR)/userprogs.S $(A64UELFS)
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(A64ELF): $(OBJS) $(A64DIR)/linker.ld
@@ -58,3 +76,5 @@ run: $(KERNEL)
 
 check: $(KERNEL)
 	@out=$$(timeout 20 $(QEMU_A64) 2>&1); echo "$$out"; echo "$$out" | ug -q 'AARCH64 SELFTEST PASS'
+
+.SECONDARY:

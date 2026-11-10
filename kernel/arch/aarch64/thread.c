@@ -8,7 +8,6 @@
 #include <stdbool.h>
 
 #define KSTACK_SIZE 16384
-#define USER_STACK_TOP (USER_BASE + 0x2000)
 
 enum { T_RUNNABLE, T_RUNNING, T_DEAD };
 
@@ -20,6 +19,7 @@ struct thread {
   uint8_t *stack;
   uintptr_t sp;
   uint64_t *root; /* user address space, 0 for kernel threads */
+  uint64_t user_entry, user_sp;
   char name[16];
 };
 
@@ -62,7 +62,7 @@ void sched_new_thread(void) { __sync_lock_release(&sched_lock); }
 
 int thread_self(void) { return cur[cpu_id()]->id; }
 
-static int thread_spawn(const char *name, void (*entry)(void *), void *arg, uint64_t *root)
+static int thread_spawn(const char *name, void (*entry)(void *), void *arg, const struct user_image *img)
 {
   struct thread *t = kmalloc(sizeof *t);
   uint8_t *stack = kmalloc(KSTACK_SIZE + 16);
@@ -72,7 +72,9 @@ static int thread_spawn(const char *name, void (*entry)(void *), void *arg, uint
     return -1;
   }
   t->stack = stack;
-  t->root = root;
+  t->root = img ? img->root : 0;
+  t->user_entry = img ? img->entry : 0;
+  t->user_sp = img ? img->sp : 0;
   t->exit_code = 0;
   strlcpy(t->name, name, sizeof t->name);
   t->sp = context_init((void *)(((uintptr_t)stack + KSTACK_SIZE) & ~(uintptr_t)15), entry, arg);
@@ -188,38 +190,17 @@ static void user_launch(void *arg)
 {
   (void)arg;
   irq_save(); /* ELR/SPSR must not be clobbered by a tick before the eret */
-  SYSREG_WRITE(sp_el0, USER_STACK_TOP);
-  SYSREG_WRITE(elr_el1, USER_BASE);
+  struct thread *t = cur[cpu_id()];
+  SYSREG_WRITE(sp_el0, t->user_sp);
+  SYSREG_WRITE(elr_el1, t->user_entry);
   SYSREG_WRITE(spsr_el1, 0);
   __asm__ volatile("eret");
 }
 
-int thread_create_user(const char *name, const void *code, uint32_t len)
+int thread_create_user(const char *name, const struct user_image *img)
 {
-  phys_t text = pmm_alloc_frame(), stack = pmm_alloc_frame();
-  uint64_t *root = vm_create();
-  bool text_mapped = false, stack_mapped = false;
-  int id = -1;
-
-  if (text && stack && root && len <= PMM_FRAME_SIZE) {
-    memset((void *)text, 0, PMM_FRAME_SIZE);
-    memset((void *)stack, 0, PMM_FRAME_SIZE);
-    memcpy((void *)text, code, len);
-    for (uintptr_t a = text; a < text + len; a += 64)
-      __asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(a) : "memory");
-    __asm__ volatile("dsb ish\n\tisb");
-    text_mapped = !vm_map(root, USER_BASE, text, VM_USER_RX);
-    stack_mapped = text_mapped && !vm_map(root, USER_BASE + 0x1000, stack, VM_USER_RW);
-    if (stack_mapped)
-      id = thread_spawn(name, user_launch, 0, root);
-  }
-  if (id < 0) {
-    if (root)
-      vm_destroy(root); /* frees mapped pages and the tables */
-    if (text && !text_mapped)
-      pmm_free_frame(text);
-    if (stack && !stack_mapped)
-      pmm_free_frame(stack);
-  }
+  int id = thread_spawn(name, user_launch, 0, img);
+  if (id < 0)
+    vm_destroy(img->root);
   return id;
 }

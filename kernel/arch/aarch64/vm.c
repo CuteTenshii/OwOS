@@ -50,9 +50,9 @@ int vm_map(uint64_t *root, uintptr_t va, uintptr_t pa, int prot)
   if (!l3)
     return -1;
   uint64_t e = pa | PTE_PAGE | PTE_ATTR_N | PTE_SH_ISH | PTE_AF | PTE_AP_EL0 | PTE_PXN;
-  if (prot == VM_USER_RX)
+  if (prot != VM_USER_RW)
     e |= 1ULL << 7; /* AP[2]: read-only */
-  else
+  if (prot != VM_USER_RX)
     e |= PTE_UXN;
   l3[(va >> 12) & (ENTRIES - 1)] = e;
   return 0;
