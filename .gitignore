@@ -4,6 +4,7 @@
 *.d
 owos.bin
 owos-x86_64.bin
+owos-aarch64.bin
 .arch.*
 *.iso
 

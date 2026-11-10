@@ -12,6 +12,24 @@
 
 #include <stdint.h>
 
+#ifdef __aarch64__
+/* DAIF plays the role of EFLAGS: masked bits mean interrupts off. */
+static inline uintptr_t irq_save(void)
+{
+  uintptr_t f;
+  __asm__ volatile("mrs %0, daif\n\tmsr daifset, #2" : "=r"(f)::"memory");
+  return f;
+}
+
+static inline void irq_restore(uintptr_t f) { __asm__ volatile("msr daif, %0" : : "r"(f) : "memory"); }
+
+static inline uintptr_t irq_flags(void)
+{
+  uintptr_t f;
+  __asm__ volatile("mrs %0, daif" : "=r"(f)::"memory");
+  return f;
+}
+#else
 /* Snapshot the flags register and disable interrupts. Pair with irq_restore. */
 static inline uintptr_t irq_save(void)
 {
@@ -31,5 +49,6 @@ static inline uintptr_t irq_flags(void)
   __asm__ volatile("pushf\n\tpop %0" : "=r"(f)::"memory");
   return f;
 }
+#endif
 
 #endif /* OWOS_IRQFLAGS_H */
