@@ -218,9 +218,9 @@ int textfield_key(struct textfield *tf, char c, int mods);
  * button, the way a tabbed browser/editor lays out documents. The app owns the
  * tab list and its bookkeeping; this only draws `labels[0..n)` (highlighting
  * `active`) and maps a click back to an action. Tabs share the available width
- * evenly (clamped), labels are truncated to fit, and the close box appears only
- * when more than one tab is open. When the tabs don't fit at their minimum
- * width, the strip shows a window of them between scroll arrows.
+ * evenly (clamped), labels are truncated to fit, and every tab has a close box.
+ * When the tabs don't fit at their minimum width, the strip shows a window of
+ * them between scroll arrows.
  */
 #define GUI_TAB_H 24 /* tab strip height */
 

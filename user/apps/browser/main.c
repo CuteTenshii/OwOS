@@ -141,6 +141,19 @@ void update_title(int id)
   win_settitle(id, "New Tab"); /* blank tab: match the tab-strip label */
 }
 
+bool quit_requested;
+
+static int browser_exit(int id, int wtid)
+{
+  worker_quit = true;
+  B->dlg_done = 1; /* release the worker if it's blocked in a dialog */
+  if (wtid >= 0)
+    thread_join(wtid); /* let the worker exit first */
+  storage_flush();
+  win_close(id);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   static const struct opt opts[] = {
@@ -213,16 +226,12 @@ int main(int argc, char **argv)
   unsigned frame = 0, last_paint_frame = 0;
   const unsigned LOAD_REDRAW_FRAMES = 6; /* ~6*15ms ≈ 90ms → ~10 fps while loading */
   for (;;) {
+    if (quit_requested)
+      return browser_exit(id, wtid);
     struct win_event ev;
     while (win_poll(id, &ev)) {
       if (ev.type == WEV_CLOSE) {
-        worker_quit = true;
-        B->dlg_done = 1; /* release the worker if it's blocked in a dialog */
-        if (wtid >= 0)
-          thread_join(wtid); /* let the worker exit first */
-        storage_flush();
-        win_close(id);
-        return 0;
+        return browser_exit(id, wtid);
       } else if (ev.type == WEV_KEY) {
         handle_key((char)ev.a, ev.b);
       } else if (ev.type == WEV_MOUSE) {

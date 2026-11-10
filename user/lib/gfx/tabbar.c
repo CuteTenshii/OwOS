@@ -165,11 +165,9 @@ void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labe
       tab_globe(ix, iy);
 
     int lx = ix + TAB_ICON + TAB_ICON_GAP;
-    int has_x = n > 1;
-    int textpx = tw - (lx - tx) - (has_x ? TAB_CLOSE_W : 4);
+    int textpx = tw - (lx - tx) - TAB_CLOSE_W;
     tab_label(lx, ty, labels[i], textpx, on ? TAB_ON_FG : TAB_OFF_FG);
-    if (has_x)
-      tab_closebox(tx + tw - TAB_CLOSE_W + 4, y + (GUI_TAB_H - 7) / 2, on ? 0x707880 : 0x8a93a0);
+    tab_closebox(tx + tw - TAB_CLOSE_W + 4, y + (GUI_TAB_H - 7) / 2, on ? 0x707880 : 0x8a93a0);
   }
   if (g.arrows) {
     tab_arrow(x, y, 1, g.first > 0);
@@ -205,7 +203,7 @@ int tabbar_hit(struct tabbar *tb, int x, int y, int w, int n, int mx, int my, in
   int tx = g.tabs_x + slot * g.tw;
   if (index)
     *index = i;
-  if (n > 1 && mx >= tx + g.tw - TAB_CLOSE_W)
+  if (mx >= tx + g.tw - TAB_CLOSE_W)
     return TABBAR_CLOSE;
   return TABBAR_SELECT;
 }

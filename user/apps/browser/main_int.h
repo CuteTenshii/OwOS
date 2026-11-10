@@ -153,6 +153,7 @@ void close_tab(int i);
 extern unsigned g_lay_sig;
 extern char worker_stack[262144];
 extern volatile bool worker_quit;
+extern bool quit_requested; /* the last tab was closed: the main loop exits like a window close */
 void worker_fn(void);
 
 /* text.c */

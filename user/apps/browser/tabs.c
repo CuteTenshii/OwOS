@@ -443,8 +443,12 @@ void new_tab(void)
 
 void close_tab(int i)
 {
-  if (i < 0 || i >= n_tabs || n_tabs <= 1)
-    return; /* keep at least one */
+  if (i < 0 || i >= n_tabs)
+    return;
+  if (n_tabs == 1) {
+    quit_requested = true;
+    return;
+  }
   int was_active = (i == active_tab);
   if (was_active)
     load_quiesce(); /* only the active tab loads: stop its fetch first */
