@@ -151,6 +151,8 @@ RESOLVE := user/lib/resolve/resolve.o user/lib/resolve/svcb.o $(MDNS)
 STUN    := user/lib/stun/stun.o
 # xml: allocation-free XML element reader + escaper (SOAP, device descriptions); no dependencies.
 XML     := user/lib/xml/xml.o
+# xmltree: XML decoder and encoder over a heap node tree (namespaces, entities, CDATA, pretty printing); libc only.
+XMLTREE := user/lib/xml/xmltree.o
 # upnp: UPnP IGD client - SSDP discovery, device description, SOAP port mapping. Needs $(XML) and the HTTP
 # client stack ($(HTTP) $(HEADERS) $(URL) $(NETCONN) and what http.c pulls in).
 UPNP    := user/lib/upnp/upnp.o user/lib/upnp/igd.o
