@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png jpeg webp gif imganim canvas2d mp3 ogg sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray zstd archive plist uuid airplay
+ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png jpeg webp gif imganim canvas2d mp3 ogg sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray zstd archive plist uuid airplay xml upnp
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -149,6 +149,11 @@ RESOLVE := user/lib/resolve/resolve.o user/lib/resolve/svcb.o $(MDNS)
 # NAT-traversal substrate ICE/WebRTC gathers candidates over. Needs $(CRYPTO)
 # (hmac_sha1 for MESSAGE-INTEGRITY) and $(RESOLVE) (stun_query's name->IP).
 STUN    := user/lib/stun/stun.o
+# xml: allocation-free XML element reader + escaper (SOAP, device descriptions); no dependencies.
+XML     := user/lib/xml/xml.o
+# upnp: UPnP IGD client - SSDP discovery, device description, SOAP port mapping. Needs $(XML) and the HTTP
+# client stack ($(HTTP) $(HEADERS) $(URL) $(NETCONN) and what http.c pulls in).
+UPNP    := user/lib/upnp/upnp.o user/lib/upnp/igd.o
 # ntp: NTPv4 client arithmetic (timestamps, packet validation, offset/delay, sample
 # filter, poll schedule). Pure computation, libc-free; needs $(LIBGCC) for 64-bit divides.
 NTP     := user/lib/ntp/ntp.o

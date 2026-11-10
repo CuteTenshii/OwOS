@@ -11,7 +11,7 @@
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
 
 GUI_APPS := about archive browser calc cliphist clock compositor editor files imgview notifyd player settings term
-CLI_APPS := aac alac base64 cast chmod chown clipd curl dhcpcd dig edit h264 init json lspci mdnsd mediactl mediad mpeg neofetch notifysend ntpd ping sh smbd ssh sshd stun sudo torrent trayd uname unrar vmclipd webp
+CLI_APPS := aac alac base64 cast chmod chown clipd curl dhcpcd dig edit h264 init json lspci mdnsd mediactl mediad mpeg neofetch notifysend ntpd ping sh smbd ssh sshd stun sudo torrent trayd uname unrar upnpc vmclipd webp
 APPS := $(GUI_APPS) $(CLI_APPS)
 
 # --- per-app libraries ---------------------------------------------------
@@ -55,6 +55,7 @@ APP_LIBS_sh := $(SHLIB)
 APP_OBJS_settings := $(addprefix user/apps/settings/,settings.o util.o devices.o controls.o updates.o about.o)
 APP_LIBS_settings := $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE)
 APP_LIBS_torrent := $(TORLIB) $(CRYPTO)
+APP_LIBS_upnpc := $(UPNP) $(XML) $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE)
 APP_LIBS_vmclipd := $(CLIPBOARD)
 APP_LIBS_webp := $(WEBP) $(PNGDEC) $(INFLATE)
 

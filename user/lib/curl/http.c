@@ -79,8 +79,9 @@ static void emit_byte(struct emitter *e, int b)
 /* Send the request line + headers and stream the response over `conn` (which
  * the caller opened and will close). Identical framing for plaintext and TLS.
  * Returns the HTTP status or a negative HTTP_E* code. */
-static int http1_exchange(netconn *conn, const char *method, const struct purl *u, const char *extra_headers, char *hdr,
-                          int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
+static int http1_exchange(netconn *conn, const char *method, const struct purl *u, const char *extra_headers,
+                          const void *req_body, int req_len, char *hdr, int hdrcap, int *hdrlen, http_body_fn body,
+                          void *ctx)
 {
   if (!method)
     method = "GET";
@@ -98,7 +99,7 @@ static int http1_exchange(netconn *conn, const char *method, const struct purl *
   if (extra_headers) /* curl -H lines, incl. User-Agent */
     sapp(req, &n, (int)sizeof req, extra_headers);
   sapp(req, &n, (int)sizeof req, "\r\n");
-  if (nc_write(conn, req, n) < 0)
+  if (nc_write(conn, req, n) < 0 || (req_len > 0 && nc_write(conn, req_body, req_len) < 0))
     return HTTP_ESEND;
 
   struct rdr r;
@@ -302,7 +303,7 @@ int http_request_ex(const char *method, const char *url, int want_h2, int want_h
       struct h2_opts opts = {0, extra_headers, 0};
       rc = h2_run(conn, u.tls, auth, method ? method : "GET", u.path, &opts, hdr, hdrcap, hdrlen, body, ctx);
     } else {
-      rc = http1_exchange(conn, method, &u, extra_headers, hdr, hdrcap, hdrlen, body, ctx);
+      rc = http1_exchange(conn, method, &u, extra_headers, 0, 0, hdr, hdrcap, hdrlen, body, ctx);
     }
     nc_close(conn);
     return rc;
@@ -311,7 +312,7 @@ int http_request_ex(const char *method, const char *url, int want_h2, int want_h
   netconn *conn = nc_open(u.host, u.port, u.tls, 0);
   if (!conn)
     return HTTP_ECONNECT;
-  int rc = http1_exchange(conn, method, &u, extra_headers, hdr, hdrcap, hdrlen, body, ctx);
+  int rc = http1_exchange(conn, method, &u, extra_headers, 0, 0, hdr, hdrcap, hdrlen, body, ctx);
   nc_close(conn);
   return rc;
 }
@@ -329,6 +330,20 @@ int http_request2(const char *method, const char *url, char *hdr, int hdrcap, in
 int http_request3(const char *method, const char *url, char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
 {
   return http_request_ex(method, url, 0, 1, 0, hdr, hdrcap, hdrlen, body, ctx);
+}
+
+int http_post(const char *url, const char *extra_headers, const void *req_body, int req_len, char *hdr, int hdrcap,
+              int *hdrlen, http_body_fn body, void *ctx)
+{
+  struct purl u;
+  if (!parse_url(url, &u))
+    return HTTP_EPARSE;
+  netconn *conn = nc_open(u.host, u.port, u.tls, 0);
+  if (!conn)
+    return HTTP_ECONNECT;
+  int rc = http1_exchange(conn, "POST", &u, extra_headers, req_body, req_len, hdr, hdrcap, hdrlen, body, ctx);
+  nc_close(conn);
+  return rc;
 }
 
 int http_get(const char *url, http_body_fn body, void *ctx) { return http_request("GET", url, 0, 0, 0, body, ctx); }

@@ -530,6 +530,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(ping);
     INSTALL_APP(dig);
     INSTALL_APP(stun);
+    INSTALL_APP(upnpc);
     INSTALL_APP(torrent);
     INSTALL_APP(player);
     INSTALL_APP(settings);

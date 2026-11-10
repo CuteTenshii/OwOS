@@ -49,7 +49,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/compositor_blob.o \
         kernel/imgview_blob.o kernel/term_blob.o \
         kernel/neofetch_blob.o kernel/lspci_blob.o kernel/uname_blob.o \
-        kernel/ping_blob.o kernel/dig_blob.o kernel/stun_blob.o kernel/torrent_blob.o \
+        kernel/ping_blob.o kernel/dig_blob.o kernel/stun_blob.o kernel/upnpc_blob.o kernel/torrent_blob.o \
         kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o kernel/sshd_blob.o \
         kernel/clipd_blob.o kernel/cliphist_blob.o kernel/vmclipd_blob.o \
         kernel/notifyd_blob.o kernel/notifysend_blob.o kernel/trayd_blob.o \

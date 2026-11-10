@@ -52,6 +52,11 @@ int http_request3(const char *method, const char *url, char *hdr, int hdrcap, in
 int http_request_ex(const char *method, const char *url, int want_h2, int want_h3, const char *extra_headers, char *hdr,
                     int hdrcap, int *hdrlen, http_body_fn body, void *ctx);
 
+/* POST req_body (req_len bytes) over HTTP/1.1. The caller supplies Content-Type and Content-Length in
+ * `extra_headers`. Same response contract as http_request. */
+int http_post(const char *url, const char *extra_headers, const void *req_body, int req_len, char *hdr, int hdrcap,
+              int *hdrlen, http_body_fn body, void *ctx);
+
 /* Convenience: GET, body to the sink. */
 int http_get(const char *url, http_body_fn body, void *ctx);
 
