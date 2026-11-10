@@ -143,7 +143,8 @@ static void normalize_path(const char *in, char *out, int cap)
 void resolve_url(const char *base, const char *loc, char *out, int cap)
 {
   int n = 0;
-  if (starts_ci(loc, "http://") || starts_ci(loc, "https://") || starts_ci(loc, "blob:")) {
+  if (starts_ci(loc, "http://") || starts_ci(loc, "https://") || starts_ci(loc, "blob:") ||
+      starts_ci(loc, "data:") || starts_ci(loc, "file:") || starts_ci(loc, "mailto:")) {
     sapp(out, &n, cap, loc);
     return;
   }
