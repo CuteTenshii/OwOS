@@ -114,6 +114,25 @@ static js_value mel_set_loop(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return js_undef();
 }
+static js_value mel_get_preload(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  const char *pl = n ? dom_get_attr(n, "preload") : 0;
+  (void)args;
+  (void)argc;
+  if (pl && streq_ci(pl, "none"))
+    return js_mk_cstring(ctx, "none");
+  if (pl && (!*pl || streq_ci(pl, "auto")))
+    return js_mk_cstring(ctx, "auto");
+  return js_mk_cstring(ctx, "metadata");
+}
+static js_value mel_set_preload(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (n)
+    dom_set_attr(n, "preload", arg_str(ctx, A(0)));
+  return js_undef();
+}
 static js_value mel_get_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -257,6 +276,7 @@ void setup_media_proto(js_ctx *ctx)
   def_acc(g_media_proto, "muted", mel_get_muted, mel_set_muted);
   def_acc(g_media_proto, "loop", mel_get_loop, mel_set_loop);
   def_acc(g_media_proto, "autoplay", mel_get_autoplay, mel_set_autoplay);
+  def_acc(g_media_proto, "preload", mel_get_preload, mel_set_preload);
   def_acc(g_media_proto, "controls", mel_get_controls, mel_set_controls);
   def_acc(g_media_proto, "readyState", mel_get_readyState, 0);
   def_acc(g_media_proto, "networkState", mel_get_networkState, 0);

@@ -18,6 +18,9 @@
 #define MEV_VOLCHANGE 0x20
 #define MEV_SEEKED 0x40
 #define MEV_ERROR 0x80
+#define MEV_LOADSTART 0x100
+#define MEV_SUSPEND 0x200
+#define MEV_EMPTIED 0x400
 
 struct media_el {
   bool in_use;
@@ -28,7 +31,7 @@ struct media_el {
 
   char src[URL_MAX]; /* resolved absolute current source ("" = none) */
   char poster[URL_MAX];
-  bool controls, autoplay, loop, muted, preload_none;
+  bool controls, autoplay, loop, muted;
   int volume; /* 0..1000 (milli-units of HTMLMediaElement) */
 
   bool registered;     /* first walk done: keep JS-mutated state     */
@@ -374,14 +377,38 @@ static void video_reopen(struct media_el *m)
 }
 
 /* Begin (or restart) loading this element's current source. */
-static void media_kick_load(struct media_el *m)
+enum { PRELOAD_NONE, PRELOAD_METADATA, PRELOAD_AUTO };
+
+/* The preload attribute: none / metadata / auto (empty = auto); anything else, or absent, is metadata */
+static int media_preload(const struct media_el *m)
 {
-  if (!m->src[0] || (m->ms && m->kind == MK_AUDIO) || m->preload_none)
+  const char *pl = m->node ? dom_get_attr(m->node, "preload") : 0;
+  if (pl && streq_ci(pl, "none"))
+    return PRELOAD_NONE;
+  if (pl && (!*pl || streq_ci(pl, "auto")))
+    return PRELOAD_AUTO;
+  return PRELOAD_METADATA;
+}
+
+/* `force`: play(), load() and autoplay fetch even under preload=none */
+static void media_kick_load(struct media_el *m, bool force)
+{
+  if (!m->src[0] || (m->ms && m->kind == MK_AUDIO))
     return;
   if (m->kind == MK_VIDEO && m->vid)
     return;
+  if (!force && media_preload(m) == PRELOAD_NONE) {
+    browser_buf_lock();
+    m->ev |= MEV_SUSPEND;
+    browser_buf_unlock();
+    return;
+  }
   loader_ensure();
+  browser_buf_lock();
+  if (m->net != MNS_LOADING)
+    m->ev |= MEV_LOADSTART;
   m->net = MNS_LOADING;
+  browser_buf_unlock();
 }
 
 static struct media_el *slot_alloc(struct dom_node *node, int kind)
@@ -527,13 +554,11 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
   m->controls = dom_get_attr(node, "controls") != 0;
 
   if (!m->registered) {
-    const char *poster, *pl;
+    const char *poster;
     m->registered = true;
     m->autoplay = dom_get_attr(node, "autoplay") != 0;
     m->loop = dom_get_attr(node, "loop") != 0;
     m->muted = dom_get_attr(node, "muted") != 0;
-    pl = dom_get_attr(node, "preload");
-    m->preload_none = pl && streq_ci(pl, "none");
     poster = dom_get_attr(node, "poster");
     if (poster && *poster)
       resolve_url(page_url, poster, m->poster, sizeof m->poster);
@@ -542,7 +567,7 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
     apply_audio_params(m);
     if (m->autoplay && m->src[0]) {
       m->want_play = true;
-      media_kick_load(m);
+      media_kick_load(m, true);
     }
   } else if (pick_source(node, page_url, abs, sizeof abs)) {
     media_set_src(m, abs); /* no-op unless the src attribute changed */
@@ -569,8 +594,12 @@ void media_set_src(struct media_el *m, const char *abs_url)
   m->reported_ended = false;
   m->want_play = false;
   m->start_ms = 0;
+  if (m->reported_meta || m->vid)
+    m->ev |= MEV_EMPTIED;
   m->net = m->src[0] ? MNS_IDLE : MNS_EMPTY;
   browser_buf_unlock();
+  if (m->src[0])
+    media_kick_load(m, false);
 }
 
 void media_get_src(struct media_el *m, char *out, int cap) { mstrcpy(out, m ? m->src : "", cap); }
@@ -578,7 +607,7 @@ void media_get_src(struct media_el *m, char *out, int cap) { mstrcpy(out, m ? m-
 void media_load(struct media_el *m)
 {
   if (m)
-    media_kick_load(m);
+    media_kick_load(m, true);
 }
 
 void media_play(struct media_el *m)
@@ -610,7 +639,7 @@ void media_play(struct media_el *m)
   }
   browser_buf_unlock();
   if (!m->ms && !m->vid)
-    media_kick_load(m);
+    media_kick_load(m, true);
 }
 
 void media_pause(struct media_el *m)
@@ -730,7 +759,7 @@ void media_set_autoplay(struct media_el *m, int on)
     m->autoplay = on != 0;
     if (on && m->src[0] && !m->ms) {
       m->want_play = true;
-      media_kick_load(m);
+      media_kick_load(m, true);
     }
   }
 }
@@ -803,12 +832,26 @@ int media_pump(void)
     if (!ev)
       continue;
 
+    if (ev & MEV_EMPTIED) {
+      js_media_fire(m->node, "emptied");
+      fired++;
+    }
+    if (ev & MEV_LOADSTART) {
+      js_media_fire(m->node, "loadstart");
+      fired++;
+    }
+    if (ev & MEV_SUSPEND) {
+      js_media_fire(m->node, "suspend");
+      fired++;
+    }
     if (ev & MEV_LOADEDMETA) {
-      js_media_fire(m->node, "loadedmetadata");
       js_media_fire(m->node, "durationchange");
+      js_media_fire(m->node, "loadedmetadata");
+      js_media_fire(m->node, "loadeddata");
+      js_media_fire(m->node, "progress");
       js_media_fire(m->node, "canplay");
       js_media_fire(m->node, "canplaythrough");
-      fired += 4;
+      fired += 6;
     }
     if (ev & MEV_PLAY) {
       js_media_fire(m->node, "play");
