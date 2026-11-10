@@ -71,11 +71,22 @@ js_value make_blob(js_ctx *ctx, const char *data, int len, const char *type)
 {
   js_object *o;
   js_value ov;
+  char ty[128];
+  int i;
+  strlcpy(ty, type ? type : "", sizeof ty);
+  for (i = 0; ty[i]; i++) { /* a media type is lowercase printable ASCII, or the empty string */
+    if ((unsigned char)ty[i] < 0x20 || (unsigned char)ty[i] > 0x7e) {
+      ty[0] = '\0';
+      break;
+    }
+    if (ty[i] >= 'A' && ty[i] <= 'Z')
+      ty[i] = (char)(ty[i] + 32);
+  }
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, g_blob_proto));
   js_def(o, "@bytes", js_mk_string(ctx, data ? data : "", len), 0);
   js_def(o, "size", js_number(len), P_ENUMERABLE);
-  js_def(o, "type", js_mk_cstring(ctx, type ? type : ""), P_ENUMERABLE);
+  js_def(o, "type", js_mk_cstring(ctx, ty), P_ENUMERABLE);
   ov = js_obj_value(o);
   gc_pop_scope();
   return ov;
@@ -230,12 +241,10 @@ js_value blob_text(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)argc;
   return js_promise_resolved(ctx, js_get(ctx, t, "@bytes"));
 }
-js_value blob_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
+static js_value blob_u8(js_ctx *ctx, js_value t, int want_buffer)
 {
   js_value b = js_get(ctx, t, "@bytes"), u8ctor, lenarg, view, buf;
   int i, len;
-  (void)args;
-  (void)argc;
   if (b.type != JV_STR)
     return js_promise_resolved(ctx, js_undef());
   len = b.u.str->len;
@@ -249,9 +258,21 @@ js_value blob_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
     for (i = 0; i < len; i++)
       js_set_index(ctx, view, (unsigned)i, js_number((unsigned char)b.u.str->data[i]));
   }
-  buf = js_get(ctx, view, "buffer");
+  buf = want_buffer ? js_get(ctx, view, "buffer") : view;
   gc_pop_scope();
   return js_promise_resolved(ctx, buf);
+}
+js_value blob_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return blob_u8(ctx, t, 1);
+}
+js_value blob_bytes_method(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return blob_u8(ctx, t, 0);
 }
 js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc)
 {

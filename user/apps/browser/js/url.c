@@ -661,6 +661,50 @@ js_value sp_for_each(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return js_undef();
 }
+/* FormData keys/values/entries: an array iterator over a snapshot of the pairs */
+static js_value fd_iter(js_ctx *ctx, js_value t, int kind)
+{
+  js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v"), *arr;
+  js_value av, it;
+  unsigned i, n = ka && va ? js_array_len(ka) : 0;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < n; i++) {
+    js_value k = js_get_index(ctx, js_obj_value(ka), i), v = js_get_index(ctx, js_obj_value(va), i);
+    if (kind == 0) {
+      js_array_push(ctx, arr, k);
+    } else if (kind == 1) {
+      js_array_push(ctx, arr, v);
+    } else {
+      js_object *pair = (js_object *)gc_keep(js_new_array(ctx, 0));
+      js_array_push(ctx, pair, k);
+      js_array_push(ctx, pair, v);
+      js_array_push(ctx, arr, js_obj_value(pair));
+    }
+  }
+  av = js_obj_value(arr);
+  it = js_call(ctx, js_get(ctx, av, "values"), av, 0, 0);
+  gc_pop_scope();
+  return it;
+}
+js_value fd_keys(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return fd_iter(ctx, t, 0);
+}
+js_value fd_values(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return fd_iter(ctx, t, 1);
+}
+js_value fd_entries(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return fd_iter(ctx, t, 2);
+}
 js_value sp_tostring(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v");

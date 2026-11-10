@@ -69,8 +69,10 @@ JS(
   method(EventTarget.prototype, "addEventListener", function (type, fn, opts) {
     if (typeof fn !== "function" && !(fn && typeof fn.handleEvent === "function")) { return; }
     var l = listeners(this), a = l[type] || (l[type] = []), once = !!(opts && typeof opts === "object" && opts.once);
+    var signal = opts && typeof opts === "object" && opts.signal ? opts.signal : null;
+    if (signal && signal.aborted) { return; }
     for (var i = 0; i < a.length; i++) { if (a[i].fn === fn) { return; } }
-    a.push({ fn: fn, once: once });
+    a.push({ fn: fn, once: once, signal: signal });
   });
   method(EventTarget.prototype, "removeEventListener", function (type, fn) {
     var a = listeners(this)[type];
@@ -83,6 +85,7 @@ JS(
       a = a.slice();
       for (i = 0; i < a.length && !ev["@stop"]; i++) {
         rec = a[i];
+        if (rec.signal && rec.signal.aborted) { continue; }
         if (rec.once) { target.removeEventListener(ev.type, rec.fn); }
         if (typeof rec.fn === "function") { rec.fn.call(target, ev); } else { rec.fn.handleEvent(ev); }
       }
@@ -140,6 +143,15 @@ JS(
     g.setTimeout(function () { abortSignal(s, new DOMException("signal timed out", "TimeoutError")); }, ms);
     return s;
   };
+  AbortSignal.any = function (signals) {
+    var s = newSignal(), list = Array.from(signals), i;
+    function from(src) { return function () { abortSignal(s, src.reason); }; }
+    for (i = 0; i < list.length; i++) {
+      if (list[i].aborted) { abortSignal(s, list[i].reason); break; }
+      list[i].addEventListener("abort", from(list[i]));
+    }
+    return s;
+  };
   function AbortController() { hide(this, "@signal", newSignal()); }
   Object.defineProperty(AbortController.prototype, "signal", { get: function () { return this["@signal"]; }, configurable: true });
   method(AbortController.prototype, "abort", function (reason) { abortSignal(this["@signal"], reason); });
@@ -150,11 +162,7 @@ JS(
   function TextEncoder() {}
   Object.defineProperty(TextEncoder.prototype, "encoding", { get: function () { return "utf-8"; }, configurable: true });
   method(TextEncoder.prototype, "encode", function (s) { return N.utf8encode(s === undefined ? "" : String(s)); });
-  method(TextEncoder.prototype, "encodeInto", function (s, dst) {
-    var bytes = N.utf8encode(String(s)), n = Math.min(bytes.length, dst.length);
-    dst.set(bytes.subarray(0, n));
-    return { read: String(s).length, written: n };
-  });
+  method(TextEncoder.prototype, "encodeInto", function (s, dst) { return N.encodeInto(String(s), dst); });
   hide(g, "TextEncoder", TextEncoder);
 
   function TextDecoder(label, opts) {

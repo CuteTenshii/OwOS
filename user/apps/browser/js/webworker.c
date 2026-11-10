@@ -802,6 +802,25 @@ static js_value wt_n_utf8encode(js_ctx *ctx, js_value t, js_value *args, int arg
   return r;
 }
 
+/* N.encodeInto(string, view): {read, written} */
+static js_value wt_n_encode_into(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value s = js_to_string(ctx, A(0)), r;
+  int len = 0, nread = 0, nwritten = 0;
+  const unsigned char *p = view_bytes(A(1), &len);
+  js_object *ro;
+  (void)t;
+  if (s.type == JV_STR && p)
+    text_encode_into(s.u.str->data, s.u.str->len, (unsigned char *)p, len, &nread, &nwritten);
+  gc_push_scope();
+  ro = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(ro, "read", js_number(nread), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  js_def(ro, "written", js_number(nwritten), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  r = js_obj_value(ro);
+  gc_pop_scope();
+  return r;
+}
+
 static js_value wt_n_encoding_name(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value s = js_to_string(ctx, A(0));
@@ -1403,6 +1422,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "headers", wt_n_headers, 0);
   js_def_native(ctx, n, "utf8encode", wt_n_utf8encode, 1);
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
+  js_def_native(ctx, n, "encodeInto", wt_n_encode_into, 2);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
   url_natives_install(ctx, n);

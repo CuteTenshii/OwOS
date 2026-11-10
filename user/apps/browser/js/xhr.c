@@ -199,6 +199,12 @@ js_value xhr_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onabort", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onloadend", js_null(), P_WRITABLE | P_ENUMERABLE);
+  {
+    js_value et = js_get(ctx, js_obj_value(ctx->global), "EventTarget");
+    js_value up = js_is_callable(et) ? js_construct(ctx, et, 0, 0) : js_undef();
+    if (up.type == JV_OBJ)
+      js_def(o, "upload", up, P_ENUMERABLE); /* a target for upload progress events; none are sent */
+  }
   ov = js_obj_value(o);
   gc_pop_scope();
   return ov;

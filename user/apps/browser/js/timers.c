@@ -152,7 +152,7 @@ static js_object *new_abort_signal(js_ctx *ctx)
 /* Abort `signal` with `reason` (an AbortError when none is given), once */
 static void signal_abort(js_ctx *ctx, js_object *signal, js_value reason)
 {
-  js_value ev, h;
+  js_value ev;
   if (!signal || js_to_boolean(js_get(ctx, js_obj_value(signal), "aborted")))
     return;
   gc_push_scope();
@@ -168,14 +168,6 @@ static void signal_abort(js_ctx *ctx, js_object *signal, js_value reason)
     gc_keep(ev.u.obj);
     js_set(ctx, ev, "target", js_obj_value(signal));
     js_set(ctx, ev, "currentTarget", js_obj_value(signal));
-  }
-  h = js_get(ctx, js_obj_value(signal), "onabort");
-  if (js_is_callable(h)) {
-    js_value a = ev;
-    js_set_event_script("abort", 0);
-    js_call(ctx, h, js_obj_value(signal), &a, 1);
-    if (ctx->has_exc)
-      report_exc(ctx);
   }
   ev_fire_on(signal, ev, 0);
   gc_pop_scope();
@@ -208,6 +200,76 @@ js_value sig_static_abort(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_push_scope();
   s = (js_object *)gc_keep(new_abort_signal(ctx));
   signal_abort(ctx, s, A(0));
+  rv = js_obj_value(s);
+  gc_pop_scope();
+  return rv;
+}
+
+/* The timer callback of AbortSignal.timeout: ctx->native_data is the signal */
+static js_value sig_timeout_fire(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value s = ctx->native_data;
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (s.type == JV_OBJ)
+    signal_abort(ctx, s.u.obj, dom_exception(ctx, "TimeoutError", "signal timed out"));
+  return js_undef();
+}
+
+/* Static AbortSignal.timeout(ms): aborts with a TimeoutError once the timer fires */
+js_value sig_static_timeout(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *s, *cb;
+  js_value a[2], rv;
+  (void)t;
+  gc_push_scope();
+  s = (js_object *)gc_keep(new_abort_signal(ctx));
+  cb = (js_object *)gc_keep(js_new_native(ctx, sig_timeout_fire, "", 0));
+  cb->fn->data = js_obj_value(s);
+  a[0] = js_obj_value(cb);
+  a[1] = A(0);
+  win_set_timeout(ctx, js_undef(), a, 2);
+  rv = js_obj_value(s);
+  gc_pop_scope();
+  return rv;
+}
+
+/* The abort listener of AbortSignal.any: `t` is the source signal, ctx->native_data the combined one */
+static js_value sig_any_fire(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value s = ctx->native_data;
+  (void)args;
+  (void)argc;
+  if (s.type == JV_OBJ && t.type == JV_OBJ)
+    signal_abort(ctx, s.u.obj, js_get(ctx, t, "reason"));
+  return js_undef();
+}
+
+/* Static AbortSignal.any(signals): aborts as soon as one of them does, with its reason */
+js_value sig_static_any(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *s;
+  js_value list = A(0), rv;
+  unsigned i, n = list.type == JV_OBJ ? js_array_len(list.u.obj) : 0;
+  (void)t;
+  gc_push_scope();
+  s = (js_object *)gc_keep(new_abort_signal(ctx));
+  for (i = 0; i < n && !js_to_boolean(js_get(ctx, js_obj_value(s), "aborted")); i++) {
+    js_value src = js_get_index(ctx, list, i), la[2];
+    js_object *cb;
+    if (src.type != JV_OBJ)
+      continue;
+    if (js_to_boolean(js_get(ctx, src, "aborted"))) {
+      signal_abort(ctx, s, js_get(ctx, src, "reason"));
+      break;
+    }
+    cb = (js_object *)gc_keep(js_new_native(ctx, sig_any_fire, "", 0));
+    cb->fn->data = js_obj_value(s);
+    la[0] = js_mk_cstring(ctx, "abort");
+    la[1] = js_obj_value(cb);
+    el_add_listener(ctx, src, la, 2);
+  }
   rv = js_obj_value(s);
   gc_pop_scope();
   return rv;

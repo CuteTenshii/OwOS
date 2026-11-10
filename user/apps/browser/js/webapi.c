@@ -92,12 +92,30 @@ static js_value textenc_encode(js_ctx *ctx, js_value t, js_value *args, int argc
   gc_pop_scope();
   return r;
 }
+/* TextEncoder.encodeInto: copy whole characters of the UTF-8 string `s` into out[0..cap); *read counts UTF-16 units */
+void text_encode_into(const char *s, int len, unsigned char *out, int cap, int *read, int *written)
+{
+  int p = 0, w = 0, r = 0;
+  while (p < len) {
+    unsigned cp;
+    int n = utf8_decode(s + p, s + len, &cp);
+    if (n <= 0 || w + n > cap)
+      break;
+    memcpy(out + w, s + p, (unsigned)n);
+    p += n;
+    w += n;
+    r += cp >= 0x10000 ? 2 : 1;
+  }
+  *read = r;
+  *written = w;
+}
+
 static js_value textenc_encodeinto(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value s = js_to_string(ctx, A(0)), dst = A(1), r;
   js_object *ro;
   unsigned char *out = 0;
-  int cap = 0, n;
+  int cap = 0, nread = 0, nwritten = 0;
   (void)t;
   if (dst.type == JV_OBJ && dst.u.obj->kind == OBJ_TYPEDARRAY && dst.u.obj->host) {
     js_typedarray *ta = (js_typedarray *)dst.u.obj->host;
@@ -107,16 +125,13 @@ static js_value textenc_encodeinto(js_ctx *ctx, js_value t, js_value *args, int 
       cap = ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
     }
   }
-  n = (s.type == JV_STR) ? s.u.str->len : 0;
-  if (n > cap)
-    n = cap;
-  if (out && n > 0)
-    memcpy(out, s.u.str->data, (unsigned)n);
+  if (s.type == JV_STR && out)
+    text_encode_into(s.u.str->data, s.u.str->len, out, cap, &nread, &nwritten);
   ro = js_new_object(ctx, ctx->object_proto);
   gc_push_scope();
   gc_keep(ro);
-  js_def(ro, "read", js_number(n), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
-  js_def(ro, "written", js_number(n), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  js_def(ro, "read", js_number(nread), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  js_def(ro, "written", js_number(nwritten), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
   r = js_obj_value(ro);
   gc_pop_scope();
   return r;

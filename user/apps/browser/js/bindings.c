@@ -2436,6 +2436,13 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_formdata_proto, "set", sp_set, 2);
   def_method(g_formdata_proto, "delete", sp_delete, 1);
   def_method(g_formdata_proto, "forEach", sp_for_each, 1);
+  def_method(g_formdata_proto, "keys", fd_keys, 0);
+  def_method(g_formdata_proto, "values", fd_values, 0);
+  def_method(g_formdata_proto, "entries", fd_entries, 0);
+  {
+    js_object *f = js_new_native(ctx, fd_entries, "[Symbol.iterator]", 0);
+    js_def(g_formdata_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), P_CONFIGURABLE);
+  }
   {
     js_object *fc = js_new_native(ctx, fd_ctor, "FormData", 1);
     gc_push_scope();
@@ -2714,6 +2721,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   /* Blob (bytes + type), enough for sendBeacon / fetch bodies */
   def_method(g_blob_proto, "text", blob_text, 0);
   def_method(g_blob_proto, "arrayBuffer", blob_arraybuffer, 0);
+  def_method(g_blob_proto, "bytes", blob_bytes_method, 0);
   def_method(g_blob_proto, "slice", blob_slice, 2);
   {
     js_object *bc = js_new_native(ctx, blob_ctor, "Blob", 1);
@@ -2753,6 +2761,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(sc, "prototype", js_obj_value(g_abortsignal_proto), 0);
     js_def(g_abortsignal_proto, "constructor", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
     js_def_native(ctx, sc, "abort", sig_static_abort, 1); /* AbortSignal.abort(reason?) */
+    js_def_native(ctx, sc, "timeout", sig_static_timeout, 1);
+    js_def_native(ctx, sc, "any", sig_static_any, 1);
     js_def(cc, "prototype", js_obj_value(g_abortcontroller_proto), 0);
     js_def(g_abortcontroller_proto, "constructor", js_obj_value(cc), P_WRITABLE | P_CONFIGURABLE);
     js_def(win, "AbortSignal", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
