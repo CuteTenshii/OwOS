@@ -1,8 +1,20 @@
 /* boot.S: AArch64 entry: park secondary cores, drop to EL1, clear BSS, enter C. */
 
+/* Linux arm64 Image header: QEMU only passes the DTB in x0 to images that carry it. */
 .section .text.boot
 .global _start
 _start:
+	b	start_real
+	.word	0
+	.quad	0x80000                      /* text_offset */
+	.quad	__image_size
+	.quad	0                            /* flags: little endian */
+	.quad	0, 0, 0
+	.ascii	"ARM\x64"
+	.word	0
+
+start_real:
+	mov	x20, x0                      /* DTB pointer from the loader */
 	mrs	x0, mpidr_el1
 	and	x0, x0, #0xff
 	cbnz	x0, park
@@ -48,7 +60,9 @@ at_el1:
 	b.hs	2f
 	stp	xzr, xzr, [x0], #16
 	b	1b
-2:	bl	arch_main
+2:	adrp	x0, boot_dtb
+	str	x20, [x0, :lo12:boot_dtb]
+	bl	arch_main
 
 park:	wfe
 	b	park
@@ -65,4 +79,7 @@ __stack_top:
 .balign 8
 .global boot_el
 boot_el:
+	.quad	0
+.global boot_dtb
+boot_dtb:
 	.quad	0

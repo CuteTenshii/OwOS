@@ -42,6 +42,19 @@ void gic_init(void);
 void timer_init(void);
 uint64_t timer_ticks(void);
 
+#define PMM_FRAME_SIZE 4096
+
+extern uint64_t boot_dtb;
+
+/* Base and size of the first /memory node. Returns 0 on success, -1 if the blob is invalid. */
+int fdt_memory(const void *fdt, uint64_t *base, uint64_t *size);
+
+void pmm_init(uint64_t ram_base, uint64_t ram_size);
+uintptr_t pmm_alloc_frame(void); /* 0 when out of memory */
+void pmm_free_frame(uintptr_t frame);
+uint64_t pmm_free_count(void);
+uint64_t pmm_total_count(void);
+
 void arch_exception(struct trap_frame *tf, uint64_t kind);
 void arch_poweroff(void);
 

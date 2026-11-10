@@ -15,7 +15,9 @@ else
 endif
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
+OBJCOPY := $(CROSS)objcopy
 KERNEL  := owos-aarch64.bin
+A64ELF  := owos-aarch64.elf
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
 A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
@@ -27,7 +29,7 @@ ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
 endif
 
-OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o) kernel/kstring.o
+OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o pmm.o) kernel/kstring.o
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@
@@ -38,8 +40,11 @@ $(A64DIR)/%.o: $(A64DIR)/%.c $(A64DIR)/arch.h
 kernel/kstring.o: kernel/kstring.c kernel/kstring.h
 	$(CC) $(A64FLAGS) -c $< -o $@
 
-$(KERNEL): $(OBJS) $(A64DIR)/linker.ld
+$(A64ELF): $(OBJS) $(A64DIR)/linker.ld
 	$(LD) --no-warn-rwx-segments -nostdlib -T $(A64DIR)/linker.ld -o $@ $(OBJS)
+
+$(KERNEL): $(A64ELF)
+	$(OBJCOPY) -O binary $< $@
 
 run: $(KERNEL)
 	$(QEMU_A64)

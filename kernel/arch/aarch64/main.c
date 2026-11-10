@@ -41,6 +41,22 @@ static void test_kstring(void)
   check("ksnprintf", streq(buf, "os-42-ff"));
 }
 
+static void test_memory(void)
+{
+  uint64_t base = 0, size = 0;
+  check("dtb memory node",
+        fdt_memory((const void *)boot_dtb, &base, &size) == 0 && base == 0x40000000UL && size == 256UL << 20);
+  pmm_init(base, size);
+
+  uint64_t total = pmm_total_count();
+  uintptr_t a = pmm_alloc_frame(), b = pmm_alloc_frame();
+  check("pmm distinct aligned frames",
+        a && b && a != b && !(a & (PMM_FRAME_SIZE - 1)) && pmm_free_count() == total - 2);
+  memset((void *)a, 0xa5, PMM_FRAME_SIZE);
+  pmm_free_frame(a);
+  check("pmm reuses freed frame", pmm_alloc_frame() == a && pmm_free_count() == total - 2);
+}
+
 void arch_main(void)
 {
   uart_init();
@@ -58,6 +74,7 @@ void arch_main(void)
   check("synchronous exception round trip", svc_count == 2);
 
   test_kstring();
+  test_memory();
 
   gic_init();
   timer_init();

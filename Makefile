@@ -66,7 +66,7 @@ install-hooks:
 	lefthook install
 
 clean:
-	rm -f $(OBJS) owos.bin owos-x86_64.bin owos-aarch64.bin $(ISO) .arch.*
+	rm -f $(OBJS) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete

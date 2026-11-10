@@ -23,6 +23,7 @@ SECTIONS
   }
 
   __kernel_end = .;
+  __image_size = __kernel_end - __kernel_start;
 
   /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
