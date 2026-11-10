@@ -6,6 +6,7 @@
 #include "atapi.h"
 #include "blk.h"
 #include "console.h"
+#include "crc32c.h"
 #include "entropy.h"
 #include "ext.h"
 #include "fat.h"
@@ -74,10 +75,72 @@ static void shell_interrupt_locked(void)
 }
 
 /* Install an embedded blob to owofs when absent or when its size differs from the built-in one. */
+/* What the installs last wrote, one "crc size path" line per file: a rebuilt blob of unchanged size (a one-line
+ * fix often is) must still replace the copy on disk, and checksumming the embedded blob is far cheaper than
+ * reading every installed file back. Loaded before the installs, rewritten after them. */
+#define INSTALL_MANIFEST "/var/lib/installed"
+static char *inst_old;
+static char *inst_new;
+static uint32_t inst_new_len, inst_new_cap;
+
+static void install_begin(void)
+{
+  int sz = fs_size(INSTALL_MANIFEST);
+  if (sz <= 0 || !(inst_old = kmalloc((uint32_t)sz + 1)))
+    return;
+  int n = fs_read(INSTALL_MANIFEST, inst_old, (uint32_t)sz);
+  inst_old[n > 0 ? n : 0] = '\0';
+}
+
+/* 1 if the boot-time manifest holds exactly this line */
+static int manifest_has(const char *line)
+{
+  for (const char *p = inst_old; p && (p = strstr(p, line)); p++)
+    if (p == inst_old || p[-1] == '\n')
+      return 1;
+  return 0;
+}
+
+static void manifest_add(const char *line)
+{
+  uint32_t n = (uint32_t)strlen(line);
+  if (inst_new_len + n + 1 > inst_new_cap) {
+    uint32_t cap = inst_new_cap ? inst_new_cap * 2 : 8192;
+    while (cap < inst_new_len + n + 1)
+      cap *= 2;
+    char *grown = kmalloc(cap);
+    if (!grown)
+      return;
+    if (inst_new)
+      memcpy(grown, inst_new, inst_new_len);
+    kfree(inst_new);
+    inst_new = grown;
+    inst_new_cap = cap;
+  }
+  memcpy(inst_new + inst_new_len, line, n + 1);
+  inst_new_len += n;
+}
+
+static void install_end(void)
+{
+  if (inst_new && !(inst_old && strcmp(inst_old, inst_new) == 0)) {
+    fs_delete(INSTALL_MANIFEST);
+    fs_create(INSTALL_MANIFEST, inst_new, inst_new_len);
+    fs_chmod(INSTALL_MANIFEST, 0644);
+  }
+  kfree(inst_old);
+  kfree(inst_new);
+  inst_old = inst_new = 0;
+  inst_new_len = inst_new_cap = 0;
+}
+
 static void install_blob(const char *path, const unsigned char *start, const unsigned char *end, uint32_t mode)
 {
   uint32_t len = (uint32_t)(end - start);
-  if (fs_size(path) == (int)len)
+  char line[192];
+  ksnprintf(line, sizeof line, "%08x %u %s\n", crc32c_raw(0, start, len), len, path);
+  manifest_add(line);
+  if (fs_size(path) == (int)len && manifest_has(line))
     return;        /* already up to date */
   fs_delete(path); /* no-op if absent; drop stale copy */
   fs_create(path, start, len);
@@ -393,6 +456,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     mkdir_mode("/home/root", 0700);
     mkdir_mode("/home/root/Downloads", 0755);
 
+    mkdir_mode("/var", 0755);
+    mkdir_mode("/var/lib", 0755);
+    install_begin();
+
     /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
     mkdir_mode("/etc", 0755);
     mkdir_mode("/etc/fonts", 0755);
@@ -495,6 +562,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(sudo);
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
     INSTALL_APP(trayd);
+    install_end();
   }
   con_write("usermode: ready ('curl <url>').\n");
 
