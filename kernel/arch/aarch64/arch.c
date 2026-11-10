@@ -1,6 +1,7 @@
 /* arch.c: AArch64 platform support for the QEMU virt machine: PL011 UART,
  * stage-1 MMU, GICv2, generic timer and exception dispatch. */
 #include "arch.h"
+#include "spinlock.h"
 
 #define UARTDR 0x00
 #define UARTFR 0x18
@@ -17,26 +18,40 @@ void uart_init(void)
   mmio_write32(UART0_BASE + UARTCR, (1 << 0) | (1 << 8) | (1 << 9));
 }
 
-void uart_putc(char c)
+static spinlock_t uart_lock;
+
+static void uart_write(char c)
 {
   if (c == '\n')
-    uart_putc('\r');
+    uart_write('\r');
   while (mmio_read32(UART0_BASE + UARTFR) & UARTFR_TXFF)
     ;
   mmio_write32(UART0_BASE + UARTDR, (uint32_t)c);
 }
 
+void uart_putc(char c)
+{
+  uintptr_t f = spin_lock_irqsave(&uart_lock);
+  uart_write(c);
+  spin_unlock_irqrestore(&uart_lock, f);
+}
+
 void uart_puts(const char *s)
 {
+  uintptr_t f = spin_lock_irqsave(&uart_lock);
   while (*s)
-    uart_putc(*s++);
+    uart_write(*s++);
+  spin_unlock_irqrestore(&uart_lock, f);
 }
 
 void uart_puthex(uint64_t v)
 {
-  uart_puts("0x");
+  uintptr_t f = spin_lock_irqsave(&uart_lock);
+  uart_write('0');
+  uart_write('x');
   for (int i = 60; i >= 0; i -= 4)
-    uart_putc("0123456789abcdef"[(v >> i) & 0xf]);
+    uart_write("0123456789abcdef"[(v >> i) & 0xf]);
+  spin_unlock_irqrestore(&uart_lock, f);
 }
 
 #define PTE_BLOCK 0x1ULL
@@ -48,6 +63,7 @@ void uart_puthex(uint64_t v)
 #define MAIR_NORMAL 1
 
 /* 39-bit VA, 4 KiB granule: the L1 table maps 1 GiB per entry, identity. */
+uint64_t mmu_regs[3];
 uint64_t kernel_l1[512] __attribute__((aligned(4096)));
 
 void mmu_init(void)
@@ -62,7 +78,14 @@ void mmu_init(void)
   uint64_t ips = SYSREG_READ(id_aa64mmfr0_el1) & 7;
   uint64_t tcr = 25 | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (1ULL << 23) | (ips << 32);
 
-  __asm__ volatile("dsb ish");
+  mmu_regs[0] = mair;
+  mmu_regs[1] = tcr;
+  mmu_regs[2] = (uint64_t)(uintptr_t)kernel_l1;
+  for (int i = 0; i < 3; i++) /* secondaries read these with their MMU and caches off */
+    __asm__ volatile("dc civac, %0" : : "r"(&mmu_regs[i]) : "memory");
+  for (int i = 0; i < 4; i++)
+    __asm__ volatile("dc civac, %0" : : "r"(&kernel_l1[i]) : "memory");
+  __asm__ volatile("dsb sy");
   SYSREG_WRITE(mair_el1, mair);
   SYSREG_WRITE(tcr_el1, tcr);
   SYSREG_WRITE(ttbr0_el1, kernel_l1);
@@ -82,14 +105,20 @@ void mmu_init(void)
 #define GICC_IAR 0x00c
 #define GICC_EOIR 0x010
 
+/* Per-CPU part: the PPI enable/priority registers and the CPU interface are banked. */
+void gic_cpu_init(void)
+{
+  mmio_write32(GICD_BASE + GICD_IPRIORITYR + (IRQ_TIMER_PPI & ~3), 0x80u << (8 * (IRQ_TIMER_PPI & 3)));
+  mmio_write32(GICD_BASE + GICD_ISENABLER0, 1u << IRQ_TIMER_PPI);
+  mmio_write32(GICC_BASE + GICC_PMR, 0xff);
+  mmio_write32(GICC_BASE + GICC_CTLR, 1);
+}
+
 void gic_init(void)
 {
   mmio_write32(GICD_BASE + GICD_CTLR, 0);
-  mmio_write32(GICD_BASE + GICD_IPRIORITYR + (IRQ_TIMER_PPI & ~3), 0x80u << (8 * (IRQ_TIMER_PPI & 3)));
-  mmio_write32(GICD_BASE + GICD_ISENABLER0, 1u << IRQ_TIMER_PPI);
   mmio_write32(GICD_BASE + GICD_CTLR, 1);
-  mmio_write32(GICC_BASE + GICC_PMR, 0xff);
-  mmio_write32(GICC_BASE + GICC_CTLR, 1);
+  gic_cpu_init();
 }
 
 static volatile uint64_t ticks;
@@ -110,7 +139,8 @@ static void irq_dispatch(void)
   uint32_t id = iar & 0x3ff;
   if (id == IRQ_TIMER_PPI) {
     SYSREG_WRITE(cntp_tval_el0, tick_interval);
-    ticks++;
+    if (cpu_id() == 0)
+      ticks++;
   }
   if (id < 1020)
     mmio_write32(GICC_BASE + GICC_EOIR, iar);
@@ -159,23 +189,41 @@ void arch_exception(struct trap_frame *tf, uint64_t kind)
   exception_fatal(tf, kind);
 }
 
+#define PSCI_CPU_ON 0xc4000003UL
+#define PSCI_SYSTEM_OFF 0x84000008UL
+
+static int64_t psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+  register uint64_t x0 __asm__("x0") = fn;
+  register uint64_t x1 __asm__("x1") = a1;
+  register uint64_t x2 __asm__("x2") = a2;
+  register uint64_t x3 __asm__("x3") = a3;
+  if (boot_el == 2)
+    __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+  else
+    __asm__ volatile("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+  return (int64_t)x0;
+}
+
+int psci_cpu_on(int cpu)
+{
+  return (int)psci_call(PSCI_CPU_ON, (uint64_t)cpu, (uint64_t)(uintptr_t)secondary_entry, (uint64_t)cpu);
+}
+
 void arch_poweroff(void)
 {
-  register uint64_t x0 __asm__("x0") = 0x84000008; /* PSCI SYSTEM_OFF */
-  if (boot_el == 2)
-    __asm__ volatile("smc #0" : "+r"(x0));
-  else
-    __asm__ volatile("hvc #0" : "+r"(x0));
+  psci_call(PSCI_SYSTEM_OFF, 0, 0, 0);
   for (;;)
     __asm__ volatile("wfi");
 }
 
-uintptr_t context_init(void *stack_top, void (*entry)(void))
+uintptr_t context_init(void *stack_top, void (*entry)(void *), void *arg)
 {
   uint64_t *sp = (uint64_t *)((uintptr_t)stack_top - 96);
   for (int i = 0; i < 12; i++)
     sp[i] = 0;
   sp[0] = (uint64_t)entry;              /* x19, called by the trampoline */
+  sp[1] = (uint64_t)arg;                /* x20 */
   sp[11] = (uint64_t)thread_trampoline; /* x30 */
   return (uintptr_t)sp;
 }

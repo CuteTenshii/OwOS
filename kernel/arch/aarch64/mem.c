@@ -2,7 +2,8 @@
 #include "arch.h"
 #include "heap.h"
 
-#define HEAP_BYTES (16UL << 20)
+#define HEAP_MIN (16UL << 20)
+#define HEAP_MAX (256UL << 20)
 #define ALIGN_2M(n) (((n) + (2UL << 20) - 1) & ~((2UL << 20) - 1))
 
 extern char kernel_end[];
@@ -15,7 +16,8 @@ int arch_mem_init(const void *dtb)
   if (base + size > (1ULL << 32))
     size = (1ULL << 32) - base; /* the pmm tracks physical addresses below 4 GiB */
 
-  uintptr_t heap_end = ALIGN_2M((uintptr_t)kernel_end + HEAP_BYTES);
+  uintptr_t heap_bytes = size / 4 < HEAP_MIN ? HEAP_MIN : size / 4 > HEAP_MAX ? HEAP_MAX : size / 4;
+  uintptr_t heap_end = ALIGN_2M((uintptr_t)kernel_end + heap_bytes);
   if (heap_end >= base + size)
     return -1;
 

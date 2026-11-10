@@ -26,11 +26,13 @@ context_switch:
 	ret
 .size context_switch, . - context_switch
 
-/* First code a new thread runs: context_init leaves its entry in x19. */
+/* First code a new thread runs: context_init leaves entry in x19 and its argument in x20. */
 .global thread_trampoline
 .type thread_trampoline, %function
 thread_trampoline:
+	bl	sched_new_thread
 	msr	daifclr, #2
+	mov	x0, x20
 	blr	x19
 	mov	x0, #0
 	bl	thread_exit

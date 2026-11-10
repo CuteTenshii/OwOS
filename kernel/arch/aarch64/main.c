@@ -2,6 +2,7 @@
 #include "arch.h"
 #include "heap.h"
 #include "kstring.h"
+#include "spinlock.h"
 
 extern volatile uint64_t svc_count;
 
@@ -85,40 +86,119 @@ static void test_user(void)
   check("task frames released", free_frames() == free_before);
 }
 
-static volatile int stop;
-static volatile uint32_t counters[3];
+#define LOCK_ROUNDS 500
+#define ALLOC_ROUNDS 300
+#define MANY_THREADS 400
 
-static void spin0(void)
+static volatile int stop;
+static volatile uint32_t cpus_seen;
+static spinlock_t shared_lock;
+static volatile uint32_t shared_counter;
+static volatile int alloc_errors;
+static volatile uint32_t many_done;
+
+static void spinner(void *arg)
 {
-  while (!stop)
-    counters[0]++;
+  volatile uint32_t *counter = arg;
+  while (!stop) {
+    (*counter)++;
+    __sync_fetch_and_or(&cpus_seen, 1u << cpu_id());
+  }
 }
-static void spin1(void)
+
+/* The delay inside the critical section makes a missing lock lose updates. */
+static void locked_incrementer(void *arg)
 {
-  while (!stop)
-    counters[1]++;
+  (void)arg;
+  for (int i = 0; i < LOCK_ROUNDS; i++) {
+    uintptr_t f = spin_lock_irqsave(&shared_lock);
+    uint32_t v = shared_counter;
+    for (int k = 0; k < 3000; k++)
+      __asm__ volatile("" ::: "memory");
+    shared_counter = v + 1;
+    spin_unlock_irqrestore(&shared_lock, f);
+  }
 }
-static void spin2(void)
+
+static void allocator(void *arg)
 {
-  while (!stop)
-    counters[2]++;
+  uint8_t me = (uint8_t)(uintptr_t)arg;
+  for (int i = 0; i < ALLOC_ROUNDS; i++) {
+    uint8_t *p = kmalloc(64 + (size_t)i % 200);
+    if (!p) {
+      alloc_errors++;
+      continue;
+    }
+    memset(p, me, 64);
+    thread_yield();
+    for (int j = 0; j < 64; j++)
+      if (p[j] != me)
+        alloc_errors++;
+    phys_t f = pmm_alloc_frame();
+    if (!f)
+      alloc_errors++;
+    pmm_free_frame(f);
+    kfree(p);
+  }
 }
-static void exits_seven(void) { thread_exit(7); }
+
+static void exits_seven(void *arg)
+{
+  (void)arg;
+  thread_exit(7);
+}
+
+static void quick(void *arg)
+{
+  (void)arg;
+  __sync_fetch_and_add(&many_done, 1);
+}
+
+static void run_all(void (*fn)(void *), int n)
+{
+  int *ids = kmalloc((size_t)n * sizeof *ids);
+  for (int i = 0; i < n; i++)
+    ids[i] = thread_create("worker", fn, (void *)(uintptr_t)i);
+  for (int i = 0; i < n; i++)
+    thread_join(ids[i]);
+  kfree(ids);
+}
 
 static void test_sched(void)
 {
   uint32_t frames = pmm_free_kib();
   size_t heap = heap_free_bytes();
-  int ids[3] = {thread_create("spin0", spin0), thread_create("spin1", spin1), thread_create("spin2", spin2)};
-  check("threads created", ids[0] > 0 && ids[1] > 0 && ids[2] > 0);
+  int cpus = smp_online();
+  check("secondary CPUs came online", cpus > 1);
 
+  int n = 2 * cpus;
+  int *ids = kmalloc((size_t)n * sizeof *ids);
+  uint32_t *counters = kmalloc((size_t)n * sizeof *counters);
+  memset(counters, 0, (size_t)n * sizeof *counters);
+  for (int i = 0; i < n; i++)
+    ids[i] = thread_create("spin", spinner, &counters[i]);
   thread_sleep(30);
   stop = 1;
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < n; i++)
     thread_join(ids[i]);
-  check("busy threads are preempted and all make progress", counters[0] && counters[1] && counters[2]);
+  int all_ran = 1;
+  for (int i = 0; i < n; i++)
+    all_ran &= counters[i] != 0;
+  check("busy threads are preempted and all make progress", all_ran);
+  check("threads ran on every CPU", cpus_seen == (1u << cpus) - 1);
+  kfree(ids);
+  kfree(counters);
 
-  check("thread_exit code reaches join", thread_join(thread_create("exit7", exits_seven)) == 7);
+  check("thread_exit code reaches join", thread_join(thread_create("exit7", exits_seven, 0)) == 7);
+
+  run_all(quick, MANY_THREADS);
+  check("hundreds of threads at once", many_done == MANY_THREADS);
+
+  run_all(locked_incrementer, cpus);
+  check("spinlock gives mutual exclusion across CPUs", shared_counter == (uint32_t)cpus * LOCK_ROUNDS);
+
+  run_all(allocator, cpus);
+  check("concurrent pmm and heap use stays consistent", alloc_errors == 0);
 
   int a = thread_create_user("hello1", user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
   int b = thread_create_user("fault", user_fault_start, (uint32_t)(user_fault_end - user_fault_start));
@@ -158,6 +238,7 @@ void arch_main(void)
     __asm__ volatile("wfi");
   check("timer interrupts via GIC", timer_ticks() >= 10);
 
+  smp_start();
   test_sched();
 
   uart_puts(failures ? "AARCH64 SELFTEST FAIL\n" : "AARCH64 SELFTEST PASS\n");

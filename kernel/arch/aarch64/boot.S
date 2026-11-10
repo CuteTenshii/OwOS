@@ -1,4 +1,22 @@
+#include "cpu_defs.h"
+
 /* boot.S: AArch64 entry: park secondary cores, drop to EL1, clear BSS, enter C. */
+
+.macro el2_to_el1 target
+	mov	x0, #(1 << 31)               /* HCR_EL2.RW: EL1 is AArch64 */
+	msr	hcr_el2, x0
+	mov	x0, #0x33ff                  /* CPTR_EL2: no FP/SIMD traps */
+	msr	cptr_el2, x0
+	mrs	x0, cnthctl_el2
+	orr	x0, x0, #3                   /* EL1 may use the physical counter and timer */
+	msr	cnthctl_el2, x0
+	msr	cntvoff_el2, xzr
+	mov	x0, #0x3c5                   /* SPSR: EL1h, DAIF masked */
+	msr	spsr_el2, x0
+	adr	x0, \target
+	msr	elr_el2, x0
+	eret
+.endm
 
 /* Linux arm64 Image header: QEMU only passes the DTB in x0 to images that carry it. */
 .section .text.boot
@@ -26,19 +44,7 @@ start_real:
 	cmp	x0, #2
 	b.ne	at_el1
 
-	mov	x0, #(1 << 31)               /* HCR_EL2.RW: EL1 is AArch64 */
-	msr	hcr_el2, x0
-	mov	x0, #0x33ff                  /* CPTR_EL2: no FP/SIMD traps */
-	msr	cptr_el2, x0
-	mrs	x0, cnthctl_el2
-	orr	x0, x0, #3                   /* EL1 may use the physical counter and timer */
-	msr	cnthctl_el2, x0
-	msr	cntvoff_el2, xzr
-	mov	x0, #0x3c5                   /* SPSR: EL1h, DAIF masked */
-	msr	spsr_el2, x0
-	adr	x0, at_el1
-	msr	elr_el2, x0
-	eret
+	el2_to_el1 at_el1
 
 at_el1:
 	adrp	x0, __stack_top
@@ -67,6 +73,51 @@ at_el1:
 park:	wfe
 	b	park
 
+
+/* Entered by PSCI CPU_ON with the MMU off: x0 = cpu index. */
+.global secondary_entry
+secondary_entry:
+	mov	x20, x0
+	mrs	x0, CurrentEL
+	lsr	x0, x0, #2
+	cmp	x0, #2
+	b.ne	secondary_el1
+	el2_to_el1 secondary_el1
+
+secondary_el1:
+	adrp	x0, secondary_stacks
+	add	x0, x0, :lo12:secondary_stacks
+	add	x1, x20, #1
+	mov	x2, #SECONDARY_STACK_SIZE
+	madd	x0, x1, x2, x0
+	mov	sp, x0
+
+	mov	x0, #(3 << 20)
+	msr	cpacr_el1, x0
+	adrp	x0, vector_table
+	add	x0, x0, :lo12:vector_table
+	msr	vbar_el1, x0
+
+	adrp	x1, mmu_regs
+	add	x1, x1, :lo12:mmu_regs
+	ldp	x2, x3, [x1]
+	ldr	x4, [x1, #16]
+	msr	mair_el1, x2
+	msr	tcr_el1, x3
+	msr	ttbr0_el1, x4
+	isb
+	tlbi	vmalle1
+	dsb	ish
+	isb
+	mrs	x0, sctlr_el1
+	mov	x1, #((1 << 0) | (1 << 2) | (1 << 12))
+	orr	x0, x0, x1
+	msr	sctlr_el1, x0
+	isb
+	mov	x0, x20
+	bl	secondary_main
+	b	park
+
 .section .bss
 .balign 16
 .global __stack_bottom
@@ -74,6 +125,11 @@ __stack_bottom:
 	.skip	16384
 .global __stack_top
 __stack_top:
+
+.balign 16
+.global secondary_stacks
+secondary_stacks:
+	.skip	SECONDARY_STACK_SIZE * (MAX_CPUS + 1)
 
 .section .data
 .balign 8

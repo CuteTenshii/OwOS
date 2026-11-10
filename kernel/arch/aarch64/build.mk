@@ -29,13 +29,14 @@ A64DIR  := kernel/arch/aarch64
 A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
             -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
 A64_EL2 ?= on
-QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2) -cpu cortex-a57 -m 256 -display none -serial stdio -kernel $(KERNEL)
+A64_SMP ?= 4
+QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2) -cpu cortex-a57 -smp $(A64_SMP) -m 256 -display none -serial stdio -kernel $(KERNEL)
 
 ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
 endif
 
-OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o task.o user.o console.o mem.o kstring.o pmm.o heap.o)
+OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o smp.o task.o user.o console.o mem.o kstring.o pmm.o heap.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@
