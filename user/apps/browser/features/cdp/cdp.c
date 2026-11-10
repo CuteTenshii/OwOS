@@ -213,6 +213,31 @@ static void oset(json_value *o, const char *k, json_value *v)
 }
 
 /* Reply `{"id":id,"result":result}` to the originating session (takes result). */
+/* Set by a command handler (worker thread only) to answer with a CDP error instead of its result */
+static const char *g_cmd_error;
+
+/* Reply `{"id":id,"error":{"code":-32000,"message":msg}}`, CDP's generic server error */
+static void reply_error(struct cdp_session *s, double id, const char *msg)
+{
+  json_value *msg_o = json_new_object(), *err = json_new_object();
+  if (!msg_o || !err) {
+    json_free(msg_o);
+    json_free(err);
+    return;
+  }
+  oset(err, "code", jnum(-32000));
+  oset(err, "message", jstr(msg));
+  oset(msg_o, "id", jnum(id));
+  oset(msg_o, "error", err);
+  char *str = json_encode(msg_o, 0, 0);
+  json_free(msg_o);
+  if (str) {
+    mutex_lock(&sess_lk);
+    sess_out_push_l(s, str);
+    mutex_unlock(&sess_lk);
+  }
+}
+
 static void reply_result(struct cdp_session *s, double id, json_value *result)
 {
   json_value *msg = json_new_object();
@@ -950,7 +975,9 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
     oset(o, "attributes", attrs);
   }
 
-  int nch = 0;
+  /* The <!DOCTYPE> is no DOM node here; it is kept on the document root and shown as a first child (type 10). */
+  const char *dt = is_doc ? dom_doctype(n) : 0;
+  int nch = dt ? 1 : 0;
   for (struct dom_node *c = n->first_child; c; c = c->next)
     if (child_shown(c))
       nch++;
@@ -958,6 +985,20 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
 
   if (nch && depth < maxdepth) {
     json_value *kids = json_new_array();
+    if (dt) {
+      int did = node_register(0); /* no backing node; resolves to nothing */
+      json_value *d = json_new_object();
+      oset(d, "nodeId", jnum(did));
+      oset(d, "backendNodeId", jnum(did));
+      oset(d, "nodeType", jnum(10));
+      oset(d, "nodeName", jstr(dt));
+      oset(d, "localName", jstr(""));
+      oset(d, "nodeValue", jstr(""));
+      oset(d, "name", jstr(dt));
+      oset(d, "publicId", jstr(""));
+      oset(d, "systemId", jstr(""));
+      json_array_push(kids, d);
+    }
     for (struct dom_node *c = n->first_child; c; c = c->next) {
       if (!child_shown(c))
         continue;
@@ -1101,68 +1142,79 @@ static json_value *computed_style(struct dom_node *n)
   return arr;
 }
 
-/* --- response-body cache (for Network.getResponseBody) --------------------- *
- * A small round-robin cache of recent response bodies keyed by request id, filled
- * from the fetch completion paths only while a client is attached (so it costs
- * nothing otherwise). Bodies over the per-entry cap are truncated. */
-#define CDP_BODY_SLOTS 16
-#define CDP_BODY_CAP (512 * 1024)
+/* --- response-body store (for Network.getResponseBody) --------------------- *
+ * Recent response bodies keyed by request id, filled from the fetch completion paths only while a client is
+ * attached. Bodies are kept whole: the oldest are evicted to stay within the budget, and one larger than the
+ * whole budget isn't kept at all, so a client gets an error rather than a truncated body. */
+#define CDP_BODY_BUDGET (32u << 20)
 struct cdp_body {
   int id;
   unsigned char *data;
   int len;
 };
-static struct cdp_body cdp_bodies[CDP_BODY_SLOTS];
-static int cdp_body_next;
+static struct cdp_body *cdp_bodies; /* oldest first */
+static int cdp_nbodies, cdp_bodies_cap;
+static unsigned cdp_body_bytes;
 static mutex_t body_lk = MUTEX_INIT;
+
+static void body_drop_l(int i)
+{
+  cdp_body_bytes -= (unsigned)cdp_bodies[i].len;
+  free(cdp_bodies[i].data);
+  memmove(&cdp_bodies[i], &cdp_bodies[i + 1], (unsigned)(cdp_nbodies - i - 1) * sizeof *cdp_bodies);
+  cdp_nbodies--;
+}
 
 void cdp_net_body(int id, const void *data, int len, const char *ctype)
 {
   (void)ctype;
-  if (!cdp_nsessions || !data || len <= 0)
+  if (!cdp_nsessions || !data || len < 0 || (unsigned)len > CDP_BODY_BUDGET)
     return;
-  int cap = len > CDP_BODY_CAP ? CDP_BODY_CAP : len;
-  unsigned char *copy = malloc((unsigned)cap);
+  unsigned char *copy = malloc((unsigned)(len ? len : 1));
   if (!copy)
     return;
-  memcpy(copy, data, (unsigned)cap);
+  memcpy(copy, data, (unsigned)len);
   mutex_lock(&body_lk);
-  int slot = -1;
-  for (int i = 0; i < CDP_BODY_SLOTS; i++)
-    if (cdp_bodies[i].data && cdp_bodies[i].id == id) {
-      slot = i;
+  for (int i = 0; i < cdp_nbodies; i++)
+    if (cdp_bodies[i].id == id) {
+      body_drop_l(i);
       break;
     }
-  if (slot < 0) {
-    slot = cdp_body_next;
-    cdp_body_next = (cdp_body_next + 1) % CDP_BODY_SLOTS;
+  while (cdp_nbodies && cdp_body_bytes + (unsigned)len > CDP_BODY_BUDGET)
+    body_drop_l(0);
+  if (cdp_nbodies == cdp_bodies_cap) {
+    int nc = cdp_bodies_cap ? cdp_bodies_cap * 2 : 32;
+    struct cdp_body *grown = realloc(cdp_bodies, (unsigned)nc * sizeof *grown);
+    if (!grown) {
+      mutex_unlock(&body_lk);
+      free(copy);
+      return;
+    }
+    cdp_bodies = grown;
+    cdp_bodies_cap = nc;
   }
-  free(cdp_bodies[slot].data);
-  cdp_bodies[slot].id = id;
-  cdp_bodies[slot].data = copy;
-  cdp_bodies[slot].len = cap;
+  cdp_bodies[cdp_nbodies].id = id;
+  cdp_bodies[cdp_nbodies].data = copy;
+  cdp_bodies[cdp_nbodies].len = len;
+  cdp_nbodies++;
+  cdp_body_bytes += (unsigned)len;
   mutex_unlock(&body_lk);
 }
 void cdp_net_reset(void)
 {
   mutex_lock(&body_lk);
-  for (int i = 0; i < CDP_BODY_SLOTS; i++) {
-    free(cdp_bodies[i].data);
-    cdp_bodies[i].data = 0;
-    cdp_bodies[i].id = 0;
-    cdp_bodies[i].len = 0;
-  }
-  cdp_body_next = 0;
+  while (cdp_nbodies)
+    body_drop_l(cdp_nbodies - 1);
   mutex_unlock(&body_lk);
 }
-/* Copy out the cached body for `id` (caller frees *out); returns its length or -1. */
+/* Copy out the stored body for `id` (caller frees *out); returns its length or -1. */
 static int cdp_body_dup(int id, unsigned char **out)
 {
   int n = -1;
   mutex_lock(&body_lk);
-  for (int i = 0; i < CDP_BODY_SLOTS; i++)
-    if (cdp_bodies[i].data && cdp_bodies[i].id == id) {
-      unsigned char *c = malloc((unsigned)cdp_bodies[i].len);
+  for (int i = 0; i < cdp_nbodies; i++)
+    if (cdp_bodies[i].id == id) {
+      unsigned char *c = malloc((unsigned)(cdp_bodies[i].len ? cdp_bodies[i].len : 1));
       if (c) {
         memcpy(c, cdp_bodies[i].data, (unsigned)cdp_bodies[i].len);
         *out = c;
@@ -1528,18 +1580,15 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     }
     unsigned char *body = 0;
     int n = cdp_body_dup(id, &body);
-    if (n >= 0 && body) {
-      char *b64 = malloc((unsigned)base64_encoded_len(n) + 1);
-      if (b64) {
-        base64_encode(body, n, b64);
-        oset(r, "body", jstr(b64));
-        free(b64);
-      } else
-        oset(r, "body", jstr(""));
+    char *b64 = n >= 0 ? malloc((unsigned)base64_encoded_len(n) + 1) : 0;
+    if (!b64) {
+      g_cmd_error = "No data found for resource with given identifier";
     } else {
-      oset(r, "body", jstr(""));
+      base64_encode(body, n, b64);
+      oset(r, "body", jstr(b64));
+      oset(r, "base64Encoded", jbool(1));
+      free(b64);
     }
-    oset(r, "base64Encoded", jbool(1));
     free(body);
     return r;
   }
@@ -1593,8 +1642,12 @@ static void dispatch_one(struct cdp_session *sess, const char *text)
   int has_id = jid && json_typeof(jid) == JSON_NUMBER;
   double id = json_as_number(jid, -1);
   if (method) {
+    g_cmd_error = 0;
     json_value *result = handle_method(sess, method, params);
-    if (has_id)
+    if (has_id && g_cmd_error) {
+      reply_error(sess, id, g_cmd_error);
+      json_free(result);
+    } else if (has_id)
       reply_result(sess, id, result);
     else
       json_free(result);
@@ -1707,6 +1760,8 @@ static void reqid_str(int id, char *out, int cap)
 
 /* Parse a raw response-header block into a CDP headers object (status line, which
  * has no ':', is naturally skipped). */
+/* Parse a raw header block into a CDP headers object, full length; a repeated name (Set-Cookie) joins its values
+ * with '\n' as CDP expects. A line without ':' (a status line) is skipped. */
 static json_value *headers_obj(const char *raw)
 {
   json_value *o = json_new_object();
@@ -1723,24 +1778,29 @@ static json_value *headers_obj(const char *raw)
     while (c < t && *c != ':')
       c++;
     if (c < t && c > p) {
-      char key[128];
-      int kl = (int)(c - p);
-      if (kl > 127)
-        kl = 127;
-      memcpy(key, p, (unsigned)kl);
-      key[kl] = '\0';
       const char *v = c + 1;
       while (v < t && (*v == ' ' || *v == '\t'))
         v++;
-      char val[1024];
-      int vl = (int)(t - v);
-      if (vl < 0)
-        vl = 0;
-      if (vl > 1023)
-        vl = 1023;
-      memcpy(val, v, (unsigned)vl);
-      val[vl] = '\0';
-      json_object_set(o, key, jstr(val));
+      int kl = (int)(c - p), vl = (int)(t - v);
+      char *key = malloc((unsigned)kl + 1);
+      if (key) {
+        memcpy(key, p, (unsigned)kl);
+        key[kl] = '\0';
+        const char *prev = json_as_string(json_object_get(o, key));
+        int pl = prev ? (int)strlen(prev) + 1 : 0;
+        char *val = malloc((unsigned)(pl + vl) + 1);
+        if (val) {
+          if (prev) {
+            memcpy(val, prev, (unsigned)pl - 1);
+            val[pl - 1] = '\n';
+          }
+          memcpy(val + pl, v, (unsigned)vl);
+          val[pl + vl] = '\0';
+          json_object_set(o, key, json_new_stringn(val, pl + vl));
+          free(val);
+        }
+        free(key);
+      }
     }
     p = *e ? e + 1 : e;
   }
@@ -1843,6 +1903,20 @@ void cdp_net_finish(int id, const struct net_log *e)
     elapsed = 0.001;
   double tend = t0 + elapsed;
 
+  /* The request headers are only known once the request ran, so they follow as CDP's "extra info"; DevTools drops
+   * the event without associatedCookies and connectTiming. The request line before them isn't a header. */
+  const char *hdrs = e->req_hdr ? strchr(e->req_hdr, '\n') : 0;
+  if (hdrs && hdrs[1]) {
+    json_value *xi = json_new_object();
+    oset(xi, "requestId", jstr(rid));
+    oset(xi, "associatedCookies", json_new_array());
+    oset(xi, "headers", headers_obj(hdrs + 1));
+    json_value *ct = json_new_object();
+    oset(ct, "requestTime", jnum(t0));
+    oset(xi, "connectTiming", ct);
+    broadcast_event(EV_NETWORK, "Network.requestWillBeSentExtraInfo", xi);
+  }
+
   if (e->state == NET_FAILED || e->state == NET_CANCELLED) {
     json_value *p = json_new_object();
     oset(p, "requestId", jstr(rid));
@@ -1866,14 +1940,20 @@ void cdp_net_finish(int id, const struct net_log *e)
   oset(resp, "statusText", jstr(""));
   oset(resp, "mimeType", jstr(e->ctype ? e->ctype : ""));
   oset(resp, "headers", headers_obj(e->resp_hdr));
-  oset(resp, "encodedDataLength", jnum(e->size));
+  oset(resp, "encodedDataLength", jnum(e->from_cache ? 0 : e->size));
+  oset(resp, "fromDiskCache", jbool(e->from_cache));
   oset(p, "response", resp);
+  if (e->from_cache) { /* DevTools labels the row "(disk cache)" */
+    json_value *sc = json_new_object();
+    oset(sc, "requestId", jstr(rid));
+    broadcast_event(EV_NETWORK, "Network.requestServedFromCache", sc);
+  }
   broadcast_event(EV_NETWORK, "Network.responseReceived", p);
 
   json_value *fin = json_new_object();
   oset(fin, "requestId", jstr(rid));
   oset(fin, "timestamp", jnum(tend));
-  oset(fin, "encodedDataLength", jnum(e->size));
+  oset(fin, "encodedDataLength", jnum(e->from_cache ? 0 : e->size));
   broadcast_event(EV_NETWORK, "Network.loadingFinished", fin);
 }
 

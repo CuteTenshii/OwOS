@@ -657,6 +657,7 @@ static char *join_headers(const struct http_headers *H, const char *name)
 /* Parse an HTTP/1.1 or h2-synthesized header block into browser state; returns the status code. */
 /* Last document response's raw headers and start tick, for the devtools Network log. */
 static char g_doc_hdr[RESP_HDR_MAX];
+static bool g_doc_from_cache; /* the last document came from the HTTP cache, with no request sent */
 static unsigned g_doc_t0;
 /* Lowercased conditional-request header lines for a stale cached document, shared by h1.1/h2/h3. */
 static char g_doc_cond[512];
@@ -1005,7 +1006,11 @@ static int doc_cache_finish(const struct purl *u, const char *full_url, long now
   if (revalidating && status == 304) {
     unsigned char *rb = 0;
     int rl = 0;
-    if (cache_revalidated(full_url, vh, now, g_doc_hdr, &rb, &rl, B->pg->ctype, sizeof B->pg->ctype, 0, 0)) {
+    /* The page is the cached response, so its headers (refreshed by the 304) replace the 304's own */
+    static char stored[RESP_HDR_MAX];
+    if (cache_revalidated(full_url, vh, now, g_doc_hdr, &rb, &rl, B->pg->ctype, sizeof B->pg->ctype, stored,
+                          sizeof stored)) {
+      strlcpy(g_doc_hdr, stored, sizeof g_doc_hdr);
       B->pg->raw_len = 0;
       if (browser_ensure_raw(rl)) {
         memcpy(B->pg->raw, rb, (unsigned)rl);
@@ -1024,6 +1029,54 @@ static int doc_cache_finish(const struct purl *u, const char *full_url, long now
 
 /* The connection half of a document request, on an idle or new connection (h2 session or HTTP/1.1). *stale is set
  * when a reused connection failed before any response, so retrying on a new one is safe. */
+/* The document request line and header block (the HTTP/1.1 wire form) into req; returns its length */
+static int doc_request(char *req, int cap, const struct purl *u, const char *method, const unsigned char *body,
+                       int blen, const char *bctype)
+{
+  int n = 0;
+  sapp(req, &n, cap, method);
+  sapp(req, &n, cap, " ");
+  sapp(req, &n, cap, u->path);
+  sapp(req, &n, cap, " HTTP/1.1\r\nHost: ");
+  {
+    char hb[URL_HOST_MAX + 3];
+    sapp(req, &n, cap, url_bracket_host(u->host, hb, sizeof hb));
+  }
+  if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
+    sapp(req, &n, cap, ":");
+    uapp(req, &n, cap, (unsigned)u->port);
+  }
+  {
+    char ck[1024];
+    if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
+      sapp(req, &n, cap, "\r\nCookie: ");
+      sapp(req, &n, cap, ck);
+    }
+  }
+  sapp(req, &n, cap, "\r\nUser-Agent: ");
+  sapp(req, &n, cap, browser_ua());
+  sapp(req, &n, cap,
+       "\r\nAccept: " BR_ACCEPT "\r\n"
+       "Accept-Language: " BR_ACCLNG "\r\n"
+       "Accept-Encoding: gzip, deflate, br\r\n");
+  {
+    char ch[512];
+    if (ch_headers_for(u, false, ch, sizeof ch) > 0)
+      sapp(req, &n, cap, ch);
+  }
+  if (g_doc_cond[0])
+    sapp(req, &n, cap, g_doc_cond); /* revalidation */
+  if (body && blen > 0) {           /* POST/PUT body */
+    sapp(req, &n, cap, "Content-Type: ");
+    sapp(req, &n, cap, bctype ? bctype : "application/x-www-form-urlencoded");
+    sapp(req, &n, cap, "\r\nContent-Length: ");
+    uapp(req, &n, cap, (unsigned)blen);
+    sapp(req, &n, cap, "\r\n");
+  }
+  sapp(req, &n, cap, "\r\n");
+  return n;
+}
+
 static int http_txn_conn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
                          const char *method, const unsigned char *body, int blen, const char *bctype, long now,
                          bool revalidating, bool fresh, bool *stale)
@@ -1052,47 +1105,7 @@ static int http_txn_conn(const struct purl *u, const char *full_url, char *loc, 
   bool pooled = nc_pooled(B->sock);
 
   char req[2048];
-  int n = 0;
-  sapp(req, &n, sizeof req, method);
-  sapp(req, &n, sizeof req, " ");
-  sapp(req, &n, sizeof req, u->path);
-  sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
-  {
-    char hb[URL_HOST_MAX + 3];
-    sapp(req, &n, sizeof req, url_bracket_host(u->host, hb, sizeof hb));
-  }
-  if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
-    sapp(req, &n, sizeof req, ":");
-    uapp(req, &n, sizeof req, (unsigned)u->port);
-  }
-  {
-    char ck[1024];
-    if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
-      sapp(req, &n, sizeof req, "\r\nCookie: ");
-      sapp(req, &n, sizeof req, ck);
-    }
-  }
-  sapp(req, &n, sizeof req, "\r\nUser-Agent: ");
-  sapp(req, &n, sizeof req, browser_ua());
-  sapp(req, &n, sizeof req,
-       "\r\nAccept: " BR_ACCEPT "\r\n"
-       "Accept-Language: " BR_ACCLNG "\r\n"
-       "Accept-Encoding: gzip, deflate, br\r\n");
-  {
-    char ch[512];
-    if (ch_headers_for(u, false, ch, sizeof ch) > 0)
-      sapp(req, &n, sizeof req, ch);
-  }
-  if (g_doc_cond[0])
-    sapp(req, &n, sizeof req, g_doc_cond); /* revalidation */
-  if (body && blen > 0) {                  /* POST/PUT body */
-    sapp(req, &n, sizeof req, "Content-Type: ");
-    sapp(req, &n, sizeof req, bctype ? bctype : "application/x-www-form-urlencoded");
-    sapp(req, &n, sizeof req, "\r\nContent-Length: ");
-    uapp(req, &n, sizeof req, (unsigned)blen);
-    sapp(req, &n, sizeof req, "\r\n");
-  }
-  sapp(req, &n, sizeof req, "\r\n");
+  int n = doc_request(req, sizeof req, u, method, body, blen, bctype);
 
   if (nc_write(B->sock, req, n) < 0 || (body && blen > 0 && nc_write(B->sock, (const char *)body, blen) < 0)) {
     nc_close(B->sock);
@@ -1194,6 +1207,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
   long now = (long)rtc_epoch();
   bool revalidating = false;
   g_doc_cond[0] = '\0';
+  g_doc_from_cache = false;
   if (is_get) { /* only GET is cacheable / revalidatable */
     unsigned char *cbody = 0;
     int clen = 0;
@@ -1208,6 +1222,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
         B->pg->raw_len = clen;
       }
       free(cbody);
+      g_doc_from_cache = true;
       return 200;
     }
     revalidating = (cv == CACHE_REVALIDATE);
@@ -1510,9 +1525,23 @@ void do_fetch(void)
 
     /* Resolve the in-flight document row with the final response. */
     {
-      struct net_log e = {
-          method,    url,      st, B->pg->ctype, B->dl_saved ? 0 : B->pg->raw_len, (int)(msec() - g_doc_t0),
-          g_doc_hdr, NET_DONE, 0};
+      char reqh[2048];
+      reqh[0] = '\0';
+      if (!g_doc_from_cache)
+        doc_request(reqh, sizeof reqh, &u, method, body, blen, bctype);
+      struct net_log e = {method,
+                          url,
+                          st,
+                          B->pg->ctype,
+                          B->dl_saved ? 0 : B->pg->raw_len,
+                          (int)(msec() - g_doc_t0),
+                          g_doc_hdr,
+                          NET_DONE,
+                          0,
+                          reqh,
+                          B->dl_saved ? 0 : B->pg->raw,
+                          B->dl_saved ? 0 : B->pg->raw_len,
+                          g_doc_from_cache};
       devtools_net_update(docnid, &e);
     }
 

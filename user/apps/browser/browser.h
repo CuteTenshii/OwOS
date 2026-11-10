@@ -488,6 +488,11 @@ struct net_log {
   const char *resp_hdr;
   int state;          /* NET_* */
   const char *reason; /* NET_FAILED failure text, else NULL */
+  /* Optional, for remote DevTools; initialisers that stop before these leave them unset */
+  const char *req_hdr; /* the request line + header block as sent, or NULL */
+  const void *body;    /* the decoded response body, or NULL */
+  int body_len;
+  int from_cache; /* served from the HTTP cache, so no request was sent */
 };
 /* _begin logs an in-flight row and returns an id, _update resolves it, _add is the one-shot form. */
 int devtools_net_begin(const char *method, const char *url);
@@ -538,7 +543,8 @@ struct http_resp {
   char *final_url;
   int final_cap; /* out (opt): final URL after redirects     */
   char *hdr;
-  int hdr_cap; /* out (opt): raw response header block      */
+  int hdr_cap;    /* out (opt): raw response header block      */
+  int from_cache; /* out: served from the HTTP cache, no request sent */
 };
 
 /* Single request following redirects; returns the body (caller frees) for any status, NULL on error. */

@@ -855,6 +855,17 @@ static unsigned char *http_exchange(const struct purl *u, const char *method, co
   return body;
 }
 
+/* The HTTP/1.1 request block a plain `method` fetch of url sends, for the network log; "" if url won't parse */
+static void request_head(char *out, int cap, const char *url, const char *method, const char *accept)
+{
+  struct http_req rq = {url, method, 0, 0, 0, accept, 0, 0};
+  struct purl u;
+  int n = 0;
+  out[0] = '\0';
+  if (parse_url(url, &u))
+    build_request(out, &n, cap, &u, method, accept, &rq);
+}
+
 /* Single-request transport (h2 or h1.1, follows redirects); NULL on error. Worker-thread only. */
 /* Log an unfinished request as cancelled or failed. */
 static void net_fail(int id, const char *method, const char *url)
@@ -879,6 +890,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
   rs->status = 0;
   rs->len = 0;
   rs->ctype[0] = '\0';
+  rs->from_cache = 0;
   if (rs->final_url && rs->final_cap)
     rs->final_url[0] = '\0';
   if (rs->hdr && rs->hdr_cap)
@@ -914,6 +926,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
     if (cv == CACHE_FRESH) {
       rs->status = 200;
       rs->len = clen;
+      rs->from_cache = 1;
       if (rs->final_url && rs->final_cap) {
         int k = 0;
         sapp(rs->final_url, &k, rs->final_cap, origurl);
@@ -1013,13 +1026,35 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
   const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
   unsigned t0 = msec();
   int nid = devtools_net_begin(method, rq->url);
+  /* The network log wants the response headers even when the caller didn't ask for them */
+  char *own_hdr = 0;
+  if (!rs->hdr || !rs->hdr_cap) {
+    own_hdr = malloc(RESP_HDR_MAX);
+    if (own_hdr) {
+      own_hdr[0] = '\0';
+      rs->hdr = own_hdr;
+      rs->hdr_cap = RESP_HDR_MAX;
+    }
+  }
   unsigned char *body = browser_fetch_raw(rq, rs);
   if (body) {
     const char *url = (rs->final_url && rs->final_cap && rs->final_url[0]) ? rs->final_url : rq->url;
-    struct net_log e = {method, url, rs->status, rs->ctype, rs->len, (int)(msec() - t0), rs->hdr, NET_DONE, 0};
+    char reqh[2048];
+    int rn = 0;
+    struct purl u;
+    reqh[0] = '\0';
+    if (!rs->from_cache && parse_url(url, &u))
+      build_request(reqh, &rn, sizeof reqh, &u, method, (rq->accept && rq->accept[0]) ? rq->accept : "*/*", rq);
+    struct net_log e = {method,   url, rs->status, rs->ctype, rs->len, (int)(msec() - t0), rs->hdr,
+                        NET_DONE, 0,   reqh,       body,      rs->len, rs->from_cache};
     devtools_net_update(nid, &e);
   } else {
     net_fail(nid, method, rq->url);
+  }
+  if (own_hdr) {
+    rs->hdr = 0;
+    rs->hdr_cap = 0;
+    free(own_hdr);
   }
   return body;
 }
@@ -1994,7 +2029,10 @@ static void subres_job(void *vctx, int i)
         cache_store("GET", c->urls[grp[g]], vh, reqs[g].status, now, reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
       }
       {
-        struct net_log e = {"GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0};
+        char reqh[2048];
+        request_head(reqh, sizeof reqh, c->urls[grp[g]], "GET", c->accept);
+        struct net_log e = {"GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, reqs[g].hdr, NET_DONE, 0,
+                            reqh,  reqs[g].body,    reqs[g].blen};
         devtools_net_add(&e);
       }
     } else {
@@ -2037,19 +2075,22 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
 
   /* Serve fresh cache hits first (single-threaded, before the pool) and mark them handled. */
   long now = (long)rtc_epoch();
+  char *chdr = malloc(RESP_HDR_MAX); /* the stored response headers, for the network log */
   for (int i = 0; i < n; i++) {
     unsigned char *cb = 0;
     int cl = 0;
-    char vh[VARY_HDRS_MAX];
+    char vh[VARY_HDRS_MAX], ct[160];
     vary_req_hdrs(urls[i], accept, 0, true, vh);
-    if (cache_lookup("GET", urls[i], vh, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+    if (cache_lookup("GET", urls[i], vh, now, &cb, &cl, ct, sizeof ct, chdr, chdr ? RESP_HDR_MAX : 0, 0, 0) ==
+        CACHE_FRESH) {
       bodies[i] = cb;
       lens[i] = cl;
       handled[i] = true;
-      struct net_log e = {"GET", urls[i], 200, "", cl, 0, 0};
+      struct net_log e = {"GET", urls[i], 200, ct, cl, 0, chdr, NET_DONE, 0, 0, cb, cl, 1};
       devtools_net_add(&e);
     }
   }
+  free(chdr);
 
   struct subres_batch ctx = {urls, n, accept, bodies, lens, handled, MUTEX_INIT};
   par_fetch(n, subres_job, &ctx);
@@ -2226,7 +2267,7 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
   if (c->idxs[b] == FAV_IDX) {
     resolve_url(g_img_page, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico", full, sizeof full);
     {
-      struct net_log e = {"GET", full, 200, "", blen, 0, 0};
+      struct net_log e = {"GET", full, 200, "", blen, 0, 0, NET_DONE, 0, 0, body, blen};
       devtools_net_add(&e);
     }
     if (favicon_decode(body, blen)) {
@@ -2236,7 +2277,7 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
   } else {
     resolve_url(g_img_page, B->pg->imgs[c->idxs[b]].href, full, sizeof full);
     {
-      struct net_log e = {"GET", full, 200, "image/*", blen, 0, 0};
+      struct net_log e = {"GET", full, 200, "image/*", blen, 0, 0, NET_DONE, 0, 0, body, blen};
       devtools_net_add(&e);
     }
     commit_image(c->idxs[b], body, blen, 0x000000);
@@ -2391,11 +2432,12 @@ void fetch_inline_images(const char *page_url)
       int cl = 0;
       char vh[VARY_HDRS_MAX];
       vary_req_hdrs(full, IMG_ACCEPT, 0, true, vh);
-      if (cache_lookup("GET", full, vh, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+      char ct[160];
+      if (cache_lookup("GET", full, vh, now, &cb, &cl, ct, sizeof ct, 0, 0, 0, 0) == CACHE_FRESH) {
         commit_image(i, cb, cl, 0x000000);
-        free(cb);
-        struct net_log e = {"GET", full, 200, "image/*", cl, 0, 0};
+        struct net_log e = {"GET", full, 200, ct[0] ? ct : "image/*", cl, 0, 0, NET_DONE, 0, 0, cb, cl, 1};
         devtools_net_add(&e);
+        free(cb);
       }
     }
   }

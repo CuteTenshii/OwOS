@@ -484,6 +484,8 @@ void devtools_net_add(const struct net_log *e)
   int id = net_push_e(e);
   mutex_unlock(&dt_lk);
   cdp_net_begin(id, e->method, e->url, e->ctype);
+  if (e->body)
+    cdp_net_body(id, e->body, e->body_len, e->ctype);
   cdp_net_finish(id, e);
   net_repaint();
 }
@@ -516,6 +518,8 @@ void devtools_net_update(int id, const struct net_log *e)
   else
     net_push_e(e);
   mutex_unlock(&dt_lk);
+  if (e->body)
+    cdp_net_body(id, e->body, e->body_len, e->ctype);
   cdp_net_finish(id, e);
   net_repaint();
 }
