@@ -26,11 +26,11 @@ static volatile bool worker_in_recovery;
 /* The tab whose page the worker is operating on this loop iteration */
 static volatile int worker_tab;
 
-/* The tab slot backing page `p` (B->pg always points into some tabs[i].page) */
+/* The tab slot backing page `p` (B->pg always points into some tabs[i]->page) */
 static int tab_of_page(const struct page *p)
 {
   for (int i = 0; i < n_tabs; i++)
-    if (&tabs[i].page == p)
+    if (&tabs[i]->page == p)
       return i;
   return active_tab; /* unreachable: B->pg is always a live tab's page */
 }
@@ -231,8 +231,8 @@ void worker_fn(void)
   int crash_sig = setjmp(worker_recovery);
   if (crash_sig) {
     worker_after_crash();
-    tabs[worker_tab].crashed = 1;
-    tabs[worker_tab].crash_sig = crash_sig;
+    tabs[worker_tab]->crashed = 1;
+    tabs[worker_tab]->crash_sig = crash_sig;
     B->loading = 0;
     B->abort_load = 0;
     B->scripts_pending = 0;
@@ -293,7 +293,7 @@ void worker_fn(void)
       js_page_hide();
       B->abort_load = 0; /* a fresh navigation clears any pending Stop */
       B->pg->doc_title[0] = '\0';
-      tabs[worker_tab].crashed = 0; /* reloading/navigating clears the crash page */
+      tabs[worker_tab]->crashed = 0; /* reloading/navigating clears the crash page */
       B->loading = 1;
       B->seq++;
       do_fetch();

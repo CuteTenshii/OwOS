@@ -502,7 +502,7 @@ void handle_click(int mx, int my)
   if (my >= MENU_H && my < MENU_H + TAB_H) { /* tab strip */
     blur_content_control();
     int idx = 0;
-    switch (tabbar_hit(0, MENU_H, BW, n_tabs, mx, my, &idx)) {
+    switch (tabbar_hit(&tab_strip, 0, MENU_H, BW, n_tabs, mx, my, &idx)) {
     case TABBAR_SELECT:
       select_tab(idx);
       break;
@@ -520,7 +520,7 @@ void handle_click(int mx, int my)
     blur_content_control();
     struct rect rb, rf, rrl, rtf, rst;
     addr_layout(&rb, &rf, &rrl, &rtf, &rst);
-    struct tab *at = &tabs[active_tab];
+    struct tab *at = tabs[active_tab];
     if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
       go_back();
     } else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my)) {
@@ -559,7 +559,7 @@ void handle_click(int mx, int my)
   }
   if (my >= py && my < py + phh) { /* content pane click */
     /* Crashed tab: the only thing in the pane is the Reload button. */
-    if (tabs[active_tab].crashed) {
+    if (tabs[active_tab]->crashed) {
       if (button_hit(crash_reload_rect.x, crash_reload_rect.y, crash_reload_rect.w, crash_reload_rect.h, mx, my))
         do_reload();
       return;
@@ -663,7 +663,7 @@ static int cursor_for(int mx, int my, const char *link)
   if (mx >= (devtools_visible() ? devtools_left() : BW) - PAGE_SCROLL_W)
     return WIN_CURSOR_ARROW;
   /* Crashed tab */
-  if (tabs[active_tab].crashed)
+  if (tabs[active_tab]->crashed)
     return in_rect(mx, my, &crash_reload_rect) ? WIN_CURSOR_HAND : WIN_CURSOR_ARROW;
   if (hit_cursor != CSS_CUR_AUTO)
     return hit_cursor; /* the CSS_CUR_* order is WIN_CURSOR_* */
@@ -853,8 +853,8 @@ void handle_key(char c, int mods)
     close_tab(active_tab);
     return;
   }
-  if ((mods & KMOD_CTRL) && c >= '1' && c <= '8') {
-    int tab = c - '1';
+  if ((mods & KMOD_CTRL) && c >= '1' && c <= '9') {
+    int tab = c == '9' ? n_tabs - 1 : c - '1'; /* Ctrl+9 is the last tab, however many there are */
     if (tab < n_tabs)
       select_tab(tab);
     return;

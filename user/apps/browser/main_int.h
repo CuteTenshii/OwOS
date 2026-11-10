@@ -80,7 +80,6 @@ struct layout_out {
 };
 /* --- tabs ------------------------------------------------------------------ */
 /* Each tab keeps its URL, label and scroll offset, plus */
-#define MAX_TABS 8
 #define HIST_MAX 32 /* per-tab back/forward history depth */
 struct tab {
   char url[URL_MAX]; /* address-bar / navigation target               */
@@ -126,9 +125,11 @@ struct dmg_state {
 };
 
 /* tabs.c */
-extern struct tab tabs[MAX_TABS];
+extern struct tab **tabs; /* heap-allocated, so a tab's address survives others opening and closing */
 extern int n_tabs;
 extern int active_tab;
+extern struct tabbar tab_strip;
+int tabs_init(void);
 extern bool nav_from_history;
 void hist_push(struct tab *t, const char *url);
 bool hist_can_back(const struct tab *t);

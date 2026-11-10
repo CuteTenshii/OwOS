@@ -166,7 +166,11 @@ int main(int argc, char **argv)
       return 1;
     }
   }
-  B->pg = &tabs[active_tab].page; /* point at the first tab's page */
+  if (tabs_init() != 0) {
+    puts("browser: out of memory\n");
+    return 1;
+  }
+  B->pg = &tabs[active_tab]->page; /* point at the first tab's page */
   int id = win_create(BW, BH, "Browser");
   if (id < 0) {
     puts("browser: no window\n");
@@ -242,7 +246,10 @@ int main(int argc, char **argv)
         handle_move(ev.a, ev.b);
       } else if (ev.type == WEV_SCROLL) {
         /* The wheel scrolls whichever surface the pointer is over */
-        if (bm_panel_open && last_mx >= 0 && last_mx < BM_PANEL_W && last_my >= MENU_H + TAB_H + ADDR_H) {
+        if (last_my >= MENU_H && last_my < MENU_H + TAB_H) {
+          tabbar_scroll(&tab_strip, BW, n_tabs, -ev.a);
+          B->seq++;
+        } else if (bm_panel_open && last_mx >= 0 && last_mx < BM_PANEL_W && last_my >= MENU_H + TAB_H + ADDR_H) {
           bm_panel_scroll -= ev.a;
           if (bm_panel_scroll < 0)
             bm_panel_scroll = 0;
@@ -270,7 +277,7 @@ int main(int argc, char **argv)
     }
     /* History API requests posted by JS on the worker (see browser/js/bindings.c) */
     if (B->hist_nav) { /* pushState / replaceState */
-      struct tab *t = &tabs[active_tab];
+      struct tab *t = tabs[active_tab];
       B->hist_nav = 0;
       if (B->hist_replace && t->hist_n > 0) {
         int n = (int)strlen(B->hist_url) + 1;
@@ -345,7 +352,7 @@ int main(int argc, char **argv)
       B->dlg_done = 1; /* release the worker (publish last) */
       B->seq++;        /* repaint the browser window */
     }
-    B->hist_len = tabs[active_tab].hist_n;
+    B->hist_len = tabs[active_tab]->hist_n;
 
     if (B->loading && !prev_loading) { /* fetch started */
       gfx_cursor(id, WIN_CURSOR_BUSY); /* spinner while loading */
@@ -361,7 +368,7 @@ int main(int argc, char **argv)
         textfield_set(&B->addr_tf, B->pg->cur_url); /* (incl. the scheme) */
       /* Record the page we landed on, unless this load was itself a Back/Next move */
       if (!nav_from_history)
-        hist_push(&tabs[active_tab], B->pg->cur_url);
+        hist_push(tabs[active_tab], B->pg->cur_url);
       nav_from_history = false;
       if (B->pg->favicon_ok && B->pg->cur_url[0]) /* update a saved bookmark's icon */
         bookmark_set_icon(B->pg->cur_url, B->pg->favicon);

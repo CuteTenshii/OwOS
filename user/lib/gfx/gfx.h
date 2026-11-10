@@ -215,26 +215,36 @@ int textfield_key(struct textfield *tf, char c, int mods);
 /* --------------------------------------------------------------- tab strip */
 /*
  * A horizontal strip of tabs with per-tab close boxes and a trailing "+"
- * button, the way a tabbed browser/editor lays out documents. The widget is
- * stateless: the app owns the tab list and its bookkeeping; this only draws
- * `labels[0..n)` (highlighting `active`) and maps a click back to an action.
- * Tabs share the available width evenly (clamped), labels are truncated to fit,
- * and the close box appears only when more than one tab is open.
+ * button, the way a tabbed browser/editor lays out documents. The app owns the
+ * tab list and its bookkeeping; this only draws `labels[0..n)` (highlighting
+ * `active`) and maps a click back to an action. Tabs share the available width
+ * evenly (clamped), labels are truncated to fit, and the close box appears only
+ * when more than one tab is open. When the tabs don't fit at their minimum
+ * width, the strip shows a window of them between scroll arrows.
  */
 #define GUI_TAB_H 24 /* tab strip height */
 
-/* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+".
- */
-enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW };
+/* Per-strip state the app keeps between frames (zero-initialize it) */
+struct tabbar {
+  int first;       /* first visible tab while the strip overflows */
+  int last_active; /* scroll to reveal `active` only when it changes */
+};
+
+/* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+";
+ * SCROLL means an arrow moved the strip and the app should repaint. */
+enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW, TABBAR_SCROLL };
 
 /* Draw the strip filling [x, x+w) at height GUI_TAB_H from y. The app fills no
- * background itself — the widget paints the whole strip. icons[i] is an
+ * background itself; the widget paints the whole strip. icons[i] is an
  * optional 16x16 ARGB favicon for tab i (NULL -> a default globe); pass a NULL
  * icons array to give every tab the globe. */
-void tabbar_draw(int x, int y, int w, const char *const *labels, const unsigned *const *icons, int n, int active);
-/* Hit-test a click at (mx,my) against the same geometry. Returns a TABBAR_*
- * code; for SELECT/CLOSE sets *index to the tab index. */
-int tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
+void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labels, const unsigned *const *icons, int n,
+                 int active);
+/* Hit-test a click at (mx,my) against the geometry of the last draw. Returns a
+ * TABBAR_* code; for SELECT/CLOSE sets *index to the tab index. */
+int tabbar_hit(struct tabbar *tb, int x, int y, int w, int n, int mx, int my, int *index);
+/* Scroll an overflowing strip by `delta` tabs (positive = right) */
+void tabbar_scroll(struct tabbar *tb, int w, int n, int delta);
 
 /* --------------------------------------------------------------- button */
 /*

@@ -206,7 +206,7 @@ struct fslice {
 };
 
 struct browser {
-  struct page *pg; /* the active tab's page (tabs[active_tab].page) */
+  struct page *pg; /* the active tab's page (tabs[active_tab]->page) */
 
   char addr[URL_MAX];       /* address-bar buffer (owned by addr_tf)       */
   struct textfield addr_tf; /* editable address-bar field (caret + scroll) */

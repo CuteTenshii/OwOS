@@ -750,7 +750,7 @@ void draw_crash_page(int py, int pw, int phh)
 {
   gfx_fill_rect(0, py, pw, phh, 0xf2f3f5); /* neutral canvas, not the dead page's */
 
-  const char *reason = crash_reason(tabs[active_tab].crash_sig);
+  const char *reason = crash_reason(tabs[active_tab]->crash_sig);
   const char *head = "This tab has crashed";
   int cx = pw / 2;
   int cy = py + phh / 2;

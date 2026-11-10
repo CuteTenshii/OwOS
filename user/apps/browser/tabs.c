@@ -1,10 +1,42 @@
 #include "main_int.h"
 
-struct tab tabs[MAX_TABS];
-int n_tabs = 1;
+struct tab **tabs;
+int n_tabs;
 int active_tab = 0;
+struct tabbar tab_strip;
+static int tabs_cap;
 
-/* Free every heap buffer a page owns and zero it (so a reused slot starts clean) */
+static struct tab *tab_alloc(void) { return calloc(1, sizeof(struct tab)); }
+
+/* Room for `n` tabs; only called with the worker parked, as it indexes tabs too */
+static bool tabs_reserve(int n)
+{
+  if (n <= tabs_cap)
+    return true;
+  int cap = tabs_cap ? tabs_cap * 2 : 4;
+  while (cap < n)
+    cap *= 2;
+  struct tab **nt = realloc(tabs, (unsigned)cap * sizeof *nt);
+  if (nt) {
+    tabs = nt;
+    tabs_cap = cap;
+  }
+  return nt != 0;
+}
+
+int tabs_init(void)
+{
+  struct tab *t = tab_alloc();
+  if (!t || !tabs_reserve(1)) {
+    free(t);
+    return -1;
+  }
+  tabs[0] = t;
+  n_tabs = 1;
+  return 0;
+}
+
+/* Free every heap buffer a page owns and zero it */
 static void page_free(struct page *p)
 {
   free(p->raw);
@@ -133,7 +165,7 @@ static void worker_unpark(void) { B->worker_pause = 0; }
 /* Leaving the active tab */
 static void tab_leave(int i)
 {
-  struct tab *t = &tabs[i];
+  struct tab *t = tabs[i];
   B->drop_dom_tab = i; /* the tab whose DOM the worker is about to free */
   B->drop_dom = 1;
   B->events_live = 0;         /* worker frees the live DOM; page goes static */
@@ -220,7 +252,7 @@ void do_reload(void)
 /* The user stayed on the page at the beforeunload prompt: undo the address bar and history move */
 void nav_cancelled(void)
 {
-  struct tab *t = &tabs[active_tab];
+  struct tab *t = tabs[active_tab];
   for (int d = 0; d < t->hist_n; d++) {
     int lo = t->hist_i - d, hi = t->hist_i + d;
     if (lo >= 0 && streq(t->hist[lo], B->pg->cur_url)) {
@@ -248,7 +280,7 @@ void do_stop(void)
 /* Navigate to the active tab's previous/next history entry */
 void go_back(void)
 {
-  struct tab *t = &tabs[active_tab];
+  struct tab *t = tabs[active_tab];
   if (!hist_can_back(t))
     return;
   t->hist_i--;
@@ -258,7 +290,7 @@ void go_back(void)
 
 void go_fwd(void)
 {
-  struct tab *t = &tabs[active_tab];
+  struct tab *t = tabs[active_tab];
   if (!hist_can_fwd(t))
     return;
   t->hist_i++;
@@ -291,7 +323,7 @@ static void show_blank(void)
 /* Pull the freshly-loaded page's url + a label into the active tab */
 void tab_sync_active(void)
 {
-  struct tab *t = &tabs[active_tab];
+  struct tab *t = tabs[active_tab];
   strlcpy(t->url, B->pg->cur_url, sizeof t->url);
   if (B->pg->doc_title[0]) {
     strlcpy(t->label, B->pg->doc_title, sizeof t->label);
@@ -307,19 +339,19 @@ void tab_sync_active(void)
 /* Reveal tab `i` */
 static void reveal_tab(int i)
 {
-  B->pg = &tabs[i].page;           /* the swap , buffers already live here */
-  devtools_view_load(&tabs[i].dt); /* this tab's devtools view; drops old capture */
-  page_restore_images(&tabs[i].page);
+  B->pg = &tabs[i]->page;           /* the swap , buffers already live here */
+  devtools_view_load(&tabs[i]->dt); /* this tab's devtools view; drops old capture */
+  page_restore_images(&tabs[i]->page);
   B->events_live = 0; /* revealed page has no live DOM        */
   B->loading = 0;
   B->req_pending = 0;
   B->layout_dirty = 1; /* force a re-wrap at the live width     */
-  textfield_set(&B->addr_tf, tabs[i].url[0] ? tabs[i].url : tabs[i].page.cur_url);
+  textfield_set(&B->addr_tf, tabs[i]->url[0] ? tabs[i]->url : tabs[i]->page.cur_url);
   update_title(B->win_id);
   B->seq++;
   /* A crashed tab keeps its sad page (its empty text isn't "interrupted mid-load"), so don't */
-  if (!tabs[i].crashed && tabs[i].page.text_len == 0 && tabs[i].url[0])
-    navigate(tabs[i].url);
+  if (!tabs[i]->crashed && tabs[i]->page.text_len == 0 && tabs[i]->url[0])
+    navigate(tabs[i]->url);
 }
 
 /* Make tab `i` the active one */
@@ -337,31 +369,28 @@ void select_tab(int i)
 
 void new_tab(void)
 {
-  if (n_tabs >= MAX_TABS) {
+  struct tab *t = tab_alloc();
+  if (!t) {
     B->seq++;
     return;
   }
   load_quiesce();
   worker_park();
+  if (!tabs_reserve(n_tabs + 1)) {
+    worker_unpark();
+    free(t);
+    B->seq++;
+    return;
+  }
   tab_leave(active_tab);
+  tabs[n_tabs] = t;
   active_tab = n_tabs++;
-  struct tab *t = &tabs[active_tab];
-  page_free(&t->page);        /* recycle the slot: free any stale page, zero it */
-  devtools_view_free(&t->dt); /* and any stale devtools capture */
-  t->url[0] = '\0';
-  t->hist_n = 0;
-  t->hist_i = 0;
-  for (int k = 0; k < HIST_MAX; k++)
-    t->hist[k] = 0;
-  t->dt.open = 0;
-  t->dt.tab = 0; /* devtools closed   */
-  for (int k = 0; k < DT_PANELS; k++)
-    t->dt.scroll[k] = 0;
   B->pg = &t->page; /* swap to the fresh page */
   devtools_view_load(&t->dt);
   strlcpy(t->label, "New Tab", sizeof t->label);
   show_blank();
   update_title(B->win_id); /* clear the previous tab's title */
+  worker_unpark();
 }
 
 void close_tab(int i)
@@ -374,19 +403,19 @@ void close_tab(int i)
   /* Fence the worker */
   worker_park();
   if (was_active)
-    devtools_reset_live();             /* its live devtools capture isn't in .cap */
-  page_free(&tabs[i].page);            /* free its page buffers   */
-  devtools_view_free(&tabs[i].dt);     /* and its devtools capture */
-  hist_clear(&tabs[i]);                /* and its history strings */
-  for (int j = i; j < n_tabs - 1; j++) /* shift the rest down a slot (moves pages) */
-    memcpy(&tabs[j], &tabs[j + 1], sizeof(struct tab));
-  memset(&tabs[n_tabs - 1], 0, sizeof(struct tab)); /* vacated slot: drop the aliases */
+    devtools_reset_live(); /* its live devtools capture isn't in .cap */
+  struct tab *gone = tabs[i];
+  memmove(&tabs[i], &tabs[i + 1], (unsigned)(n_tabs - i - 1) * sizeof *tabs);
   n_tabs--;
   if (active_tab > i)
     active_tab--;
   else if (active_tab >= n_tabs)
     active_tab = n_tabs - 1;
-  B->pg = &tabs[active_tab].page; /* tabs moved: repoint at the active page */
+  page_free(&gone->page);
+  devtools_view_free(&gone->dt);
+  hist_clear(gone);
+  free(gone);
+  B->pg = &tabs[active_tab]->page;
   if (was_active)
     reveal_tab(active_tab); /* reveal the neighbour */
   worker_unpark();
