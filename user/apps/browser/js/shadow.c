@@ -498,14 +498,6 @@ static js_value el_attach_internals(js_ctx *ctx, js_value t, js_value *args, int
 
 /* ------------------------------------------------------------ install ---- */
 
-static js_value sr_illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 static js_value frag_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   (void)thisv;
@@ -553,7 +545,7 @@ void shadow_install(js_ctx *ctx, js_object *win)
   def_acc(g_shadowroot_proto, "activeElement", sr_null, 0);
   def_acc(g_shadowroot_proto, "adoptedStyleSheets", sr_get_adopted, sr_set_adopted);
   def_method(g_shadowroot_proto, "getElementById", sr_get_by_id, 1);
-  sc = js_new_native(ctx, sr_illegal_ctor, "ShadowRoot", 0);
+  sc = js_new_native(ctx, illegal_ctor, "ShadowRoot", 0);
   gc_push_scope();
   gc_keep(sc);
   js_def(sc, "prototype", js_obj_value(g_shadowroot_proto), 0);

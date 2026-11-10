@@ -96,6 +96,7 @@ void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *prot
 /* ---- shared helpers used by the service-worker module (defined in js.c) --- */
 int arenas_push(js_arena *ar);                                       /* keep a script's AST arena alive  */
 js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc); /* no-op native */
+js_value illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc); /* constructor of an interface without one */
 void js_set_cur_script(const char *label);                           /* current script name for exc attribution */
 js_value make_message_event(js_value data, js_value ports); /* a MessageEvent carrying `data` and the array `ports` */
 js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, js_value hdrs,
@@ -138,6 +139,15 @@ js_value response_init_body(js_ctx *ctx, js_value body, js_value *stream, char *
 /* Read a Response body to the end: a promise of an ArrayBuffer, string, Blob or parsed JSON value */
 js_value response_consume(js_ctx *ctx, js_value resp, int kind);
 js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc); /* new Response(body, init) */
+/* the Body mixin shared by Response and Request */
+js_value body_text(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_json(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_formdata(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_blob(js_ctx *ctx, js_value t, js_value *args, int argc);
+const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap); /* the bytes of a fetch body value */
+int body_take(js_ctx *ctx, js_value t);
+js_value body_used_error(js_ctx *ctx);
 void js_webapi_teardown(void);                                                 /* unroot the Encoding-API prototypes  */
 
 /* A global observer class: ctor native plus its prototype (rooted), from js/webapi.c */

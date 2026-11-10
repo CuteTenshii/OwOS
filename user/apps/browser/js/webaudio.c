@@ -55,14 +55,6 @@ static bool brand(js_ctx *ctx, js_value t, const char *kind)
   return false;
 }
 
-static js_value illegal(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 /* A finite number, or false with a TypeError pending */
 static bool finite(js_ctx *ctx, js_value v, double *out)
 {
@@ -999,15 +991,15 @@ static js_object *proto_of(js_ctx *ctx, const char *global, const char *key)
 static void build(js_ctx *ctx, js_object *ex, js_object *audio)
 {
   js_object *et = proto_of(ctx, "EventTarget", "prototype"), *base, *actx, *node, *dest, *wnode, *worklet, *param, *map;
-  base = make_class(ctx, ex, "BaseAudioContext", illegal, et);
+  base = make_class(ctx, ex, "BaseAudioContext", illegal_ctor, et);
   actx = make_class(ctx, ex, "AudioContext", ctx_ctor, base);
   js_def(ex, "webkitAudioContext", js_get(ctx, js_obj_value(ex), "AudioContext"), PE);
-  node = make_class(ctx, ex, "AudioNode", illegal, et);
-  dest = make_class(ctx, ex, "AudioDestinationNode", illegal, node);
+  node = make_class(ctx, ex, "AudioNode", illegal_ctor, et);
+  dest = make_class(ctx, ex, "AudioDestinationNode", illegal_ctor, node);
   wnode = make_class(ctx, ex, "AudioWorkletNode", wnode_ctor, node);
-  worklet = make_class(ctx, ex, "AudioWorklet", illegal, ctx->object_proto);
-  param = make_class(ctx, ex, "AudioParam", illegal, ctx->object_proto);
-  map = make_class(ctx, ex, "AudioParamMap", illegal, ctx->map_proto);
+  worklet = make_class(ctx, ex, "AudioWorklet", illegal_ctor, ctx->object_proto);
+  param = make_class(ctx, ex, "AudioParam", illegal_ctor, ctx->object_proto);
+  map = make_class(ctx, ex, "AudioParamMap", illegal_ctor, ctx->map_proto);
   js_def(audio, "ctx", js_obj_value(actx), 0);
   js_def(audio, "dest", js_obj_value(dest), 0);
   js_def(audio, "wnode", js_obj_value(wnode), 0);

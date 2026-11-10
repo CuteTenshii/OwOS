@@ -1001,14 +1001,6 @@ static js_value rd_release_m(js_ctx *ctx, js_value thisv, js_value *args, int ar
   return js_undef();
 }
 
-static js_value illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 #define RC_OWNER(o) (((struct own *)(o)->host)->owner)
 
 static js_value rc_desired_get(js_ctx *ctx, js_value thisv, js_value *args, int argc)

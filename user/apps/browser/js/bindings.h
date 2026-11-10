@@ -27,7 +27,7 @@ js_value el_get_search(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_hash(js_ctx *ctx, js_value t, js_value *args, int argc);
 
 js_value abortcontroller_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
-js_value abortsignal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+js_value illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc); /* throws "Illegal constructor" */
 js_value bc_close_m(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value bc_post_m(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value bchannel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
@@ -224,8 +224,14 @@ bool node_is_comment(const struct dom_node *n);
 void remove_node(struct dom_node *parent, struct dom_node *c);
 js_value report_exc_v(js_ctx *ctx);
 js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value resp_json(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value resp_text(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_json(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_text(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value body_formdata(js_ctx *ctx, js_value t, js_value *args, int argc);
+int body_take(js_ctx *ctx, js_value t);   /* mark a body read; 0 when it already was */
+js_value body_used_error(js_ctx *ctx);   /* the rejected promise of a second read */
+js_value response_static_error(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value response_static_json(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value response_static_redirect(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value rtc_create_answer(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value rtc_create_data_channel(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value rtc_create_offer(js_ctx *ctx, js_value t, js_value *args, int argc);

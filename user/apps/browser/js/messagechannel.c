@@ -47,14 +47,6 @@ static js_value port_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-static js_value port_illegal(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 js_object *js_new_port(js_ctx *ctx)
 {
   js_object *p = js_new_object(ctx, g_port_proto);
@@ -107,7 +99,7 @@ void js_msgchannel_setup(js_ctx *ctx, js_object *win)
   def_method(g_port_proto, "addEventListener", el_add_listener, 3);
   def_method(g_port_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_port_proto, "dispatchEvent", el_dispatch, 1);
-  expose(ctx, win, "MessagePort", port_illegal, g_port_proto);
+  expose(ctx, win, "MessagePort", illegal_ctor, g_port_proto);
   g_channel_proto = js_new_object(ctx, ctx->object_proto);
   gc_add_root((void **)&g_channel_proto);
   expose(ctx, win, "MessageChannel", channel_ctor, g_channel_proto);

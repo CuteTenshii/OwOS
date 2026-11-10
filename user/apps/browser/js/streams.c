@@ -387,11 +387,13 @@ js_value response_consume(js_ctx *ctx, js_value resp, int kind)
   return r;
 }
 
-static js_value response_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
+js_value body_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value body, u8;
   (void)args;
   (void)argc;
+  if (!body_take(ctx, t))
+    return body_used_error(ctx);
   if (js_get(ctx, t, "@source").type == JV_OBJ)
     return response_consume(ctx, t, CONSUME_BUFFER);
   body = js_get(ctx, t, "@body");
@@ -405,11 +407,13 @@ static js_value response_arraybuffer(js_ctx *ctx, js_value t, js_value *args, in
   return js_promise_resolved(ctx, u8);
 }
 
-static js_value response_blob(js_ctx *ctx, js_value t, js_value *args, int argc)
+js_value body_blob(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value body, hdrs, type;
   (void)args;
   (void)argc;
+  if (!body_take(ctx, t))
+    return body_used_error(ctx);
   if (js_get(ctx, t, "@source").type == JV_OBJ)
     return response_consume(ctx, t, CONSUME_BLOB);
   body = js_get(ctx, t, "@body");
@@ -438,6 +442,6 @@ void js_streams_setup(js_ctx *ctx, js_object *win)
   }
   def_method(g_blob_proto, "stream", blob_stream, 0);
   def_acc(g_response_proto, "body", response_body, 0);
-  def_method(g_response_proto, "arrayBuffer", response_arraybuffer, 0);
-  def_method(g_response_proto, "blob", response_blob, 0);
+  def_method(g_response_proto, "arrayBuffer", body_arraybuffer, 0);
+  def_method(g_response_proto, "blob", body_blob, 0);
 }

@@ -583,9 +583,23 @@ static js_value sw_make_request(js_ctx *ctx, const char *url, const char *method
   js_def(o, "redirect", js_mk_cstring(ctx, "follow"), P_ENUMERABLE);
   js_def(o, "referrer", js_mk_cstring(ctx, "about:client"), P_ENUMERABLE);
   js_def(o, "destination", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(o, "bodyUsed", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+  js_def(o, "@body", js_mk_cstring(ctx, ""), P_WRITABLE);
   hv = headers_new(ctx, js_undef());
   if (hv.type == JV_OBJ)
     js_def(o, "headers", hv, P_ENUMERABLE);
+  {
+    js_value ac = js_get(ctx, js_obj_value(ctx->global), "AbortController");
+    js_value c = js_is_callable(ac) ? js_construct(ctx, ac, 0, 0) : js_undef();
+    if (c.type == JV_OBJ) {
+      js_value sg;
+      gc_keep(c.u.obj);
+      sg = js_get(ctx, c, "signal");
+      if (sg.type == JV_OBJ)
+        gc_keep(sg.u.obj);
+      js_def(o, "signal", sg, P_ENUMERABLE);
+    }
+  }
   rv = js_obj_value(o);
   gc_pop_scope();
   return rv;
@@ -597,58 +611,92 @@ static void sw_set_headers(js_ctx *ctx, js_value rq, js_value init)
   if (h.type == JV_OBJ)
     js_def(rq.u.obj, "headers", h, P_ENUMERABLE);
 }
+/* init[name] if it has one, else the Request input's */
+static js_value request_opt(js_ctx *ctx, js_value in, js_value init, const char *name)
+{
+  js_value v = init.type == JV_OBJ ? js_get(ctx, init, name) : js_undef();
+  return v.type == JV_UNDEF && in.type == JV_OBJ ? js_get(ctx, in, name) : v;
+}
+static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 static js_value req_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char m[16];
-  js_value u = js_get(ctx, t, "url"), mv = js_get(ctx, t, "method");
   (void)args;
   (void)argc;
-  js_value rv, hv = js_get(ctx, t, "headers");
-  strlcpy(m, mv.type == JV_STR ? mv.u.str->data : "GET", sizeof m);
-  rv = sw_make_request(ctx, u.type == JV_STR ? u.u.str->data : "", m);
-  if (hv.type == JV_OBJ)
-    sw_set_headers(ctx, rv, hv);
-  return rv;
+  if (js_to_boolean(js_get(ctx, t, "bodyUsed")))
+    return js_throw_type(ctx, "Request.clone: Body has already been consumed.");
+  return request_ctor(ctx, js_undef(), &t, 1);
 }
 static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
-  char url[URL_MAX], method[16];
-  js_value in = A(0);
+  static const char *const std_methods[] = {"DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"};
+  char url[URL_MAX], method[16], ctype[160];
+  js_value in = A(0), init = A(1), srcbody;
   const char *s, *err;
-  js_value rv, mv, hv;
-  int cm;
+  js_value rv, mv, hv, bv, v, body = js_undef();
+  int cm, blen = 0;
+  unsigned i;
   (void)thisv;
-  method[0] = 0;
+  ctype[0] = 0;
+  strlcpy(method, "GET", sizeof method);
   if (in.type == JV_OBJ) {
-    js_value u = js_get(ctx, in, "url"), m = js_get(ctx, in, "method");
+    js_value u = js_get(ctx, in, "url");
     s = (u.type == JV_STR) ? u.u.str->data : arg_str(ctx, in);
-    if (m.type == JV_STR)
-      strlcpy(method, m.u.str->data, sizeof method);
   } else
     s = arg_str(ctx, in);
   resolve_url(g_page_url_buf, s, url, sizeof url);
-  if (argc >= 2 && A(1).type == JV_OBJ) {
-    js_value m = js_get(ctx, A(1), "method");
-    if (m.type == JV_STR)
-      strlcpy(method, m.u.str->data, sizeof method);
+  mv = request_opt(ctx, in, init, "method");
+  if (mv.type == JV_STR) {
+    strlcpy(method, mv.u.str->data, sizeof method);
+    for (i = 0; i < sizeof std_methods / sizeof *std_methods; i++)
+      if (streq_ci(method, std_methods[i]))
+        strlcpy(method, std_methods[i], sizeof method);
   }
-  cm = fetch_cache_mode(ctx, A(0), A(1), &err);
+  cm = fetch_cache_mode(ctx, in, init, &err);
   if (cm < 0)
     return js_throw_type(ctx, err);
-  rv = sw_make_request(ctx, url, method);
+  bv = init.type == JV_OBJ ? js_get(ctx, init, "body") : js_undef();
+  if (bv.type == JV_UNDEF || bv.type == JV_NULL) { /* no body of its own: the Request input's */
+    srcbody = in.type == JV_OBJ ? js_get(ctx, in, "@body") : js_undef();
+    if (srcbody.type == JV_STR && srcbody.u.str->len) {
+      if (js_to_boolean(js_get(ctx, in, "bodyUsed")))
+        return js_throw_type(ctx, "Cannot construct a Request with a Request object that has already been used.");
+      body = srcbody;
+      blen = srcbody.u.str->len;
+    }
+  } else {
+    const char *bytes = body_bytes(ctx, bv, &blen, ctype, sizeof ctype);
+    body = js_mk_string(ctx, bytes, blen); /* body_bytes may point into a transient string: copy it first */
+  }
+  if (blen && (streq(method, "GET") || streq(method, "HEAD")))
+    return js_throw_type(ctx, "Request with GET/HEAD method cannot have body.");
   gc_push_scope();
+  if (body.type == JV_STR)
+    gc_keep(body.u.str);
+  rv = sw_make_request(ctx, url, method);
   gc_keep(rv.u.obj);
   js_def(rv.u.obj, "cache", js_mk_cstring(ctx, fetch_cache_names[cm]), P_ENUMERABLE);
-  hv = A(1).type == JV_OBJ ? js_get(ctx, A(1), "headers") : js_undef();
-  if (hv.type == JV_UNDEF && in.type == JV_OBJ)
-    hv = js_get(ctx, in, "headers");
+  hv = request_opt(ctx, in, init, "headers");
   if (hv.type != JV_UNDEF)
     sw_set_headers(ctx, rv, hv);
-  mv = A(1).type == JV_OBJ ? js_get(ctx, A(1), "mode") : js_undef();
-  if (mv.type == JV_UNDEF && in.type == JV_OBJ)
-    mv = js_get(ctx, in, "mode");
+  if (ctype[0]) { /* the body names its type unless the headers already did */
+    js_value h = js_get(ctx, rv, "headers"), kv[2];
+    if (h.type == JV_OBJ && headers_ctype(ctx, h).type != JV_STR) {
+      kv[0] = js_mk_cstring(ctx, "content-type");
+      kv[1] = js_mk_cstring(ctx, ctype);
+      js_call(ctx, js_get(ctx, h, "set"), h, kv, 2);
+    }
+  }
+  if (blen)
+    js_def(rv.u.obj, "@body", body, P_WRITABLE);
+  mv = request_opt(ctx, in, init, "mode");
   if (mv.type == JV_STR)
     js_def(rv.u.obj, "mode", mv, P_ENUMERABLE);
+  mv = request_opt(ctx, in, init, "credentials");
+  if (mv.type == JV_STR)
+    js_def(rv.u.obj, "credentials", mv, P_ENUMERABLE);
+  v = request_opt(ctx, in, init, "signal");
+  if (v.type == JV_OBJ)
+    js_def(rv.u.obj, "signal", v, P_ENUMERABLE);
   gc_pop_scope();
   return rv;
 }
@@ -1887,15 +1935,16 @@ void sw_cache_worker_setup(js_ctx *ctx, js_object *n, const char *origin)
 void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
 {
   js_object *nav = 0;
-  g_swcontainer_proto = js_new_object(ctx, ctx->object_proto);
-  g_swreg_proto = js_new_object(ctx, ctx->object_proto);
-  g_sw_proto = js_new_object(ctx, ctx->object_proto);
-  g_swscope_proto = js_new_object(ctx, ctx->object_proto);
-  g_clients_proto = js_new_object(ctx, ctx->object_proto);
-  g_client_proto = js_new_object(ctx, ctx->object_proto);
-  g_cachestorage_proto = js_new_object(ctx, ctx->object_proto);
-  g_cache_proto = js_new_object(ctx, ctx->object_proto);
-  g_request_proto = js_new_object(ctx, ctx->object_proto);
+  gc_push_scope();
+  g_swcontainer_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_swreg_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_sw_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_swscope_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_clients_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_client_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_cachestorage_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_cache_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
+  g_request_proto = gc_keep(js_new_object(ctx, ctx->object_proto));
   g_sw_container = 0;
   g_sw_active_scope = 0;
   g_sw_exec_holder = 0;
@@ -1911,6 +1960,7 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   gc_add_root((void **)&g_request_proto);
   gc_add_root((void **)&g_sw_container);
   gc_add_root((void **)&g_sw_active_scope);
+  gc_pop_scope();
 
   def_method(g_swscope_proto, "addEventListener", el_add_listener, 3);
   def_method(g_swscope_proto, "removeEventListener", el_remove_listener, 3);
@@ -1954,8 +2004,29 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   def_method(g_cache_proto, "keys", cache_keys_locked, 0);
 
   def_method(g_request_proto, "clone", req_clone, 0);
+  def_method(g_request_proto, "text", body_text, 0);
+  def_method(g_request_proto, "json", body_json, 0);
+  def_method(g_request_proto, "formData", body_formdata, 0);
+  def_method(g_request_proto, "arrayBuffer", body_arraybuffer, 0);
+  def_method(g_request_proto, "blob", body_blob, 0);
 
   js_def(win, "caches", sw_make_cachestorage(ctx), P_WRITABLE | P_CONFIGURABLE);
+  {
+    static const struct {
+      const char *name;
+      js_object **proto;
+    } ifaces[] = {{"Cache", &g_cache_proto}, {"CacheStorage", &g_cachestorage_proto}};
+    unsigned i;
+    for (i = 0; i < sizeof ifaces / sizeof *ifaces; i++) { /* the interfaces, for instanceof; not constructible */
+      js_object *c;
+      gc_push_scope();
+      c = (js_object *)gc_keep(js_new_native(ctx, illegal_ctor, ifaces[i].name, 0));
+      js_def(c, "prototype", js_obj_value(*ifaces[i].proto), 0);
+      js_def(*ifaces[i].proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+      js_def(win, ifaces[i].name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+      gc_pop_scope();
+    }
+  }
 
   {
     js_object *qc;

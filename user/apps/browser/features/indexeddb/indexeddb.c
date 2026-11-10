@@ -2132,14 +2132,6 @@ static js_value idb_db_storenames(js_ctx *ctx, js_value t, js_value *args, int a
 
 /* ---- IDBFactory (window.indexedDB) --------------------------------------- */
 
-static js_value idb_illegal_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
-{
-  (void)t;
-  (void)a;
-  (void)n;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 static js_value idb_factory_open(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char name[128];
@@ -2491,7 +2483,7 @@ void js_idb_setup(js_ctx *ctx, js_object *win)
 
   {
     js_object *factory = js_new_object(ctx, ctx->object_proto);
-    js_object *kr = js_new_native(ctx, idb_illegal_ctor, "IDBKeyRange", 0);
+    js_object *kr = js_new_native(ctx, illegal_ctor, "IDBKeyRange", 0);
     gc_push_scope();
     gc_keep(factory);
     gc_keep(kr);

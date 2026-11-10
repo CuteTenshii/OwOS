@@ -182,8 +182,8 @@ js_value sig_throw_if_aborted(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* AbortSignal is not directly constructable */
-js_value abortsignal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+/* Interfaces that script cannot construct (AbortSignal, Cache) */
+js_value illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   (void)thisv;
   (void)args;

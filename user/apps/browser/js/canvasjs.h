@@ -43,7 +43,6 @@ void canvas_img_teardown(void);
 /* Run `fn` once from the timer queue with `data` readable as ctx->native_data on entry. */
 void queue_native(js_ctx *ctx, js_native fn, js_value data);
 
-js_value js_illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 
 void canvas_js_setup(js_ctx *ctx, js_object *win);
 /* The part of the canvas API a worker has: OffscreenCanvas, CanvasRenderingContext2D, ImageData, Path2D, ... */

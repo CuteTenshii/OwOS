@@ -368,7 +368,7 @@ static void bitmap_setup(js_ctx *ctx, js_object *win)
   gc_add_root((void **)&g_bitmap_proto);
   js_def_native(ctx, g_bitmap_proto, "close", bitmap_close, 0);
   js_def_native(ctx, win, "createImageBitmap", create_image_bitmap, 1);
-  ic = js_new_native(ctx, js_illegal_ctor, "ImageBitmap", 0);
+  ic = js_new_native(ctx, illegal_ctor, "ImageBitmap", 0);
   gc_push_scope();
   gc_keep(ic);
   js_def(ic, "prototype", js_obj_value(g_bitmap_proto), 0);

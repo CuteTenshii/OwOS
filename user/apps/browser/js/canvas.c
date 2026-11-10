@@ -1460,12 +1460,6 @@ static void define_ctor(js_ctx *ctx, js_object *win, const char *name, js_native
   gc_pop_scope();
 }
 
-js_value js_illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv, (void)args, (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 static js_object *canvas_element_proto(void)
 {
   for (unsigned i = 0; i < g_nhtml_ifaces; i++)
@@ -1562,9 +1556,9 @@ static void canvas_setup_core(js_ctx *ctx, js_object *win)
   js_def_native(ctx, g_gradient_proto, "addColorStop", gradient_add_stop, 2);
   js_def_native(ctx, g_pattern_proto, "setTransform", pattern_set_transform, 1);
 
-  define_ctor(ctx, win, "CanvasRenderingContext2D", js_illegal_ctor, 0, cp);
-  define_ctor(ctx, win, "CanvasGradient", js_illegal_ctor, 0, g_gradient_proto);
-  define_ctor(ctx, win, "CanvasPattern", js_illegal_ctor, 0, g_pattern_proto);
+  define_ctor(ctx, win, "CanvasRenderingContext2D", illegal_ctor, 0, cp);
+  define_ctor(ctx, win, "CanvasGradient", illegal_ctor, 0, g_gradient_proto);
+  define_ctor(ctx, win, "CanvasPattern", illegal_ctor, 0, g_pattern_proto);
   define_ctor(ctx, win, "ImageData", imagedata_ctor, 2, g_imagedata_proto);
   define_ctor(ctx, win, "OffscreenCanvas", offscreen_ctor, 2, g_offscreen_proto);
 

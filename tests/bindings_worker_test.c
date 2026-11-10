@@ -10,6 +10,7 @@
 #include <time.h>
 
 int js_workers_pump(void);
+int js_timers_pump(void);
 void msleep(unsigned ms);
 
 static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int argc)
@@ -79,6 +80,7 @@ static int wait_for(const char *condition)
   int i;
   for (i = 0; i < 600; i++) {
     js_workers_pump();
+    js_timers_pump();
     if (check(condition))
       return 1;
     msleep(5);
@@ -723,6 +725,68 @@ static void worker_test(const char *name, void (*fn)(void))
 
 static const char page[] = "<html><body><script>var ready=1</script></body></html>";
 
+/* The page and a worker run the same probe of web APIs and must agree on every answer */
+static char *read_probe(void)
+{
+  FILE *f = fopen("tests/parity_probe.js", "rb");
+  char *b;
+  long n;
+  if (!f)
+    return strdup("");
+  fseek(f, 0, SEEK_END);
+  n = ftell(f);
+  rewind(f);
+  b = malloc((size_t)n + 1);
+  if (b && fread(b, 1, (size_t)n, f) != (size_t)n)
+    n = 0;
+  if (b)
+    b[n] = 0;
+  fclose(f);
+  return b;
+}
+
+static js_value probe_worker_src(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  static const char tail[] = "\nPROBE().then(function(r){ postMessage(r); },function(e){ postMessage({fail:String(e)}); });\n";
+  char *probe = read_probe(), *src = malloc(strlen(probe) + sizeof tail);
+  js_value r;
+  (void)thisv;
+  (void)args;
+  (void)argc;
+  strcpy(src, probe);
+  strcat(src, tail);
+  r = js_mk_cstring(ctx, src);
+  free(probe);
+  free(src);
+  return r;
+}
+
+static void test_page_and_worker_agree(void)
+{
+  static const char tail[] = "\nPROBE().then(function(r){ window.pr=r; });\n";
+  char *probe = read_probe(), *src = malloc(strlen(probe) + sizeof tail);
+  expect(probe[0] != 0);
+  strcpy(src, probe);
+  strcat(src, tail);
+  run_script(src);
+  free(probe);
+  free(src);
+  expect(wait_for("typeof pr==='object'"));
+  run_script("var wr=null, wk=new Worker(URL.createObjectURL(new Blob([probe_worker_src()]))); "
+             "wk.onmessage=function(e){ wr=e.data; }; wk.onerror=function(e){ wr={err:e.message}; };\n");
+  expect(wait_for("wr!==null"));
+  run_script(
+      "expect(wr.fail===undefined && wr.err===undefined, 'the probe ran in the worker: '+JSON.stringify(wr).slice(0,200));\n"
+      /* order: the engine runs promise reactions eagerly, differently on each side; request.rel: a worker has no base URL */
+      "var skip={order:1,'request.rel':1,globals:1}, bad=[], k;\n"
+      "for (k in pr) { if (!skip[k] && pr[k]!==wr[k]) { bad.push(k+' page='+pr[k]+' worker='+wr[k]); } }\n"
+      "for (k in wr) { if (!skip[k] && !(k in pr)) { bad.push(k+' only in the worker'); } }\n"
+      "expect(bad.length===0, 'page and worker disagree on '+bad.length+': '+bad.join(' ;; '));\n"
+      "var pg=pr.globals.split(','), wg=wr.globals.split(','), pageOnly=pg.filter(function(n){ return wg.indexOf(n)<0; }), "
+      "extra=pageOnly.filter(function(n){ return ['DOMParser','Notification','ProgressEvent','indexedDB','isSecureContext','origin'].indexOf(n)<0; });\n"
+      "expect(extra.length===0 && wg.every(function(n){ return pg.indexOf(n)>=0; }), 'global sets differ: '+extra+' / '+wg.filter(function(n){ return pg.indexOf(n)<0; }));\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -731,10 +795,12 @@ int main(void)
   js_run_document(root, "https://example.com/dir/p.html", fetch_none);
   js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
   js_def_native(g_ctx, g_ctx->global, "fixture", test_fixture, 0);
+  js_def_native(g_ctx, g_ctx->global, "probe_worker_src", probe_worker_src, 0);
   run_script("var __workers=[]; (function(){ var W=Worker; Worker=function(a,b){ var w=new W(a,b); __workers.push(w); "
              "return w; };"
              "Worker.prototype=W.prototype; })();\n");
 
+  worker_test("page and worker answer the same web API probe alike", test_page_and_worker_agree);
   worker_test("postMessage round trip and ordering", test_round_trip);
   worker_test("self.addEventListener and structured clone", test_self_listeners_and_clone);
   worker_test("terminate and close", test_terminate_and_close);

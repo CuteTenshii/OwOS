@@ -1639,14 +1639,6 @@ static js_value xpeval_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   gc_pop_scope();
   return js_obj_value(o);
 }
-static js_value xpresult_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  return js_throw_type(ctx, "Illegal constructor");
-}
-
 void xpath_install(js_ctx *ctx, js_object *win)
 {
   static const struct {
@@ -1662,7 +1654,7 @@ void xpath_install(js_ctx *ctx, js_object *win)
                 {"ORDERED_NODE_SNAPSHOT_TYPE", R_ORDERED_SNAP},
                 {"ANY_UNORDERED_NODE_TYPE", R_ANY_UNORDERED},
                 {"FIRST_ORDERED_NODE_TYPE", R_FIRST_ORDERED}};
-  js_object *rc = js_new_native(ctx, xpresult_ctor, "XPathResult", 0);
+  js_object *rc = js_new_native(ctx, illegal_ctor, "XPathResult", 0);
   gc_push_scope();
   gc_keep(rc);
   for (unsigned i = 0; i < sizeof consts / sizeof consts[0]; i++)

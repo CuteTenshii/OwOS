@@ -2630,8 +2630,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   namespace_install();
 
   /* fetch() + Response.prototype */
-  def_method(g_response_proto, "text", resp_text, 0);
-  def_method(g_response_proto, "json", resp_json, 0);
+  def_method(g_response_proto, "text", body_text, 0);
+  def_method(g_response_proto, "json", body_json, 0);
+  def_method(g_response_proto, "formData", body_formdata, 0);
   def_method(g_response_proto, "clone", resp_clone, 0);
   {
     js_object *rc;
@@ -2639,6 +2640,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     rc = (js_object *)gc_keep(js_new_native(ctx, response_ctor, "Response", 2));
     js_def(rc, "prototype", js_obj_value(g_response_proto), 0);
     js_def(g_response_proto, "constructor", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+    js_def_native(ctx, rc, "error", response_static_error, 0);
+    js_def_native(ctx, rc, "json", response_static_json, 2);
+    js_def_native(ctx, rc, "redirect", response_static_redirect, 2);
     js_def(win, "Response", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
@@ -2753,7 +2757,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_abortsignal_proto, "throwIfAborted", sig_throw_if_aborted, 0);
   def_method(g_abortcontroller_proto, "abort", ctrl_abort, 1);
   {
-    js_object *sc = js_new_native(ctx, abortsignal_ctor, "AbortSignal", 0);
+    js_object *sc = js_new_native(ctx, illegal_ctor, "AbortSignal", 0);
     js_object *cc = js_new_native(ctx, abortcontroller_ctor, "AbortController", 0);
     gc_push_scope();
     gc_keep(sc);

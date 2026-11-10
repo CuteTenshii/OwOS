@@ -4,21 +4,39 @@
 #include "fetchint.h"
 
 /* ------------------------------------------------------- fetch ------------- */
-js_value resp_text(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* Body mixin, shared by Response and Request: the first read takes the body, a second one rejects */
+int body_take(js_ctx *ctx, js_value t)
+{
+  if (js_to_boolean(js_get(ctx, t, "bodyUsed")))
+    return 0;
+  js_set(ctx, t, "bodyUsed", js_bool(1));
+  return 1;
+}
+js_value body_used_error(js_ctx *ctx)
+{
+  return js_promise_rejected(
+      ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Body is unusable: Body has already been read"));
+}
+js_value body_text(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
   (void)argc;
+  if (!body_take(ctx, t))
+    return body_used_error(ctx);
   if (js_get(ctx, t, "@source").type == JV_OBJ)
     return response_consume(ctx, t, CONSUME_TEXT);
   return js_promise_resolved(ctx, js_get(ctx, t, "@body"));
 }
-js_value resp_json(js_ctx *ctx, js_value t, js_value *args, int argc)
+js_value body_json(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value body = js_get(ctx, t, "@body"), parsed, jsonobj, parsefn;
+  js_value body, parsed, jsonobj, parsefn;
   (void)args;
   (void)argc;
+  if (!body_take(ctx, t))
+    return body_used_error(ctx);
   if (js_get(ctx, t, "@source").type == JV_OBJ)
     return response_consume(ctx, t, CONSUME_JSON);
+  body = js_get(ctx, t, "@body");
   jsonobj = js_get(ctx, js_obj_value(ctx->global), "JSON");
   parsefn = js_get(ctx, jsonobj, "parse");
   if (!js_is_callable(parsefn))
@@ -32,13 +50,70 @@ js_value resp_json(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return js_promise_resolved(ctx, parsed);
 }
-js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* formData() of an application/x-www-form-urlencoded body; multipart bodies are not parsed */
+js_value body_formdata(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  (void)ctx;
+  js_value ct, body, fd;
+  const char *p;
+  js_object *ka, *va;
   (void)args;
   (void)argc;
-  return t; /* body isn't consumed here, so self works */
+  if (!body_take(ctx, t))
+    return body_used_error(ctx);
+  ct = headers_ctype(ctx, js_get(ctx, t, "headers"));
+  body = js_get(ctx, t, "@body");
+  if (ct.type != JV_STR || !starts_ci(ct.u.str->data, "application/x-www-form-urlencoded") || body.type != JV_STR)
+    return js_promise_rejected(
+        ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Content-Type was not one of \"application/x-www-form-urlencoded\""));
+  gc_push_scope();
+  fd = fd_ctor(ctx, js_undef(), 0, 0);
+  gc_keep(fd.u.obj);
+  ka = js_get(ctx, fd, "@k").u.obj;
+  va = js_get(ctx, fd, "@v").u.obj;
+  for (p = body.u.str->data; *p;) {
+    const char *amp = strchr(p, '&'), *end = amp ? amp : p + strlen(p), *eq = p;
+    while (eq < end && *eq != '=')
+      eq++;
+    if (end > p) {
+      char *k = form_decode(p, (int)(eq - p)), *v = form_decode(eq < end ? eq + 1 : end, eq < end ? (int)(end - eq - 1) : 0);
+      js_array_push(ctx, ka, js_mk_cstring(ctx, k ? k : ""));
+      js_array_push(ctx, va, js_mk_cstring(ctx, v ? v : ""));
+      free(k);
+      free(v);
+    }
+    p = amp ? amp + 1 : end;
+  }
+  gc_pop_scope();
+  return js_promise_resolved(ctx, fd);
 }
+/* Response.clone(): a second Response over the same bytes; an unread streamed body can't be split */
+js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value b, st, so, u, ty;
+  js_object *c;
+  (void)args;
+  (void)argc;
+  if (js_to_boolean(js_get(ctx, t, "bodyUsed")) || js_get(ctx, t, "@source").type == JV_OBJ)
+    return js_throw_type(ctx, js_to_boolean(js_get(ctx, t, "bodyUsed")) ? "Response.clone: Body has already been consumed."
+                                                                       : "Response.clone: a streamed body can't be cloned");
+  gc_push_scope();
+  b = js_get(ctx, t, "@body");
+  st = js_get(ctx, t, "statusText");
+  u = js_get(ctx, t, "url");
+  ty = js_get(ctx, t, "type");
+  c = make_response(ctx, u.type == JV_STR ? u.u.str->data : "", (int)js_to_number(ctx, js_get(ctx, t, "status")),
+                    st.type == JV_STR ? st.u.str->data : "", js_get(ctx, t, "headers"), "",
+                    b.type == JV_STR ? b.u.str->data : "", b.type == JV_STR ? b.u.str->len : 0);
+  gc_keep(c);
+  so = js_obj_value(c);
+  js_def(c, "status", js_get(ctx, t, "status"), P_ENUMERABLE);
+  js_def(c, "ok", js_get(ctx, t, "ok"), P_ENUMERABLE);
+  if (ty.type == JV_STR)
+    js_def(c, "type", ty, P_ENUMERABLE);
+  gc_pop_scope();
+  return so;
+}
+
 #define JS(...) #__VA_ARGS__
 /* Headers, in JavaScript: the same source runs on the page and in dedicated workers (webworker.c) */
 const char fetch_headers_js[] =
@@ -150,36 +225,110 @@ js_object *make_response(js_ctx *ctx, const char *url, int status, const char *s
   return resp;
 }
 
-js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+/* A Response from a body value and a ResponseInit; `default_ctype` replaces the one the body implies, when given */
+static js_value response_build(js_ctx *ctx, js_value body, js_value init, const char *default_ctype)
 {
   int status = 200;
   char st[64], ct[160];
   js_value stream = js_undef(), bstr, rv, hinit = js_undef();
   js_object *resp;
-  (void)thisv;
   strlcpy(st, "", sizeof st);
   strlcpy(ct, "text/plain;charset=UTF-8", sizeof ct);
   gc_push_scope();
-  bstr = response_init_body(ctx, A(0), &stream, ct, sizeof ct);
+  bstr = response_init_body(ctx, body, &stream, ct, sizeof ct);
+  if (default_ctype)
+    strlcpy(ct, default_ctype, sizeof ct);
   if (stream.type == JV_OBJ)
     gc_keep(stream.u.obj);
   if (bstr.type == JV_STR)
     gc_keep(bstr.u.str);
-  if (argc >= 2 && A(1).type == JV_OBJ) {
-    js_value s = js_get(ctx, A(1), "status");
-    js_value stt = js_get(ctx, A(1), "statusText");
-    js_value h = js_get(ctx, A(1), "headers");
-    if (s.type == JV_NUM)
-      status = (int)s.u.num;
+  if (init.type == JV_OBJ) {
+    js_value s = js_get(ctx, init, "status");
+    js_value stt = js_get(ctx, init, "statusText");
+    if (s.type != JV_UNDEF) {
+      double d = js_to_number(ctx, s);
+      if (!(d >= 200 && d <= 599)) {
+        gc_pop_scope();
+        return js_throw_range(ctx, "The status provided is outside the range [200, 599].");
+      }
+      status = (int)d;
+    }
     if (stt.type == JV_STR)
       strlcpy(st, stt.u.str->data, sizeof st);
-    hinit = h;
+    hinit = js_get(ctx, init, "headers");
   }
   resp = (js_object *)gc_keep(make_response(ctx, "", status, st, hinit, ct, bstr.type == JV_STR ? bstr.u.str->data : "",
                                             bstr.type == JV_STR ? bstr.u.str->len : 0));
+  js_def(resp, "type", js_mk_cstring(ctx, "default"), P_ENUMERABLE);
   if (stream.type == JV_OBJ)
     js_def(resp, "@source", stream, 0);
   rv = js_obj_value(resp);
+  gc_pop_scope();
+  return rv;
+}
+
+js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  (void)thisv;
+  (void)argc;
+  return response_build(ctx, A(0), A(1), 0);
+}
+
+/* Response.error(): a network error, status 0 */
+js_value response_static_error(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *r;
+  js_value rv;
+  (void)t;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  r = (js_object *)gc_keep(make_response(ctx, "", 200, "", js_undef(), "", "", 0));
+  js_def(r, "status", js_number(0), P_ENUMERABLE);
+  js_def(r, "ok", js_bool(0), P_ENUMERABLE);
+  js_def(r, "type", js_mk_cstring(ctx, "error"), P_ENUMERABLE);
+  rv = js_obj_value(r);
+  gc_pop_scope();
+  return rv;
+}
+
+/* Response.json(data, init): the JSON text of data as an application/json body */
+js_value response_static_json(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value json = js_get(ctx, js_obj_value(ctx->global), "JSON"), text, rv;
+  (void)t;
+  (void)argc;
+  text = js_call(ctx, js_get(ctx, json, "stringify"), json, args, argc > 0 ? 1 : 0);
+  if (ctx->has_exc)
+    return js_undef();
+  if (text.type != JV_STR)
+    return js_throw_type(ctx, "Response.json: the value is not serializable");
+  gc_push_scope();
+  gc_keep(text.u.str);
+  rv = response_build(ctx, text, A(1), "application/json");
+  gc_pop_scope();
+  return rv;
+}
+
+/* Response.redirect(url, status = 302) */
+js_value response_static_redirect(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char url[URL_MAX];
+  int status = argc > 1 && A(1).type != JV_UNDEF ? js_to_int_sat(ctx, A(1)) : 302;
+  js_object *r;
+  js_value rv, kv[2], h;
+  (void)t;
+  if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308)
+    return js_throw_range(ctx, "Invalid status code");
+  resolve_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
+  gc_push_scope();
+  r = (js_object *)gc_keep(make_response(ctx, "", status, "", js_undef(), "", "", 0));
+  js_def(r, "type", js_mk_cstring(ctx, "default"), P_ENUMERABLE);
+  h = js_get(ctx, js_obj_value(r), "headers");
+  kv[0] = js_mk_cstring(ctx, "location");
+  kv[1] = js_mk_cstring(ctx, url);
+  js_call(ctx, js_get(ctx, h, "set"), h, kv, 2);
+  rv = js_obj_value(r);
   gc_pop_scope();
   return rv;
 }
@@ -457,14 +606,17 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     fetch_req_free(&rq);
     return js_promise_rejected(ctx, exc);
   }
-  if (init.type == JV_OBJ) {
-    js_value m = js_get(ctx, init, "method");
-    js_value b = js_get(ctx, init, "body");
-    js_value sig = js_get(ctx, init, "signal");
-    js_value cr = js_get(ctx, init, "credentials");
+  if (init.type == JV_OBJ || in.type == JV_OBJ) {
+    js_value m = init.type == JV_OBJ ? js_get(ctx, init, "method") : js_undef();
+    js_value b = init.type == JV_OBJ ? js_get(ctx, init, "body") : js_undef();
+    js_value sig = init.type == JV_OBJ ? js_get(ctx, init, "signal") : js_undef();
+    js_value cr = init.type == JV_OBJ ? js_get(ctx, init, "credentials") : js_undef();
+    if (sig.type == JV_UNDEF && in.type == JV_OBJ)
+      sig = js_get(ctx, in, "signal");
+    if (cr.type == JV_UNDEF && in.type == JV_OBJ)
+      cr = js_get(ctx, in, "credentials");
     if (m.type == JV_STR)
       strlcpy(rq.method, m.u.str->data, sizeof rq.method);
-    (void)js_to_boolean(js_get(ctx, init, "keepalive")); /* sync fetch: inherently satisfied */
     rq.with_creds = cr.type == JV_STR && streq(cr.u.str->data, "include"); /* "include" sends cookies cross-origin */
     /* An already-aborted signal short-circuits before touching the network */
     if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
@@ -477,6 +629,14 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     /* Body last, just before the request: body_bytes may hand back a pointer into a transient string */
     if (b.type != JV_UNDEF && b.type != JV_NULL)
       rq.body = (const unsigned char *)body_bytes(ctx, b, &rq.body_len, rq.ctype, sizeof rq.ctype);
+  }
+  if (!rq.body && in.type == JV_OBJ) { /* the body of a Request input (its headers carry the type) */
+    js_value b = js_get(ctx, in, "@body");
+    if (b.type == JV_STR && b.u.str->len) {
+      rq.body = (const unsigned char *)b.u.str->data;
+      rq.body_len = b.u.str->len;
+      js_set(ctx, in, "bodyUsed", js_bool(1));
+    }
   }
   rq.cache_mode = fetch_cache_mode(ctx, in, init, &cache_err);
   if (rq.cache_mode < 0) {
