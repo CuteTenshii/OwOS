@@ -2,6 +2,7 @@
 #ifndef OWOS_ARCH_AARCH64_H
 #define OWOS_ARCH_AARCH64_H
 
+#include "pmm.h"
 #include <stdint.h>
 
 #define UART0_BASE 0x09000000UL
@@ -42,18 +43,34 @@ void gic_init(void);
 void timer_init(void);
 uint64_t timer_ticks(void);
 
-#define PMM_FRAME_SIZE 4096
-
 extern uint64_t boot_dtb;
 
 /* Base and size of the first /memory node. Returns 0 on success, -1 if the blob is invalid. */
 int fdt_memory(const void *fdt, uint64_t *base, uint64_t *size);
 
-void pmm_init(uint64_t ram_base, uint64_t ram_size);
-uintptr_t pmm_alloc_frame(void); /* 0 when out of memory */
-void pmm_free_frame(uintptr_t frame);
-uint64_t pmm_free_count(void);
-uint64_t pmm_total_count(void);
+/* Size RAM from the DTB, then bring up the frame allocator and the kernel heap. Returns 0 on success. */
+int arch_mem_init(const void *dtb);
+
+extern uint64_t kernel_l1[512];
+
+#define USER_BASE 0x100000000UL
+#define USER_END (USER_BASE + 0x200000UL)
+#define VM_USER_RX 1
+#define VM_USER_RW 2
+
+/* Per-process translation tables: the kernel identity map plus a user window at USER_BASE. */
+uint64_t *vm_create(void);
+int vm_map(uint64_t *root, uintptr_t va, uintptr_t pa, int prot);
+void vm_switch(uint64_t *root);
+void vm_destroy(uint64_t *root);
+
+/* EL0 tasks. task_run returns the exit code, or -1 if the task faulted. */
+int task_run(const void *code, uint32_t len);
+void task_syscall(struct trap_frame *tf);
+void task_fault(struct trap_frame *tf);
+
+#define SYS_WRITE 1
+#define SYS_EXIT 2
 
 void arch_exception(struct trap_frame *tf, uint64_t kind);
 void arch_poweroff(void);

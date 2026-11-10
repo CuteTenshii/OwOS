@@ -2,6 +2,7 @@
 
 #include "heap.h"
 #include "console.h"
+#include "irqflags.h"
 #include "pmm.h"
 #include "spinlock.h"
 #include <stdbool.h>
@@ -31,14 +32,14 @@ static spinlock_t heap_lock;
 
 void heap_init(void)
 {
-  uint32_t start = ALIGN_UP((uint32_t)(uintptr_t)kernel_end, 4096u);
+  uintptr_t start = ALIGN_UP((uintptr_t)kernel_end, (uintptr_t)4096);
   /* No room for a heap: halt rather than wrap the size subtraction below. */
   if (start >= KHEAP_END || (KHEAP_END - start) <= sizeof(block_t) + 8) {
     con_write("heap: no room between kernel image and page-table pool -- halting.\n");
     for (;;)
-      __asm__ volatile("cli; hlt");
+      cpu_halt();
   }
-  head = (block_t *)(uintptr_t)start;
+  head = (block_t *)start;
   head->size = (KHEAP_END - start) - sizeof(block_t);
   head->magic = BLOCK_MAGIC;
   head->free = true;

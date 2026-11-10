@@ -29,6 +29,9 @@ static inline uintptr_t irq_flags(void)
   __asm__ volatile("mrs %0, daif" : "=r"(f)::"memory");
   return f;
 }
+
+/* Mask interrupts and wait; call in a loop to halt for good. */
+static inline void cpu_halt(void) { __asm__ volatile("msr daifset, #2\n\twfi"); }
 #else
 /* Snapshot the flags register and disable interrupts. Pair with irq_restore. */
 static inline uintptr_t irq_save(void)
@@ -49,6 +52,8 @@ static inline uintptr_t irq_flags(void)
   __asm__ volatile("pushf\n\tpop %0" : "=r"(f)::"memory");
   return f;
 }
+
+static inline void cpu_halt(void) { __asm__ volatile("cli; hlt"); }
 #endif
 
 #endif /* OWOS_IRQFLAGS_H */

@@ -1,9 +1,7 @@
 /* pmm.c — track physical RAM one 4 KiB frame at a time with a bitmap. */
 
 #include "pmm.h"
-#include "console.h"
-#include "irqflags.h"
-#include "multiboot.h"
+#include "spinlock.h"
 
 #define FRAME_SIZE PMM_FRAME_SIZE
 #define MAX_FRAMES (1u << 20) /* support up to 4 GiB                 */
@@ -37,21 +35,10 @@ uint32_t pmm_pool_start(void) { return pool_start_b; } /* = kernel heap end */
  * forking) re-scanned every already-taken low frame on each allocation. A free
  * below the cursor pulls it back so the freed frame is reused. */
 static uint32_t alloc_hint;
-static volatile uint32_t pmm_lock;
+static spinlock_t pmm_lock;
 
-static uintptr_t pmm_lock_acquire(void)
-{
-  uintptr_t flags = irq_save();
-  while (__sync_lock_test_and_set(&pmm_lock, 1))
-    __asm__ volatile("pause");
-  return flags;
-}
-
-static void pmm_lock_release(uintptr_t flags)
-{
-  __sync_lock_release(&pmm_lock);
-  irq_restore(flags);
-}
+static uintptr_t pmm_lock_acquire(void) { return spin_lock_irqsave(&pmm_lock); }
+static void pmm_lock_release(uintptr_t flags) { spin_unlock_irqrestore(&pmm_lock, flags); }
 
 /* Frames backed by *real, allocatable RAM* (the available regions below 4 GiB).
  * Distinct from total_frames, which also spans the PCI/MMIO hole and reserved
@@ -91,59 +78,9 @@ static uint32_t find_free_frame(uint32_t start, uint32_t end)
   return end;
 }
 
-void pmm_init(const struct multiboot_info *mbi)
+void pmm_begin(uint64_t highest, uint64_t installed_bytes)
 {
-  /* Without a memory map we can't know what's safe; refuse to guess. */
-  if (!(mbi->flags & MULTIBOOT_FLAG_MMAP)) {
-    con_write("pmm: no multiboot memory map -- cannot init.\n");
-    return;
-  }
-
-  /* First pass: find the highest usable address to size the bitmap, and sum
-   * every available region (in 64-bit, so RAM above 4 GiB still counts) to
-   * report the true installed total even though we can only manage 4 GiB. */
-  uint64_t highest = 0;
-  uint64_t avail = 0;
-  uint32_t addr = mbi->mmap_addr;
-  uint32_t end = mbi->mmap_addr + mbi->mmap_length;
-  while (addr < end) {
-    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)(uintptr_t)addr;
-    if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
-      uint64_t top = e->addr + e->len;
-      if (top > highest)
-        highest = top;
-      avail += e->len;
-    }
-    addr += e->size + 4;
-  }
-  installed_kib = (uint32_t)(avail / 1024);
-
-  /* Size the identity-mapped low region (kernel heap + page-table pool) from
-   * detected RAM instead of a fixed 16 MiB, so the kmalloc heap — and thus the
-   * number of tasks/windows whose 32 KiB kernel stacks come from it, plus the
-   * palloc pool that backs per-process page dirs — scales with the machine.
-   * ~1/16 of RAM, clamped to [16 MiB, 192 MiB] (must stay under SCRATCH_VADDR
-   * at 256 MiB) and 4 MiB-granular (one identity page table each). A 256 MiB
-   * box keeps the original 16 MiB layout; 4 GiB gets 192 MiB. The pool takes
-   * the top ~1/8; the heap gets the rest. */
-  {
-    uint32_t mib = installed_kib / 1024;
-    uint32_t le = mib / 16;
-    if (le < 16)
-      le = 16;
-    if (le > 192)
-      le = 192;
-    le &= ~3u;
-    uint32_t pl = le / 8;
-    if (pl < 4)
-      pl = 4;
-    if (pl > 24)
-      pl = 24;
-    pl &= ~3u;
-    low_end_b = le << 20;
-    pool_start_b = (uint32_t)(le - pl) << 20;
-  }
-
+  installed_kib = (uint32_t)(installed_bytes / 1024);
   total_frames = highest / FRAME_SIZE;
   if (total_frames > MAX_FRAMES)
     total_frames = MAX_FRAMES;
@@ -152,25 +89,25 @@ void pmm_init(const struct multiboot_info *mbi)
   for (uint32_t i = 0; i < BITMAP_DWORDS; i++)
     bitmap[i] = 0xFFFFFFFF;
   used_frames = total_frames;
+}
 
-  addr = mbi->mmap_addr;
-  while (addr < end) {
-    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)(uintptr_t)addr;
-    if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
-      uint32_t f0 = (e->addr + FRAME_SIZE - 1) / FRAME_SIZE; /* round up   */
-      uint32_t f1 = (e->addr + e->len) / FRAME_SIZE;         /* round down */
-      for (uint32_t f = f0; f < f1 && f < total_frames; f++) {
-        if (frame_test(f)) {
-          frame_clear(f);
-          used_frames--;
-          ram_frames++; /* a frame of real, usable RAM */
-        }
-      }
+void pmm_add_region(uint64_t addr, uint64_t len)
+{
+  uint64_t f0 = (addr + FRAME_SIZE - 1) / FRAME_SIZE; /* round up   */
+  uint64_t f1 = (addr + len) / FRAME_SIZE;            /* round down */
+  for (uint64_t f = f0; f < f1 && f < total_frames; f++) {
+    if (frame_test((uint32_t)f)) {
+      frame_clear((uint32_t)f);
+      used_frames--;
+      ram_frames++; /* a frame of real, usable RAM */
     }
-    addr += e->size + 4;
   }
+}
 
-  /* Reserve the low 16 MiB (kernel image + identity-mapped heap). */
+void pmm_reserve_low(uint32_t low_end, uint32_t pool_start)
+{
+  low_end_b = low_end;
+  pool_start_b = pool_start;
   for (uint32_t f = 0; f < (low_end_b / FRAME_SIZE) && f < total_frames; f++) {
     if (!frame_test(f)) {
       frame_set(f);
@@ -182,7 +119,7 @@ void pmm_init(const struct multiboot_info *mbi)
   alloc_hint = (low_end_b / FRAME_SIZE);
 }
 
-uint32_t pmm_alloc_frame(void)
+phys_t pmm_alloc_frame(void)
 {
   uintptr_t flags = pmm_lock_acquire();
   uint32_t f = find_free_frame(alloc_hint, total_frames);
@@ -198,13 +135,13 @@ uint32_t pmm_alloc_frame(void)
     used_frames++;
     alloc_hint = f + 1;
     pmm_lock_release(flags);
-    return f * FRAME_SIZE;
+    return (phys_t)f * FRAME_SIZE;
   }
   pmm_lock_release(flags);
   return 0; /* out of physical memory */
 }
 
-uint32_t pmm_alloc_contig(uint32_t bytes)
+phys_t pmm_alloc_contig(uint32_t bytes)
 {
   /* Reject an absurd size before the round-up overflows uint32 and yields a
    * tiny `need` that would hand back a run far shorter than asked for. */
@@ -242,7 +179,7 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
         }
         alloc_hint = f + need;
         pmm_lock_release(flags);
-        return f * FRAME_SIZE;
+        return (phys_t)f * FRAME_SIZE;
       }
       f += run + 1;
     }
@@ -251,12 +188,12 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
   return 0;
 }
 
-void pmm_free_frame(uint32_t phys)
+void pmm_free_frame(phys_t phys)
 {
   if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
     return;
   uintptr_t flags = pmm_lock_acquire();
-  uint32_t f = phys / FRAME_SIZE;
+  uint32_t f = (uint32_t)(phys / FRAME_SIZE);
   if (f < total_frames && frame_test(f)) {
     if (refs[f] > 1) {
       refs[f]--;
@@ -272,23 +209,23 @@ void pmm_free_frame(uint32_t phys)
   pmm_lock_release(flags);
 }
 
-void pmm_retain_frame(uint32_t phys)
+void pmm_retain_frame(phys_t phys)
 {
   if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
     return;
   uintptr_t flags = pmm_lock_acquire();
-  uint32_t f = phys / FRAME_SIZE;
+  uint32_t f = (uint32_t)(phys / FRAME_SIZE);
   if (f < total_frames && frame_test(f) && refs[f] != 0 && refs[f] != 0xFFFF)
     refs[f]++;
   pmm_lock_release(flags);
 }
 
-uint32_t pmm_frame_refs(uint32_t phys)
+uint32_t pmm_frame_refs(phys_t phys)
 {
   if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
     return 0;
   uintptr_t flags = pmm_lock_acquire();
-  uint32_t f = phys / FRAME_SIZE;
+  uint32_t f = (uint32_t)(phys / FRAME_SIZE);
   uint32_t result = f < total_frames ? refs[f] : 0;
   pmm_lock_release(flags);
   return result;
@@ -297,7 +234,7 @@ uint32_t pmm_frame_refs(uint32_t phys)
 /* Release a run previously handed out by pmm_alloc_contig. The bitmap allocator
  * tracks frames individually, so a contiguous run is just freed frame by frame.
  */
-void pmm_free_contig(uint32_t phys, uint32_t bytes)
+void pmm_free_contig(phys_t phys, uint32_t bytes)
 {
   if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
     return;
@@ -306,7 +243,7 @@ void pmm_free_contig(uint32_t phys, uint32_t bytes)
   uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
   uintptr_t flags = pmm_lock_acquire();
   for (uint32_t i = 0; i < need; i++) {
-    uint32_t f = phys / FRAME_SIZE + i;
+    uint32_t f = (uint32_t)(phys / FRAME_SIZE) + i;
     if (f >= total_frames || !frame_test(f))
       continue;
     if (refs[f] > 1) {

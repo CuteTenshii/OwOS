@@ -1,5 +1,6 @@
 /* main.c: AArch64 bring-up and boot self-test. */
 #include "arch.h"
+#include "heap.h"
 #include "kstring.h"
 
 extern volatile uint64_t svc_count;
@@ -41,20 +42,59 @@ static void test_kstring(void)
   check("ksnprintf", streq(buf, "os-42-ff"));
 }
 
+static uint32_t free_frames(void) { return pmm_free_kib() / (PMM_FRAME_SIZE / 1024); }
+
 static void test_memory(void)
 {
-  uint64_t base = 0, size = 0;
-  check("dtb memory node",
-        fdt_memory((const void *)boot_dtb, &base, &size) == 0 && base == 0x40000000UL && size == 256UL << 20);
-  pmm_init(base, size);
+  check("memory init from DTB", arch_mem_init((const void *)boot_dtb) == 0);
+  check("pmm sized to 256 MiB RAM", pmm_installed_kib() == 256 * 1024);
 
-  uint64_t total = pmm_total_count();
-  uintptr_t a = pmm_alloc_frame(), b = pmm_alloc_frame();
-  check("pmm distinct aligned frames",
-        a && b && a != b && !(a & (PMM_FRAME_SIZE - 1)) && pmm_free_count() == total - 2);
+  uint32_t before = free_frames();
+  phys_t a = pmm_alloc_frame(), b = pmm_alloc_frame();
+  check("pmm distinct aligned frames", a && b && a != b && !(a & (PMM_FRAME_SIZE - 1)) && free_frames() == before - 2);
   memset((void *)a, 0xa5, PMM_FRAME_SIZE);
   pmm_free_frame(a);
-  check("pmm reuses freed frame", pmm_alloc_frame() == a && pmm_free_count() == total - 2);
+  check("pmm reuses freed frame", pmm_alloc_frame() == a && free_frames() == before - 2);
+
+  pmm_retain_frame(b);
+  check("pmm refcount", pmm_frame_refs(b) == 2);
+  pmm_free_frame(b);
+  check("pmm shared frame survives one free", pmm_frame_refs(b) == 1 && free_frames() == before - 2);
+  pmm_free_frame(b);
+  pmm_free_frame(a);
+  check("pmm frees return to pool", free_frames() == before);
+
+  phys_t run = pmm_alloc_contig(5 * PMM_FRAME_SIZE);
+  check("pmm contiguous run", run && free_frames() == before - 5);
+  pmm_free_contig(run, 5 * PMM_FRAME_SIZE);
+  check("pmm contiguous free", free_frames() == before);
+
+  size_t heap_before = heap_free_bytes();
+  uint8_t *p = kmalloc(100), *q = kmalloc(200);
+  check("kmalloc aligned and distinct", p && q && p != q && !((uintptr_t)p & 7) && !((uintptr_t)q & 7));
+  memset(p, 1, 100);
+  memset(q, 2, 200);
+  check("kmalloc blocks do not overlap", p[99] == 1 && q[0] == 2);
+  kfree(p);
+  uint8_t *r = kmalloc(50);
+  memset(r, 3, 50);
+  check("kmalloc after kfree leaves live blocks intact", r && q[0] == 2 && q[199] == 2);
+  kfree(r);
+  kfree(q);
+  kfree(q);
+  check("kfree coalesces and ignores double free", heap_free_bytes() == heap_before);
+}
+
+extern const char user_hello_start[], user_hello_end[], user_fault_start[], user_fault_end[];
+
+static void test_user(void)
+{
+  uint32_t free_before = free_frames();
+  int code = task_run(user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
+  check("EL0 task: write syscall and exit code", code == 42);
+  code = task_run(user_fault_start, (uint32_t)(user_fault_end - user_fault_start));
+  check("EL0 task: kernel access faults and is killed", code == -1);
+  check("task frames released", free_frames() == free_before);
 }
 
 void arch_main(void)
@@ -75,6 +115,8 @@ void arch_main(void)
 
   test_kstring();
   test_memory();
+
+  test_user();
 
   gic_init();
   timer_init();

@@ -48,14 +48,14 @@ void uart_puthex(uint64_t v)
 #define MAIR_NORMAL 1
 
 /* 39-bit VA, 4 KiB granule: the L1 table maps 1 GiB per entry, identity. */
-static uint64_t l1_table[512] __attribute__((aligned(4096)));
+uint64_t kernel_l1[512] __attribute__((aligned(4096)));
 
 void mmu_init(void)
 {
   for (int i = 0; i < 4; i++) {
     uint64_t base = (uint64_t)i << 30;
-    l1_table[i] = i == 1 ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF)
-                         : (base | PTE_BLOCK | PTE_ATTR(MAIR_DEVICE) | PTE_AF | PTE_XN);
+    kernel_l1[i] = i == 1 ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF)
+                          : (base | PTE_BLOCK | PTE_ATTR(MAIR_DEVICE) | PTE_AF | PTE_XN);
   }
 
   uint64_t mair = (0xffULL << (8 * MAIR_NORMAL));
@@ -65,7 +65,7 @@ void mmu_init(void)
   __asm__ volatile("dsb ish");
   SYSREG_WRITE(mair_el1, mair);
   SYSREG_WRITE(tcr_el1, tcr);
-  SYSREG_WRITE(ttbr0_el1, l1_table);
+  SYSREG_WRITE(ttbr0_el1, kernel_l1);
   __asm__ volatile("tlbi vmalle1\n\tdsb ish\n\tisb");
 
   uint64_t sctlr = SYSREG_READ(sctlr_el1);
@@ -142,7 +142,15 @@ void arch_exception(struct trap_frame *tf, uint64_t kind)
     irq_dispatch();
     return;
   }
-  if (type == 0 && (SYSREG_READ(esr_el1) >> 26) == 0x15) { /* SVC from AArch64 */
+  uint64_t ec = SYSREG_READ(esr_el1) >> 26;
+  if (type == 0 && kind >= 8 && kind < 12) {
+    if (ec == 0x15)
+      task_syscall(tf);
+    else
+      task_fault(tf);
+    return;
+  }
+  if (type == 0 && ec == 0x15) { /* SVC from EL1 */
     svc_count++;
     return;
   }

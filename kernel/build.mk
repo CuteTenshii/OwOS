@@ -31,7 +31,7 @@ $(ARCH_STAMP): FORCE
 OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
         kernel/idt.o kernel/isr.o kernel/irq.o kernel/irq_stubs.o \
         drivers/input/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
-        kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
+        kernel/pmm.o kernel/pmm_multiboot.o kernel/paging.o kernel/heap.o kernel/kstring.o \
         kernel/uaccess.o \
         kernel/sched.o kernel/switch.o \
         drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/sysfs.o kernel/users.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/btrfs.o kernel/lzo.o kernel/zstd.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o drivers/usb/hub.o drivers/usb/hid.o drivers/usb/hid_desc.o drivers/usb/hid_pad.o drivers/usb/xbox.o drivers/usb/btusb.o drivers/bt/bt_hci.o drivers/bt/bt_l2cap.o drivers/bt/bt_gatt.o drivers/bt/bt_avdtp.o drivers/bt/bt_hid.o drivers/bt/bt_aes.o drivers/bt/bt_smp.o drivers/bt/bt_p256.o drivers/bt/sbc.o \

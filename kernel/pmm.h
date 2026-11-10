@@ -8,23 +8,38 @@ struct multiboot_info;
 
 #define PMM_FRAME_SIZE 4096
 
+/* Physical address type: 32-bit on x86 (RAM below 4 GiB), pointer-wide on AArch64. */
+#ifdef __aarch64__
+typedef uintptr_t phys_t;
+#else
+typedef uint32_t phys_t;
+#endif
+
 /* Parse the multiboot memory map, then reserve the low region the kernel and
  * the identity-mapped heap occupy. Frames above that become allocatable. */
 void pmm_init(const struct multiboot_info *mbi);
 
-uint32_t pmm_alloc_frame(void); /* physical addr of a free frame, or 0 */
-void pmm_free_frame(uint32_t phys);
-void pmm_retain_frame(uint32_t phys);
-uint32_t pmm_frame_refs(uint32_t phys);
+/* Platform-neutral setup, for firmware that isn't multiboot. Call in order:
+ * pmm_begin(highest, installed_bytes), pmm_add_region() per usable range, then
+ * pmm_reserve_low(low_end, pool_start). The allocator tracks physical addresses
+ * below 4 GiB. */
+void pmm_begin(uint64_t highest, uint64_t installed_bytes);
+void pmm_add_region(uint64_t addr, uint64_t len);
+void pmm_reserve_low(uint32_t low_end, uint32_t pool_start);
+
+phys_t pmm_alloc_frame(void); /* physical addr of a free frame, or 0 */
+void pmm_free_frame(phys_t phys);
+void pmm_retain_frame(phys_t phys);
+uint32_t pmm_frame_refs(phys_t phys);
 
 /* Reserve a physically contiguous run of `bytes` (rounded up to whole frames)
  * and return its base physical address, or 0 if no run that large is free. For
  * large kernel-side buffers (e.g. a framebuffer back buffer) that need to be
  * contiguous and don't fit in the small identity-mapped heap. Not freeable. */
-uint32_t pmm_alloc_contig(uint32_t bytes);
+phys_t pmm_alloc_contig(uint32_t bytes);
 
 /* Free a run returned by pmm_alloc_contig (frame by frame). */
-void pmm_free_contig(uint32_t phys, uint32_t bytes);
+void pmm_free_contig(phys_t phys, uint32_t bytes);
 
 /* The RAM-scaled low-memory layout (computed in pmm_init from detected RAM).
  * pmm_low_end()    = end of the identity-mapped/reserved low region (paging.c).
