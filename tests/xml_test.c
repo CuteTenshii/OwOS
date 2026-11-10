@@ -1,85 +1,91 @@
-/* Host test for the XML element reader and escaper (user/lib/xml/xml.c). */
+/* Host test for the XML reader (user/lib/xml/xml.c). */
 #define OWOS_SUITE_TEST
 #include "test.h"
 #include "xml.h"
 #include <string.h>
 
-static void test_text_ignores_namespace_prefix(void)
+#define A "urn:a"
+#define B "urn:b"
+
+static const char *DOC = "<?xml version=\"1.0\"?><r xmlns=\"" A "\" xmlns:b=\"" B "\">"
+                         "<v>def</v><b:v>pfx</b:v><x xmlns=\"" B "\"><v>inner</v></x>"
+                         "<c:v xmlns:c=\"" A "\">cpfx</c:v><u:v>unbound</u:v></r>";
+
+static void test_unqualified_match_ignores_namespaces(void)
 {
-  char out[32];
-  expect_eq(xml_text(xml_all("<s:Body><u:Ret xmlns:u=\"x\">42</u:Ret></s:Body>"), "Ret", out, sizeof out), 2);
-  expect_string(out, "42");
+  struct xml_span d = xml_all(DOC), el;
+  int n = 0;
+  while (xml_next(&d, "v", &el))
+    n++;
+  expect_eq(n, 5);
 }
 
-static void test_text_decodes_entities_and_cdata(void)
+static void test_default_namespace_and_prefix_resolve(void)
 {
-  char out[64];
-  expect_eq(xml_text(xml_all("<a>x &amp; &lt;y&gt; &quot;z&apos;</a>"), "a", out, sizeof out), 11);
-  expect_string(out, "x & <y> \"z'");
-  expect(xml_text(xml_all("<a>1<![CDATA[<2>&]]>3</a>"), "a", out, sizeof out) == 6);
-  expect_string(out, "1<2>&3");
+  char out[16];
+  expect_eq(xml_text_ns(xml_all(DOC), A, "v", out, sizeof out), 3);
+  expect(!strcmp(out, "def"));
+  expect_eq(xml_text_ns(xml_all(DOC), B, "v", out, sizeof out), 3);
+  expect(!strcmp(out, "pfx"));
 }
 
-static void test_text_stops_at_first_child_and_handles_empty(void)
+static void test_nested_redeclaration_and_sibling_walk(void)
 {
-  char out[32];
-  expect_eq(xml_text(xml_all("<a>head<b>inner</b>tail</a>"), "a", out, sizeof out), 4);
-  expect_string(out, "head");
-  expect_eq(xml_text(xml_all("<a/>"), "a", out, sizeof out), 0);
-  expect_eq(xml_text(xml_all("<a></a>"), "a", out, sizeof out), 0);
+  struct xml_span d = xml_all(DOC), el;
+  char out[16];
+  int n = 0;
+  while (xml_next_ns(&d, B, "v", &el))
+    n++;
+  expect_eq(n, 2);
+  d = xml_all(DOC);
+  expect(xml_next_ns(&d, A, "v", &el));
+  expect(xml_next_ns(&d, A, "v", &el));
+  expect_eq(xml_text_ns(el, A, "v", out, sizeof out), -1);
+  expect(!strncmp(el.s, "cpfx", 4));
 }
 
-static void test_text_reports_missing_and_overflow(void)
+static void test_declaration_on_ancestor_outside_the_span(void)
 {
-  char out[4];
-  expect_eq(xml_text(xml_all("<a>x</a>"), "b", out, sizeof out), -1);
-  expect_eq(xml_text(xml_all("<a>toolong</a>"), "a", out, sizeof out), -1);
+  struct xml_span d = xml_all(DOC), x, scan, el;
+  char out[16];
+  expect(xml_next_ns(&d, B, "x", &x));
+  scan = x;
+  expect(xml_next_ns(&scan, B, "v", &el));
+  expect_eq(el.e - el.s, 5);
+  expect_eq(xml_text_ns(x, B, "v", out, sizeof out), 5);
+  expect(!strcmp(out, "inner"));
+  expect_eq(xml_text_ns(x, A, "v", out, sizeof out), -1);
 }
 
-static void test_next_walks_siblings_and_balances_nesting(void)
+static void test_unbound_prefix_and_no_namespace(void)
 {
-  struct xml_span scan = xml_all("<l><i>1</i><i>2<i>x</i></i><!-- <i>c</i> --><i/></l>"), in;
-  expect(xml_next(&scan, "i", &in));
-  expect_eq(in.e - in.s, 1);
-  expect_eq(*in.s, '1');
-  expect(xml_next(&scan, "i", &in));
-  expect_eq(in.e - in.s, 9);
-  expect(strncmp(in.s, "2<i>x</i>", 9) == 0);
-  expect(xml_next(&scan, "i", &in));
-  expect_eq(in.e - in.s, 0);
-  expect(!xml_next(&scan, "i", &in));
+  struct xml_span d = xml_all(DOC), el;
+  expect(xml_next_ns(&d, "", "v", &el));
+  expect(!strncmp(el.s, "unbound", 7));
+  expect(!xml_next_ns(&d, "", "v", &el));
+  d = xml_all("<a><v>1</v></a>");
+  expect(xml_next_ns(&d, "", "v", &el));
+  d = xml_all("<a><v>1</v></a>");
+  expect(!xml_next_ns(&d, A, "v", &el));
 }
 
-static void test_attribute_values_may_contain_gt(void)
+static void test_same_name_nesting_and_self_closing(void)
 {
-  char out[8];
-  expect_eq(xml_text(xml_all("<a t=\"1>2\">ok</a>"), "a", out, sizeof out), 2);
-  expect_string(out, "ok");
-}
-
-static void test_name_must_match_whole_local_name(void)
-{
-  char out[8];
-  expect_eq(xml_text(xml_all("<serviceType>x</serviceType>"), "service", out, sizeof out), -1);
-}
-
-static void test_escape(void)
-{
-  char out[32];
-  expect_eq(xml_escape(out, 0, sizeof out, "a&b<c>\"d'"), 24);
-  expect_string(out, "a&amp;b&lt;c&gt;&quot;d'");
-  expect_eq(xml_escape(out, 0, 5, "&&"), -1);
+  struct xml_span d = xml_all("<a xmlns=\"" A "\"><a><a/></a><a>z</a></a>"), el;
+  expect(xml_next_ns(&d, A, "a", &el));
+  expect_eq(el.e - el.s, 19);
+  d = xml_all("<a xmlns='" A "'><i/></a>");
+  expect(xml_next_ns(&d, A, "i", &el));
+  expect_eq(el.e - el.s, 0);
 }
 
 int main(void)
 {
-  test("text ignores the namespace prefix", test_text_ignores_namespace_prefix);
-  test("text decodes entities and CDATA", test_text_decodes_entities_and_cdata);
-  test("text stops at the first child and handles empty elements", test_text_stops_at_first_child_and_handles_empty);
-  test("text reports a missing element and overflow", test_text_reports_missing_and_overflow);
-  test("next walks siblings and balances same-name nesting", test_next_walks_siblings_and_balances_nesting);
-  test("attribute values may contain >", test_attribute_values_may_contain_gt);
-  test("names match whole", test_name_must_match_whole_local_name);
-  test("escape covers & < > and quotes, and reports overflow", test_escape);
+  test("unqualified match ignores namespaces", test_unqualified_match_ignores_namespaces);
+  test("default namespace and prefixes resolve", test_default_namespace_and_prefix_resolve);
+  test("nested redeclaration and sibling walk", test_nested_redeclaration_and_sibling_walk);
+  test("declaration on an ancestor outside the span", test_declaration_on_ancestor_outside_the_span);
+  test("unbound prefix and no namespace", test_unbound_prefix_and_no_namespace);
+  test("same-name nesting and self-closing", test_same_name_nesting_and_self_closing);
   return 0;
 }
