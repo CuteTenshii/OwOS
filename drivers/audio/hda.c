@@ -9,6 +9,8 @@
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
+#include "sched.h"
+#include "spinlock.h"
 #include "timer.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -79,6 +81,7 @@
 #define DIP_XMIT_BEST 0xC0 /* every frame, best effort        */
 
 #define WT_DAC 0   /* audio output converter        */
+#define WT_ADC 1   /* audio input converter         */
 #define WT_MIXER 2 /* mixer                         */
 #define WT_SEL 3   /* selector                      */
 #define WT_PIN 4   /* pin complex                   */
@@ -92,6 +95,7 @@ static int pin_sel_idx;                     /* pin input index -> mixer/DAC     
 static bool mix_is_sel;                     /* path_mix is a selector (not a mixer)   */
 static bool pin_is_hp;                      /* output pin is a headphone jack         */
 static uint32_t sd_off;                     /* output stream descriptor offset        */
+static uint32_t isd_off;                    /* first input stream descriptor (0 = none) */
 
 /* Master volume goes to one output amp in the path (pin, else DAC, else mixer). */
 static uint16_t vol_nid;   /* widget carrying the volume amp (0 = none) */
@@ -445,6 +449,60 @@ static void collect_outputs(uint16_t w_start, int w_count)
   }
 }
 
+/* The capture path: an input pin, optionally through one mixer/selector, into an ADC. */
+#define PINCAP_INPUT (1u << 5)
+struct cap_path {
+  uint8_t codec;
+  uint16_t adc, hop, pin;
+  int adc_idx, hop_idx; /* connection index on the ADC and on the hop */
+  bool hop_is_sel;
+  uint32_t pincap;
+  int rank;
+};
+static struct cap_path cap;
+static bool cap_found;
+
+/* Mic In beats Line In; other analog inputs rank last. */
+static int in_rank(int dev) { return dev == 0x8 ? 0 : dev == 0x6 ? 1 : 2; }
+
+static void consider_input(uint16_t adc, int adc_idx, uint16_t hop, int hop_idx, bool hop_sel, uint16_t pin)
+{
+  uint32_t pincap = get_param(pin, P_PINCAP);
+  if (pincap == 0xFFFFFFFFu || !(pincap & PINCAP_INPUT) || (pincap & PINCAP_DIGITAL))
+    return;
+  uint32_t cfg = codec_cmd(pin, V_GET_CFGDEF);
+  if (cfg == 0xFFFFFFFFu || ((cfg >> 30) & 0x3) == 1) /* no physical connection */
+    return;
+  int rank = in_rank((int)((cfg >> 20) & 0xF));
+  if (cap_found && rank >= cap.rank)
+    return;
+  cap = (struct cap_path){codec, adc, hop, pin, adc_idx, hop_idx, hop_sel, pincap, rank};
+  cap_found = true;
+}
+
+static void collect_inputs(uint16_t w_start, int w_count)
+{
+  for (int i = 0; i < w_count; i++) {
+    uint16_t adc = (uint16_t)(w_start + i);
+    if (widget_type(adc) != WT_ADC)
+      continue;
+    uint16_t src[16];
+    int n = conn_list(adc, src, 16);
+    for (int a = 0; a < n; a++) {
+      int wt = src[a] ? widget_type(src[a]) : -1;
+      if (wt == WT_PIN) {
+        consider_input(adc, a, 0, 0, false, src[a]);
+      } else if (wt == WT_MIXER || wt == WT_SEL) {
+        uint16_t sub[16];
+        int m = conn_list(src[a], sub, 16);
+        for (int b = 0; b < m; b++)
+          if (sub[b] && widget_type(sub[b]) == WT_PIN)
+            consider_input(adc, a, src[a], b, wt == WT_SEL, sub[b]);
+      }
+    }
+  }
+}
+
 /* Collect the output pins of the current codec's audio function group. */
 static void enumerate_codec(void)
 {
@@ -470,6 +528,7 @@ static void enumerate_codec(void)
   int w_count = (int)(wsub & 0xFF);
 
   collect_outputs(w_start, w_count);
+  collect_inputs(w_start, w_count);
 }
 
 static bool find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
@@ -618,6 +677,7 @@ void hda_init(void)
   uint16_t gcap = rd16(R_GCAP);
   int num_iss = (gcap >> 8) & 0x0F;
   sd_off = SD_BASE + (uint32_t)num_iss * SD_STRIDE;
+  isd_off = num_iss ? SD_BASE : 0;
 
   present = true;
   con_printf("hda: HD Audio ready (%d outputs, codec %u, dac nid %u, pin nid %u)\n", n_outs, codec, dac_nid, pin_nid);
@@ -1000,4 +1060,209 @@ int hda_output_select(int i)
   else
     apply_active_globals();
   return 0;
+}
+
+/* Microphone capture: 48 kHz/S16/mono cyclic DMA into cap_buf. The cyclic buffer is the retained history; stream
+ * positions are bytes since start, tracked from LPIB deltas by the watcher thread and by every reader. */
+#define CAP_FMT 0x0010
+#define CAP_TAG 2
+#define CAP_BYTES 0x20000u
+#define CAP_MARGIN 256u /* LPIB runs slightly ahead of the data in memory */
+#define CAP_IDLE_MS 3000u
+#define CAP_WATCH_MS 200u
+
+static uint8_t *cap_buf;
+static uint32_t cap_buf_phys;
+static spinlock_t cap_lock;
+static bool cap_on, cap_thread;
+static uint32_t cap_total, cap_last_lpib, cap_last_use;
+
+static uint32_t now_ms(void) { return timer_ticks() * (1000 / TIMER_HZ); }
+
+/* Run codec commands against the capture codec, restoring the playback codec address afterwards. */
+static uintptr_t cap_codec_enter(uint8_t *saved)
+{
+  uintptr_t fl = irq_save();
+  *saved = codec;
+  codec = cap.codec;
+  return fl;
+}
+
+static void cap_codec_leave(uint8_t saved, uintptr_t fl)
+{
+  codec = saved;
+  irq_restore(fl);
+}
+
+/* Input amp at connection idx of nid set to its 0 dB step and unmuted (the offset field of the amp capabilities). */
+static void amp_in_zero_db(uint16_t nid, int idx)
+{
+  uint32_t capb = get_param(nid, P_INAMPCAP);
+  if (capb == 0xFFFFFFFFu || !capb)
+    return;
+  codec_cmd(nid, V_SET_AMP | 0x7000 | ((uint32_t)idx << 8) | (capb & 0x7F));
+}
+
+static void cap_update_locked(void)
+{
+  uint32_t lpib = rd32(isd_off + SD_LPIB) % CAP_BYTES;
+  cap_total += (lpib + CAP_BYTES - cap_last_lpib) % CAP_BYTES;
+  cap_last_lpib = lpib;
+}
+
+bool hda_capture_present(void) { return present && cap_found && isd_off; }
+
+static void cap_program_sd(void)
+{
+  wr8(isd_off + SD_CTL, 0);
+  wr8(isd_off + SD_CTL, 0x01);
+  for (int t = 0; t < 1000 && !(rd8(isd_off + SD_CTL) & 1); t++)
+    spin(50);
+  wr8(isd_off + SD_CTL, 0x00);
+  for (int t = 0; t < 1000 && (rd8(isd_off + SD_CTL) & 1); t++)
+    spin(50);
+
+  volatile uint32_t *e = bdl + 64; /* input BDL, clear of the two output entries */
+  for (int i = 0; i < 2; i++) {
+    e[i * 4] = cap_buf_phys + (uint32_t)i * (CAP_BYTES / 2);
+    e[i * 4 + 1] = 0;
+    e[i * 4 + 2] = CAP_BYTES / 2;
+    e[i * 4 + 3] = 0;
+  }
+  wr32(isd_off + SD_BDPL, bdl_phys + 64 * 4);
+  wr32(isd_off + SD_BDPU, 0);
+  wr32(isd_off + SD_CBL, CAP_BYTES);
+  wr16(isd_off + SD_LVI, 1);
+  wr16(isd_off + SD_FMT, CAP_FMT);
+  wr8(isd_off + SD_CTL + 2, (uint8_t)(CAP_TAG << 4));
+}
+
+static void cap_route(bool on)
+{
+  uint8_t saved;
+  uintptr_t fl = cap_codec_enter(&saved);
+  if (on) {
+    codec_cmd(cap.adc, V_SET_POWER | 0x00);
+    codec_cmd(cap.pin, V_SET_POWER | 0x00);
+    if (cap.hop) {
+      codec_cmd(cap.hop, V_SET_POWER | 0x00);
+      if (cap.hop_is_sel)
+        codec_cmd(cap.hop, V_SET_CONNSEL | (uint32_t)cap.hop_idx);
+      amp_in_zero_db(cap.hop, cap.hop_idx);
+    }
+    uint32_t vref = (cap.pincap >> 8) & 0xFF; /* supported VREF levels */
+    codec_cmd(cap.pin, V_SET_PINCTL | 0x20 | ((vref & 0x08) ? 0x4 : (vref & 0x02) ? 0x1 : 0x0));
+    amp_in_zero_db(cap.pin, 0);
+    codec_cmd(cap.adc, V_SET_CONNSEL | (uint32_t)cap.adc_idx);
+    amp_in_zero_db(cap.adc, cap.adc_idx);
+    codec_cmd(cap.adc, V_SET_FORMAT | CAP_FMT);
+    codec_cmd(cap.adc, V_SET_STREAM | ((CAP_TAG << 4) | 0));
+  } else {
+    codec_cmd(cap.adc, V_SET_STREAM | 0);
+    codec_cmd(cap.pin, V_SET_PINCTL | 0x00);
+  }
+  cap_codec_leave(saved, fl);
+}
+
+static void cap_halt(void)
+{
+  uintptr_t fl = spin_lock_irqsave(&cap_lock);
+  bool was = cap_on;
+  cap_on = false;
+  spin_unlock_irqrestore(&cap_lock, fl);
+  if (!was)
+    return;
+  wr8(isd_off + SD_CTL, 0);
+  cap_route(false);
+}
+
+static void cap_watch(void)
+{
+  for (;;) {
+    timer_sleep(CAP_WATCH_MS);
+    if (!cap_on)
+      continue;
+    uintptr_t fl = spin_lock_irqsave(&cap_lock);
+    bool idle = cap_on && now_ms() - cap_last_use > CAP_IDLE_MS;
+    if (cap_on && !idle)
+      cap_update_locked();
+    spin_unlock_irqrestore(&cap_lock, fl);
+    if (idle)
+      cap_halt();
+  }
+}
+
+int hda_capture_start(void)
+{
+  if (!present || !cap_found || !isd_off)
+    return -1;
+  if (!cap_buf) {
+    uint32_t base = pmm_alloc_contig(CAP_BYTES);
+    if (!base || paging_identity_map(base, CAP_BYTES) != 0)
+      return -1;
+    cap_buf = (uint8_t *)(uintptr_t)base;
+    cap_buf_phys = base;
+  }
+  if (cap_on) {
+    cap_last_use = now_ms();
+    return 0;
+  }
+  if (!cap_thread) {
+    cap_thread = true;
+    sched_create_thread("hdacap", cap_watch);
+  }
+  for (uint32_t i = 0; i < CAP_BYTES; i++)
+    cap_buf[i] = 0;
+  cap_route(true);
+  cap_program_sd();
+  uintptr_t fl = spin_lock_irqsave(&cap_lock);
+  cap_total = cap_last_lpib = 0;
+  cap_last_use = now_ms();
+  cap_on = true;
+  spin_unlock_irqrestore(&cap_lock, fl);
+  __asm__ volatile("" ::: "memory");
+  wr8(isd_off + SD_CTL, (uint8_t)(rd8(isd_off + SD_CTL) | 0x02));
+  return 0;
+}
+
+int hda_capture_stop(void)
+{
+  if (!hda_capture_present())
+    return -1;
+  cap_halt();
+  return 0;
+}
+
+uint32_t hda_capture_pos(void)
+{
+  uintptr_t fl = spin_lock_irqsave(&cap_lock);
+  if (cap_on)
+    cap_update_locked();
+  uint32_t t = cap_on ? cap_total : 0;
+  spin_unlock_irqrestore(&cap_lock, fl);
+  return t;
+}
+
+bool hda_capture_active(void) { return cap_on; }
+
+int hda_capture_read(uint32_t off, void *out, uint32_t len)
+{
+  uint8_t *dst = out;
+  uintptr_t fl = spin_lock_irqsave(&cap_lock);
+  if (!cap_on) {
+    spin_unlock_irqrestore(&cap_lock, fl);
+    return 0;
+  }
+  cap_update_locked();
+  cap_last_use = now_ms();
+  uint32_t avail = cap_total > CAP_MARGIN ? cap_total - CAP_MARGIN : 0;
+  uint32_t oldest = avail > CAP_BYTES - 4096 ? avail - (CAP_BYTES - 4096) : 0;
+  uint32_t from = off < oldest ? oldest : off;
+  uint32_t n = from < avail ? avail - from : 0;
+  if (n > len)
+    n = len;
+  for (uint32_t i = 0; i < n; i++)
+    dst[i] = cap_buf[(from + i) % CAP_BYTES];
+  spin_unlock_irqrestore(&cap_lock, fl);
+  return (int)n;
 }

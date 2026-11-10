@@ -1,4 +1,5 @@
-/* Host test for navigator.mediaDevices, MediaStream/MediaStreamTrack and camera frame decoding (features/camera). */
+/* Host test for navigator.mediaDevices, MediaStream/MediaStreamTrack, camera frame decoding and microphone capture
+ * (features/mediastream, camera, microphone) against a fake /sys. The three sources are built into this one unit. */
 #define OWOS_SUITE_TEST
 #include "jsint.h"
 #include "uuid.h"
@@ -34,7 +35,30 @@ bool cam_fake_secure_url(const char *url);
 js_value cam_fake_illegal_ctor(js_ctx *c, js_value t, js_value *a, int n);
 void cam_fake_uuid_v4(uuid_t out);
 void cam_fake_uuid_to_string(const uuid_t u, char *out, int upper);
+#define ctx ms_ctx
+#include "features/mediastream/mediastream.c"
+#undef ctx
+#define ctx cam_ctx
+#define device_id cam_device_id
 #include "features/camera/camera.c"
+#undef ctx
+#undef device_id
+#undef DIR
+#define ctx mic_ctx
+#define device_id mic_device_id
+#include "features/microphone/microphone.c"
+#undef ctx
+#undef device_id
+#undef INFO_PATH
+#undef CONTROL_PATH
+#undef FRAME_PATH
+#undef CAPTURE_PATH
+#undef PCM_PATH
+#define INFO_PATH "/sys/class/video/cam0/info"
+#define CONTROL_PATH "/sys/class/video/cam0/control"
+#define FRAME_PATH "/sys/class/video/cam0/frame"
+#define CAPTURE_PATH "/sys/class/sound/card0/capture"
+#define PCM_PATH "/sys/class/sound/card0/capture_pcm"
 #include "jpeg_fixtures.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,10 +75,12 @@ static const char *const INFO_TEXT = "name Test Cam\n"
                                      "format YUY2 320x240 30\n"
                                      "format NV12 160x120 15\n";
 
-static bool present, start_fails;
+static bool present, start_fails, mic_there, mic_start_fails, mic_capturing;
+static unsigned long long mic_pos;
+#define MIC_RING 96000 /* what the fake kernel retains */
 static char control_state[96];
 static char cmds[64][96];
-static int ncmds, prompts, payload_reads;
+static int ncmds, prompts, payload_reads, pcm_reads;
 static int perm_answer[PERM_FEATURE_COUNT], perm_now[PERM_FEATURE_COUNT];
 static unsigned frame_seq, frame_w, frame_h;
 static char frame_fourcc[5];
@@ -82,12 +108,13 @@ js_value cam_fake_illegal_ctor(js_ctx *c, js_value t, js_value *a, int n)
 void cam_fake_uuid_v4(uuid_t out)
 {
   memset(out, 0, 16);
-  out[15] = (unsigned char)++uuid_counter;
+  out[14] = (unsigned char)(++uuid_counter >> 8);
+  out[15] = (unsigned char)uuid_counter;
 }
 void cam_fake_uuid_to_string(const uuid_t u, char *out, int upper)
 {
   (void)upper;
-  snprintf(out, UUID_STR_LEN, "00000000-0000-0000-0000-0000000000%02x", u[15]);
+  snprintf(out, UUID_STR_LEN, "00000000-0000-0000-0000-00000000%02x%02x", u[14], u[15]);
 }
 
 js_value cam_fake_dom_exception(js_ctx *c, const char *name, const char *msg)
@@ -130,8 +157,20 @@ js_value cam_fake_remove_listener(js_ctx *c, js_value t, js_value *a, int n)
 }
 js_value cam_fake_dispatch(js_ctx *c, js_value t, js_value *a, int n) { return cam_fake_add_listener(c, t, a, n); }
 
+/* Sample i of the fake microphone stream */
+static short mic_sample(unsigned long long i) { return (short)((i * 7 + 3) % 20011) - 10000; }
+
 int cam_fake_readfile(const char *name, char *buf, int max)
 {
+  if (!strcmp(name, CAPTURE_PATH)) {
+    char text[96];
+    if (!mic_there)
+      return -1;
+    snprintf(text, sizeof text, "%s\npos %llu\n", mic_capturing ? "capturing 48000 1" : "idle", mic_pos);
+    int n = (int)strlen(text) < max ? (int)strlen(text) : max;
+    memcpy(buf, text, (size_t)n);
+    return n;
+  }
   const char *text = !present                      ? 0
                      : !strcmp(name, INFO_PATH)    ? INFO_TEXT
                      : !strcmp(name, CONTROL_PATH) ? control_state
@@ -146,6 +185,20 @@ int cam_fake_readfile(const char *name, char *buf, int max)
 int cam_fake_readfile_at(const char *name, unsigned off, void *buf, unsigned len)
 {
   unsigned char all[HDR_LEN + sizeof frame_payload];
+  if (!strcmp(name, PCM_PATH)) {
+    if (!mic_there || !mic_capturing)
+      return -1;
+    unsigned long long oldest = mic_pos > MIC_RING ? mic_pos - MIC_RING : 0, start = off < oldest ? oldest : off;
+    if (start >= mic_pos)
+      return 0;
+    unsigned n = mic_pos - start < len ? (unsigned)(mic_pos - start) : len;
+    for (unsigned i = 0; i < n; i++) {
+      unsigned long long b = start + i;
+      ((unsigned char *)buf)[i] = (unsigned char)(mic_sample(b / 2) >> (8 * (b & 1)));
+    }
+    pcm_reads++;
+    return (int)n;
+  }
   if (!present || strcmp(name, FRAME_PATH))
     return -1;
   unsigned hdr[6] = {frame_seq, 0, frame_w, frame_h, frame_len, 0};
@@ -164,6 +217,14 @@ int cam_fake_readfile_at(const char *name, unsigned off, void *buf, unsigned len
 int cam_fake_writefile(const char *name, const void *buf, int len)
 {
   char line[96];
+  if (!strcmp(name, CAPTURE_PATH)) {
+    snprintf(cmds[ncmds++ % 64], 96, "mic %.*s", len, (const char *)buf);
+    if (!mic_there || (mic_start_fails && !strncmp(buf, "start", 5)))
+      return -1;
+    mic_capturing = !strncmp(buf, "start", 5);
+    mic_pos = 0;
+    return 0;
+  }
   if (strcmp(name, CONTROL_PATH) || len >= (int)sizeof line)
     return -1;
   memcpy(line, buf, (size_t)len);
@@ -231,14 +292,19 @@ static void run(const char *source)
   program = js_parse(source, arena, &error);
   expect(program != 0);
   if (program)
-    expect(js_run(g_ctx, program, &result) == 0);
+    if (js_run(g_ctx, program, &result) != 0) {
+      js_value m = js_get(g_ctx, g_ctx->exc, "message");
+      printf("  uncaught: %s\n", m.type == JV_STR ? m.u.str->data : "(none)");
+      expect(0);
+      g_ctx->has_exc = 0;
+    }
 }
 
 static void tick(int n)
 {
   while (n-- > 0) {
     clock_ms += 20;
-    camera_tick();
+    mediastream_tick();
   }
 }
 
@@ -255,9 +321,11 @@ static void set_frame(const char *fourcc, unsigned w, unsigned h, const void *da
 
 static void setup_url(const char *url)
 {
-  camera_teardown();
+  mediastream_teardown();
   present = true;
-  start_fails = false;
+  start_fails = mic_start_fails = false;
+  mic_there = mic_capturing = false;
+  mic_pos = 0;
   strcpy(control_state, "idle\n");
   ncmds = prompts = payload_reads = 0;
   frame_seq = frame_len = 0;
@@ -266,10 +334,11 @@ static void setup_url(const char *url)
   js_object *nav = js_new_object(g_ctx, g_ctx->object_proto);
   js_def(g_ctx->global, "navigator", js_obj_value(nav), P_WRITABLE);
   navigator = nav;
-  camera_install(g_ctx, navigator, url);
+  mediastream_install(g_ctx, navigator, url);
   run("var R = {}, L = [];"
       "function done(k, p) { p.then(function (v) { R[k] = ['ok', v]; }, function (e) { R[k] = ['err', e.name, "
       "e.constraint]; }); }"
+      "function gum(c) { return navigator.mediaDevices.getUserMedia(c); }"
       "function vid(c) { return navigator.mediaDevices.getUserMedia({video: c}); }");
 }
 
@@ -295,7 +364,8 @@ static void check_pick(const char *constraints, const char *expect_cmd)
   ncmds = 0;
   snprintf(js, sizeof js, "done('p', vid(%s));", constraints);
   run(js);
-  run("expect(R.p && R.p[0] === 'ok'); R.p[1].getVideoTracks()[0].stop();");
+  run("if (!(R.p && R.p[0] === 'ok')) throw new Error('gum: ' + JSON.stringify(R.p)); "
+      "R.p[1].getVideoTracks()[0].stop();");
   if (strcmp(cmds[0], expect_cmd))
     printf("  constraints %s started \"%s\", wanted \"%s\"\n", constraints, cmds[0], expect_cmd);
   expect_string(cmds[0], expect_cmd);
@@ -349,9 +419,6 @@ static void test_permissions_and_errors(void)
   run("done('mic', navigator.mediaDevices.getUserMedia({audio: true}));"
       "done('both', navigator.mediaDevices.getUserMedia({audio: true, video: true}));");
   run("expect(R.mic[1] === 'NotFoundError' && R.both[1] === 'NotFoundError');");
-  perm_now[PERM_MICROPHONE] = PERM_DENIED;
-  run("done('micdeny', navigator.mediaDevices.getUserMedia({audio: true, video: true}));");
-  run("expect(R.micdeny[1] === 'NotAllowedError');");
   expect_eq(prompts, 0);
   expect_eq(ncmds, 0);
 
@@ -625,10 +692,319 @@ static void test_page_teardown_stops_camera(void)
   tick(1);
   expect(camera_frame(&w, &h, &seq) != 0);
   ncmds = 0;
-  camera_teardown();
+  mediastream_teardown();
   expect_string(last_cmd(), "stop");
   expect(camera_frame(&w, &h, &seq) == 0);
-  expect(!camera_is_stream(js_undef()));
+  expect(!mediastream_is_stream(js_undef()));
+}
+
+static void test_audio_user_media(void)
+{
+  setup();
+  run("done('a', gum({audio: true})); done('av', gum({audio: true, video: true}));");
+  run("expect(R.a[1] === 'NotFoundError' && R.av[1] === 'NotFoundError');");
+  expect_eq(prompts, 0);
+  expect_eq(ncmds, 0);
+
+  mic_there = true;
+  perm_answer[PERM_MICROPHONE] = PERM_DENIED;
+  run("done('deny', gum({audio: true}));");
+  run("expect(R.deny[1] === 'NotAllowedError');");
+  expect_eq(prompts, 1);
+  expect_eq(count_cmds("mic start"), 0);
+
+  perm_answer[PERM_MICROPHONE] = PERM_GRANTED;
+  mic_start_fails = true;
+  run("done('busy', gum({audio: true}));");
+  run("expect(R.busy[1] === 'NotReadableError');");
+  mic_start_fails = false;
+
+  prompts = ncmds = 0;
+  run("done('s', gum({audio: true}));");
+  run("expect(R.s[0] === 'ok'); var s = R.s[1], t = s.getAudioTracks()[0];"
+      "expect(s.getTracks().length === 1 && s.getVideoTracks().length === 0 && s.getTracks()[0] === t);"
+      "expect(t.kind === 'audio' && t.label === 'Microphone' && t.readyState === 'live' && t.enabled === true);"
+      "var st = t.getSettings();"
+      "expect(st.sampleRate === 48000 && st.channelCount === 1 && st.sampleSize === 16 && st.deviceId.length === 16);"
+      "expect(st.echoCancellation === false && st.noiseSuppression === false && st.autoGainControl === false);"
+      "var cp = t.getCapabilities();"
+      "expect(cp.sampleRate.min === 48000 && cp.sampleRate.max === 48000 && cp.channelCount.max === 1);"
+      "expect(cp.echoCancellation.length === 1 && cp.echoCancellation[0] === false);");
+  expect_eq(prompts, 1);
+  expect_string(last_cmd(), "mic start");
+  run("t.stop(); expect(t.readyState === 'ended' && s.active === false);");
+  expect_string(last_cmd(), "mic stop");
+  expect_eq(count_cmds("mic stop"), 1);
+
+  run("done('r1', gum({audio: {sampleRate: {exact: 44100}}})); done('r2', gum({audio: {channelCount: {exact: 2}}}));"
+      "done('r3', gum({audio: {echoCancellation: {exact: true}}})); done('r4', gum({audio: {deviceId: {exact: 'x'}}}));"
+      "done('r5', gum({audio: {sampleRate: {min: 96000}}}));");
+  run("expect(R.r1[1] === 'OverconstrainedError' && R.r1[2] === 'sampleRate');"
+      "expect(R.r2[1] === 'OverconstrainedError' && R.r2[2] === 'channelCount');"
+      "expect(R.r3[1] === 'OverconstrainedError' && R.r3[2] === 'echoCancellation');"
+      "expect(R.r4[1] === 'OverconstrainedError' && R.r4[2] === 'deviceId');"
+      "expect(R.r5[1] === 'OverconstrainedError' && R.r5[2] === 'sampleRate');");
+  ncmds = 0;
+  run("done('ok', gum({audio: {sampleRate: 44100, channelCount: 2, echoCancellation: true, noiseSuppression: {ideal: "
+      "true},"
+      "autoGainControl: false, deviceId: {ideal: 'zzz'}}}));");
+  run("var ok = R.ok[1].getAudioTracks()[0];"
+      "expect(R.ok[0] === 'ok' && ok.getSettings().echoCancellation === false && ok.getSettings().sampleRate === "
+      "48000);"
+      "expect(ok.getConstraints().channelCount === 2);"
+      "done('apply', ok.applyConstraints({sampleRate: {exact: 8000}})); done('apply2', "
+      "ok.applyConstraints({channelCount: 1}));");
+  run("expect(R.apply[1] === 'OverconstrainedError' && R.apply[2] === 'sampleRate' && R.apply2[0] === 'ok');"
+      "ok.stop();");
+  expect_eq(count_cmds("mic start"), 1);
+
+  run("done('id', navigator.mediaDevices.enumerateDevices());");
+  perm_now[PERM_MICROPHONE] = PERM_GRANTED;
+  run("var open = gum({audio: true}); done('open', open);");
+  run("var mid = R.open[1].getAudioTracks()[0].getSettings().deviceId; done('right', gum({audio: {deviceId: {exact: "
+      "mid}}}));"
+      "done('arr', gum({audio: {deviceId: {exact: ['nope', mid]}}}));");
+  run("expect(R.right[0] === 'ok' && R.arr[0] === 'ok');");
+}
+
+static void test_audio_and_video_together(void)
+{
+  setup();
+  mic_there = true;
+  run("done('av', gum({audio: true, video: {width: 1280}}));");
+  run("var av = R.av[1]; expect(R.av[0] === 'ok' && av.getTracks().length === 2);"
+      "expect(av.getAudioTracks().length === 1 && av.getVideoTracks().length === 1 && av.getTracks()[0].kind === "
+      "'audio');"
+      "expect(av.getVideoTracks()[0].getSettings().width === 1280 && av.getAudioTracks()[0].getSettings().sampleRate "
+      "=== 48000);"
+      "expect(av.getTrackById(av.getVideoTracks()[0].id) === av.getVideoTracks()[0]);");
+  expect_eq(prompts, 2);
+  expect_eq(count_cmds("mic start"), 1);
+  expect_eq(count_cmds("start MJPG 1280 720"), 1);
+  run("av.getVideoTracks()[0].stop(); expect(av.active === true);");
+  expect_eq(count_cmds("stop"), 1);
+  expect_eq(count_cmds("mic stop"), 0);
+  run("var c = av.clone(); expect(c.getTracks().length === 2 && c.getTracks()[0].kind === 'audio');"
+      "av.getAudioTracks()[0].stop();");
+  expect_eq(count_cmds("mic stop"), 0);
+  run("c.getAudioTracks()[0].stop();");
+  expect_eq(count_cmds("mic stop"), 1);
+
+  ncmds = prompts = 0;
+  perm_answer[PERM_MICROPHONE] = PERM_DENIED;
+  run("done('micno', gum({audio: true, video: true}));");
+  run("expect(R.micno[1] === 'NotAllowedError');");
+  expect_eq(count_cmds("mic start") + count_cmds("start"), 0);
+
+  perm_answer[PERM_MICROPHONE] = PERM_GRANTED;
+  perm_answer[PERM_CAMERA] = PERM_DENIED;
+  run("done('camno', gum({audio: true, video: true}));");
+  run("expect(R.camno[1] === 'NotAllowedError');");
+  expect_eq(count_cmds("mic start") + count_cmds("start"), 0);
+
+  perm_answer[PERM_CAMERA] = PERM_GRANTED;
+  run("done('over', gum({audio: true, video: {width: {exact: 999}}}));");
+  run("expect(R.over[1] === 'OverconstrainedError' && R.over[2] === 'width');");
+  expect_eq(count_cmds("mic start") + count_cmds("start"), 0);
+
+  present = false;
+  prompts = 0;
+  run("done('nocam', gum({audio: true, video: true})); done('micok', gum({audio: true}));");
+  run("expect(R.nocam[1] === 'NotFoundError' && R.micok[0] === 'ok');");
+  expect_eq(prompts, 1);
+  expect_eq(count_cmds("start"), 0);
+}
+
+static void test_enumerate_audio_devices(void)
+{
+  setup();
+  mic_there = true;
+  run("done('before', navigator.mediaDevices.enumerateDevices());");
+  run("var d = R.before[1]; expect(d.length === 2 && d[0].kind === 'audioinput' && d[1].kind === 'videoinput');"
+      "expect(d[0].label === '' && d[0].deviceId === '' && d[1].label === '');");
+  perm_now[PERM_MICROPHONE] = PERM_GRANTED;
+  run("done('mic', navigator.mediaDevices.enumerateDevices());");
+  run("var d = R.mic[1]; expect(d[0].label === 'Microphone' && d[0].deviceId.length === 16 && d[1].label === '');"
+      "expect(d[0].groupId === d[0].deviceId && d[0].deviceId !== '');");
+  mic_there = false;
+  run("done('nomic', navigator.mediaDevices.enumerateDevices());");
+  run("expect(R.nomic[1].length === 1 && R.nomic[1][0].kind === 'videoinput');");
+  setup();
+  mic_there = true;
+  run("done('live', gum({audio: true}));");
+  run("done('during', navigator.mediaDevices.enumerateDevices());");
+  run("expect(R.during[1][0].label === 'Microphone' && R.during[1][1].label === '');"
+      "expect(R.during[1][0].deviceId === R.live[1].getTracks()[0].getSettings().deviceId);");
+}
+
+static short got[65536];
+static int ngot, sink_calls, sink_handle;
+
+static void test_sink(js_ctx *c, int handle, const short *pcm, int n)
+{
+  (void)c;
+  sink_handle = handle;
+  sink_calls++;
+  if (ngot + n <= (int)(sizeof got / sizeof *got))
+    memcpy(got + ngot, pcm, (size_t)n * sizeof *got);
+  ngot += n;
+}
+
+static js_value mic_track(void) { return js_get(g_ctx, js_obj_value(g_ctx->global), "mt"); }
+
+static int sink;
+
+static void open_mic(void)
+{
+  setup();
+  mic_there = true;
+  run("done('s', gum({audio: true}));");
+  run("window.mt = R.s[1].getAudioTracks()[0];");
+  ngot = sink_calls = 0;
+  sink = mic_attach(mic_track(), test_sink);
+  expect(sink > 0);
+}
+
+static void advance(unsigned long long bytes)
+{
+  mic_pos += bytes;
+  tick(1);
+}
+
+/* got[0..ngot) is the stream from sample `first` on, without gaps */
+static void expect_stream(unsigned long long first)
+{
+  int bad = -1;
+  for (int i = 0; i < ngot && i < (int)(sizeof got / sizeof *got) && bad < 0; i++)
+    if (got[i] != mic_sample(first + (unsigned)i))
+      bad = i;
+  if (bad >= 0)
+    printf("  sample %d is %d, wanted %d\n", bad, got[bad], mic_sample(first + (unsigned)bad));
+  expect(bad < 0);
+}
+
+static void test_mic_pcm_stream(void)
+{
+  open_mic();
+  advance(960);
+  expect_eq(ngot, 480);
+  expect_stream(0);
+
+  advance(1001);
+  expect_eq(ngot, 980);
+  advance(1);
+  expect_eq(ngot, 981);
+  expect_stream(0);
+
+  ngot = 0;
+  advance(20000);
+  tick(4);
+  expect_eq(ngot, 10000);
+  expect_stream(981);
+  unsigned long long next = 981 + 10000;
+
+  ngot = 0;
+  advance(0);
+  expect_eq(ngot, 0);
+  mic_detach(sink);
+  advance(960);
+  expect_eq(ngot, 0);
+  expect(pcm_reads > 0);
+  int reads = pcm_reads;
+  advance(960);
+  expect(pcm_reads > reads);
+  sink = mic_attach(mic_track(), test_sink);
+  next += 960;
+  advance(960);
+  expect_stream(next);
+  expect_eq(ngot, 480);
+  next += 480;
+
+  run("mt.stop();");
+  expect_string(last_cmd(), "mic stop");
+  expect(mic_attach(mic_track(), test_sink) == 0);
+  int calls = sink_calls;
+  advance(960);
+  expect_eq(sink_calls, calls);
+}
+
+static void test_mic_falls_behind(void)
+{
+  open_mic();
+  advance(300000);
+  tick(3);
+  unsigned long long first = (300000 - 9600) / 2;
+  expect_eq(ngot, 4800);
+  expect_stream(first);
+
+  ngot = 0;
+  mic_pos = 100;
+  tick(1);
+  advance(960);
+  expect_eq(ngot, 480);
+  expect_stream(50);
+}
+
+static void test_mic_disabled_is_silent(void)
+{
+  open_mic();
+  advance(960);
+  expect_stream(0);
+  run("mt.enabled = false;");
+  ngot = 0;
+  advance(960);
+  expect_eq(ngot, 480);
+  int silent = 1;
+  for (int i = 0; i < ngot; i++)
+    silent &= got[i] == 0;
+  expect(silent);
+  run("mt.enabled = true;");
+  ngot = 0;
+  advance(960);
+  expect_eq(ngot, 480);
+  expect_stream(960);
+}
+
+static void test_mic_restarts(void)
+{
+  open_mic();
+  advance(960);
+  expect_eq(count_cmds("mic start"), 1);
+  mic_capturing = false;
+  mic_pos = 0;
+  tick(1);
+  expect_eq(count_cmds("mic start"), 2);
+  expect(mic_capturing);
+  ngot = 0;
+  advance(960);
+  expect_eq(ngot, 480);
+  expect_stream(0);
+
+  mic_pos = 0xC0000000ull + 20000;
+  tick(3);
+  expect_eq(count_cmds("mic stop"), 1);
+  expect_eq(count_cmds("mic start"), 3);
+  expect_eq((int)mic_pos, 0);
+  ngot = 0;
+  advance(960);
+  expect_stream(0);
+  expect_eq(ngot, 480);
+}
+
+static void test_mic_loss_ends_tracks(void)
+{
+  open_mic();
+  run("mt.onended = function () { L.push('ended'); }; var other = mt.clone();");
+  advance(960);
+  mic_there = false;
+  tick(2);
+  run("expect(L.length === 1 && mt.readyState === 'ended' && other.readyState === 'ended' && R.s[1].active === "
+      "false);");
+  int calls = sink_calls;
+  mic_there = true;
+  mic_capturing = true;
+  advance(960);
+  expect_eq(sink_calls, calls);
 }
 
 int main(void)
@@ -648,6 +1024,14 @@ int main(void)
   test("MJPEG frames without Huffman tables", test_mjpeg_frames);
   test("a stalled camera is restarted", test_stall_restarts_camera);
   test("page teardown stops the camera", test_page_teardown_stops_camera);
+  test("microphone getUserMedia, constraints and settings", test_audio_user_media);
+  test("microphone together with the camera", test_audio_and_video_together);
+  test("audioinput devices and label gating", test_enumerate_audio_devices);
+  test("microphone PCM position handling", test_mic_pcm_stream);
+  test("microphone skips ahead when it falls behind", test_mic_falls_behind);
+  test("a disabled audio track is silent", test_mic_disabled_is_silent);
+  test("microphone capture restarts", test_mic_restarts);
+  test("microphone loss ends the tracks", test_mic_loss_ends_tracks);
 
   js_ctx_free(g_ctx);
   return 0;

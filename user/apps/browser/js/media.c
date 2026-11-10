@@ -1,10 +1,10 @@
 /* HTMLMediaElement, Remote Playback API (Cast) and Image()/Audio() constructors. */
 #include <stdbool.h>
 
-#include "airplay.h" /* AirPlay sender: RemotePlayback backend                  */
-#include "cast.h"    /* Google Cast sender: RemotePlayback backend             */
-#include "features/camera/camera.h"
+#include "airplay.h"               /* AirPlay sender: RemotePlayback backend                  */
+#include "cast.h"                  /* Google Cast sender: RemotePlayback backend             */
 #include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
+#include "features/mediastream/mediastream.h"
 #include "jsint.h"
 
 static int g_cast_used; /* a page touched a remote-playback entry point */
@@ -46,7 +46,7 @@ static js_value mel_get_srcObject(js_ctx *ctx, js_value t, js_value *args, int a
 static js_value mel_set_srcObject(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value v = A(0);
-  bool stream = camera_is_stream(v);
+  bool stream = mediastream_is_stream(v);
   if (!stream && v.type != JV_NULL && v.type != JV_UNDEF)
     return js_throw_type(ctx, "Failed to set the 'srcObject' property on 'HTMLMediaElement': The provided value is not "
                               "of type 'MediaStream'.");

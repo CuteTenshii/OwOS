@@ -13,6 +13,7 @@ int js_timers_pump(void);
 void msleep(unsigned ms);
 extern int host_audio_available, host_audio_opens, host_audio_peak;
 extern long host_audio_frames;
+int host_mic_push(int handle, const short *pcm, int n);
 
 static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -52,6 +53,20 @@ static js_value test_reset_peak(js_ctx *ctx, js_value thisv, js_value *args, int
   (void)argc;
   __atomic_store_n(&host_audio_peak, 0, __ATOMIC_RELAXED);
   return js_undef();
+}
+
+/* micPush(handle, start, count): samples start..start+count-1 of the ramp ((i % 1000) * 16 - 8000) into the source node
+ */
+static js_value test_mic_push(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  int handle = (int)js_to_number(ctx, A(0)), start = (int)js_to_number(ctx, A(1)), n = (int)js_to_number(ctx, A(2));
+  short *pcm = malloc((size_t)n * sizeof *pcm);
+  (void)thisv;
+  for (int i = 0; i < n; i++)
+    pcm[i] = (short)((start + i) % 1000 * 16 - 8000);
+  n = host_mic_push(handle, pcm, n);
+  free(pcm);
+  return js_number(n);
 }
 
 static void run_script(const char *source)
@@ -372,6 +387,68 @@ static void test_subclass_and_no_device(void)
 
 static const char page[] = "<html><body><script>var ready=1</script></body></html>";
 
+static const char k_tap[] =
+    "var ft={kind:'audio'}, fs={getAudioTracks:function(){ return [ft]; }}, got=null;\n"
+    "function tapper(c){ var u=mod('registerProcessor(\"tap\", class extends AudioWorkletProcessor{ constructor(o){ "
+    "super(o); this.b=[]; this.d=false; } process(i,o){ var a=i[0][0]; if(a){ for(var k=0;k<a.length;k++){ "
+    "this.b.push(a[k]); } } if(this.b.length>=2000&&!this.d){ this.d=true; "
+    "this.port.postMessage({n:i[0].length,s:this.b}); } "
+    "return true; } });'); return c.audioWorklet.addModule(u); }\n"
+    "function ramp(i){ return ((i%1000)*16-8000)/32768; }\n"
+    "function check(s, first){ var at=s.findIndex(function(v){ return v!==0; }); var ok=at>=0;\n"
+    "  for(var k=0;ok&&at+k<s.length;k++){ if(s[at+k]!==ramp(first+k)) ok=false; } return ok?at:-1; }\n";
+
+static void test_microphone_source(void)
+{
+  run_script(k_helpers);
+  run_script(k_tap);
+  run_script("var mc=new AudioContext(), mready=false; tapper(mc).then(function(){ mready=true; });\n");
+  expect(wait_for("mready"));
+  run_script("var src=mc.createMediaStreamSource(fs);\n"
+             "expect(src instanceof MediaStreamAudioSourceNode && src instanceof AudioNode, 'classes');\n"
+             "expect(src.numberOfInputs===0 && src.numberOfOutputs===1 && src.mediaStream===fs && src.context===mc, "
+             "'shape');\n"
+             "var tap=new AudioWorkletNode(mc,'tap'); src.connect(tap); tap.connect(mc.destination);\n"
+             "tap.port.onmessage=function(e){ got=e.data; };\n"
+             "expect(micPush(1,0,3000)===1, 'the track is subscribed');\n");
+  expect(wait_for("got"));
+  run_script(
+      "expect(got.n===1 && got.s.length>=2000, 'a mono input: '+got.n);\n"
+      "var at=check(got.s,0); expect(at>=0, 'the samples arrive in order, scaled by 1/32768: '+at);\n"
+      "expect(got.s[at]===-8000/32768, 'first sample '+got.s[at]);\n"
+      "var e=[]; try{ mc.createMediaStreamSource({}); }catch(x){ e.push(x.name); }\n"
+      "try{ mc.createMediaStreamSource({getAudioTracks:function(){ return []; }}); }catch(x){ e.push(x.name); }\n"
+      "try{ mc.createMediaStreamTrackSource({kind:'video'}); }catch(x){ e.push(x.name); }\n"
+      "try{ mc.createMediaStreamTrackSource(5); }catch(x){ e.push(x.name); }\n"
+      "try{ new MediaStreamAudioSourceNode(mc,{}); }catch(x){ e.push(x.name); }\n"
+      "expect(e.join()==='TypeError,InvalidStateError,InvalidStateError,TypeError,TypeError', 'arguments: '+e);\n"
+      "var viaCtor=new MediaStreamAudioSourceNode(mc,{mediaStream:fs}), viaTrack=mc.createMediaStreamTrackSource(ft);\n"
+      "expect(viaCtor instanceof MediaStreamAudioSourceNode && viaTrack instanceof MediaStreamTrackAudioSourceNode && "
+      "viaTrack.mediaStreamTrack===ft, 'other forms');\n"
+      "var dead=mc.createMediaStreamTrackSource({kind:'audio',ended:true});\n"
+      "expect(micPush(4,0,10)===0, 'an ended track has no subscription');\n"
+      "mc.close(); expect(micPush(1,0,10)===0, 'closing the context unsubscribes');\n");
+  settle();
+}
+
+static void test_microphone_source_overflow(void)
+{
+  run_script(k_helpers);
+  run_script(k_tap);
+  run_script("var oc=new AudioContext(), oready=false; tapper(oc).then(function(){ oready=true; });\n");
+  expect(wait_for("oready"));
+  run_script("oc.suspend(); var osrc=oc.createMediaStreamSource(fs), otap=new AudioWorkletNode(oc,'tap'); "
+             "osrc.connect(otap); otap.connect(oc.destination); got=null;\n"
+             "otap.port.onmessage=function(e){ got=e.data; };\n"
+             "expect(micPush(1,0,20000)===1);\n"
+             "oc.resume();\n");
+  expect(wait_for("got"));
+  run_script("var at=check(got.s,10400); expect(at>=0, 'a full queue drops the oldest samples: '+at);\n"
+             "expect(got.s[at]===ramp(10400), 'first kept sample '+got.s[at]);\n"
+             "oc.close();\n");
+  settle();
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -382,6 +459,7 @@ int main(void)
   js_def_native(g_ctx, g_ctx->global, "frames", test_frames, 0);
   js_def_native(g_ctx, g_ctx->global, "peakSample", test_peak, 0);
   js_def_native(g_ctx, g_ctx->global, "resetPeak", test_reset_peak, 0);
+  js_def_native(g_ctx, g_ctx->global, "micPush", test_mic_push, 3);
 
   test("AudioContext surface and clock", test_context_surface);
   test("suspend, resume and statechange", test_state_changes);
@@ -391,6 +469,8 @@ int main(void)
   test("nodes mix into the destination", test_graph);
   test("addModule and processor failures", test_failures);
   test("subclassing AudioWorkletNode, a source that stops", test_subclass_and_no_device);
+  test("a microphone track feeds a source node", test_microphone_source);
+  test("a source node drops its oldest samples when full", test_microphone_source_overflow);
 
   dom_free(root);
   free(B->pg);

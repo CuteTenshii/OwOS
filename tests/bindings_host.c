@@ -15,6 +15,7 @@
 #include "cast.h"
 #include "clipboard.h"
 #include "features/media/bmedia.h"
+#include "features/microphone/microphone.h"
 #include "features/notification/notification.h"
 #include "jsint.h"
 #include "notify.h"
@@ -414,13 +415,37 @@ void bluetooth_install(js_ctx *ctx, js_object *navigator, const char *page_url)
   (void)page_url;
 }
 void bluetooth_teardown(void) {}
-void camera_install(js_ctx *ctx, js_object *navigator, const char *page_url)
+void mediastream_install(js_ctx *ctx, js_object *navigator, const char *page_url)
 {
   (void)ctx;
   (void)navigator;
   (void)page_url;
 }
-void camera_teardown(void) {}
+void mediastream_teardown(void) {}
+
+/* Microphone subscriptions: a track with an "ended" property is not live. Tests feed samples through host_mic_push. */
+static mic_sink host_mic_fn[4];
+int mic_attach(js_value track, mic_sink fn)
+{
+  for (int i = 0; i < 4; i++)
+    if (!host_mic_fn[i] && js_get(g_ctx, track, "ended").type == JV_UNDEF) {
+      host_mic_fn[i] = fn;
+      return i + 1;
+    }
+  return 0;
+}
+void mic_detach(int handle)
+{
+  if (handle >= 1 && handle <= 4)
+    host_mic_fn[handle - 1] = 0;
+}
+int host_mic_push(int handle, const short *pcm, int n)
+{
+  if (handle < 1 || handle > 4 || !host_mic_fn[handle - 1])
+    return 0;
+  host_mic_fn[handle - 1](g_ctx, handle, pcm, n);
+  return 1;
+}
 
 /* A <video> shows the frame a test hands it through host_video_frame */
 const unsigned char *host_video_frame;

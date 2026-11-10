@@ -4,9 +4,9 @@
 #include "canvasjs.h"
 #include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
-#include "features/camera/camera.h"
 #include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
+#include "features/mediastream/mediastream.h"
 #include "features/notification/notification.h"
 #include "features/storage/storage.h"
 #include "websocket.h"
@@ -836,7 +836,7 @@ void js_page_end(void)
   gamepad_teardown();
   battery_teardown();
   bluetooth_teardown();
-  camera_teardown();
+  mediastream_teardown();
   gc_remove_root((void **)&g_timers);
   js_idb_teardown();
   js_webapi_teardown();

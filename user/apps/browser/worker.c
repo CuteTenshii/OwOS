@@ -1,10 +1,10 @@
 #include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
-#include "features/camera/camera.h"
 #include "features/canvas/canvas.h"
 #include "features/cdp/cdp.h"
 #include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
+#include "features/mediastream/mediastream.h"
 #include "main_int.h"
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
@@ -354,7 +354,7 @@ void worker_fn(void)
       /* media_pump fires HTMLMediaElement events (play/timeupdate/ended/...) from the worker, the only */
       if (js_timers_pump() + js_resize_pump() + js_intersection_pump() + js_workers_pump() + js_websockets_pump() +
           js_notifications_pump() + media_pump() + js_cast_pump() + js_idb_pump() + sw_cache_pump() + bluetooth_tick() +
-          camera_tick()) {
+          mediastream_tick()) {
         if (dom_mutation_seq != mseq) {
           html_relayout();
           if (B->pg->n_imgs > 0)

@@ -4,11 +4,20 @@
  * the objects, so nothing here needs a GC root. */
 
 #include "bindings.h"
+#include "features/microphone/microphone.h"
 #include "math.h"
 
-static const char *const k_globals[] = {"AudioContext",     "webkitAudioContext",   "BaseAudioContext",
-                                        "AudioNode",        "AudioDestinationNode", "AudioWorklet",
-                                        "AudioWorkletNode", "AudioParam",           "AudioParamMap"};
+static const char *const k_globals[] = {"AudioContext",
+                                        "webkitAudioContext",
+                                        "BaseAudioContext",
+                                        "AudioNode",
+                                        "AudioDestinationNode",
+                                        "AudioWorklet",
+                                        "AudioWorkletNode",
+                                        "AudioParam",
+                                        "AudioParamMap",
+                                        "MediaStreamAudioSourceNode",
+                                        "MediaStreamTrackAudioSourceNode"};
 
 enum { LOAD_NONE, LOAD_RUNNING, LOAD_OK, LOAD_FAILED };
 static int g_load_state;
@@ -112,6 +121,8 @@ static js_value constructed_this(js_ctx *ctx, js_value thisv, const char *proto)
 {
   return thisv.type == JV_OBJ ? thisv : js_obj_value(js_new_object(ctx, audio_proto(ctx, proto).u.obj));
 }
+
+static void detach_sources(js_ctx *ctx, js_value c);
 
 /* ---- the context ------------------------------------------------------------ */
 
@@ -403,6 +414,7 @@ static js_value ctx_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (streq(str_of(js_get(ctx, t, "@state")), "closed"))
     return reject_dom(ctx, "InvalidStateError", "Cannot close a closed AudioContext");
   announce(ctx, t, "closed");
+  detach_sources(ctx, t);
   w = js_get(ctx, t, "@thread");
   if (w.type == JV_OBJ)
     js_call(ctx, js_get(ctx, w, "terminate"), w, 0, 0);
@@ -968,6 +980,158 @@ static js_value wnode_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc
   return node;
 }
 
+/* ---- microphone sources --------------------------------------------------------------- */
+
+/* Captured samples for the node behind `handle` go to the context's thread */
+static void source_chunk(js_ctx *ctx, int handle, const short *pcm, int n)
+{
+  char key[16];
+  js_value node, m, data;
+  snprintf(key, sizeof key, "%d", handle);
+  node = js_get(ctx, js_get(ctx, global_of(ctx), "@mics"), key);
+  if (node.type != JV_OBJ)
+    return;
+  gc_push_scope();
+  m = new_msg(ctx, "pcm");
+  gc_keep(m.u.obj);
+  data = js_new_arraybuffer(ctx, pcm, n * (int)sizeof *pcm);
+  if (data.type == JV_OBJ) {
+    gc_keep(data.u.obj);
+    js_def(m.u.obj, "id", js_get(ctx, node, "@id"), PE);
+    js_def(m.u.obj, "data", data, PE);
+    thread_post(ctx, js_get(ctx, node, "@ctx"), m, js_undef());
+  }
+  gc_pop_scope();
+}
+
+/* Stop feeding the source nodes of context `c` */
+static void detach_sources(js_ctx *ctx, js_value c)
+{
+  js_value mics = js_get(ctx, global_of(ctx), "@mics"), keys;
+  unsigned i;
+  if (mics.type != JV_OBJ)
+    return;
+  gc_push_scope();
+  keys = js_call(ctx, js_get(ctx, js_get(ctx, global_of(ctx), "Object"), "keys"), js_undef(), &mics, 1);
+  gc_keep(keys.u.obj);
+  for (i = 0; keys.type == JV_OBJ && i < js_array_len(keys.u.obj); i++) {
+    const char *key = str_of(js_get_index(ctx, keys, i));
+    js_value node = js_get(ctx, mics, key);
+    if (node.type == JV_OBJ && js_get(ctx, node, "@ctx").u.obj == c.u.obj) {
+      mic_detach((int)js_to_number(ctx, js_get(ctx, node, "@mic")));
+      js_delete(mics.u.obj, key);
+    }
+  }
+  gc_pop_scope();
+}
+
+/* The audio track a MediaStream-like value offers (undefined when it has none); sets a TypeError if it is no stream */
+static js_value stream_audio_track(js_ctx *ctx, js_value stream)
+{
+  js_value fn = stream.type == JV_OBJ ? js_get(ctx, stream, "getAudioTracks") : js_undef(), list;
+  if (!js_is_callable(fn))
+    return js_throw_type(ctx, "The provided value is not of type 'MediaStream'");
+  list = js_call(ctx, fn, stream, 0, 0);
+  return list.type == JV_OBJ && js_array_len(list.u.obj) ? js_get_index(ctx, list, 0) : js_undef();
+}
+
+/* A node that plays `track` into context `c`; `media` is what the script handed over (stream or track) */
+static js_value make_source(js_ctx *ctx, js_value c, js_value track, js_value media, js_value thisv, const char *proto,
+                            const char *media_key)
+{
+  js_value node, m, mics;
+  char key[16];
+  int id, handle;
+  thread_of(ctx, c);
+  if (ctx->has_exc)
+    return js_undef();
+  id = (int)js_to_number(ctx, js_get(ctx, c, "@nodeid")) + 1;
+  gc_push_scope();
+  m = new_msg(ctx, "src");
+  gc_keep(m.u.obj);
+  set_num(ctx, m, "id", id);
+  thread_post(ctx, c, m, js_undef());
+  js_set(ctx, c, "@nodeid", js_number(id));
+  node = constructed_this(ctx, thisv, proto);
+  gc_keep(node.u.obj);
+  js_def(node.u.obj, "@kind", js_mk_cstring(ctx, "node"), P_WRITABLE);
+  js_def(node.u.obj, "@ctx", c, P_WRITABLE);
+  js_def(node.u.obj, "@id", js_number(id), P_WRITABLE);
+  js_def(node.u.obj, "@nin", js_number(0), P_WRITABLE);
+  js_def(node.u.obj, "@nout", js_number(1), P_WRITABLE);
+  js_def(node.u.obj, "@cc", js_number(2), P_WRITABLE);
+  js_def(node.u.obj, "@ccm", js_mk_cstring(ctx, "max"), P_WRITABLE);
+  js_def(node.u.obj, "@ci", js_mk_cstring(ctx, "speakers"), P_WRITABLE);
+  js_def(node.u.obj, media_key, media, P_WRITABLE);
+  handle = track.type == JV_OBJ ? mic_attach(track, source_chunk) : 0;
+  js_def(node.u.obj, "@mic", js_number(handle), P_WRITABLE);
+  if (handle) {
+    mics = js_get(ctx, global_of(ctx), "@mics");
+    snprintf(key, sizeof key, "%d", handle);
+    js_set(ctx, mics, key, node);
+  }
+  snprintf(key, sizeof key, "%d", id);
+  js_set(ctx, js_get(ctx, c, "@nodes"), key, node);
+  gc_pop_scope();
+  return node;
+}
+
+static js_value source_from_stream(js_ctx *ctx, js_value c, js_value stream, js_value thisv)
+{
+  js_value track = stream_audio_track(ctx, stream);
+  if (ctx->has_exc)
+    return js_undef();
+  if (track.type != JV_OBJ)
+    return throw_dom(ctx, "InvalidStateError", "The MediaStream has no audio track");
+  return make_source(ctx, c, track, stream, thisv, "mssrc", "@media");
+}
+
+static js_value source_from_track(js_ctx *ctx, js_value c, js_value track, js_value thisv)
+{
+  if (track.type != JV_OBJ || js_get(ctx, track, "kind").type != JV_STR)
+    return js_throw_type(ctx, "The provided value is not of type 'MediaStreamTrack'");
+  if (!streq(str_of(js_get(ctx, track, "kind")), "audio"))
+    return throw_dom(ctx, "InvalidStateError", "The MediaStreamTrack is not an audio track");
+  return make_source(ctx, c, track, track, thisv, "mstsrc", "@media");
+}
+
+static js_value ctx_create_stream_source(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return brand(ctx, t, "ctx") ? source_from_stream(ctx, t, A(0), js_undef()) : js_undef();
+}
+
+static js_value ctx_create_track_source(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return brand(ctx, t, "ctx") ? source_from_track(ctx, t, A(0), js_undef()) : js_undef();
+}
+
+/* new MediaStream[Track]AudioSourceNode(context, {mediaStream | mediaStreamTrack}) */
+static js_value source_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc, const char *option, bool track)
+{
+  js_value c = A(0), opts = A(1), v;
+  if (argc < 2 || !is_kind(c, "ctx") || opts.type != JV_OBJ)
+    return js_throw_type(ctx, "Failed to construct the source node: a context and an options object are required");
+  v = js_get(ctx, opts, option);
+  return track ? source_from_track(ctx, c, v, thisv) : source_from_stream(ctx, c, v, thisv);
+}
+
+static js_value mssn_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  return source_ctor(ctx, thisv, args, argc, "mediaStream", false);
+}
+
+static js_value mstsn_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  return source_ctor(ctx, thisv, args, argc, "mediaStreamTrack", true);
+}
+
+static js_value src_get_media(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return node_get(ctx, t, "@media");
+}
+
 /* ---- loading ------------------------------------------------------------------------ */
 
 static js_object *make_class(js_ctx *ctx, js_object *exports, const char *name, js_native ctor_fn, js_object *parent)
@@ -990,13 +1154,16 @@ static js_object *proto_of(js_ctx *ctx, const char *global, const char *key)
 
 static void build(js_ctx *ctx, js_object *ex, js_object *audio)
 {
-  js_object *et = proto_of(ctx, "EventTarget", "prototype"), *base, *actx, *node, *dest, *wnode, *worklet, *param, *map;
+  js_object *et = proto_of(ctx, "EventTarget", "prototype"), *base, *actx, *node, *dest, *wnode, *worklet, *param, *map,
+            *mssrc, *mstsrc;
   base = make_class(ctx, ex, "BaseAudioContext", illegal_ctor, et);
   actx = make_class(ctx, ex, "AudioContext", ctx_ctor, base);
   js_def(ex, "webkitAudioContext", js_get(ctx, js_obj_value(ex), "AudioContext"), PE);
   node = make_class(ctx, ex, "AudioNode", illegal_ctor, et);
   dest = make_class(ctx, ex, "AudioDestinationNode", illegal_ctor, node);
   wnode = make_class(ctx, ex, "AudioWorkletNode", wnode_ctor, node);
+  mssrc = make_class(ctx, ex, "MediaStreamAudioSourceNode", mssn_ctor, node);
+  mstsrc = make_class(ctx, ex, "MediaStreamTrackAudioSourceNode", mstsn_ctor, node);
   worklet = make_class(ctx, ex, "AudioWorklet", illegal_ctor, ctx->object_proto);
   param = make_class(ctx, ex, "AudioParam", illegal_ctor, ctx->object_proto);
   map = make_class(ctx, ex, "AudioParamMap", illegal_ctor, ctx->map_proto);
@@ -1004,6 +1171,8 @@ static void build(js_ctx *ctx, js_object *ex, js_object *audio)
   js_def(audio, "dest", js_obj_value(dest), 0);
   js_def(audio, "wnode", js_obj_value(wnode), 0);
   js_def(audio, "worklet", js_obj_value(worklet), 0);
+  js_def(audio, "mssrc", js_obj_value(mssrc), 0);
+  js_def(audio, "mstsrc", js_obj_value(mstsrc), 0);
   js_def(audio, "param", js_obj_value(param), 0);
   js_def(audio, "map", js_obj_value(map), 0);
 
@@ -1017,6 +1186,10 @@ static void build(js_ctx *ctx, js_object *ex, js_object *audio)
   def_method(actx, "resume", ctx_resume, 0);
   def_method(actx, "suspend", ctx_suspend, 0);
   def_method(actx, "close", ctx_close, 0);
+  def_method(actx, "createMediaStreamSource", ctx_create_stream_source, 1);
+  def_method(actx, "createMediaStreamTrackSource", ctx_create_track_source, 1);
+  acc(mssrc, "mediaStream", src_get_media, 0);
+  acc(mstsrc, "mediaStreamTrack", src_get_media, 0);
 
   def_method(worklet, "addModule", worklet_add_module, 1);
 
@@ -1061,6 +1234,7 @@ static int audio_load(js_ctx *ctx)
   ex = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   audio = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(ctx->global, "@audio", js_obj_value(audio), 0);
+  js_def(ctx->global, "@mics", js_obj_value(js_new_object(ctx, ctx->object_proto)), 0);
   build(ctx, ex, audio);
   for (i = 0; i < sizeof k_globals / sizeof k_globals[0]; i++)
     js_def(ctx->global, k_globals[i], js_get(ctx, js_obj_value(ex), k_globals[i]), P_WRITABLE | P_CONFIGURABLE);

@@ -14,6 +14,7 @@
 #ifndef OWOS_HDA_H
 #define OWOS_HDA_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 void hda_init(void);   /* probe + bring up the controller/codec        */
@@ -52,5 +53,15 @@ int hda_output_count(void);                     /* number of switchable outputs 
 int hda_output_name(int i, char *out, int max); /* output i's name (1 if valid) */
 int hda_output_active(void);                    /* active index, or -1            */
 int hda_output_select(int i);                   /* switch active output; 0 on ok  */
+
+/* Microphone capture: 48 kHz, S16, mono. Positions are bytes since hda_capture_start. A capture nobody reads for
+ * three seconds stops itself. Present only when the codec has an input pin wired to an ADC. */
+bool hda_capture_present(void);
+int hda_capture_start(void);
+int hda_capture_stop(void);
+bool hda_capture_active(void);
+uint32_t hda_capture_pos(void);
+/* Copy up to len bytes of the stream from position off; samples older than the retained history are skipped. */
+int hda_capture_read(uint32_t off, void *buf, uint32_t len);
 
 #endif /* OWOS_HDA_H */

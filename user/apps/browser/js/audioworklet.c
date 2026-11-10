@@ -4,6 +4,8 @@
  *   module {id,url}                load a module script, answer with the processors it registered
  *   node {id,name,nin,nout,ochan,auto,options,pdata,port}
  *   conn / disc {from,out,to,inp}  to is 0 for the destination, null in disc means any
+ *   src {id}                       a microphone source node (no processor), fed by pcm messages
+ *   pcm {id,data}                  signed 16-bit mono samples for a source node
  *   p {id,name,op,a,b,c}           AudioParam automation
  *   state {run,time}               start or stop rendering at the given context time */
 
@@ -13,7 +15,9 @@
 #define QUANTUM 128
 #define RATE 48000
 #define MAXCH 32
-#define BLOCK 4 /* quanta per device write */
+#define BLOCK 4       /* quanta per device write */
+#define SRC_CAP 9600  /* microphone source: at most 200 ms queued, the oldest samples go first */
+#define SRC_PRIME 960 /* queued samples needed before it plays after running dry */
 
 enum { EV_SET, EV_LIN, EV_EXP, EV_TGT };
 
@@ -43,6 +47,8 @@ struct anode {
   int *in_vis; /* channel count of the array the processor sees for each input */
   struct aparam *params;
   int nparams;
+  float *fifo; /* microphone source: queued samples, a ring */
+  int fifo_r, fifo_n, primed;
 };
 
 struct conn {
@@ -484,25 +490,14 @@ static void shape_output(js_ctx *ctx, struct anode *n, js_value rec, int o, int 
   gc_pop_scope();
 }
 
-static void make_node(js_ctx *ctx, js_value m)
+/* A node with its buffers, added to the graph's tables; NULL when out of memory */
+static struct anode *alloc_node(int nin, int nout, int np)
 {
-  js_value name = js_get(ctx, m, "name"), reg, params, ochan = js_get(ctx, m, "ochan"), pdata = js_get(ctx, m, "pdata");
-  js_value options = js_get(ctx, m, "options"), port = js_get(ctx, m, "port"), procv;
-  js_object *rec, *inputs, *outputs, *pools, *parameters, *p1, *pm;
-  struct anode *n;
-  int i, np;
-  reg = js_get(ctx, hidden(ctx, "@registry"), str_of(name));
-  if (reg.type != JV_OBJ)
-    return;
-  params = js_get(ctx, reg, "params");
-  np = params.type == JV_OBJ ? (int)js_array_len(params.u.obj) : 0;
-  n = (struct anode *)calloc(1, sizeof *n);
+  struct anode *n = (struct anode *)calloc(1, sizeof *n);
   if (!n)
-    return;
-  n->id = id_of(js_get(ctx, m, "id"), 0);
-  n->nin = id_of(js_get(ctx, m, "nin"), 0);
-  n->nout = id_of(js_get(ctx, m, "nout"), 0);
-  n->auto_out = js_to_boolean(js_get(ctx, m, "auto"));
+    return 0;
+  n->nin = nin;
+  n->nout = nout;
   n->active = 1;
   n->nparams = np;
   n->in = (struct chans *)calloc((unsigned)n->nin + 1, sizeof *n->in);
@@ -528,8 +523,28 @@ static void make_node(js_ctx *ctx, js_value m)
     free(n->in_vis);
     free(n->params);
     free(n);
-    return;
+    return 0;
   }
+  return n;
+}
+
+static void make_node(js_ctx *ctx, js_value m)
+{
+  js_value name = js_get(ctx, m, "name"), reg, params, ochan = js_get(ctx, m, "ochan"), pdata = js_get(ctx, m, "pdata");
+  js_value options = js_get(ctx, m, "options"), port = js_get(ctx, m, "port"), procv;
+  js_object *rec, *inputs, *outputs, *pools, *parameters, *p1, *pm;
+  struct anode *n;
+  int i, np;
+  reg = js_get(ctx, hidden(ctx, "@registry"), str_of(name));
+  if (reg.type != JV_OBJ)
+    return;
+  params = js_get(ctx, reg, "params");
+  np = params.type == JV_OBJ ? (int)js_array_len(params.u.obj) : 0;
+  n = alloc_node(id_of(js_get(ctx, m, "nin"), 0), id_of(js_get(ctx, m, "nout"), 0), np);
+  if (!n)
+    return;
+  n->id = id_of(js_get(ctx, m, "id"), 0);
+  n->auto_out = js_to_boolean(js_get(ctx, m, "auto"));
   gc_push_scope();
   rec = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   inputs = (js_object *)gc_keep(js_new_array(ctx, 0));
@@ -586,6 +601,71 @@ static void make_node(js_ctx *ctx, js_value m)
     js_def(rec, "proc", procv, P_WRITABLE);
   }
   gc_pop_scope();
+}
+
+/* A source fed by pcm messages: one mono output, no processor */
+static void make_src(js_ctx *ctx, js_value m)
+{
+  struct anode *n = alloc_node(0, 1, 0);
+  js_object *rec, *outputs;
+  if (!n)
+    return;
+  n->fifo = (float *)malloc(SRC_CAP * sizeof *n->fifo);
+  if (!n->fifo) {
+    free(n->in);
+    free(n->out);
+    free(n->in_vis);
+    free(n->params);
+    free(n);
+    return;
+  }
+  n->id = id_of(js_get(ctx, m, "id"), 0);
+  gc_push_scope();
+  rec = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  outputs = (js_object *)gc_keep(js_new_array(ctx, 0));
+  js_def(rec, "outputs", js_obj_value(outputs), P_WRITABLE);
+  n->slot = (int)js_array_len(hidden(ctx, "@nodes").u.obj);
+  js_array_push(ctx, hidden(ctx, "@nodes").u.obj, js_obj_value(rec));
+  js_array_push(ctx, outputs, js_undef());
+  shape_output(ctx, n, js_obj_value(rec), 0, 1);
+  nodes[nnodes++] = n;
+  dirty = 1;
+  gc_pop_scope();
+}
+
+static void push_pcm(js_ctx *ctx, js_value m)
+{
+  struct anode *n = find_node(id_of(js_get(ctx, m, "id"), -1));
+  const short *s;
+  int len = 0, i;
+  if (!n || !n->fifo)
+    return;
+  s = (const short *)view_bytes(js_get(ctx, m, "data"), &len);
+  for (i = 0; s && i < len / 2; i++) {
+    if (n->fifo_n == SRC_CAP) {
+      n->fifo_r = (n->fifo_r + 1) % SRC_CAP;
+      n->fifo_n--;
+    }
+    n->fifo[(n->fifo_r + n->fifo_n++) % SRC_CAP] = (float)s[i] / 32768.0f;
+  }
+}
+
+/* One quantum of a source: it waits for SRC_PRIME samples after running dry, so jitter does not stutter */
+static void pull_src(struct anode *n)
+{
+  float *o = n->out[0].ch[0];
+  int i, take;
+  if (!n->primed && n->fifo_n >= SRC_PRIME)
+    n->primed = 1;
+  if (!n->primed)
+    return;
+  take = n->fifo_n < QUANTUM ? n->fifo_n : QUANTUM;
+  for (i = 0; i < take; i++)
+    o[i] = n->fifo[(n->fifo_r + i) % SRC_CAP];
+  n->fifo_r = (n->fifo_r + take) % SRC_CAP;
+  n->fifo_n -= take;
+  if (take < QUANTUM)
+    n->primed = 0;
 }
 
 /* ---- the graph ------------------------------------------------------------- */
@@ -723,6 +803,10 @@ static void run_node(js_ctx *ctx, struct anode *n, double t0)
     for (j = 0; j < n->out[i].n; j++)
       memset(n->out[i].ch[j], 0, sizeof(float) * QUANTUM);
   }
+  if (n->fifo) {
+    pull_src(n);
+    return;
+  }
   if (n->dead || proc.type != JV_OBJ || (!n->active && !has_active_input(n)))
     return;
   gc_push_scope();
@@ -857,6 +941,10 @@ static js_value on_message(js_ctx *ctx, js_value t, js_value *args, int argc)
     add_module(ctx, m);
   else if (streq(type, "node"))
     make_node(ctx, m);
+  else if (streq(type, "src"))
+    make_src(ctx, m);
+  else if (streq(type, "pcm"))
+    push_pcm(ctx, m);
   else if (streq(type, "conn"))
     connect_nodes(ctx, m);
   else if (streq(type, "disc"))
@@ -927,6 +1015,7 @@ void js_worklet_end(void)
     free(nodes[i]->in);
     free(nodes[i]->out);
     free(nodes[i]->in_vis);
+    free(nodes[i]->fifo);
     free(nodes[i]);
   }
   free(nodes);

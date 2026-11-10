@@ -7,11 +7,11 @@
 #include "dom_query.h"
 #include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
-#include "features/camera/camera.h"
 #include "features/clienthints/clienthints.h"
 #include "features/gamepad/gamepad.h"
 #include "features/jar/jar.h"
 #include "features/mediasession/mediasession.h"
+#include "features/mediastream/mediastream.h"
 #include "features/notification/notification.h"
 #include "features/storage/storage.h"
 #include "websocket.h"
@@ -2374,7 +2374,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gamepad_install(ctx, nav);
     battery_install(ctx, nav, page_url);
     bluetooth_install(ctx, nav, page_url);
-    camera_install(ctx, nav, page_url);
+    mediastream_install(ctx, nav, page_url);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }

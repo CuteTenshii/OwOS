@@ -15,6 +15,7 @@
  *   /sys/class/graphics/fb0/scale              UI scale "auto"|1..4 (rw)
  *   /sys/class/graphics/fb0/{mode,modes}       screen resolution   (rw/ro,
  * DISPI) /sys/class/sound/card0/{output,outputs}    audio output select (rw/ro)
+ *   /sys/class/sound/card0/{capture,capture_pcm}  microphone: start/stop + position, PCM stream (rw / ro binary)
  *   /sys/class/video/cam0/{info,control,frame}  USB camera: formats, start/stop, newest frame (ro/rw/ro binary)
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
  *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one
@@ -416,6 +417,10 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
           return S_FILE_RO;
         if (eq(seg[3], "volume"))
           return S_FILE_RW;
+        if (eq(seg[3], "capture") && hda_capture_present())
+          return S_FILE_RW;
+        if (eq(seg[3], "capture_pcm") && hda_capture_present())
+          return S_FILE_RO;
       }
       return S_NONE;
     }
@@ -687,6 +692,16 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
+      if (eq(seg[3], "capture")) {
+        if (hda_capture_active()) {
+          ps(b, "capturing 48000 1\npos ");
+          pu(b, hda_capture_pos());
+        } else {
+          ps(b, "idle\npos 0");
+        }
+        pc(b, '\n');
+        return;
+      }
       if (eq(seg[3], "outputs")) { /* one name per line, index = row */
         int cnt = hda_output_count();
         for (int i = 0; i < cnt; i++)
@@ -803,6 +818,11 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
         }
     }
     return hda_output_select(idx) == 0 ? 0 : -1;
+  }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "capture")) {
+    if (eq(arg, "start"))
+      return hda_capture_start();
+    return eq(arg, "stop") ? hda_capture_stop() : -1;
   }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "volume")) {
     int v = parse_percent(arg);
@@ -1089,8 +1109,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0")) {
-    static const char *const k[] = {"output", "outputs", "volume", "muted"};
-    hit = from_list(idx, name, max, k, 4);
+    static const char *const k[] = {"output", "outputs", "volume", "muted", "capture", "capture_pcm"};
+    hit = from_list(idx, name, max, k, hda_capture_present() ? 6 : 4);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;
@@ -1178,6 +1198,9 @@ int sysfs_read_binary(const char *sub, uint32_t off, void *buf, uint32_t len)
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && eq(seg[3], "frame") &&
       uvc_present())
     return uvc_frame_read(off, buf, len);
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "capture_pcm") &&
+      hda_capture_present())
+    return hda_capture_read(off, buf, len);
   return SYSFS_NOT_BINARY;
 }
 
