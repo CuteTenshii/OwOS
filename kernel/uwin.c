@@ -587,12 +587,15 @@ static void uwin_clear_region(uint32_t phys, int stride, int x0, int y0, int x1,
     for (int x = x0; x < x1; x++) {
       uint32_t idx = (uint32_t)y * (uint32_t)stride + (uint32_t)x;
       if ((idx >> 10) != pg) {
+        if (v)
+          paging_scratch_unmap(0); /* slot 0 is a non-recursive lock */
         pg = idx >> 10;
         v = paging_scratch_map(0, phys + pg * 4096u);
       }
       v[idx & 1023] = UWIN_BG;
     }
-    paging_scratch_unmap(0);
+    if (v)
+      paging_scratch_unmap(0);
     irq_restore(fl);
   }
 }
@@ -622,9 +625,9 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
     u->w = cw;
     u->h = ch;
     /* Clear the new logical buffer rather than copy the old image. */
-    uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
-    touch_full(u);
-    evq_push(u, WEV_RESIZE, cw, ch);
+      uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
+      touch_full(u);
+      evq_push(u, WEV_RESIZE, cw, ch);
     return;
   }
 
