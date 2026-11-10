@@ -21,8 +21,6 @@ js_object *g_element_proto;
 js_object *g_style_proto;
 js_object *g_rellist_proto;   /* DOMTokenList for element.relList, chains to g_classlist_proto */
 js_object *g_classlist_proto; /* DOMTokenList.prototype (element.classList) */
-js_object *g_url_proto;
-js_object *g_sp_proto;
 js_object *g_formdata_proto; /* FormData.prototype (shares URLSearchParams' @k/@v) */
 js_object *g_event_proto;
 js_object *g_html_proto;  /* HTMLElement.prototype (chains to element) */
@@ -1988,8 +1986,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   g_style_proto = js_new_object(ctx, ctx->object_proto);
   g_classlist_proto = js_new_object(ctx, ctx->object_proto);
   g_rellist_proto = js_new_object(ctx, g_classlist_proto);
-  g_url_proto = js_new_object(ctx, ctx->object_proto);
-  g_sp_proto = js_new_object(ctx, ctx->object_proto);
   g_formdata_proto = js_new_object(ctx, ctx->object_proto);
   g_event_proto = js_new_object(ctx, ctx->object_proto);
   g_html_proto = js_new_object(ctx, g_element_proto); /* HTMLElement.prototype */
@@ -2027,8 +2023,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   gc_add_root((void **)&g_style_proto);
   gc_add_root((void **)&g_classlist_proto);
   gc_add_root((void **)&g_rellist_proto);
-  gc_add_root((void **)&g_url_proto);
-  gc_add_root((void **)&g_sp_proto);
   gc_add_root((void **)&g_formdata_proto);
   gc_add_root((void **)&g_event_proto);
   gc_add_root((void **)&g_html_proto);
@@ -2279,6 +2273,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   js_def(g_document, "defaultView", js_obj_value(win), P_CONFIGURABLE | P_ENUMERABLE);
 
   /* window / globals */
+  url_classes_install(ctx); /* before location: its searchParams are URLSearchParams */
   js_def(win, "document", js_obj_value(g_document), P_WRITABLE | P_CONFIGURABLE);
   js_def(win, "window", js_obj_value(win), P_WRITABLE | P_CONFIGURABLE);
   js_def(win, "self", js_obj_value(win), P_WRITABLE | P_CONFIGURABLE);
@@ -2433,34 +2428,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   js_streams_setup(ctx, win);
   js_filedata_setup(ctx, win);
   js_webaudio_setup(ctx, win);
-  /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
-  def_method(g_url_proto, "toString", url_tostring, 0);
-  def_method(g_url_proto, "toJSON", url_tostring, 0);
-  def_method(g_sp_proto, "get", sp_get, 1);
-  def_method(g_sp_proto, "getAll", sp_get_all, 1);
-  def_method(g_sp_proto, "has", sp_has, 1);
-  def_method(g_sp_proto, "append", sp_append, 2);
-  def_method(g_sp_proto, "set", sp_set, 2);
-  def_method(g_sp_proto, "delete", sp_delete, 1);
-  def_method(g_sp_proto, "forEach", sp_for_each, 1);
-  def_method(g_sp_proto, "toString", sp_tostring, 0);
-  {
-    js_object *uc = js_new_native(ctx, url_ctor, "URL", 1);
-    js_object *sc = js_new_native(ctx, sp_ctor, "URLSearchParams", 1);
-    gc_push_scope();
-    gc_keep(uc);
-    gc_keep(sc);
-    js_def(uc, "prototype", js_obj_value(g_url_proto), 0);
-    js_def(g_url_proto, "constructor", js_obj_value(uc), P_WRITABLE | P_CONFIGURABLE);
-    js_def(sc, "prototype", js_obj_value(g_sp_proto), 0);
-    js_def(g_sp_proto, "constructor", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
-    js_def_native(ctx, uc, "createObjectURL", url_create_object_url, 1);
-    js_def_native(ctx, uc, "revokeObjectURL", url_revoke_object_url, 1);
-    js_def(win, "URL", js_obj_value(uc), P_WRITABLE | P_CONFIGURABLE);
-    js_def(win, "URLSearchParams", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
-    gc_pop_scope();
-  }
-
   /* FormData, a name/value multimap over the same @k/@v arrays as URLSearchParams */
   def_method(g_formdata_proto, "get", sp_get, 1);
   def_method(g_formdata_proto, "getAll", sp_get_all, 1);

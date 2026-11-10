@@ -830,103 +830,6 @@ static js_value wt_n_random_fill(js_ctx *ctx, js_value t, js_value *args, int ar
   return js_undef();
 }
 
-/* N.urlParse(input, base): the URL's components as an object, or null for an invalid URL */
-static js_value wt_n_url_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value in = js_to_string(ctx, A(0)), base = A(1).type == JV_UNDEF ? js_undef() : js_to_string(ctx, A(1)), v;
-  struct url_parts u;
-  js_object *o;
-  (void)t;
-  if (in.type != JV_STR || !url_parse(in.u.str->data, base.type == JV_STR ? base.u.str->data : 0, &u))
-    return js_null();
-  gc_push_scope();
-  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(o, "protocol", js_mk_cstring(ctx, u.protocol), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "username", js_mk_cstring(ctx, u.username), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "password", js_mk_cstring(ctx, u.password), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "hostname", js_mk_cstring(ctx, u.hostname), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "port", js_mk_cstring(ctx, u.port), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "pathname", js_mk_cstring(ctx, u.pathname), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "search", js_mk_cstring(ctx, u.search), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "hash", js_mk_cstring(ctx, u.hash), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "opaque", js_bool(u.opaque), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "hasSearch", js_bool(u.has_search), P_ENUMERABLE | P_WRITABLE);
-  js_def(o, "hasHash", js_bool(u.has_hash), P_ENUMERABLE | P_WRITABLE);
-  v = js_obj_value(o);
-  gc_pop_scope();
-  return v;
-}
-
-/* N.urlEscape(text, kind): percent-encode text as a pathname (0), query (1) or fragment (2) */
-static js_value wt_n_url_escape(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value in = js_to_string(ctx, A(0));
-  char out[URL_MAX];
-  (void)t;
-  if (in.type != JV_STR)
-    return js_undef();
-  url_escape_kind(out, sizeof out, in.u.str->data, js_to_int_sat(ctx, A(1)));
-  return js_mk_cstring(ctx, out);
-}
-
-/* N.queryParse("a=1&b=2"): [[name, value], ...] */
-static js_value wt_n_query_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value q = js_to_string(ctx, A(0)), list;
-  const char *p;
-  (void)t;
-  if (q.type != JV_STR)
-    return js_undef();
-  p = q.u.str->data;
-  if (*p == '?')
-    p++;
-  gc_push_scope();
-  gc_keep(q.u.str);
-  list = js_obj_value(gc_keep(js_new_array(ctx, 0)));
-  while (*p) {
-    const char *amp = strchr(p, '&'), *end = amp ? amp : p + strlen(p), *eq = p;
-    while (eq < end && *eq != '=')
-      eq++;
-    if (end > p) {
-      char *k = form_decode(p, (int)(eq - p)),
-           *v = form_decode(eq < end ? eq + 1 : end, eq < end ? (int)(end - eq - 1) : 0);
-      js_object *pair = js_new_array(ctx, 0);
-      gc_push_scope();
-      gc_keep(pair);
-      js_array_push(ctx, pair, js_mk_cstring(ctx, k ? k : ""));
-      js_array_push(ctx, pair, js_mk_cstring(ctx, v ? v : ""));
-      js_array_push(ctx, list.u.obj, js_obj_value(pair));
-      gc_pop_scope();
-      free(k);
-      free(v);
-    }
-    p = amp ? amp + 1 : end;
-  }
-  gc_pop_scope();
-  return list;
-}
-
-/* N.queryString([[name, value], ...]): application/x-www-form-urlencoded */
-static js_value wt_n_query_string(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  sbuf sb = {0, 0, 0};
-  unsigned i, n = A(0).type == JV_OBJ ? js_array_len(A(0).u.obj) : 0;
-  js_value r;
-  (void)t;
-  for (i = 0; i < n; i++) {
-    js_value pair = js_get_index(ctx, A(0), i), k = js_to_string(ctx, js_get_index(ctx, pair, 0)),
-             v = js_to_string(ctx, js_get_index(ctx, pair, 1));
-    if (i)
-      sb_putc(&sb, '&');
-    sb_put_form(&sb, k.type == JV_STR ? k.u.str->data : "");
-    sb_putc(&sb, '=');
-    sb_put_form(&sb, v.type == JV_STR ? v.u.str->data : "");
-  }
-  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
-  free(sb.b);
-  return r;
-}
-
 /* N.base64(bytes) */
 static js_value wt_n_base64(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1451,6 +1354,20 @@ static js_value wt_n_cache_mode(js_ctx *ctx, js_value t, js_value *args, int arg
   return mode < 0 ? js_throw_type(ctx, err) : js_mk_cstring(ctx, fetch_cache_names[mode]);
 }
 
+/* N.urlClasses(): define URL and URLSearchParams (the source the page runs too) and return them */
+static js_value wt_n_url_classes(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value fn = js_undef(), a[2];
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (!wt_eval(ctx, cur_wt, url_classes_js, "url", 0, &fn) || !js_is_callable(fn))
+    return js_undef();
+  a[0] = js_obj_value(ctx->global);
+  a[1] = js_get(ctx, a[0], "@N");
+  return js_call(ctx, fn, js_undef(), a, 2);
+}
+
 /* N.headers(): define Headers (the source the page runs too) and return it */
 static js_value wt_n_headers(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1488,10 +1405,8 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
-  js_def_native(ctx, n, "urlParse", wt_n_url_parse, 2);
-  js_def_native(ctx, n, "urlEscape", wt_n_url_escape, 2);
-  js_def_native(ctx, n, "queryParse", wt_n_query_parse, 1);
-  js_def_native(ctx, n, "queryString", wt_n_query_string, 1);
+  url_natives_install(ctx, n);
+  js_def_native(ctx, n, "urlClasses", wt_n_url_classes, 0);
   js_def_native(ctx, n, "base64", wt_n_base64, 1);
   js_def_native(ctx, n, "binaryString", wt_n_binary_string, 1);
   js_def_native(ctx, n, "request", wt_n_request, 1);

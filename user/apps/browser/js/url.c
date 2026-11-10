@@ -358,40 +358,170 @@ static js_object *sp_arr(js_ctx *ctx, js_value t, const char *key)
   return a.type == JV_OBJ ? a.u.obj : 0;
 }
 
-/* parse a query string (no leading '?') into a fresh URLSearchParams object */
-js_value make_search_params(js_ctx *ctx, const char *query)
+#define JS(...) #__VA_ARGS__
+/* URL and URLSearchParams, in JavaScript: the same source runs on the page and in dedicated workers (webworker.c) */
+const char url_classes_js[] =
+#include "url.inc"
+    ;
+
+/* N.urlParse(input, base): the URL's components as an object, or null for an invalid URL */
+static js_value url_n_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_object *sp, *ka, *va;
-  const char *p = query;
+  js_value in = js_to_string(ctx, A(0)), base = A(1).type == JV_UNDEF ? js_undef() : js_to_string(ctx, A(1)), v;
+  struct url_parts u;
+  js_object *o;
+  (void)t;
+  if (in.type != JV_STR || !url_parse(in.u.str->data, base.type == JV_STR ? base.u.str->data : 0, &u))
+    return js_null();
   gc_push_scope();
-  sp = (js_object *)gc_keep(js_new_object(ctx, g_sp_proto));
-  ka = (js_object *)gc_keep(js_new_array(ctx, 0));
-  va = (js_object *)gc_keep(js_new_array(ctx, 0));
-  js_def(sp, "@k", js_obj_value(ka), 0);
-  js_def(sp, "@v", js_obj_value(va), 0);
-  while (p && *p) {
-    const char *amp = p, *eq;
-    while (*amp && *amp != '&')
-      amp++;
-    eq = p;
-    while (eq < amp && *eq != '=')
+  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(o, "protocol", js_mk_cstring(ctx, u.protocol), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "username", js_mk_cstring(ctx, u.username), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "password", js_mk_cstring(ctx, u.password), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hostname", js_mk_cstring(ctx, u.hostname), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "port", js_mk_cstring(ctx, u.port), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "pathname", js_mk_cstring(ctx, u.pathname), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "search", js_mk_cstring(ctx, u.search), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hash", js_mk_cstring(ctx, u.hash), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "opaque", js_bool(u.opaque), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hasSearch", js_bool(u.has_search), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hasHash", js_bool(u.has_hash), P_ENUMERABLE | P_WRITABLE);
+  v = js_obj_value(o);
+  gc_pop_scope();
+  return v;
+}
+
+/* N.urlEscape(text, kind): percent-encode text as a pathname (0), query (1) or fragment (2) */
+static js_value url_n_escape(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value in = js_to_string(ctx, A(0));
+  char out[URL_MAX];
+  (void)t;
+  if (in.type != JV_STR)
+    return js_undef();
+  url_escape_kind(out, sizeof out, in.u.str->data, js_to_int_sat(ctx, A(1)));
+  return js_mk_cstring(ctx, out);
+}
+
+/* N.queryParse("a=1&b=2"): [[name, value], ...] */
+static js_value url_n_query_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value q = js_to_string(ctx, A(0)), list;
+  const char *p;
+  (void)t;
+  if (q.type != JV_STR)
+    return js_undef();
+  p = q.u.str->data;
+  if (*p == '?')
+    p++;
+  gc_push_scope();
+  gc_keep(q.u.str);
+  list = js_obj_value(gc_keep(js_new_array(ctx, 0)));
+  while (*p) {
+    const char *amp = strchr(p, '&'), *end = amp ? amp : p + strlen(p), *eq = p;
+    while (eq < end && *eq != '=')
       eq++;
-    if (amp > p) {
-      char *k = form_decode(p, (int)(eq - p));
-      char *v = form_decode(eq < amp ? eq + 1 : amp, eq < amp ? (int)(amp - eq - 1) : 0);
-      if (k) {
-        js_array_push(ctx, ka, js_mk_cstring(ctx, k));
-        free(k);
-      }
-      if (v) {
-        js_array_push(ctx, va, js_mk_cstring(ctx, v));
-        free(v);
-      }
+    if (end > p) {
+      char *k = form_decode(p, (int)(eq - p)),
+           *v = form_decode(eq < end ? eq + 1 : end, eq < end ? (int)(end - eq - 1) : 0);
+      js_object *pair = js_new_array(ctx, 0);
+      gc_push_scope();
+      gc_keep(pair);
+      js_array_push(ctx, pair, js_mk_cstring(ctx, k ? k : ""));
+      js_array_push(ctx, pair, js_mk_cstring(ctx, v ? v : ""));
+      js_array_push(ctx, list.u.obj, js_obj_value(pair));
+      gc_pop_scope();
+      free(k);
+      free(v);
     }
-    p = *amp ? amp + 1 : amp;
+    p = amp ? amp + 1 : end;
   }
   gc_pop_scope();
-  return js_obj_value(sp);
+  return list;
+}
+
+/* N.queryString([[name, value], ...]): application/x-www-form-urlencoded */
+static js_value url_n_query_string(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  sbuf sb = {0, 0, 0};
+  unsigned i, n = A(0).type == JV_OBJ ? js_array_len(A(0).u.obj) : 0;
+  js_value r;
+  (void)t;
+  for (i = 0; i < n; i++) {
+    js_value pair = js_get_index(ctx, A(0), i), k = js_to_string(ctx, js_get_index(ctx, pair, 0)),
+             v = js_to_string(ctx, js_get_index(ctx, pair, 1));
+    if (i)
+      sb_putc(&sb, '&');
+    sb_put_form(&sb, k.type == JV_STR ? k.u.str->data : "");
+    sb_putc(&sb, '=');
+    sb_put_form(&sb, v.type == JV_STR ? v.u.str->data : "");
+  }
+  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
+}
+
+
+void url_natives_install(js_ctx *ctx, js_object *n)
+{
+  js_def_native(ctx, n, "urlParse", url_n_parse, 2);
+  js_def_native(ctx, n, "urlEscape", url_n_escape, 2);
+  js_def_native(ctx, n, "queryParse", url_n_query_parse, 1);
+  js_def_native(ctx, n, "queryString", url_n_query_string, 1);
+}
+
+js_value url_classes_install(js_ctx *ctx)
+{
+  js_arena *ar = (js_arena *)malloc(sizeof *ar);
+  js_parse_error pe;
+  js_node *prog;
+  js_value fn = js_undef(), cls = js_undef(), args[2], uc, sc;
+  js_object *n;
+  if (!ar)
+    return cls;
+  gc_push_scope();
+  n = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  url_natives_install(ctx, n);
+  js_arena_init(ar);
+  prog = js_parse(url_classes_js, ar, &pe);
+  if (prog && js_run(ctx, prog, &fn) == 0 && js_is_callable(fn)) {
+    args[0] = js_obj_value(ctx->global);
+    args[1] = js_obj_value(n);
+    cls = js_call(ctx, fn, js_undef(), args, 2);
+  }
+  if (!prog || !arenas_push(ar)) {
+    js_arena_free(ar);
+    free(ar);
+  }
+  if (cls.type == JV_OBJ) {
+    uc = js_get(ctx, cls, "URL");
+    sc = js_get(ctx, cls, "URLSearchParams");
+    js_def(ctx->global, "@URLSearchParams", sc, P_WRITABLE);
+    js_def_native(ctx, uc.u.obj, "createObjectURL", url_create_object_url, 1);
+    js_def_native(ctx, uc.u.obj, "revokeObjectURL", url_revoke_object_url, 1);
+  }
+  gc_pop_scope();
+  return cls;
+}
+
+js_value make_search_params(js_ctx *ctx, const char *query)
+{
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "@URLSearchParams"), q;
+  if (!js_is_callable(ctor))
+    return js_undef();
+  gc_push_scope();
+  q = js_mk_cstring(ctx, query);
+  gc_keep(q.u.str);
+  q = js_construct(ctx, ctor, &q, 1);
+  gc_pop_scope();
+  return q;
+}
+
+js_object *search_params_proto(js_ctx *ctx)
+{
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "@URLSearchParams"), p;
+  p = js_is_callable(ctor) ? js_get(ctx, ctor, "prototype") : js_undef();
+  return p.type == JV_OBJ ? p.u.obj : 0;
 }
 
 js_value sp_get(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -559,15 +689,6 @@ js_value sp_tostring(js_ctx *ctx, js_value t, js_value *args, int argc)
     free(sb.b);
   return r;
 }
-js_value sp_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  const char *q = arg_str(ctx, A(0));
-  (void)thisv;
-  if (*q == '?')
-    q++;
-  return make_search_params(ctx, q);
-}
-
 /* --------------------------------------------------------------- FormData -- */
 static void fd_collect(js_ctx *ctx, struct dom_node *n, js_object *ka, js_object *va)
 {

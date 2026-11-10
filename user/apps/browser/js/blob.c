@@ -429,8 +429,8 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
       *len = ta_length(ta) * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type);
       return (const char *)ab->data + ta->offset;
     }
-    if (o->proto == g_sp_proto) {
-      js_value s = sp_tostring(ctx, v, 0, 0);
+    if (o->proto == search_params_proto(ctx)) {
+      js_value s = js_call(ctx, js_get(ctx, v, "toString"), v, 0, 0);
       if (ctype && !ctype[0])
         strlcpy(ctype, "application/x-www-form-urlencoded;charset=UTF-8", ctcap);
       *len = s.type == JV_STR ? s.u.str->len : 0;

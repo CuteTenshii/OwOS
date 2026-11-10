@@ -799,8 +799,6 @@ void js_page_end(void)
   gc_remove_root((void **)&g_style_proto);
   gc_remove_root((void **)&g_classlist_proto);
   gc_remove_root((void **)&g_rellist_proto);
-  gc_remove_root((void **)&g_url_proto);
-  gc_remove_root((void **)&g_sp_proto);
   gc_remove_root((void **)&g_formdata_proto);
   gc_remove_root((void **)&g_event_proto);
   gc_remove_root((void **)&g_html_proto);
@@ -860,7 +858,7 @@ void js_page_end(void)
   g_ntimers = 0;
   g_media_proto = 0;
   g_node_proto = g_clipitem_proto = 0;
-  g_element_proto = g_style_proto = g_classlist_proto = g_rellist_proto = g_url_proto = g_sp_proto = g_formdata_proto =
+  g_element_proto = g_style_proto = g_classlist_proto = g_rellist_proto = g_formdata_proto =
       0;
   g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
   g_module_cache = g_document_proto = g_response_proto = 0;

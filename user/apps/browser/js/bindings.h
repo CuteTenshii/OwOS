@@ -166,10 +166,8 @@ extern js_object *g_module_src;
 extern js_object *g_importmap;
 extern int g_ntimers;
 extern js_object *g_rtc_proto;
-extern js_object *g_sp_proto;
 extern int g_tcap;
 extern js_object *g_timers;
-extern js_object *g_url_proto;
 extern js_object *g_websockets;
 extern js_object *g_ws_proto;
 extern js_object *g_xhr_proto;
@@ -214,7 +212,11 @@ char *form_decode(const char *s, int len);                           /* percent-
 void sb_put_form(sbuf *s, const char *t);                            /* application/x-www-form-urlencoded component */
 int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
 js_value blob_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
-js_value make_search_params(js_ctx *ctx, const char *query);
+js_value make_search_params(js_ctx *ctx, const char *query); /* new URLSearchParams(query) */
+js_object *search_params_proto(js_ctx *ctx);                  /* URLSearchParams.prototype, to recognise one */
+extern const char url_classes_js[];                           /* the URL and URLSearchParams source, run on the page and in workers */
+void url_natives_install(js_ctx *ctx, js_object *n);          /* N.urlParse/urlEscape/queryParse/queryString */
+js_value url_classes_install(js_ctx *ctx);                    /* define URL and URLSearchParams on the global */
 js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc);
 bool node_connected(struct dom_node *n);
 bool node_is_comment(const struct dom_node *n);
@@ -236,7 +238,6 @@ void set_text_content(struct dom_node *n, const char *text);
 js_value sig_static_abort(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value sig_throw_if_aborted(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value sp_append(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value sp_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value sp_delete(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value sp_for_each(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value sp_get(js_ctx *ctx, js_value t, js_value *args, int argc);
@@ -248,8 +249,6 @@ void span_copy(char *dst, int cap, const char *s, const char *e);
 bool tag_in_list(const char *list, const char *tag);
 struct dom_node *tree_next(struct dom_node *n);
 void uint_to_str(char *dst, unsigned v);
-js_value url_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
-js_value url_tostring(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value win_clear_timer(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value win_request_anim(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value win_set_interval(js_ctx *ctx, js_value t, js_value *args, int argc);

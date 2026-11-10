@@ -263,33 +263,3 @@ AURL_ACC(search, AURL_SEARCH)
 AURL_ACC(hash, AURL_HASH)
 #undef AURL_ACC
 
-js_value url_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  char input[URL_MAX], abs[URL_MAX];
-  struct purl pu;
-  js_object *o;
-  js_value ov;
-  (void)thisv;
-  strlcpy(input, arg_str(ctx, A(0)), sizeof input);
-  if (argc >= 2 && A(1).type != JV_UNDEF && A(1).type != JV_NULL) {
-    char base[URL_MAX];
-    strlcpy(base, arg_str(ctx, A(1)), sizeof base);
-    resolve_url(base, input, abs, sizeof abs);
-  } else {
-    strlcpy(abs, input, sizeof abs);
-  }
-  if (!parse_url(abs, &pu))
-    return js_throw_type(ctx, "Invalid URL");
-  gc_push_scope();
-  o = (js_object *)gc_keep(js_new_object(ctx, g_url_proto));
-  fill_url_props(ctx, o, abs);
-  ov = js_obj_value(o);
-  gc_pop_scope();
-  return ov;
-}
-js_value url_tostring(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  (void)args;
-  (void)argc;
-  return js_get(ctx, t, "href");
-}
