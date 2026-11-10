@@ -10,6 +10,8 @@
 #include <string.h>
 
 extern long long fake_now_ms;
+extern const unsigned char *host_video_frame;
+extern int host_video_w, host_video_h;
 int js_timers_pump(void);
 int js_workers_pump(void);
 void msleep(unsigned ms);
@@ -63,7 +65,7 @@ static void fetch_none(char *const *urls, int n, unsigned char **bodies, int *le
 }
 
 static const char page[] = "<html><body><canvas id=c width=40 height=30></canvas><canvas id=d></canvas>"
-                           "<img id=im><script>var ready=1</script></body></html>";
+                           "<img id=im><video id=v></video><script>var ready=1</script></body></html>";
 
 static struct dom_node *root;
 
@@ -239,6 +241,23 @@ static void test_draw_image_sources(void)
   expect(pixel("c", 8, 1)[3] == 0);
   expect(pixel("c", 20, 20)[1] == 255 && pixel("c", 21, 21)[1] == 255 && pixel("c", 22, 22)[3] == 0);
   expect(pixel("c", 34, 0)[0] == 255 && pixel("c", 34, 0)[1] == 255 && pixel("c", 35, 1)[3] == 255);
+}
+
+/* A camera-backed <video> draws its current frame; with no frame yet it draws nothing */
+static void test_draw_image_video(void)
+{
+  static const unsigned char frame[] = {255, 0, 0, 255, 0, 0, 255, 255};
+  run_script("var cx=document.getElementById('c').getContext('2d'), v=document.getElementById('v');\n"
+             "cx.clearRect(0,0,40,30); cx.imageSmoothingEnabled=false; cx.drawImage(v, 0, 0);\n"
+             "var none=cx.getImageData(0,0,2,1).data; expect(none[3]===0, 'no frame yet draws nothing');\n");
+  host_video_frame = frame;
+  host_video_w = 2;
+  host_video_h = 1;
+  run_script("cx.drawImage(v, 4, 4); cx.drawImage(v, 0, 0, 2, 1, 10, 10, 4, 2);\n");
+  host_video_frame = 0;
+  expect(pixel("c", 4, 4)[0] == 255 && pixel("c", 4, 4)[2] == 0 && pixel("c", 4, 4)[3] == 255);
+  expect(pixel("c", 5, 4)[0] == 0 && pixel("c", 5, 4)[2] == 255 && pixel("c", 5, 4)[3] == 255);
+  expect(pixel("c", 11, 11)[0] == 255 && pixel("c", 12, 10)[2] == 255 && pixel("c", 14, 10)[3] == 0);
 }
 
 static void test_bitmap_from_blob(void)
@@ -456,6 +475,7 @@ int main(void)
   test("gradients and patterns", test_gradients_and_patterns);
   test("ImageData round trips", test_image_data);
   test("drawImage from canvas sources", test_draw_image_sources);
+  test("drawImage from a camera video", test_draw_image_video);
   test("createImageBitmap from a Blob", test_bitmap_from_blob);
   test("OffscreenCanvas transfer to bitmap and from element", test_offscreen_transfer);
   test("OffscreenCanvas inside a worker", test_offscreen_in_worker);

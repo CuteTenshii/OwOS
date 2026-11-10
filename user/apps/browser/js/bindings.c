@@ -7,6 +7,7 @@
 #include "dom_query.h"
 #include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
+#include "features/camera/camera.h"
 #include "features/clienthints/clienthints.h"
 #include "features/gamepad/gamepad.h"
 #include "features/jar/jar.h"
@@ -21,7 +22,7 @@ js_object *g_element_proto;
 js_object *g_style_proto;
 js_object *g_rellist_proto;   /* DOMTokenList for element.relList, chains to g_classlist_proto */
 js_object *g_classlist_proto; /* DOMTokenList.prototype (element.classList) */
-js_object *g_formdata_proto; /* FormData.prototype (shares URLSearchParams' @k/@v) */
+js_object *g_formdata_proto;  /* FormData.prototype (shares URLSearchParams' @k/@v) */
 js_object *g_event_proto;
 js_object *g_html_proto;  /* HTMLElement.prototype (chains to element) */
 js_object *g_media_proto; /* HTMLMediaElement.prototype (audio/video) */
@@ -1536,7 +1537,8 @@ static js_value doc_has_focus(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
   (void)argc;
-  return js_bool(!js_to_boolean(js_get(ctx, t, "hidden"))); /* the window has no focus signal; a visible page is the active one */
+  return js_bool(
+      !js_to_boolean(js_get(ctx, t, "hidden"))); /* the window has no focus signal; a visible page is the active one */
 }
 static js_value doc_root_el(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2355,16 +2357,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
       js_def(nav, "geolocation", js_obj_value(geo), P_ENUMERABLE);
     }
     {
-      js_object *md = js_new_object(ctx, ctx->object_proto); /* navigator.mediaDevices */
-      gc_keep(md);
-      def_method(md, "getUserMedia", md_get_user_media, 1);
-      def_method(md, "getDisplayMedia", md_get_display_media, 1);
-      def_method(md, "enumerateDevices", md_enumerate, 0);
-      def_method(md, "addEventListener", el_noop, 2);
-      def_method(md, "removeEventListener", el_noop, 2);
-      js_def(nav, "mediaDevices", js_obj_value(md), P_ENUMERABLE);
-    }
-    {
       js_object *perm = js_new_object(ctx, ctx->object_proto); /* navigator.permissions */
       gc_keep(perm);
       def_method(perm, "query", perm_query, 1);
@@ -2382,6 +2374,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gamepad_install(ctx, nav);
     battery_install(ctx, nav, page_url);
     bluetooth_install(ctx, nav, page_url);
+    camera_install(ctx, nav, page_url);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
@@ -2517,7 +2510,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
         {"KeyboardEvent", 0},    {"FocusEvent", 0},    {"InputEvent", 0},
         {"CompositionEvent", 0}, {"PointerEvent", 1}, /* -> MouseEvent.prototype */
         {"WheelEvent", 1},       {"DragEvent", 1},     {"ErrorEvent", -1},
-        {"MessageEvent", -1},    {"StorageEvent", -1},  {"ClipboardEvent", -1},
+        {"MessageEvent", -1},    {"StorageEvent", -1}, {"ClipboardEvent", -1},
     };
     js_object *protos[sizeof subs / sizeof subs[0]];
     unsigned i;

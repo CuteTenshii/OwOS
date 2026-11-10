@@ -1,8 +1,9 @@
 /* HTMLMediaElement, Remote Playback API (Cast) and Image()/Audio() constructors. */
 #include <stdbool.h>
 
-#include "airplay.h"               /* AirPlay sender: RemotePlayback backend                  */
-#include "cast.h"                  /* Google Cast sender: RemotePlayback backend             */
+#include "airplay.h" /* AirPlay sender: RemotePlayback backend                  */
+#include "cast.h"    /* Google Cast sender: RemotePlayback backend             */
+#include "features/camera/camera.h"
 #include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "jsint.h"
 
@@ -34,6 +35,43 @@ static js_value mel_set_src(js_ctx *ctx, js_value t, js_value *args, int argc)
   resolve_url(g_page_url_buf, raw, abs, sizeof abs);
   media_set_src(media_for_node(n), abs);
   return js_undef();
+}
+static js_value mel_get_srcObject(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value v = js_get(ctx, t, "_srcobj");
+  (void)args;
+  (void)argc;
+  return v.type == JV_OBJ ? v : js_null();
+}
+static js_value mel_set_srcObject(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value v = A(0);
+  bool stream = camera_is_stream(v);
+  if (!stream && v.type != JV_NULL && v.type != JV_UNDEF)
+    return js_throw_type(ctx, "Failed to set the 'srcObject' property on 'HTMLMediaElement': The provided value is not "
+                              "of type 'MediaStream'.");
+  if (t.type == JV_OBJ)
+    js_def(t.u.obj, "_srcobj", stream ? v : js_null(), P_WRITABLE | P_CONFIGURABLE);
+  media_set_stream(mel_of(t), stream);
+  return js_undef();
+}
+static js_value mel_get_video_width(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int w, h;
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  media_video_size(mel_of(t), &w, &h);
+  return js_number(w);
+}
+static js_value mel_get_video_height(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int w, h;
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  media_video_size(mel_of(t), &w, &h);
+  return js_number(h);
 }
 static js_value mel_get_currentTime(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -282,6 +320,9 @@ void setup_media_proto(js_ctx *ctx)
   g_cast_used = 0;
   def_acc(g_media_proto, "src", mel_get_src, mel_set_src);
   def_acc(g_media_proto, "currentSrc", mel_get_src, 0);
+  def_acc(g_media_proto, "srcObject", mel_get_srcObject, mel_set_srcObject);
+  def_acc(g_media_proto, "videoWidth", mel_get_video_width, 0);
+  def_acc(g_media_proto, "videoHeight", mel_get_video_height, 0);
   def_acc(g_media_proto, "currentTime", mel_get_currentTime, mel_set_currentTime);
   def_acc(g_media_proto, "duration", mel_get_duration, 0);
   def_acc(g_media_proto, "paused", mel_get_paused, 0);
@@ -490,9 +531,10 @@ static const char *cast_start(struct media_el *m, struct dom_node *n, js_object 
   return 0;
 }
 
-static const char *const g_cast_msg[] = {"NotFoundError", "No available Cast devices", "NotAllowedError",
-                                         "The Cast prompt was dismissed or the connection failed", "NotSupportedError",
-                                         "This source cannot be cast", "InvalidStateError", "Already casting"};
+static const char *const g_cast_msg[] = {"NotFoundError",     "No available Cast devices",
+                                         "NotAllowedError",   "The Cast prompt was dismissed or the connection failed",
+                                         "NotSupportedError", "This source cannot be cast",
+                                         "InvalidStateError", "Already casting"};
 
 static js_value cast_reject(js_ctx *ctx, const char *name)
 {

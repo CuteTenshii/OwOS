@@ -19,6 +19,7 @@
 #define USBH_BOUND_HID 0x08
 #define USBH_BOUND_HUB 0x10
 #define USBH_BOUND_BT 0x20
+#define USBH_BOUND_UVC 0x40
 
 struct usbdev {
   bool active;
@@ -71,6 +72,15 @@ struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usb
 struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps);
 int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len);
 
+/* An isochronous IN endpoint kept armed, one TD per service interval of mps * (burst + 1) * (mult + 1) bytes (at most a
+ * page). cb runs per completed interval with the received bytes (they are only valid during the call), or with
+ * err != 0 (xHCI completion code, len 0) when the controller missed it. binterval is the descriptor's bInterval. */
+typedef void (*usbh_isoc_cb)(void *ctx, const uint8_t *data, int len, int err);
+struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
+                                    uint8_t binterval, usbh_isoc_cb cb, void *ctx);
+/* Stop and drop an endpoint opened above (not for a device that is gone: its pipes are freed with the slot). */
+void usbh_close_pipe(struct usbh_pipe *p);
+
 /* Configure a hub slot (Hub flag, port count, TT think time) and its status-change endpoint. */
 int usbh_config_hub(int slot, int nports, int think_time);
 
@@ -114,6 +124,10 @@ void btusb_bind(struct usbdev *d);
 void btusb_unbind(int slot);
 void btusb_tick(void);
 void btusb_print(int slot);
+void uvc_bind(struct usbdev *d);
+void uvc_unbind(int slot);
+void uvc_tick(void);
+void uvc_print(int slot);
 void hub_bind(struct usbdev *d);
 void hub_unbind(int slot);
 void hub_service(void);

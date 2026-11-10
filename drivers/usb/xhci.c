@@ -85,6 +85,7 @@
 
 /* ---- TRB types ---------------------------------------------------------- */
 #define TRB_NORMAL 1
+#define TRB_ISOCH 5
 #define TRB_SETUP 2
 #define TRB_DATA 3
 #define TRB_STATUS 4
@@ -95,6 +96,7 @@
 #define TRB_CONFIG_EP 12
 #define TRB_EVAL_CONTEXT 13
 #define TRB_RESET_EP 14
+#define TRB_STOP_EP 15
 #define TRB_SET_TRDQ 16
 #define TRB_TRANSFER_EVENT 32
 #define TRB_CMD_COMPLETION 33
@@ -107,6 +109,7 @@
 #define TRB_IOC (1u << 5)    /* interrupt on completion              */
 #define TRB_IDT (1u << 6)    /* immediate data (setup stage)         */
 #define TRB_TOGGLE (1u << 1) /* link TRB: toggle cycle               */
+#define TRB_SIA (1u << 31)   /* isoch TRB: start as soon as possible */
 
 /* TRB completion codes (event status >> 24). */
 #define CC_SUCCESS 1
@@ -157,6 +160,17 @@ static volatile bool hc_responsive = true;
 #define XHCI_MAX_SLOTS 256
 #define PIPE_BUFS 2
 
+/* Isochronous IN state: ISOC_DEPTH one-interval TDs kept queued, each with a stride-aligned slice of a buffer page. */
+#define ISOC_DEPTH 96
+
+struct isoc {
+  uint8_t *pages[ISOC_DEPTH];
+  uint8_t trb_slot[RING_TRBS];
+  uint32_t payload, stride, per_page;
+  uint8_t burst, head, tail, queued;
+  usbh_isoc_cb cb;
+};
+
 struct usbh_pipe {
   struct usbh_pipe *next;
   int slot, dci;
@@ -168,6 +182,7 @@ struct usbh_pipe {
   bool halted, dead, out;
   usbh_pipe_cb cb;
   void *ctx;
+  struct isoc *iso;
 };
 
 struct xdev {
@@ -274,6 +289,7 @@ static struct trb *event_next(void)
 }
 
 static bool pipe_event(struct trb *e);
+static void isoc_event(struct usbh_pipe *p, struct trb *e);
 
 /* Events no synchronous waiter owns: port changes (flagged for the poll thread) and interrupt-pipe completions. */
 static bool event_consumed(struct trb *e)
@@ -2177,11 +2193,69 @@ static struct usbh_pipe *pipe_find(int slot, int dci)
   return NULL;
 }
 
+static uint8_t *isoc_buf(const struct isoc *s, int i)
+{
+  return s->pages[i / s->per_page] + (uint32_t)(i % s->per_page) * s->stride;
+}
+
+/* Queue TDs until ISOC_DEPTH are outstanding and ring the doorbell. Every TD asks to start as soon as possible, so a
+ * ring that ran dry resumes at the next interval instead of waiting for a stale frame number. */
+static void isoc_post(struct usbh_pipe *p)
+{
+  struct isoc *s = p->iso;
+  uint32_t packets = (s->payload + p->mps - 1) / p->mps, tbc = 0, tlbpc = packets - 1;
+  bool posted = false;
+  if (devs[p->slot]->pub.speed >= USB_SPEED_SUPER) {
+    tbc = (packets + s->burst) / (s->burst + 1u) - 1;
+    tlbpc = (packets - 1) % (s->burst + 1u);
+  }
+  while (s->queued < ISOC_DEPTH) {
+    s->trb_slot[p->ring.enq] = s->tail;
+    ring_push(&p->ring, (uint32_t)(uintptr_t)isoc_buf(s, s->tail), 0, s->payload,
+              TRB_TYPE(TRB_ISOCH) | TRB_IOC | TRB_ISP | TRB_SIA | (tbc << 7) | (tlbpc << 16));
+    s->tail = (s->tail + 1) % ISOC_DEPTH;
+    s->queued++;
+    posted = true;
+  }
+  if (posted)
+    db[p->slot] = p->dci;
+}
+
+/* A completed interval: retire it (and any the controller skipped before it), hand the data on, queue a replacement. */
+static void isoc_event(struct usbh_pipe *p, struct trb *e)
+{
+  struct isoc *s = p->iso;
+  if (p->dead)
+    return;
+  uint32_t idx = ((uint32_t)e->p0 - (uint32_t)(uintptr_t)p->ring.base) / sizeof(struct trb);
+  int cc = (e->status >> 24) & 0xFF;
+  if (idx >= RING_TRBS - 1 || (e->p0 & 0xF))
+    return;
+  uint8_t slot = s->trb_slot[idx];
+  uint8_t done = (uint8_t)((slot + ISOC_DEPTH - s->head) % ISOC_DEPTH + 1);
+  if (done > s->queued)
+    return;
+  s->head = (slot + 1) % ISOC_DEPTH;
+  s->queued -= done;
+  if (cc == CC_STOPPED || cc == CC_STOPPED_LEN)
+    return;
+  uint32_t resid = e->status & 0xFFFFFF;
+  if (cc == CC_SUCCESS || cc == CC_SHORT_PKT)
+    s->cb(p->ctx, isoc_buf(s, slot), resid < s->payload ? (int)(s->payload - resid) : 0, 0);
+  else
+    s->cb(p->ctx, NULL, 0, cc);
+  isoc_post(p);
+}
+
 /* A transfer event for an interrupt pipe: hand the report to its driver and re-arm. Errors never issue commands here
  * (we may be inside another command's wait); a halt is flagged for pipes_recover on the poll thread. */
 static bool pipe_event(struct trb *e)
 {
   struct usbh_pipe *p = pipe_find((e->control >> 24) & 0xFF, (e->control >> 16) & 0x1F);
+  if (p && p->iso) {
+    isoc_event(p, e);
+    return true;
+  }
   if (!p || p->out)
     return false;
   int cc = (e->status >> 24) & 0xFF;
@@ -2308,6 +2382,118 @@ struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps)
   return open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_OUT, 0, NULL, NULL);
 }
 
+static void pipe_free(struct usbh_pipe *p)
+{
+  if (p->iso) {
+    for (int i = 0; i < ISOC_DEPTH && p->iso->pages[i]; i++)
+      pfree(p->iso->pages[i]);
+    kfree(p->iso);
+  }
+  if (p->ring.base)
+    pfree(p->ring.base);
+  if (p->buf)
+    pfree(p->buf);
+  kfree(p);
+}
+
+struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
+                                    uint8_t binterval, usbh_isoc_cb cb, void *ctx)
+{
+  struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
+  uint32_t payload = (uint32_t)mps * (burst + 1u) * (mult + 1u);
+  if (!x || !(ep_addr & 0x80) || mps == 0 || mps > 1024 || payload > 4096 || burst > 15 || mult > 2 || !cb)
+    return NULL;
+  struct usbh_pipe *p = kmalloc(sizeof *p);
+  if (!p)
+    return NULL;
+  memset(p, 0, sizeof *p);
+  p->iso = kmalloc(sizeof *p->iso);
+  if (!p->iso) {
+    kfree(p);
+    return NULL;
+  }
+  memset(p->iso, 0, sizeof *p->iso);
+  struct isoc *s = p->iso;
+  s->payload = payload;
+  s->stride = (payload + 63) & ~63u;
+  s->per_page = 4096 / s->stride;
+  s->burst = burst;
+  s->cb = cb;
+  ring_init(&p->ring);
+  bool ok = p->ring.base != NULL;
+  for (int i = 0; ok && i < ISOC_DEPTH; i += (int)s->per_page)
+    ok = (s->pages[i / s->per_page] = palloc()) != NULL;
+  if (!ok) {
+    pipe_free(p);
+    return NULL;
+  }
+  p->slot = slot;
+  p->dci = ep_dci(ep_addr);
+  p->ep_addr = ep_addr;
+  p->mps = mps;
+  p->ctx = ctx;
+
+  uint32_t exponent = binterval ? binterval - 1u : 0;
+  if (x->pub.speed < USB_SPEED_HIGH)
+    exponent += 3;
+  if (exponent > 15)
+    exponent = 15;
+  uint32_t ep[5] = {0};
+  ep[0] = ((uint32_t)mult << 8) | (exponent << 16) | ((payload >> 16) << 24);
+  ep[1] = (5u << 3) | ((uint32_t)burst << 8) | ((uint32_t)mps << 16);
+  ep[2] = (uint32_t)(uintptr_t)p->ring.base | 1;
+  ep[4] = payload | ((payload & 0xFFFF) << 16);
+  if (config_endpoint(slot, p->dci, ep) != 0) {
+    pipe_free(p);
+    return NULL;
+  }
+  p->next = x->pipes;
+  x->pipes = p;
+  isoc_post(p);
+  return p;
+}
+
+void usbh_close_pipe(struct usbh_pipe *p)
+{
+  struct xdev *x = p ? devs[p->slot] : NULL;
+  if (!x)
+    return;
+  p->dead = true;
+  ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_STOP_EP) | ((uint32_t)p->dci << 16) | ((uint32_t)p->slot << 24));
+  cmd_submit();
+
+  uint8_t *input = palloc();
+  if (input && dcbaa[p->slot]) {
+    uint32_t *icc = (uint32_t *)input;
+    uint32_t *sctx = (uint32_t *)(input + ctx_sz);
+    uint32_t *out_slot = (uint32_t *)(uintptr_t)dcbaa[p->slot];
+    icc[0] = 1u << p->dci;
+    icc[1] = 1u;
+    for (uint32_t i = 0; i < ctx_sz / 4; i++)
+      sctx[i] = out_slot[i];
+    ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)p->slot << 24));
+    cmd_submit();
+  }
+  if (input)
+    pfree(input);
+  for (struct usbh_pipe **pp = &x->pipes; *pp; pp = &(*pp)->next)
+    if (*pp == p) {
+      *pp = p->next;
+      break;
+    }
+  pipe_free(p);
+}
+
+/* Keep isochronous rings full even if completion events were lost. */
+static void isoc_service(void)
+{
+  for (int s = 1; s <= max_slot_id; s++)
+    if (devs[s])
+      for (struct usbh_pipe *p = devs[s]->pipes; p; p = p->next)
+        if (p->iso && !p->dead)
+          isoc_post(p);
+}
+
 int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len)
 {
   if (!p || !p->out || p->dead || len <= 0 || len > 4096)
@@ -2366,6 +2552,7 @@ static void remove_device(int slot)
   hid_unbind(slot);
   xbox_unbind(slot);
   btusb_unbind(slot);
+  uvc_unbind(slot);
   if (x->pub.is_msc && slot == msc_slot)
     msc_ready = 0;
   if (x->pub.is_mtp && slot == mtp_slot)
@@ -2378,9 +2565,7 @@ static void remove_device(int slot)
   while (x->pipes) {
     struct usbh_pipe *p = x->pipes;
     x->pipes = p->next;
-    pfree(p->ring.base);
-    pfree(p->buf);
-    kfree(p);
+    pipe_free(p);
   }
   if (x->ep0.base)
     pfree(x->ep0.base);
@@ -2502,6 +2687,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
     hid_bind(d);
     xbox_bind(d);
     btusb_bind(d);
+    uvc_bind(d);
   }
   return slot_id;
 
@@ -2648,6 +2834,8 @@ static void usb_service(void)
   hid_tick();
   hub_service();
   btusb_tick();
+  isoc_service();
+  uvc_tick();
   uint32_t now = timer_ticks();
   if (port_event || now - last_scan >= TIMER_HZ) {
     port_event = false;

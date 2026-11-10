@@ -1,8 +1,8 @@
 /* media.c: <audio>/<video> HTMLMediaElement layer (bmedia.h) over the user/lib/media mixer.
  * Audio decodes WAV/MPEG; <video> decodes H.264 only (an MP4's AAC track is silent). */
 #include "media.h" /* user/lib/media: decoder + software mixer */
-#include "browser.h"
 #include "airplay.h"
+#include "browser.h"
 #include "cast.h"
 #include "features/media/bmedia.h"
 
@@ -62,6 +62,8 @@ struct media_el {
   volatile bool vshown;   /* vfront holds a real (not blank) frame     */
   bool vpending;          /* a decoded frame waits in vbuf[1-vfront]   */
   unsigned vpending_pts;  /* its presentation time                     */
+  bool vstream;           /* srcObject: playing the camera instead of a file */
+  unsigned vstream_seq;   /* camera_frame seq last copied into vbuf    */
   volatile bool vplaying;
   volatile bool vended;
   volatile bool vbusy;     /* video thread is mid-decode on this slot   */
@@ -87,6 +89,8 @@ static void mstrcpy(char *d, const char *s, int cap)
     d[i] = s[i];
   d[i] = '\0';
 }
+
+static bool has_picture(const struct media_el *m) { return m->vid || m->vstream; }
 
 static int vol256_of(const struct media_el *m) { return m->muted ? 0 : m->volume * 256 / 1000; }
 
@@ -588,8 +592,8 @@ void media_set_src(struct media_el *m, const char *abs_url)
 {
   if (!m || !abs_url)
     return;
-  if (streq(m->src, abs_url))
-    return; /* unchanged */
+  if (m->vstream || streq(m->src, abs_url))
+    return; /* srcObject wins; unchanged */
   if (m->vid || m->vbuf[0])
     video_dispose(m); /* off-lock: waits vbusy */
   browser_buf_lock();
@@ -609,6 +613,83 @@ void media_set_src(struct media_el *m, const char *abs_url)
   browser_buf_unlock();
   if (m->src[0])
     media_kick_load(m, false);
+}
+
+void media_set_stream(struct media_el *m, int on)
+{
+  if (!m || m->vstream == (on != 0))
+    return;
+  media_pause(m);
+  browser_buf_lock();
+  m->vshown = false; /* the draw path skips the buffers video_dispose is about to free */
+  browser_buf_unlock();
+  video_dispose(m); /* the file decoder, or the previous stream's frame buffers */
+  browser_buf_lock();
+  m->vstream = on != 0;
+  m->vstream_seq = 0;
+  m->vw = m->vh = 0;
+  m->reported_meta = false;
+  m->ev |= on ? MEV_LOADSTART : MEV_EMPTIED;
+  if (on) {
+    m->net = MNS_IDLE;
+    if (m->autoplay) {
+      m->vplaying = true;
+      m->playing_state = true;
+      m->ev |= MEV_PLAY;
+    }
+  }
+  browser_buf_unlock();
+}
+
+/* Copy the camera's newest frame into the back buffer and flip it in; worker thread */
+static void stream_pull(struct media_el *m)
+{
+  int w, h, back;
+  unsigned seq;
+  const unsigned char *src = camera_frame(&w, &h, &seq);
+  if (!src || seq == m->vstream_seq)
+    return;
+  if (m->vw != w || m->vh != h) {
+    unsigned char *a = malloc((unsigned)w * (unsigned)h * 3), *b = malloc((unsigned)w * (unsigned)h * 3);
+    if (!a || !b) {
+      free(a);
+      free(b);
+      return;
+    }
+    browser_buf_lock();
+    free(m->vbuf[0]);
+    free(m->vbuf[1]);
+    m->vbuf[0] = a;
+    m->vbuf[1] = b;
+    m->vw = w;
+    m->vh = h;
+    m->vfront = 0;
+    m->vshown = false;
+    browser_buf_unlock();
+  }
+  back = 1 - m->vfront;
+  for (int i = 0; i < w * h; i++)
+    memcpy(m->vbuf[back] + i * 3, src + i * 4, 3);
+  browser_buf_lock();
+  m->vfront = back;
+  if (!m->vshown)
+    m->ev |= MEV_LOADEDMETA;
+  m->vshown = true;
+  m->vstream_seq = seq;
+  browser_buf_unlock();
+  B->seq++;
+}
+
+const unsigned char *media_frame_rgba(struct media_el *m, int *w, int *h)
+{
+  unsigned seq;
+  return m && m->vstream ? camera_frame(w, h, &seq) : 0;
+}
+
+void media_video_size(struct media_el *m, int *w, int *h)
+{
+  *w = m ? m->vw : 0;
+  *h = m ? m->vh : 0;
 }
 
 void media_get_src(struct media_el *m, char *out, int cap) { mstrcpy(out, m ? m->src : "", cap); }
@@ -719,6 +800,16 @@ void media_play(struct media_el *m)
     browser_buf_unlock();
     return;
   }
+  if (m->vstream) {
+    browser_buf_lock();
+    m->vplaying = true;
+    if (!m->playing_state) {
+      m->ev |= MEV_PLAY;
+      m->playing_state = true;
+    }
+    browser_buf_unlock();
+    return;
+  }
   if (m->vid && m->vended)
     video_reopen(m); /* replay a finished clip */
   browser_buf_lock();
@@ -756,7 +847,7 @@ void media_pause(struct media_el *m)
   m->want_play = false;
   if (m->ms)
     media_source_pause(m->ms);
-  if (m->vid)
+  if (has_picture(m))
     m->vplaying = false; /* vpos_ms holds the resume point */
   if (m->playing_state) {
     m->ev |= MEV_PAUSE;
@@ -774,7 +865,7 @@ int media_paused(struct media_el *m)
     r_status(&st);
     return st.state == CAST_PAUSED || st.state == CAST_IDLE;
   }
-  return !((m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying));
+  return !((m->ms && media_source_playing(m->ms)) || (has_picture(m) && m->vplaying));
 }
 
 int media_ended(struct media_el *m)
@@ -902,6 +993,8 @@ int media_ready_state(struct media_el *m)
     return media_source_duration_ms(m->ms) ? MRS_ENOUGH : MRS_METADATA;
   if (m->vid)
     return m->vdur_ms ? MRS_ENOUGH : MRS_METADATA;
+  if (m->vstream)
+    return m->vshown ? MRS_ENOUGH : MRS_NOTHING;
   return MRS_NOTHING;
 }
 
@@ -1009,6 +1102,8 @@ int media_pump(void)
     unsigned ev;
     if (!m->in_use || m->owner != B->pg || !m->node)
       continue;
+    if (m->vstream && (m->vplaying || !m->vshown))
+      stream_pull(m);
 
     /* loop a finished silent video by reopening (off the big lock) */
     if (m->vid && m->loop && m->vended && !m->ms) {
@@ -1165,9 +1260,9 @@ struct mrects {
   int play_x, play_y, play_w;
   int seek_x, seek_y, seek_w, seek_h;
   int vol_x, vol_y, vol_w;
-  int fs_x, fs_w; /* fullscreen button (video only; fs_w 0 = none) */
+  int fs_x, fs_w;     /* fullscreen button (video only; fs_w 0 = none) */
   int cast_x, cast_w; /* cast button (shown when a receiver is around; cast_w 0 = none) */
-  int time_right; /* right edge of the time text */
+  int time_right;     /* right edge of the time text */
 };
 
 /* The cast button shows while casting, or when the source is http(s) and a receiver was seen */
@@ -1177,7 +1272,8 @@ static bool cast_offered(const struct media_el *m)
     return true;
   if (!m->node || dom_get_attr(m->node, "disableremoteplayback"))
     return false;
-  return (starts_ci(m->src, "http://") || starts_ci(m->src, "https://")) && cast_scan_count() + airplay_scan_count() > 0;
+  return (starts_ci(m->src, "http://") || starts_ci(m->src, "https://")) &&
+         cast_scan_count() + airplay_scan_count() > 0;
 }
 
 /* `fsh` > 0: the widget fills a fullscreen pane that tall, instead of the inline size */
@@ -1315,13 +1411,13 @@ static void blit_video_frame(struct media_el *m, int x0, int y0, int w, int ph, 
 static void media_draw(struct media_el *m, int x0, int y0, int w, int fsh, int ct, int cb)
 {
   struct mrects r;
-  int playing = (m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying);
+  int playing = (m->ms && media_source_playing(m->ms)) || (has_picture(m) && m->vplaying);
   unsigned pos = m->ms ? media_source_position_ms(m->ms) : (m->vid ? (unsigned)m->vpos_ms : 0);
   unsigned dur = m->ms ? media_source_duration_ms(m->ms) : (m->vid ? m->vdur_ms : 0);
   media_rects(m, x0, y0, w, fsh, &r);
 
   if (m->kind == MK_VIDEO) { /* decoded frame, or a black poster */
-    if (m->vid && m->vshown) {
+    if (has_picture(m) && m->vshown) {
       blit_video_frame(m, x0, y0, w, r.poster_h, ct, cb);
       if (!playing)
         draw_play_glyph(x0 + w / 2, y0 + r.poster_h / 2, 16, 0xf0f3f7, ct, cb);
@@ -1360,6 +1456,11 @@ static void media_draw(struct media_el *m, int x0, int y0, int w, int fsh, int c
       sapp(line, &k, sizeof line, tt);
     } else
       sapp(line, &k, sizeof line, "--:--");
+    if (m->vstream) {
+      line[0] = 0;
+      k = 0;
+      sapp(line, &k, sizeof line, "LIVE");
+    }
     mtext(r.time_right - gfx_ui_width(line), r.bar_y + (MBAR_H - UIFONT_H) / 2, line, 0xb6bdc7, ct, cb);
   }
 
@@ -1478,7 +1579,10 @@ static void media_click(struct media_el *m, int mx, int my, int x0, int y0, int 
   B->seq++;
 }
 
-void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw) { media_click(m, mx, my, x0, y0, paw, 0); }
+void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw)
+{
+  media_click(m, mx, my, x0, y0, paw, 0);
+}
 
 void media_fs_click(struct media_el *m, int mx, int my, int x0, int y0, int w, int h)
 {
@@ -1492,7 +1596,7 @@ int media_active(void)
     struct media_el *m = &g_media[i];
     if (!m->in_use || m->owner != B->pg)
       continue;
-    if ((m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying))
+    if ((m->ms && media_source_playing(m->ms)) || (has_picture(m) && m->vplaying))
       return 1;
   }
   return 0;
@@ -1504,7 +1608,7 @@ struct media_el *media_current(void)
   int i;
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *e = &g_media[i];
-    if (e->in_use && e->owner == B->pg && ((e->ms && media_source_playing(e->ms)) || (e->vid && e->vplaying)))
+    if (e->in_use && e->owner == B->pg && ((e->ms && media_source_playing(e->ms)) || (has_picture(e) && e->vplaying)))
       return e;
   }
   if (m && m->in_use && m->owner == B->pg && (m->ms || m->vid))

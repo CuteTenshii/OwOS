@@ -98,6 +98,35 @@ static void test_damaged_input_is_safe(void)
   }
 }
 
+/* webcam MJPEG frames omit their Huffman tables; the Annex K defaults must decode them identically */
+static void test_missing_dht(void)
+{
+  const unsigned char *srcs[] = {jpg_b444, jpg_b420, jpg_gray};
+  const unsigned lens[] = {sizeof jpg_b444, sizeof jpg_b420, sizeof jpg_gray};
+  for (int s = 0; s < 3; s++) {
+    unsigned char *stripped = malloc(lens[s]), *want, *got;
+    unsigned n = 2, w, h, w2, h2;
+    memcpy(stripped, srcs[s], 2);
+    for (unsigned i = 2; i < lens[s];) {
+      unsigned seg = i + 4 <= lens[s] ? 2u + (srcs[s][i + 2] << 8 | srcs[s][i + 3]) : lens[s] - i;
+      if (srcs[s][i + 1] == 0xDA)
+        seg = lens[s] - i;
+      if (srcs[s][i + 1] != 0xC4) {
+        memcpy(stripped + n, srcs[s] + i, seg);
+        n += seg;
+      }
+      i += seg;
+    }
+    expect(n < lens[s]);
+    expect_eq(jpeg_decode(srcs[s], (int)lens[s], 0, &want, &w, &h), JPEG_OK);
+    expect_eq(jpeg_decode(stripped, (int)n, 0, &got, &w2, &h2), JPEG_OK);
+    expect(got && w == w2 && h == h2 && !memcmp(want, got, w * h * 4));
+    free(want);
+    free(got);
+    free(stripped);
+  }
+}
+
 int main(void)
 {
   test("JPEG baseline 4:4:4", test_baseline_444);
@@ -109,5 +138,6 @@ int main(void)
   test("JPEG downscale", test_downscale);
   test("JPEG rejects garbage", test_rejects_garbage);
   test("JPEG damaged input is safe", test_damaged_input_is_safe);
+  test("JPEG missing DHT uses default tables", test_missing_dht);
   return 0;
 }

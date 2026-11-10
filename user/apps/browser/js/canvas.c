@@ -4,6 +4,7 @@
 #include "bindings.h"
 #include "canvasjs.h"
 #include "color.h"
+#include "features/media/bmedia.h"
 #include "font.h"
 #include "math.h"
 #include "streamscore.h"
@@ -1425,7 +1426,11 @@ int source_pixels(js_ctx *ctx, js_value v, struct pixsrc *out)
     out->rgba = js_image_pixels(n, &out->w, &out->h);
     return out->rgba ? SRC_OK : SRC_NOT_READY;
   }
-  return streq(n->tag, "video") ? SRC_NOT_READY : SRC_BAD_TYPE;
+  if (streq(n->tag, "video")) {
+    out->rgba = media_frame_rgba(media_for_node(n), &out->w, &out->h);
+    return out->rgba ? SRC_OK : SRC_NOT_READY;
+  }
+  return SRC_BAD_TYPE;
 }
 
 /* --------------------------------------------------------------------- setup */

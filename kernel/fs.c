@@ -783,7 +783,8 @@ static int sysfs_read_at(void *inst, const char *path, uint32_t off, void *buf, 
   (void)inst;
   if (sysfs_kind(path) != 0)
     return -1;
-  return gen_read_at(sysfs_read, path, off, buf, len);
+  int bin = sysfs_read_binary(path, off, buf, len);
+  return bin != SYSFS_NOT_BINARY ? bin : gen_read_at(sysfs_read, path, off, buf, len);
 }
 
 static int sysfs_list_op(void *inst, const char *path)

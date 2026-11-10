@@ -114,40 +114,6 @@ js_value geo_watch(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_number(1);                 /* a watch id; clearWatch is a no-op */
 }
 
-/* --- navigator.mediaDevices.getUserMedia ---------------------------------- */
-js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value c = A(0);
-  bool want_audio = false, want_video = false;
-  (void)t;
-  if (c.type == JV_OBJ) {
-    want_audio = js_to_boolean(js_get(ctx, c, "audio"));
-    want_video = js_to_boolean(js_get(ctx, c, "video"));
-  }
-  if (!want_audio && !want_video)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
-                                                  "At least one of audio and video must be requested"));
-  if (want_video && worker_permission(PERM_CAMERA) != PERM_GRANTED)
-    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
-  if (want_audio && worker_permission(PERM_MICROPHONE) != PERM_GRANTED)
-    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
-  return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "Requested device not found"));
-}
-js_value md_get_display_media(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  (void)t;
-  (void)args;
-  (void)argc;
-  return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
-}
-js_value md_enumerate(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  (void)t;
-  (void)args;
-  (void)argc;
-  return js_promise_resolved(ctx, js_obj_value(js_new_array(ctx, 0))); /* no devices */
-}
-
 /* --- navigator.permissions.query ------------------------------------------ */
 js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {

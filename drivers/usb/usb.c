@@ -418,6 +418,7 @@ static void print_device(int slot, const char *path, int depth, int detail_port)
     con_write(" [msc]");
   hub_print(slot);
   btusb_print(slot);
+  uvc_print(slot);
   hid_print(slot, false);
   con_putc('\n');
   if (detail_port == d->root_port) {

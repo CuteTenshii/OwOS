@@ -4,6 +4,7 @@
 #include "canvasjs.h"
 #include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
+#include "features/camera/camera.h"
 #include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
@@ -835,6 +836,7 @@ void js_page_end(void)
   gamepad_teardown();
   battery_teardown();
   bluetooth_teardown();
+  camera_teardown();
   gc_remove_root((void **)&g_timers);
   js_idb_teardown();
   js_webapi_teardown();
@@ -858,8 +860,7 @@ void js_page_end(void)
   g_ntimers = 0;
   g_media_proto = 0;
   g_node_proto = g_clipitem_proto = 0;
-  g_element_proto = g_style_proto = g_classlist_proto = g_rellist_proto = g_formdata_proto =
-      0;
+  g_element_proto = g_style_proto = g_classlist_proto = g_rellist_proto = g_formdata_proto = 0;
   g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
   g_module_cache = g_document_proto = g_response_proto = 0;
   g_module_src = 0;

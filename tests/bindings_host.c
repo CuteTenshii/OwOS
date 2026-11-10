@@ -14,6 +14,7 @@
 #endif
 #include "cast.h"
 #include "clipboard.h"
+#include "features/media/bmedia.h"
 #include "features/notification/notification.h"
 #include "jsint.h"
 #include "notify.h"
@@ -413,6 +414,29 @@ void bluetooth_install(js_ctx *ctx, js_object *navigator, const char *page_url)
   (void)page_url;
 }
 void bluetooth_teardown(void) {}
+void camera_install(js_ctx *ctx, js_object *navigator, const char *page_url)
+{
+  (void)ctx;
+  (void)navigator;
+  (void)page_url;
+}
+void camera_teardown(void) {}
+
+/* A <video> shows the frame a test hands it through host_video_frame */
+const unsigned char *host_video_frame;
+int host_video_w, host_video_h;
+struct media_el *media_for_node(struct dom_node *node)
+{
+  (void)node;
+  return (struct media_el *)&host_video_frame;
+}
+const unsigned char *media_frame_rgba(struct media_el *m, int *w, int *h)
+{
+  (void)m;
+  *w = host_video_w;
+  *h = host_video_h;
+  return host_video_frame;
+}
 
 /* PCM sink for the audio worklet: counts the frames it was given and keeps the loudest sample (the worklet runs on
  * its own thread, so everything the tests read is atomic) */

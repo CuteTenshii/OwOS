@@ -15,6 +15,7 @@
  *   /sys/class/graphics/fb0/scale              UI scale "auto"|1..4 (rw)
  *   /sys/class/graphics/fb0/{mode,modes}       screen resolution   (rw/ro,
  * DISPI) /sys/class/sound/card0/{output,outputs}    audio output select (rw/ro)
+ *   /sys/class/video/cam0/{info,control,frame}  USB camera: formats, start/stop, newest frame (ro/rw/ro binary)
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
  *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one
  * dir/device) /sys/power/battery/{capacity,status}                      (ro,
@@ -43,6 +44,7 @@
 #include "pci.h"
 #include "sb16.h"
 #include "smbios.h"
+#include "uvc.h"
 #include <stdint.h>
 
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
@@ -315,7 +317,7 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
     if (n == 2)
       return (eq(seg[1], "input") || eq(seg[1], "net") || eq(seg[1], "block") || eq(seg[1], "graphics") ||
               eq(seg[1], "dmi") || (eq(seg[1], "sound") && sound_present()) ||
-              (eq(seg[1], "bluetooth") && bt_present()))
+              (eq(seg[1], "bluetooth") && bt_present()) || (eq(seg[1], "video") && uvc_present()))
                  ? S_DIR
                  : S_NONE;
     if (eq(seg[1], "input")) {
@@ -373,6 +375,19 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return eq(seg[2], "id") ? S_DIR : S_NONE;
       if (n == 4 && eq(seg[2], "id") && (eq(seg[3], "product_name") || eq(seg[3], "sys_vendor")))
         return S_FILE_RO;
+      return S_NONE;
+    }
+    if (eq(seg[1], "video")) {
+      if (!uvc_present())
+        return S_NONE;
+      if (n == 3)
+        return eq(seg[2], "cam0") ? S_DIR : S_NONE;
+      if (n == 4 && eq(seg[2], "cam0")) {
+        if (eq(seg[3], "control"))
+          return S_FILE_RW;
+        if (eq(seg[3], "info") || eq(seg[3], "frame"))
+          return S_FILE_RO;
+      }
       return S_NONE;
     }
     if (eq(seg[1], "bluetooth")) {
@@ -631,6 +646,14 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         return;
       }
     }
+    if (eq(seg[1], "video")) {
+      int room = (int)(b->end - b->p);
+      if (eq(seg[3], "info"))
+        b->p += uvc_info_text(b->p, room);
+      else if (eq(seg[3], "control"))
+        b->p += uvc_control_text(b->p, room);
+      return;
+    }
     if (eq(seg[1], "bluetooth")) {
       int room = (int)(b->end - b->p);
       if (eq(seg[3], "status"))
@@ -762,6 +785,8 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
   }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0") && eq(seg[3], "control"))
     return bt_command(arg) == 0 ? 0 : -1;
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && eq(seg[3], "control"))
+    return uvc_command(arg) == 0 ? 0 : -1;
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "output")) {
     /* Accept an index ("1") or a name ("Headphones"). */
     int idx = -1;
@@ -861,7 +886,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   if (n == 1 && eq(seg[0], "class")) {
     /* input + graphics always; net/block only when present (so an empty dir
      * doesn't show). fb0 exists even in text mode, like /proc/display did. */
-    const char *kids[7];
+    const char *kids[8];
     int k = 0;
     kids[k++] = "input";
     if (nic_present())
@@ -874,6 +899,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
       kids[k++] = "sound";
     if (bt_present())
       kids[k++] = "bluetooth";
+    if (uvc_present())
+      kids[k++] = "video";
     kids[k++] = "dmi";
     hit = from_list(idx, name, max, kids, k);
     if (hit && is_dir)
@@ -948,6 +975,21 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (is_dir)
       *is_dir = 1;
     return 1;
+  }
+  if (n == 2 && eq(seg[0], "class") && eq(seg[1], "video")) {
+    if (!uvc_present() || idx != 0)
+      return 0;
+    cpy(name, "cam0", max);
+    if (is_dir)
+      *is_dir = 1;
+    return 1;
+  }
+  if (n == 3 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && uvc_present()) {
+    static const char *const k[] = {"info", "control", "frame"};
+    hit = from_list(idx, name, max, k, 3);
+    if (hit && is_dir)
+      *is_dir = 0;
+    return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0")) {
     static const char *const k[] = {"status", "devices", "le_devices", "gatt", "gatt_events", "control"};
@@ -1129,9 +1171,24 @@ int sysfs_write(const char *sub, const char *buf, int len)
   return apply(seg, n, arg) == 0 ? len : -1;
 }
 
+int sysfs_read_binary(const char *sub, uint32_t off, void *buf, uint32_t len)
+{
+  char seg[MAXSEG][SEGLEN];
+  int n = split(sub, seg);
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && eq(seg[3], "frame") &&
+      uvc_present())
+    return uvc_frame_read(off, buf, len);
+  return SYSFS_NOT_BINARY;
+}
+
 int sysfs_size(const char *sub)
 {
-  static char scratch[2048];
-  int n = sysfs_read(sub, scratch, (int)sizeof scratch);
+  static char scratch[4096];
+  char seg[MAXSEG][SEGLEN];
+  int n = split(sub, seg);
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && eq(seg[3], "frame") &&
+      uvc_present())
+    return (int)uvc_frame_size();
+  n = sysfs_read(sub, scratch, (int)sizeof scratch);
   return n < 0 ? 0 : n;
 }

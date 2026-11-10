@@ -12,6 +12,8 @@
 #ifndef OWOS_SYSFS_H
 #define OWOS_SYSFS_H
 
+#include <stdint.h>
+
 /* Part of an absolute path after a leading "/sys", or NULL if not under /sys.
  * "/sys" -> "", "/sys/class" -> "/class". */
 const char *sysfs_subpath(const char *path);
@@ -26,6 +28,10 @@ int sysfs_read(const char *sub, char *buf, int max);
 /* Perform the control action behind a writable attribute; returns len on
  * success, -1 if the path isn't a writable file. */
 int sysfs_write(const char *sub, const char *buf, int len);
+
+/* Binary attribute files (the camera frame) read at an arbitrary offset; SYSFS_NOT_BINARY when `sub` is a text file. */
+#define SYSFS_NOT_BINARY (-2)
+int sysfs_read_binary(const char *sub, uint32_t off, void *buf, uint32_t len);
 
 /* 1 if `sub` is a writable attribute file. */
 int sysfs_writable(const char *sub);

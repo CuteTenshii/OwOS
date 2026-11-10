@@ -214,10 +214,10 @@ void sb_put_form(sbuf *s, const char *t);                            /* applicat
 int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
 js_value blob_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
 js_value make_search_params(js_ctx *ctx, const char *query); /* new URLSearchParams(query) */
-js_object *search_params_proto(js_ctx *ctx);                  /* URLSearchParams.prototype, to recognise one */
-extern const char url_classes_js[];                           /* the URL and URLSearchParams source, run on the page and in workers */
-void url_natives_install(js_ctx *ctx, js_object *n);          /* N.urlParse/urlEscape/queryParse/queryString */
-js_value url_classes_install(js_ctx *ctx);                    /* define URL and URLSearchParams on the global */
+js_object *search_params_proto(js_ctx *ctx);                 /* URLSearchParams.prototype, to recognise one */
+extern const char url_classes_js[]; /* the URL and URLSearchParams source, run on the page and in workers */
+void url_natives_install(js_ctx *ctx, js_object *n); /* N.urlParse/urlEscape/queryParse/queryString */
+js_value url_classes_install(js_ctx *ctx);           /* define URL and URLSearchParams on the global */
 js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc);
 bool node_connected(struct dom_node *n);
 bool node_is_comment(const struct dom_node *n);
@@ -227,8 +227,8 @@ js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value body_json(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value body_text(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value body_formdata(js_ctx *ctx, js_value t, js_value *args, int argc);
-int body_take(js_ctx *ctx, js_value t);   /* mark a body read; 0 when it already was */
-js_value body_used_error(js_ctx *ctx);   /* the rejected promise of a second read */
+int body_take(js_ctx *ctx, js_value t); /* mark a body read; 0 when it already was */
+js_value body_used_error(js_ctx *ctx);  /* the rejected promise of a second read */
 js_value response_static_error(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value response_static_json(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value response_static_redirect(js_ctx *ctx, js_value t, js_value *args, int argc);
@@ -332,9 +332,6 @@ extern js_object *g_style_proto;
 js_value geo_get_current(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value geo_watch(js_ctx *ctx, js_value t, js_value *args, int argc);
 extern const char *const k_css_props[];
-js_value md_enumerate(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value md_get_display_media(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value nav_false(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value node_ctor(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc);

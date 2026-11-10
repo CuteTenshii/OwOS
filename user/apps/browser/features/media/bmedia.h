@@ -54,6 +54,15 @@ int media_remote_start(struct media_el *m, const struct remote_dev *dev, const c
 void media_remote_stop(struct media_el *m);
 int media_remote_conn(struct media_el *m);
 
+/* srcObject: while `on`, the element plays the camera's frames (a MediaStream from features/camera). */
+void media_set_stream(struct media_el *m, int on);
+/* The element's current picture as RGBA (camera-backed videos only), or NULL. */
+const unsigned char *media_frame_rgba(struct media_el *m, int *w, int *h);
+void media_video_size(struct media_el *m, int *w, int *h); /* videoWidth/videoHeight; 0 until a frame arrives */
+/* features/camera: newest frame as RGBA (black while every live track is disabled), or NULL before the first one.
+ * *seq changes with the pixels. Worker thread only; valid until the next camera_tick. */
+const unsigned char *camera_frame(int *w, int *h, unsigned *seq);
+
 /* Fire queued media events; returns the number dispatched. */
 int media_pump(void);
 

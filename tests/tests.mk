@@ -36,7 +36,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
   $(LIB)/gc/gc.c tests/host_math.c $(LIB)/opt.c $(LIB)/mutex.c
 MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(LIB)/json/json.c $(wildcard $(BROWSER)/features/svg/*.c) $(BROWSER)/imgdec.c $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/gfx/toggle.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/xml/xml.c $(LIB)/xml/xmltree.c $(LIB)/upnp/upnp.c $(LIB)/ntp/ntp.c $(LIB)/plist/plist.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(LIB)/media/tags.c $(LIB)/jpeg/jpeg.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
-  drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/video/dpaux.c drivers/video/edidparse.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
+  drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/usb/uvc_desc.c drivers/video/dpaux.c drivers/video/edidparse.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c \
   $(LIB)/zstd/zstd_common.c $(LIB)/zstd/fse.c $(LIB)/zstd/huf.c $(LIB)/zstd/zstd_enc.c kernel/arch/aarch64/fdt.c
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/features/battery/battery.c $(LIB)/uuid/uuid.c $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
@@ -65,7 +65,7 @@ EXTRA_zstd        := $(ZSTD_RENAME)
 EXTRA_a64_elf     := -Ikernel
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
-IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
+IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/uvc.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
          $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o $(B)/impl/pmm.o $(B)/impl/a64_elf.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
@@ -114,6 +114,9 @@ $(B)/impl/cache.o: $(BROWSER)/features/cache/cache.c
 	$(call COMPILE,-DCACHE_DIR='"$(RUN)/vary-cache"' -Dmkdir=vary_mkdir -Dunlink=vary_unlink -Dreaddir=vary_readdir -include tests/vary_fs.h)
 $(B)/impl/vary_fs.o: tests/vary_fs.c
 	@mkdir -p $(@D) && $(CC) -std=gnu11 -Itests -DCACHE_DIR='"$(RUN)/vary-cache"' -MMD -MP -c $< -o $@
+# The UVC driver against kernel service stand-ins (tests/uvc_host); sched_yield is renamed so the test supplies it
+$(B)/impl/uvc.o: drivers/usb/uvc.c
+	$(call COMPILE,-Itests/uvc_host -Dsched_yield=uvc_host_yield)
 $(B)/impl/tz.o: $(LIB)/tz/tz.c
 	$(call COMPILE,-DTZ_CONFIG_PATH='"$(RUN)/timezone"')
 $(B)/impl/desktop.o: $(LIB)/desktop/desktop.c
