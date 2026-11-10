@@ -33,6 +33,7 @@ static int g_state = ST_EMPTY;
 static int g_win;
 static int g_quit;             /* leave the main loop: closed, or handed off to a new instance */
 static int g_W = CW, g_H = CH; /* actual window client size */
+static bool g_fs;               /* the window covers the screen */
 static bool g_is_video;
 
 static int g_press = -1, g_press_ticks;
@@ -140,6 +141,20 @@ static void layout_video(void)
   g_H = g_dh + CTRL_H;
   g_dx = (g_W - g_dw) / 2;
   g_dy = 0;
+}
+
+/* Fullscreen: fit the frame above the transport strip, letterboxed and centred */
+static void place_video(void)
+{
+  int ah = g_H - CTRL_H;
+  int sx = g_W * 256 / g_vw, sy = ah * 256 / g_vh;
+  int s = sx < sy ? sx : sy;
+  g_dw = g_vw * s / 256;
+  g_dh = g_vh * s / 256;
+  g_dx = (g_W - g_dw) / 2;
+  g_dy = (ah - g_dh) / 2;
+  if (g_dw < 1 || g_dh < 1)
+    g_dw = g_dh = 1;
 }
 
 /* (Re)open the video decoder and decode its first frame */
@@ -639,7 +654,7 @@ static void render_audio(void)
 static void render_video_controls(void)
 {
   unsigned pos = g_shown_pts < 0 ? 0 : (unsigned)g_shown_pts;
-  draw_controls(g_dh, COL_HDR, pos, media_video_duration_ms(g_vid));
+  draw_controls(g_H - CTRL_H, COL_HDR, pos, media_video_duration_ms(g_vid));
 }
 
 /* input */
@@ -685,6 +700,29 @@ static void on_click(int mx, int my)
       return;
     }
   }
+}
+
+static void set_fullscreen(bool on)
+{
+  if (!g_is_video || g_fs == on)
+    return;
+  g_fs = on;
+  win_fullscreen(g_win, on);
+}
+
+/* The compositor resized the window (entering or leaving fullscreen) */
+static void on_resize(int w, int h)
+{
+  g_W = w;
+  g_H = h;
+  gfx_init(win_fb(), g_W, g_H);
+  if (g_fs)
+    place_video();
+  else
+    layout_video();
+  gfx_fill_rect(0, 0, g_W, g_H - CTRL_H, COL_VIDBG);
+  if (g_shown_pts >= 0)
+    blit_video();
 }
 
 /* video playback step */
@@ -777,6 +815,14 @@ int main(int argc, char **argv)
       }
       if (ev.type == WEV_MOUSE)
         on_click(ev.a, ev.b);
+      else if (ev.type == WEV_RESIZE)
+        on_resize(ev.a, ev.b);
+      else if (ev.type == WEV_DBLCLICK && g_is_video && ev.b < g_H - CTRL_H)
+        set_fullscreen(!g_fs);
+      else if (ev.type == WEV_KEY && (ev.a == 'f' || ev.a == 'F' || ev.a == KEY_F11))
+        set_fullscreen(!g_fs);
+      else if (ev.type == WEV_KEY && ev.a == 27)
+        set_fullscreen(false);
       else if (ev.type == WEV_KEY && ev.a == KEY_OPEN)
         g_quit = open_file();
       else if (ev.type == WEV_KEY && (ev.a == ' ' || ev.a == KEY_MEDIA_PLAY))

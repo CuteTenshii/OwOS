@@ -203,7 +203,7 @@ void tray_menu_toggle(const char *owner, int idx)
 
 bool tray_click(int mx, int my, bool right)
 {
-  if (my < screen_h - WM_BAR_H)
+  if (my < bar_top())
     return false;
   char cmd[TRAY_CMD_MAX] = "", id[TRAY_ID_MAX];
   struct tray_entry *menu = 0;

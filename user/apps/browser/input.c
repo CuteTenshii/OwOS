@@ -579,6 +579,11 @@ void handle_click(int mx, int my)
       cdp_pick_commit_offset(off);
       return;
     }
+    struct media_el *fsm = media_fullscreen();
+    if (fsm) {
+      media_fs_click(fsm, mx, my, 0, py, BW, BH - py);
+      return;
+    }
     /* A click on an <audio>/<video> controls widget is consumed by it (play/pause, seek, mute) */
     {
       int sc = B->pg->scroll;
@@ -791,6 +796,15 @@ void handle_key(char c, int mods)
       B->seq++;
     } else {
       field_key(&bm_name_tf, c, mods);
+      B->seq++;
+    }
+    return;
+  }
+  if ((unsigned char)c == 27 && g_fullscreen) {
+    int k = 0;
+    if (!B->evt_pending) {
+      sapp(B->evt_type, &k, sizeof B->evt_type, "escape");
+      B->evt_pending = 1;
       B->seq++;
     }
     return;

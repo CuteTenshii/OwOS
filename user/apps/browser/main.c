@@ -83,6 +83,7 @@ struct gfx_sel g_sel;
 bool g_selecting;
 
 int BW = 600, BH = 368; /* client size; grows/shrinks on resize */
+bool g_fullscreen;
 
 const unsigned palette[16] = {
     0x202830, 0x1a4fbf, 0xc01818, 0x108010, 0x9020a0, 0x9a6020, 0x107c90, 0x586070,
@@ -360,6 +361,12 @@ int main(int argc, char **argv)
       B->dlg_ok = ok;
       B->dlg_done = 1; /* release the worker (publish last) */
       B->seq++;        /* repaint the browser window */
+    }
+    if (B->fs_want != g_fullscreen) {
+      g_fullscreen = B->fs_want;
+      win_fullscreen(id, g_fullscreen);
+      B->recascade = 1;
+      B->seq++;
     }
     B->hist_len = tabs[active_tab]->hist_n;
 

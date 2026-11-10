@@ -70,7 +70,7 @@ void handle_input(int mx, int my, int buttons, int dz)
   /* Right-press */
   if (rdown && !prev_rdown) {
     tray_menu_close();
-    int bar_y = screen_h - WM_BAR_H;
+    int bar_y = bar_top();
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
     if (my >= bar_y && tray_click(mx, my, true)) {
       tb_menu_open = false;
@@ -94,7 +94,7 @@ void handle_input(int mx, int my, int buttons, int dz)
           flash_modal(mb);
         } else {
           raise_window(idx);
-          if (my >= cur[idx].y + WM_TITLE_H)
+          if (my >= cur[idx].y + titlebar_h(&cur[idx]))
             deliver_client(idx, WEV_RCLICK, mx, my);
         }
       }
@@ -143,7 +143,7 @@ void handle_input(int mx, int my, int buttons, int dz)
       }
       tb_menu_open = false;
     }
-    int bar_y = screen_h - WM_BAR_H;
+    int bar_y = bar_top();
     if (my >= bar_y && mx >= 0 && mx < START_W) { /* Start button */
       start_open = !start_open;
       prev_down = down;
@@ -213,7 +213,7 @@ void handle_input(int mx, int my, int buttons, int dz)
         rsz_oh = w->h;
         rsz_mx0 = mx;
         rsz_my0 = my;
-      } else if (my < w->y + WM_TITLE_H) { /* title bar */
+      } else if (my < w->y + titlebar_h(w)) { /* title bar */
         unsigned t = msec();
         int dx = mx - dbl_x, dy = my - dbl_y;
         if (dx < 0)

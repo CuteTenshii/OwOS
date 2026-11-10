@@ -110,6 +110,11 @@ struct maxrec {
   bool used;
   int sx, sy, sw, sh;
 };
+struct fsrec {
+  int id;
+  bool used;
+  int sx, sy, sw, sh;
+};
 #define PENDING_MAX 256
 #define PASTE_MAX 8192
 #define CONF_DISPLAY "/etc/display.conf"
@@ -187,6 +192,12 @@ extern struct maxrec maxed[WM_LIST_MAX];
 int is_maxed(int id);
 void maxed_forget_gone(void);
 void toggle_maximize(int slot);
+bool fs_active(int id);
+bool fs_top(void);
+int titlebar_h(const struct winrec *w);
+int bar_top(void);
+void fullscreen_sync(void);
+void fullscreen_refit(void);
 
 /* menus.c */
 extern bool start_open;

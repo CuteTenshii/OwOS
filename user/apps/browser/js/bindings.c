@@ -2137,6 +2137,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_element_proto, "focus", el_noop, 0);
   def_method(g_element_proto, "blur", el_noop, 0);
   def_method(g_element_proto, "scrollIntoView", el_noop, 0);
+  def_method(g_element_proto, "requestFullscreen", el_request_fullscreen, 0);
+  def_method(g_element_proto, "webkitRequestFullscreen", el_request_fullscreen, 0);
   def_method(g_element_proto, "scrollTo", el_noop, 2);
   def_method(g_element_proto, "scroll", el_noop, 2);
   def_method(g_element_proto, "normalize", el_noop, 0);
@@ -2194,7 +2196,14 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(g_document_proto, "ownerDocument", doc_null, 0);
   def_acc(g_document_proto, "textContent", doc_null, 0);
   def_acc(g_document_proto, "doctype", doc_null, 0);
-  def_acc(g_document_proto, "fullscreenElement", doc_null, 0);
+  def_acc(g_document_proto, "fullscreenElement", doc_fullscreen_element, 0);
+  def_acc(g_document_proto, "webkitFullscreenElement", doc_fullscreen_element, 0);
+  def_acc(g_document_proto, "fullscreen", doc_is_fullscreen, 0);
+  def_acc(g_document_proto, "webkitIsFullScreen", doc_is_fullscreen, 0);
+  def_acc(g_document_proto, "fullscreenEnabled", el_true, 0);
+  def_acc(g_document_proto, "webkitFullscreenEnabled", el_true, 0);
+  def_method(g_document_proto, "exitFullscreen", doc_exit_fullscreen, 0);
+  def_method(g_document_proto, "webkitExitFullscreen", doc_exit_fullscreen, 0);
   def_acc(g_document_proto, "scrollingElement", doc_root_el, 0);
   def_acc(g_document_proto, "scripts", doc_scripts, 0);
   def_acc(g_document_proto, "forms", doc_forms, 0);

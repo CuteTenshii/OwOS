@@ -298,6 +298,8 @@ int titlebtn_box(const struct winrec *w, int kind, int *bx, int *by)
 }
 int titlebtn_hit(const struct winrec *w, int mx, int my)
 {
+  if (fs_active(w->id))
+    return -1;
   for (int k = 0; k < 3; k++) {
     int bx, by;
     if (!titlebtn_box(w, k, &bx, &by))
@@ -364,7 +366,7 @@ void taskbar_layout_cached(int right)
 
 int taskbar_hit(int mx, int my)
 {
-  if (my < screen_h - WM_BAR_H)
+  if (my < bar_top())
     return -1;
   taskbar_layout_cached(tb_band_right);
   for (int k = 0; k < tb_cache.n; k++)
@@ -396,7 +398,7 @@ static int resize_edge(const struct winrec *w, int mx, int my)
 
 int resize_hit(const struct winrec *w, int mx, int my)
 {
-  if (!(w->flags & UWIN_F_RESIZABLE))
+  if (!(w->flags & UWIN_F_RESIZABLE) || fs_active(w->id))
     return 0;
   if (mx >= w->x + w->w - WM_GRIP && mx < w->x + w->w && my >= w->y + w->h - WM_GRIP && my < w->y + w->h)
     return RZ_R | RZ_B;
@@ -434,7 +436,7 @@ int pick_cursor(int mx, int my)
     return CUR_HAND;
   if (tray_menu_inside(mx, my))
     return CUR_HAND;
-  int bar_y = screen_h - WM_BAR_H;
+  int bar_y = bar_top();
   if (my >= bar_y) {
     if (mx >= 0 && mx < START_W)
       return CUR_HAND;
@@ -493,4 +495,66 @@ void toggle_maximize(int slot)
       }
     win_set_geom(w->id, 0, 0, screen_w, screen_h - WM_BAR_H);
   }
+}
+
+/* Fullscreen: a client asks via UWIN_F_FULLSCREEN, the compositor covers the screen and drops the chrome */
+static struct fsrec fsrecs[WM_LIST_MAX];
+bool fs_active(int id)
+{
+  for (int i = 0; i < WM_LIST_MAX; i++)
+    if (fsrecs[i].used && fsrecs[i].id == id)
+      return true;
+  return false;
+}
+bool fs_top(void)
+{
+  int t = topmost_visible();
+  return t >= 0 && fs_active(cur[t].id);
+}
+int titlebar_h(const struct winrec *w) { return fs_active(w->id) ? 0 : WM_TITLE_H; }
+int bar_top(void) { return fs_top() ? screen_h : screen_h - WM_BAR_H; }
+
+void fullscreen_sync(void)
+{
+  for (int i = 0; i < WM_LIST_MAX; i++) {
+    struct fsrec *f = &fsrecs[i];
+    int s = f->used ? slot_of(f->id) : -1;
+    if (f->used && s < 0)
+      f->used = false;
+    else if (f->used && !(cur[s].flags & UWIN_F_FULLSCREEN)) {
+      win_set_geom(f->id, f->sx, f->sy, f->sw, f->sh);
+      f->used = false;
+      cur[s].x = f->sx;
+      cur[s].y = f->sy;
+      cur[s].w = f->sw;
+      cur[s].h = f->sh;
+    }
+  }
+  for (int s = 0; s < nwin; s++) {
+    struct winrec *w = &cur[s];
+    if (!(w->flags & UWIN_F_FULLSCREEN) || fs_active(w->id))
+      continue;
+    struct fsrec *f = 0;
+    for (int i = 0; i < WM_LIST_MAX && !f; i++)
+      if (!fsrecs[i].used)
+        f = &fsrecs[i];
+    if (!f)
+      break;
+    *f = (struct fsrec){w->id, true, w->x, w->y, w->w, w->h};
+    win_set_geom(w->id, 0, 0, screen_w, screen_h);
+    w->x = w->y = 0;
+    w->w = screen_w;
+    w->h = screen_h;
+    raise_family_id(w->id);
+    start_open = false;
+    tb_menu_open = false;
+    force_full = true;
+  }
+}
+
+void fullscreen_refit(void)
+{
+  for (int i = 0; i < WM_LIST_MAX; i++)
+    if (fsrecs[i].used)
+      win_set_geom(fsrecs[i].id, 0, 0, screen_w, screen_h);
 }

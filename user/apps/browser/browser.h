@@ -20,9 +20,10 @@ const char *browser_ua(void);
 const char *browser_ua_version(void); /* browser_ua() minus "Mozilla/" (navigator.appVersion) */
 
 extern int BW, BH; /* client size (mutable: the window is resizable)    */
-#define MENU_H 18  /* top app-menu bar height (above the address bar)  */
-#define TAB_H 24   /* tab strip height (between menu and address bar)  */
-#define ADDR_H 26  /* address-bar height                               */
+extern bool g_fullscreen; /* the window covers the screen: no browser chrome  */
+#define MENU_H (g_fullscreen ? 0 : 18) /* top app-menu bar height (above the address bar)  */
+#define TAB_H (g_fullscreen ? 0 : 24)  /* tab strip height (between menu and address bar)  */
+#define ADDR_H (g_fullscreen ? 0 : 26) /* address-bar height                               */
 #define GLYPH_W 8
 #define GLYPH_H 16
 #define SCROLL_W 10                 /* right-edge scrollbar width                       */
@@ -270,6 +271,8 @@ struct browser {
   volatile int focus_kind;     /* worker -> main: 0 none, 1 text input, 2 textarea */
 
   /* History API: the main thread owns the tabs[] hist list and nav buttons. */
+  volatile int fs_want;   /* worker -> main: 1 = fill the screen with the window, 0 = restore */
+  struct dom_node *fs_node; /* main -> worker: element a "fsenter" event fullscreens */
   volatile int hist_go;   /* worker -> main: -1 back, +1 forward, 0 none */
   volatile int hist_nav;  /* worker -> main: a pushState/replaceState URL */
   int hist_replace;       /* the queued hist_nav replaces, not pushes     */
@@ -368,7 +371,8 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
 int js_has_listeners(void); /* any listener registered */
 int js_before_unload(void); /* worker: fire beforeunload; 0 if the user chose to stay */
 void js_page_hide(void);    /* worker: page is going away; fire visibilitychange (hidden) */
-bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
+bool js_escape_key(void);   /* Escape: leave fullscreen, else close the topmost modal dialog or auto popover */
+bool js_fullscreen_enter(struct dom_node *n); /* worker: make `n` the fullscreen element; false if not in the document */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */
 int js_intersection_pump(void);  /* report IntersectionObserver changes; -> # callbacks fired */

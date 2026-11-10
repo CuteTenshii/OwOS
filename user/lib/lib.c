@@ -173,6 +173,8 @@ int win_settitle(int id, const char *title) { return syscall(SYS_WIN_TITLE, id, 
 
 int win_resizable(int id, int on) { return syscall(SYS_WIN_RESIZABLE, id, on, 0); }
 
+int win_fullscreen(int id, int on) { return syscall(SYS_WIN_FULLSCREEN, id, on, 0); }
+
 int win_cursor(int id, int shape) { return syscall(SYS_WIN_CURSOR, id, shape, 0); }
 
 /* Phase 1 user-space compositor wrappers (root-only) */

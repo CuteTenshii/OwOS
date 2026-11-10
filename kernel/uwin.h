@@ -51,6 +51,7 @@ struct winrec {
 #define UWIN_F_MINIMIZED 0x04
 #define UWIN_F_MAXIMIZED 0x08
 #define UWIN_F_RESIZABLE 0x10
+#define UWIN_F_FULLSCREEN 0x40 /* client asked to cover the screen with no chrome */
 #define UWIN_F_MODAL                                                                                                   \
   0x20 /* a transient child that blocks its parent family                                                              \
         */
@@ -68,6 +69,7 @@ int uwin_poll(int id, struct win_event *out);         /* 1 event / 0 none / -1 *
 int uwin_close(int id);
 int uwin_set_title(int id, const char *title);
 int uwin_set_resizable(int id, int on);
+int uwin_set_fullscreen(int id, int on);
 int uwin_set_cursor(int id, int cursor); /* WIN_CURSOR_*, 0..UWIN_CURSOR_LAST */
 
 /* Link `id` to a transient `parent` (modal blocks the family); parent < 0 clears. 0 / -1. */

@@ -315,6 +315,7 @@ void css_truncate(css_sheet *sheet, int mark); /* drop every rule added after cs
 void css_apply_inline(const char *decls, struct css_style *out);
 /* Fold HTML presentational attrs into *out (lowest priority). */
 void css_apply_attrs(const struct dom_node *el, struct css_style *out);
+void css_apply_fullscreen(const struct dom_node *el, struct css_style *out); /* the element in fullscreen: overrides the cascade */
 
 /* Cascade-winning background-color for `el` as 0xAARRGGBB in *out; returns 1 if set. */
 int css_bg_argb(css_sheet *sheet, const struct dom_node *el, unsigned *out);

@@ -897,11 +897,14 @@ struct mrects {
   int play_x, play_y, play_w;
   int seek_x, seek_y, seek_w, seek_h;
   int vol_x, vol_y, vol_w;
+  int fs_x, fs_w; /* fullscreen button (video only; fs_w 0 = none) */
+  int time_right; /* right edge of the time text */
 };
 
-static void media_rects(struct media_el *m, int x0, int y0, int w, struct mrects *r)
+/* `fsh` > 0: the widget fills a fullscreen pane that tall, instead of the inline size */
+static void media_rects(struct media_el *m, int x0, int y0, int w, int fsh, struct mrects *r)
 {
-  int ph = (m->kind == MK_VIDEO) ? media_poster_h(w) : 0;
+  int ph = (m->kind == MK_VIDEO) ? (fsh > MBAR_H ? fsh - MBAR_H : media_poster_h(w)) : 0;
   int bar_y = y0 + ph;
   int btn = 22, my = bar_y + (MBAR_H - btn) / 2;
   r->x0 = x0;
@@ -916,8 +919,11 @@ static void media_rects(struct media_el *m, int x0, int y0, int w, struct mrects
   r->vol_x = x0 + w - 8 - btn;
   r->vol_y = my;
   /* seek track fills the gap between the play button and the time/volume block */
+  r->fs_w = m->kind == MK_VIDEO ? btn : 0;
+  r->fs_x = r->vol_x - 8 - btn;
+  r->time_right = (r->fs_w ? r->fs_x : r->vol_x) - 8;
   r->seek_x = r->play_x + btn + 10;
-  r->seek_w = (r->vol_x - 110) - r->seek_x; /* leave room for "M:SS / M:SS" */
+  r->seek_w = (r->time_right - 102) - r->seek_x; /* leave room for "M:SS / M:SS" */
   if (r->seek_w < 24)
     r->seek_w = 24;
   r->seek_h = 6;
@@ -1018,13 +1024,13 @@ static void blit_video_frame(struct media_el *m, int x0, int y0, int w, int ph, 
   }
 }
 
-static void media_draw(struct media_el *m, int x0, int y0, int w, int ct, int cb)
+static void media_draw(struct media_el *m, int x0, int y0, int w, int fsh, int ct, int cb)
 {
   struct mrects r;
   int playing = (m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying);
   unsigned pos = m->ms ? media_source_position_ms(m->ms) : (m->vid ? (unsigned)m->vpos_ms : 0);
   unsigned dur = m->ms ? media_source_duration_ms(m->ms) : (m->vid ? m->vdur_ms : 0);
-  media_rects(m, x0, y0, w, &r);
+  media_rects(m, x0, y0, w, fsh, &r);
 
   if (m->kind == MK_VIDEO) { /* decoded frame, or a black poster */
     if (m->vid && m->vshown) {
@@ -1066,10 +1072,19 @@ static void media_draw(struct media_el *m, int x0, int y0, int w, int ct, int cb
       sapp(line, &k, sizeof line, tt);
     } else
       sapp(line, &k, sizeof line, "--:--");
-    mtext(r.vol_x - 8 - gfx_ui_width(line), r.bar_y + (MBAR_H - UIFONT_H) / 2, line, 0xb6bdc7, ct, cb);
+    mtext(r.time_right - gfx_ui_width(line), r.bar_y + (MBAR_H - UIFONT_H) / 2, line, 0xb6bdc7, ct, cb);
   }
 
   draw_speaker_glyph(r.vol_x + 3, r.vol_y + 5, m->muted, 0xe6ebf2, ct, cb);
+  if (r.fs_w) {
+    int bx = r.fs_x + 5, by = r.vol_y + 5, s = 4; /* four corner brackets */
+    for (int cx = 0; cx < 2; cx++)
+      for (int cy = 0; cy < 2; cy++) {
+        int px = bx + cx * 11, py = by + cy * 11;
+        mfill(cx ? px - s + 1 : px, py, s, 1, 0xe6ebf2, ct, cb);
+        mfill(px, cy ? py - s + 1 : py, 1, s, 0xe6ebf2, ct, cb);
+      }
+  }
 }
 
 static struct media_el *media_doc_find(int start)
@@ -1100,17 +1115,48 @@ int media_el_height(struct media_el *m, int paw) { return m ? media_total_h(m, p
 void media_el_draw(struct media_el *m, int x0, int y0, int paw, int ct, int cb)
 {
   if (m)
-    media_draw(m, x0, y0, paw, ct, cb);
+    media_draw(m, x0, y0, paw, 0, ct, cb);
+}
+
+void media_fs_draw(struct media_el *m, int x0, int y0, int w, int h, int ct, int cb)
+{
+  if (m)
+    media_draw(m, x0, y0, w, h, ct, cb);
+}
+
+/* A <video> that is the fullscreen element, or inside it (a player wrapper), fills the pane */
+struct media_el *media_fullscreen(void)
+{
+  for (struct media_el *m = media_doc_first(); m; m = media_doc_next(m))
+    if (m->kind == MK_VIDEO)
+      for (const struct dom_node *n = m->node; n; n = n->parent)
+        if (dom_get_attr(n, "fs-top"))
+          return m;
+  return 0;
+}
+
+/* Hand a fullscreen enter/exit for `m` to the worker, which owns the DOM */
+static void media_post_fs(struct media_el *m, const char *type)
+{
+  int k = 0;
+  if (B->evt_pending)
+    return;
+  B->fs_node = m->node;
+  sapp(B->evt_type, &k, sizeof B->evt_type, type);
+  B->evt_pending = 1;
+  B->seq++;
 }
 
 /* Act on a click within the widget drawn at (x0,y0); caller checked the hit. */
-void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw)
+static void media_click(struct media_el *m, int mx, int my, int x0, int y0, int paw, int fsh)
 {
   struct mrects r;
   if (!m)
     return;
-  media_rects(m, x0, y0, paw, &r);
-  if (mx >= r.play_x && mx < r.play_x + r.play_w && my >= r.play_y - 4 && my < r.play_y + r.play_w + 4) {
+  media_rects(m, x0, y0, paw, fsh, &r);
+  if (r.fs_w && mx >= r.fs_x && mx < r.fs_x + r.fs_w && my >= r.bar_y && my < r.bar_y + MBAR_H) {
+    media_post_fs(m, fsh ? "escape" : "fsenter");
+  } else if (mx >= r.play_x && mx < r.play_x + r.play_w && my >= r.play_y - 4 && my < r.play_y + r.play_w + 4) {
     if (media_paused(m))
       media_play(m);
     else
@@ -1128,6 +1174,13 @@ void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw)
       media_pause(m);
   }
   B->seq++;
+}
+
+void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw) { media_click(m, mx, my, x0, y0, paw, 0); }
+
+void media_fs_click(struct media_el *m, int mx, int my, int x0, int y0, int w, int h)
+{
+  media_click(m, mx, my, x0, y0, w, h);
 }
 
 int media_active(void)

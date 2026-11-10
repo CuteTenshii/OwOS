@@ -111,6 +111,15 @@ static void draw_close_button(int bx, int by, unsigned bg)
 
 void client_rect(const struct winrec *w, int *x, int *y, int *width, int *height)
 {
+  if (fs_active(w->id)) {
+    *x = w->x;
+    *y = w->y;
+    if (width)
+      *width = w->w;
+    if (height)
+      *height = w->h;
+    return;
+  }
   *x = w->x + WM_BORDER;
   *y = w->y + WM_TITLE_H;
   if (width)
@@ -125,8 +134,17 @@ static void draw_window(const struct winrec *w, bool focused)
   unsigned frame = 0x10141a;
   if (w->id == flash_id && flash_frames > 0 && ((flash_frames >> 1) & 1))
     title_bg = 0xf0a020;
+  bool fs = fs_active(w->id);
 
-  gfx_fill_rect(w->x, w->y, w->w, w->h, frame);
+  gfx_fill_rect(w->x, w->y, w->w, w->h, fs ? 0x000000 : frame);
+  if (fs) {
+    int fx, fy, fw, fh;
+    client_rect(w, &fx, &fy, &fw, &fh);
+    const struct winmap *fm = client_for(w->id);
+    if (fm && fm->vaddr)
+      blit_client(fx, fy, (const unsigned *)fm->vaddr, fm->w < fw ? fm->w : fw, fm->h < fh ? fm->h : fh, fm->stride);
+    return;
+  }
   gfx_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
 
   const unsigned *icon = window_icon(w);
@@ -415,13 +433,14 @@ void compose(int mx, int my)
   for (int i = 0; i < nwin; i++)
     if (win_visible(&cur[i]) && clip_hits(cur[i].x, cur[i].y, cur[i].w, cur[i].h) && !occluded(i))
       draw_window(&cur[i], i == top);
-  if (clip_hits(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H))
+  bool fs = fs_top();
+  if (!fs && clip_hits(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H))
     draw_taskbar();
-  if (start_open)
+  if (start_open && !fs)
     draw_start_menu();
-  if (tb_menu_open)
+  if (tb_menu_open && !fs)
     draw_tb_menu();
-  if (tray_menu_open)
+  if (tray_menu_open && !fs)
     tray_menu_draw();
   for (int i = 0; i < MAXCRASHWIN; i++)
     if (crashwins[i].used)

@@ -402,6 +402,21 @@ int uwin_set_resizable(int id, int on)
   return 0;
 }
 
+int uwin_set_fullscreen(int id, int on)
+{
+  struct uwin *u = owned(id);
+  if (!u)
+    return -1;
+  uintptr_t fl = irq_save();
+  if (on)
+    u->flags |= UWIN_F_FULLSCREEN;
+  else
+    u->flags &= ~UWIN_F_FULLSCREEN;
+  u->present_seq++;
+  irq_restore(fl);
+  return 0;
+}
+
 int uwin_set_cursor(int id, int cursor)
 {
   struct uwin *u = owned(id);
@@ -664,7 +679,10 @@ int uwin_set_geom(int id, int x, int y, int w, int h)
   u->fy = y;
   u->fw = w;
   u->fh = h;
-  uwin_resize_client(u, id, w - 2 * WM_BORDER, h - WM_TITLE_H - WM_BORDER);
+  if (u->flags & UWIN_F_FULLSCREEN)
+    uwin_resize_client(u, id, w, h);
+  else
+    uwin_resize_client(u, id, w - 2 * WM_BORDER, h - WM_TITLE_H - WM_BORDER);
   return 0;
 }
 

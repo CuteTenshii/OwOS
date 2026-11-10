@@ -202,9 +202,95 @@ bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter)
   return true;
 }
 
-/* Escape: close the topmost open modal dialog (after a cancelable `cancel`) or auto popover */
+/* Fullscreen API: the fullscreen element carries the "fs-top" attribute (a top-layer box, see css_apply_fullscreen)
+ * and B->fs_want asks the main thread to make the window fill the screen. */
+
+static struct dom_node *fs_current(void)
+{
+  for (struct dom_node *p = g_doc_root; p; p = tree_next(p))
+    if (p->type == DOM_ELEMENT && dom_get_attr(p, "fs-top"))
+      return p;
+  return 0;
+}
+
+static void fs_leave(void)
+{
+  struct dom_node *n = fs_current();
+  if (n)
+    dom_remove_attr(n, "fs-top");
+  B->fs_want = 0;
+  B->seq++;
+  if (n)
+    fire_state_event(n, "fullscreenchange", 0, 0);
+}
+
+/* Make `n` the fullscreen element; false if it is not in the document */
+bool js_fullscreen_enter(struct dom_node *n)
+{
+  struct dom_node *top = n;
+  while (top && top->parent)
+    top = top->parent;
+  if (!n || n->type != DOM_ELEMENT || top != g_doc_root)
+    return false;
+  struct dom_node *old = fs_current();
+  if (old == n)
+    return true;
+  if (old)
+    dom_remove_attr(old, "fs-top");
+  dom_set_attr(n, "fs-top", "");
+  B->fs_want = 1;
+  B->seq++;
+  fire_state_event(n, "fullscreenchange", 0, 0);
+  return true;
+}
+
+js_value el_request_fullscreen(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  if (!js_fullscreen_enter(node_of(t)))
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
+                                                  "Element is not connected to the document"));
+  return js_promise_resolved(ctx, js_undef());
+}
+
+js_value doc_exit_fullscreen(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (!fs_current())
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Document not active"));
+  fs_leave();
+  return js_promise_resolved(ctx, js_undef());
+}
+
+js_value doc_fullscreen_element(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = fs_current();
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return n ? wrap_node(n) : js_null();
+}
+
+js_value doc_is_fullscreen(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_bool(fs_current() != 0);
+}
+
+/* Escape: leave fullscreen, else close the topmost open modal dialog (after a cancelable `cancel`) or auto popover */
 bool js_escape_key(void)
 {
+  if (fs_current() || B->fs_want) {
+    fs_leave();
+    return true;
+  }
   struct dom_node *top = 0;
   for (struct dom_node *p = g_doc_root; p; p = tree_next(p)) {
     if (p->type != DOM_ELEMENT)

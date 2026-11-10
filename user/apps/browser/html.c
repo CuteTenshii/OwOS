@@ -302,6 +302,7 @@ void compute_style(struct dom_node *el, struct css_style *cs)
   const char *inl = dom_get_attr(el, "style");
   if (inl && csp_style_attr_ok())
     css_apply_inline(inl, cs);
+  css_apply_fullscreen(el, cs);
   if (!el->computed_style)
     el->computed_style = malloc(sizeof *cs);
   if (el->computed_style) {
@@ -644,6 +645,7 @@ static void layout_dom(void)
 void html_page_teardown(void)
 {
   js_page_end();
+  B->fs_want = 0; /* fullscreen ends with the document */
   canvas_page_end(g_live_dom);
   media_page_teardown(); /* stop playback + free this page's media */
   if (g_live_dom) {

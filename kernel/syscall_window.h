@@ -9,6 +9,7 @@ void syscall_window_poll(struct registers *r);
 void syscall_window_close(struct registers *r);
 void syscall_window_title(struct registers *r);
 void syscall_window_resizable(struct registers *r);
+void syscall_window_fullscreen(struct registers *r);
 void syscall_window_cursor(struct registers *r);
 void syscall_window_set_parent(struct registers *r);
 void syscall_window_fb(struct registers *r);

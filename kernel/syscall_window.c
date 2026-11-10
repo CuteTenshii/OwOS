@@ -56,6 +56,8 @@ void syscall_window_title(struct registers *r)
 
 void syscall_window_resizable(struct registers *r) { r->eax = (uint32_t)uwin_set_resizable((int)r->ebx, (int)r->ecx); }
 
+void syscall_window_fullscreen(struct registers *r) { r->eax = (uint32_t)uwin_set_fullscreen((int)r->ebx, (int)r->ecx); }
+
 void syscall_window_cursor(struct registers *r) { r->eax = (uint32_t)uwin_set_cursor((int)r->ebx, (int)r->ecx); }
 
 void syscall_window_set_parent(struct registers *r)

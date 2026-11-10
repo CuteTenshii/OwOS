@@ -161,6 +161,7 @@ int win_owned(int pid);
 static inline unsigned *win_fb(void) { return (unsigned *)WIN_FB_ADDR; }
 
 int win_settitle(int id, const char *title); /* set the window's title bar */
+int win_fullscreen(int id, int on);          /* ask the compositor to cover the screen / restore */
 int win_resizable(int id, int on);           /* opt the window in/out of user resizing */
 
 /* Make `id` a transient child of `parent` (stacked above, hidden from taskbar) */
@@ -234,6 +235,7 @@ struct winrec {
 #define UWIN_F_MINIMIZED 0x04
 #define UWIN_F_MAXIMIZED 0x08
 #define UWIN_F_RESIZABLE 0x10
+#define UWIN_F_FULLSCREEN 0x40 /* covers the screen, no chrome */
 #define UWIN_F_MODAL 0x20 /* transient child that blocks its parent family */
 struct winmap {
   unsigned vaddr;

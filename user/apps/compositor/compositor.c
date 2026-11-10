@@ -70,9 +70,12 @@ static void check_resolution(void)
     return;
 
   bind_mode();
+  fullscreen_refit();
   for (int i = 0; i < nwin; i++) {
     struct winrec *w = &cur[i];
     int m = is_maxed(w->id);
+    if (fs_active(w->id))
+      continue;
     if (m >= 0) {
       win_set_geom(w->id, 0, 0, screen_w, work_bottom());
       continue;
@@ -150,6 +153,7 @@ int main(void)
       nwin = 0;
     refresh_maps(); /* maps must be current before compose */
     zorder_apply(); /* reconcile z-stack; reorder cur[] bottom->top */
+    fullscreen_sync();
     taskbar_layout_dirty = true;
     center_new_dialogs(); /* place a fresh dialog over its parent */
 

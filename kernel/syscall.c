@@ -182,7 +182,7 @@ void syscall_init(void)
 
 typedef void (*syscall_handler_t)(struct registers *r);
 
-static const syscall_handler_t syscall_handlers[SYS_SET_TLS + 1] = {
+static const syscall_handler_t syscall_handlers[SYS_WIN_FULLSCREEN + 1] = {
     [SYS_WRITE] = syscall_io_write,
     [SYS_EXIT] = syscall_process_exit,
     [SYS_READ] = syscall_io_read,
@@ -277,12 +277,13 @@ static const syscall_handler_t syscall_handlers[SYS_SET_TLS + 1] = {
     [SYS_ENV] = syscall_env,
     [SYS_FB_CURSOR] = syscall_graphics_fb_cursor,
     [SYS_SET_TLS] = syscall_process_set_tls,
+    [SYS_WIN_FULLSCREEN] = syscall_window_fullscreen,
 };
 
 void syscall_dispatch(struct registers *r)
 {
   uint32_t number = r->eax;
-  if (number > SYS_SET_TLS || !syscall_handlers[number]) {
+  if (number > SYS_WIN_FULLSCREEN || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
     return;
   }

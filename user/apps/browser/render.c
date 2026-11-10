@@ -320,20 +320,22 @@ void render(void)
     labels[i] = tabs[i]->label[0] ? tabs[i]->label : "New Tab";
     icons[i] = tabs[i]->page.favicon_ok ? tabs[i]->page.favicon : 0;
   }
-  tabbar_draw(&tab_strip, 0, MENU_H, BW, labels, icons, shown, active_tab < shown ? active_tab : 0);
+  if (!g_fullscreen) {
+    tabbar_draw(&tab_strip, 0, MENU_H, BW, labels, icons, shown, active_tab < shown ? active_tab : 0);
 
-  /* address bar (below the tab strip) */
-  gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
-  struct rect rb, rf, rrl, rtf, rst;
-  addr_layout(&rb, &rf, &rrl, &rtf, &rst);
-  struct tab *at = tabs[active_tab];
-  button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90", /* ← */
-              hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
-  button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92", /* → */
-              hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
-  reload_btn_draw(&rrl);
-  textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
-  star_btn_draw(&rst);
+    /* address bar (below the tab strip) */
+    gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
+    struct rect rb, rf, rrl, rtf, rst;
+    addr_layout(&rb, &rf, &rrl, &rtf, &rst);
+    struct tab *at = tabs[active_tab];
+    button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90", /* ← */
+                hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
+    button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92", /* → */
+                hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+    reload_btn_draw(&rrl);
+    textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
+    star_btn_draw(&rst);
+  }
 
   /* content pane , shrinks to the left of the devtools dock when it is open */
   int right = devtools_visible() ? devtools_left() : BW;
@@ -359,7 +361,11 @@ void render(void)
     draw_page_scrollbar(pw, py, phh, B->pg->scroll, g_fr->doc_h, phh);
   }
 
-  if (hover_url[0])
+  struct media_el *fsm = media_fullscreen();
+  if (fsm) {
+    gfx_fill_rect(0, py, BW, phh, 0x000000);
+    media_fs_draw(fsm, 0, py, BW, phh, py, py + phh);
+  } else if (hover_url[0])
     draw_hover_status();
 
   /* Devtools element highlight */
@@ -381,8 +387,10 @@ void render(void)
   page_flags[2] = is_loading() ? 0 : MENU_DISABLED;
   edit_flags[0] = gfx_sel_has(&g_sel) ? 0 : MENU_DISABLED; /* Copy: only with a selection */
   bookmarks_menu_sync();
-  gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
-  menubar_draw(&menubar);
+  if (!g_fullscreen) {
+    gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
+    menubar_draw(&menubar);
+  }
   field_menu_draw();
 
   g_painted.valid = true;
@@ -439,6 +447,10 @@ void damage_lines(int lo, int hi)
 /* A playing <audio>/<video> widget ticks: dirty just the visible widget rows. */
 void damage_media(void)
 {
+  if (media_fullscreen()) {
+    B->seq++;
+    return;
+  }
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   int y0 = py + phh, y1 = py;
@@ -471,6 +483,7 @@ bool render_incremental(unsigned seq_delta, int id)
       g_painted.bh != BH || g_painted.sig != render_sig())
     return false;
   if (devtools_visible() || bm_panel_open || menu_any_open() || tabs[active_tab]->crashed ||
+      media_fullscreen() ||
       B->pg->mode == MODE_IMAGE || is_loading() || !browser_surface_ready())
     return false;
   int py, phh, rows;
@@ -529,6 +542,8 @@ bool menu_any_open(void)
 /* Repaint only the address-bar strip */
 void render_addr(void)
 {
+  if (g_fullscreen)
+    return;
   browser_buf_lock();
   gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
   struct rect rb, rf, rrl, rtf, rst;

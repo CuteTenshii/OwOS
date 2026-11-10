@@ -529,6 +529,10 @@ static void walk_element_inner(struct dom_node *el)
     if (dom_get_attr(el, "dialog-modal") && dom_get_attr(el, "open") &&
         css_backdrop_argb(sheet_for(el), el, &cs.backdrop))
       cs.backdrop_set = 1;
+    if (dom_get_attr(el, "fs-top")) {
+      cs.backdrop = 0xff000000u;
+      cs.backdrop_set = 1;
+    }
     if (cs.border_color < 0)
       cs.border_color = (int)sty_cur.fg;    /* a border without a colour is currentColor */
     cs.visibility = sty_cur.hidden ? 0 : 1; /* the inherited value, not just this rule's */

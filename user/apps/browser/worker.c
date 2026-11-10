@@ -180,7 +180,9 @@ static void worker_dispatch_event(void)
     }
     return;
   }
-  if (streq(B->evt_type, "escape")) {
+  if (streq(B->evt_type, "fsenter")) {
+    need_relayout = js_fullscreen_enter(B->fs_node);
+  } else if (streq(B->evt_type, "escape")) {
     need_relayout = js_escape_key();
   } else if (streq(B->evt_type, "keyinput")) {
     struct dom_node *f = html_focus(); /* evt_x carries the char */

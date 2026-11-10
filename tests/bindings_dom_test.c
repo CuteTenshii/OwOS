@@ -204,6 +204,24 @@ static void test_popover_api_show_hide(void)
       "attribute: no-op');\n");
 }
 
+static void test_fullscreen_api(void)
+{
+  run_script("var d=document, a=d.createElement('div'), b=d.createElement('div'), loose=d.createElement('div'), "
+             "log=[];\n"
+             "d.body.appendChild(a); d.body.appendChild(b);\n"
+             "d.addEventListener('fullscreenchange', function(e){ log.push(e.target===a?'a':e.target===b?'b':'?') });\n"
+             "expect(d.fullscreenElement===null && d.fullscreen===false && d.fullscreenEnabled===true, 'idle');\n"
+             "a.requestFullscreen();\n"
+             "expect(d.fullscreenElement===a && d.fullscreen===true && log.join()==='a', 'enter: '+log);\n"
+             "b.requestFullscreen();\n"
+             "expect(d.fullscreenElement===b && log.join()==='a,b', 'a new element replaces the old: '+log);\n"
+             "d.exitFullscreen();\n"
+             "expect(d.fullscreenElement===null && log.join()==='a,b,b', 'exit fires on the leaving element: '+log);\n"
+             "var r=null; d.exitFullscreen().catch(function(e){ r=e });\n"
+             "var q=null; loose.requestFullscreen().catch(function(e){ q=e });\n"
+             "expect(d.fullscreenElement===null, 'a detached element cannot go fullscreen');\n");
+}
+
 static void test_custom_elements_lifecycle_and(void)
 {
   run_script("var log=[];\n"
@@ -880,6 +898,7 @@ int main(void)
   test("details toggles from its summary", test_details_summary_toggle);
   test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
   test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
+  test("fullscreen API: request, replace, exit and events", test_fullscreen_api);
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
   test("custom elements: nested elements upgrade on insert, clone and innerHTML", test_custom_elements_nested_upgrade);
   test("URL.createObjectURL stores Blob bytes until revoked", test_blob_object_urls);

@@ -940,13 +940,16 @@ static void layout_overlays(int paw)
     if (b->kind == LB_BLOCK && b->spec_w < 0 && b->pct_w < 0 && !(b->off_l >= 0 && b->off_r >= 0))
       b->spec_w = slice_maxcontent(b->t0, b->t1) + (b->border_box ? frame : 0); /* shrink to fit */
     b->off_t = b->off_b = -1;                                                   /* placed vertically at paint time */
-    flow_box(bx, i, 4, paw);
+    if (b->node && dom_get_attr(b->node, "fs-top"))
+      flow_box(bx, i, 0, paw + 8); /* the fullscreen element covers the pane edge to edge */
+    else
+      flow_box(bx, i, 4, paw);
     b->spec_w = saved_w;
     b->off_t = saved_t;
     b->off_b = saved_b;
     rec.row1 = o->lt.n;
     rec.h = o->geo[i].h;
-    rec.modal = b->node && dom_get_attr(b->node, "dialog-modal");
+    rec.modal = b->node && (dom_get_attr(b->node, "dialog-modal") || dom_get_attr(b->node, "fs-top"));
     for (int q = 0; q < o->n_img; q++) /* overlay images are not painted */
       if (o->img_pos[q] >= b->t0 && o->img_pos[q] < b->t1)
         o->img_row[q] = -1;

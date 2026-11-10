@@ -94,6 +94,7 @@
 #define SYS_TTY 91
 #define SYS_ENV 92
 #define SYS_FB_CURSOR 93
+#define SYS_WIN_FULLSCREEN 95 /* ebx = window id, ecx = on */
 #define SYS_SET_TLS 94 /* ebx = thread pointer: the base of the %gs segment (0 = none) */
 
 /* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */

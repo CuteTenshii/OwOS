@@ -952,6 +952,21 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
   }
 }
 
+void css_apply_fullscreen(const struct dom_node *el, struct css_style *out)
+{
+  if (!el || el->type != DOM_ELEMENT || !dom_get_attr(el, "fs-top"))
+    return;
+  out->pos = CSS_POS_FIXED;
+  out->top = out->right = out->bottom = out->left = 0;
+  out->width = out->height = out->max_w = out->max_h = out->min_w = out->min_h = -1;
+  out->pct_w = out->pct_h = out->pct_maxw = out->pct_maxh = out->pct_minw = out->pct_minh = -1;
+  out->disp = CSS_DISP_BLOCK;
+  for (int i = 0; i < 4; i++)
+    out->margin[i] = 0;
+  out->has_tr = 0;
+  out->tr_mat = 0;
+}
+
 /* css_bg_argb: cascade-winning background as 0xAARRGGBB; caller composites over the canvas. */
 
 /* Last background[-color] value in a block, var() resolved, into out[cap]; 1 if present. */
