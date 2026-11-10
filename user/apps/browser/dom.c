@@ -290,6 +290,17 @@ static void emit_literal(struct parser *ps, char c)
   node_append(ps->cur, t);
 }
 
+/* The lowercased name of a <!DOCTYPE name ...> declaration spanning [s, end), "" when it gives none; NULL on OOM */
+static char *doctype_name(const char *s, const char *end)
+{
+  while (s < end && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r'))
+    s++;
+  const char *e = s;
+  while (e < end && *e != ' ' && *e != '\t' && *e != '\n' && *e != '\r')
+    e++;
+  return dupn_lower(s, (int)(e - s));
+}
+
 static void handle_tag(struct parser *ps)
 {
   const char *p = ps->p, *end = ps->end;
@@ -305,6 +316,8 @@ static void handle_tag(struct parser *ps)
     const char *c = p + 2;
     while (c < end && *c != '>')
       c++;
+    if (p + 9 <= c && starts_ci(p + 2, "doctype") && !ps->root->text && ps->cur == ps->root)
+      ps->root->text = doctype_name(p + 9, c);
     ps->p = (c < end) ? c + 1 : end;
     return;
   }
@@ -459,6 +472,11 @@ static void handle_tag(struct parser *ps)
     ps->cur = el;
     ps->depth++;
   }
+}
+
+const char *dom_doctype(const struct dom_node *doc)
+{
+  return doc && doc->type == DOM_ELEMENT && streq(doc->tag, "#document") ? doc->text : 0;
 }
 
 struct dom_node *dom_parse(const char *html, int len)

@@ -66,6 +66,9 @@ struct dom_node {
 /* Parse `len` bytes under a synthetic "#document" root. NULL only on immediate OOM. */
 struct dom_node *dom_parse(const char *html, int len);
 void dom_free(struct dom_node *root);
+/* The name from a parsed document's <!DOCTYPE> (kept on the #document root, which has no character data), "" if
+ * the document declared one without a name, NULL if it declared none. */
+const char *dom_doctype(const struct dom_node *doc);
 const char *dom_get_attr(const struct dom_node *node, const char *name);
 
 /* Namespaces. Parsed elements derive theirs (svg/math subtrees, prefixes via xmlns:p); script-made
