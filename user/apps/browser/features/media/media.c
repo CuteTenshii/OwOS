@@ -2,6 +2,7 @@
  * Audio decodes WAV/MPEG; <video> decodes H.264 only (an MP4's AAC track is silent). */
 #include "media.h" /* user/lib/media: decoder + software mixer */
 #include "browser.h"
+#include "airplay.h"
 #include "cast.h"
 #include "features/media/bmedia.h"
 
@@ -567,8 +568,10 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
       resolve_url(page_url, poster, m->poster, sizeof m->poster);
     if (pick_source(node, page_url, abs, sizeof abs)) {
       media_set_src(m, abs);
-      if ((starts_ci(abs, "http://") || starts_ci(abs, "https://")) && !dom_get_attr(node, "disableremoteplayback"))
+      if ((starts_ci(abs, "http://") || starts_ci(abs, "https://")) && !dom_get_attr(node, "disableremoteplayback")) {
         cast_scan_start(); /* so the controls can offer a cast button */
+        airplay_scan_start();
+      }
     }
     apply_audio_params(m);
     if (m->autoplay && m->src[0]) {
@@ -617,17 +620,86 @@ void media_load(struct media_el *m)
 }
 
 /* Remote playback: one Cast session at a time, driving one element while connected */
-static cast_session *g_rsess;
+static cast_session *g_rsess;    /* a Chromecast session, or */
+static airplay_session *g_asess; /* an AirPlay one; never both */
 static struct media_el *g_rmedia;
 
-static bool remote_on(const struct media_el *m) { return g_rsess && g_rmedia == m; }
+static bool remote_on(const struct media_el *m) { return (g_rsess || g_asess) && g_rmedia == m; }
+
+/* The active receiver's state in Cast terms, whichever protocol it speaks */
+static void r_status(struct cast_status *st)
+{
+  if (g_asess) {
+    struct airplay_status a;
+    airplay_get_status(g_asess, &a);
+    memset(st, 0, sizeof *st);
+    st->conn = a.conn == AIRPLAY_CONNECTED ? CAST_CONNECTED : CAST_DISCONNECTED;
+    st->state = a.state == AIRPLAY_PLAYING     ? CAST_PLAYING
+                : a.state == AIRPLAY_PAUSED    ? CAST_PAUSED
+                : a.state == AIRPLAY_BUFFERING ? CAST_BUFFERING
+                                               : CAST_IDLE;
+    st->current_time = a.current_time;
+    st->duration = a.duration;
+    st->volume = 1.0;
+    return;
+  }
+  cast_get_status(g_rsess, st);
+}
+
+static void r_play(void)
+{
+  if (g_asess)
+    airplay_play(g_asess);
+  else
+    cast_play(g_rsess);
+}
+
+static void r_pause(void)
+{
+  if (g_asess)
+    airplay_pause(g_asess);
+  else
+    cast_pause(g_rsess);
+}
+
+static void r_seek(double sec)
+{
+  if (g_asess)
+    airplay_seek(g_asess, sec);
+  else
+    cast_seek(g_rsess, sec);
+}
+
+/* AirPlay video has no receiver volume; the TV's own remote owns it */
+static void r_set_volume(double v)
+{
+  if (g_rsess)
+    cast_set_volume(g_rsess, v);
+}
+
+static void r_set_muted(int on)
+{
+  if (g_rsess)
+    cast_set_muted(g_rsess, on);
+}
+
+static void r_close(void)
+{
+  cast_session *c = g_rsess;
+  airplay_session *a = g_asess;
+  g_rsess = 0;
+  g_asess = 0;
+  g_rmedia = 0;
+  cast_close(c);
+  airplay_close(a);
+}
 
 int media_remote_conn(struct media_el *m)
 {
   struct cast_status st;
   if (!remote_on(m))
     return CAST_DISCONNECTED;
-  cast_get_status(g_rsess, &st);
+  r_status(&st);
   return st.conn;
 }
 
@@ -637,7 +709,7 @@ void media_play(struct media_el *m)
     return;
   g_last_played = m;
   if (remote_on(m)) {
-    cast_play(g_rsess);
+    r_play();
     browser_buf_lock();
     if (!m->playing_state) {
       m->ev |= MEV_PLAY;
@@ -679,7 +751,7 @@ void media_pause(struct media_el *m)
   if (!m)
     return;
   if (remote_on(m))
-    cast_pause(g_rsess);
+    r_pause();
   browser_buf_lock();
   m->want_play = false;
   if (m->ms)
@@ -699,7 +771,7 @@ int media_paused(struct media_el *m)
     return 1;
   if (remote_on(m)) {
     struct cast_status st;
-    cast_get_status(g_rsess, &st);
+    r_status(&st);
     return st.state == CAST_PAUSED || st.state == CAST_IDLE;
   }
   return !((m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying));
@@ -720,7 +792,7 @@ double media_current_time(struct media_el *m)
     return 0.0;
   if (remote_on(m)) {
     struct cast_status st;
-    cast_get_status(g_rsess, &st);
+    r_status(&st);
     return st.current_time;
   }
   if (m->ms)
@@ -739,7 +811,7 @@ void media_set_current_time(struct media_el *m, double sec)
     sec = 0;
   ms = (unsigned)(sec * 1000.0);
   if (remote_on(m)) {
-    cast_seek(g_rsess, sec);
+    r_seek(sec);
     m->reported_ended = false;
     m->ev |= MEV_SEEKED | MEV_TIMEUPDATE;
   } else if (m->ms) {
@@ -756,7 +828,7 @@ double media_duration(struct media_el *m)
   unsigned d = 0;
   if (m && remote_on(m)) {
     struct cast_status st;
-    cast_get_status(g_rsess, &st);
+    r_status(&st);
     d = (unsigned)(st.duration * 1000.0);
   } else if (m && m->ms)
     d = media_source_duration_ms(m->ms);
@@ -784,7 +856,7 @@ void media_set_volume(struct media_el *m, double v)
   m->volume = nv;
   apply_audio_params(m);
   if (remote_on(m))
-    cast_set_volume(g_rsess, (double)nv / 1000.0);
+    r_set_volume((double)nv / 1000.0);
   m->ev |= MEV_VOLCHANGE;
 }
 
@@ -797,7 +869,7 @@ void media_set_muted(struct media_el *m, int on)
   m->muted = on != 0;
   apply_audio_params(m);
   if (remote_on(m))
-    cast_set_muted(g_rsess, on != 0);
+    r_set_muted(on != 0);
   m->ev |= MEV_VOLCHANGE;
 }
 
@@ -835,30 +907,45 @@ int media_ready_state(struct media_el *m)
 
 int media_network_state(struct media_el *m) { return m ? m->net : MNS_EMPTY; }
 
-int media_remote_start(struct media_el *m, const struct cast_device *dev, const char *ctype)
+int media_remote_start(struct media_el *m, const struct remote_dev *dev, const char *ctype)
 {
-  cast_session *s;
+  cast_session *cs = 0;
+  airplay_session *as = 0;
   double pos;
   bool was_playing;
   if (!m || !dev || !m->src[0])
     return -1;
   media_remote_stop(g_rmedia);
-  s = cast_connect(dev, 10000);
-  if (!s)
+  if (dev->kind == REMOTE_AIRPLAY) {
+    struct airplay_device d;
+    memset(&d, 0, sizeof d);
+    memcpy(d.ip, dev->ip, 4);
+    d.port = dev->port;
+    as = airplay_connect(&d, 10000);
+  } else {
+    struct cast_device d;
+    memset(&d, 0, sizeof d);
+    memcpy(d.ip, dev->ip, 4);
+    d.port = dev->port;
+    cs = cast_connect(&d, 10000);
+  }
+  if (!cs && !as)
     return -1;
   pos = media_current_time(m);
   was_playing = !media_paused(m);
   media_pause(m);
-  if (cast_load(s, m->src, ctype, m->src, 8000)) {
-    cast_close(s);
+  if (as ? airplay_load(as, m->src, pos) : cast_load(cs, m->src, ctype, m->src, 8000)) {
+    cast_close(cs);
+    airplay_close(as);
     if (was_playing)
       media_play(m);
     return -1;
   }
-  if (pos > 0.5)
-    cast_seek(s, pos);
+  if (cs && pos > 0.5)
+    cast_seek(cs, pos);
   browser_buf_lock();
-  g_rsess = s;
+  g_rsess = cs;
+  g_asess = as;
   g_rmedia = m;
   m->rplay_seen = false;
   m->reported_ended = false;
@@ -872,18 +959,14 @@ int media_remote_start(struct media_el *m, const struct cast_device *dev, const 
 void media_remote_stop(struct media_el *m)
 {
   struct cast_status st;
-  cast_session *d;
   if (!remote_on(m))
     return;
-  cast_get_status(g_rsess, &st);
+  r_status(&st);
   browser_buf_lock();
-  d = g_rsess;
-  g_rsess = 0;
-  g_rmedia = 0;
   m->playing_state = false;
   m->ev |= MEV_PAUSE;
   browser_buf_unlock();
-  cast_close(d);
+  r_close();
   media_set_current_time(m, st.current_time);
   if (st.state == CAST_PLAYING || st.state == CAST_BUFFERING)
     media_play(m);
@@ -894,9 +977,9 @@ static void remote_poll(unsigned now)
 {
   struct cast_status st;
   struct media_el *m = g_rmedia;
-  if (!g_rsess || !m)
+  if (!(g_rsess || g_asess) || !m)
     return;
-  cast_get_status(g_rsess, &st);
+  r_status(&st);
   if (st.conn == CAST_DISCONNECTED) {
     media_remote_stop(m);
     return;
@@ -1094,7 +1177,7 @@ static bool cast_offered(const struct media_el *m)
     return true;
   if (!m->node || dom_get_attr(m->node, "disableremoteplayback"))
     return false;
-  return (starts_ci(m->src, "http://") || starts_ci(m->src, "https://")) && cast_scan_count() > 0;
+  return (starts_ci(m->src, "http://") || starts_ci(m->src, "https://")) && cast_scan_count() + airplay_scan_count() > 0;
 }
 
 /* `fsh` > 0: the widget fills a fullscreen pane that tall, instead of the inline size */
@@ -1432,12 +1515,7 @@ struct media_el *media_current(void)
 void media_page_teardown(void)
 {
   int i;
-  if (g_rsess) {
-    cast_session *d = g_rsess;
-    g_rsess = 0;
-    g_rmedia = 0;
-    cast_close(d);
-  }
+  r_close();
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     if (!m->in_use || m->owner != B->pg)

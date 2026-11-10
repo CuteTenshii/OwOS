@@ -2,7 +2,10 @@
 #define OWOS_SUITE_TEST
 #define rng_bytes uuid_test_rng_bytes /* this suite supplies its own clock and entropy */
 #define now_ms uuid_test_now_ms
+void rng_bytes(void *out, int n);
+long long now_ms(void);
 #include "../user/lib/uuid/uuid.c"
+#include "../user/lib/uuid/gen.c"
 #include "test.h"
 #include <string.h>
 

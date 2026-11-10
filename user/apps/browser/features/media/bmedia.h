@@ -4,7 +4,6 @@
 
 struct dom_node;
 struct media_el;
-struct cast_device;
 
 /* canPlayType / source selection verdicts. */
 enum { MEDIA_CANT = 0, MEDIA_MAYBE = 1, MEDIA_PROBABLY = 2 };
@@ -44,7 +43,14 @@ int media_can_play_type(const char *type); /* MEDIA_* */
 
 /* Remote playback (Cast): the element plays on a receiver until media_remote_stop.
  * start connects (blocking) and returns 0 / -1; conn is a CAST_* connection state. */
-int media_remote_start(struct media_el *m, const struct cast_device *dev, const char *ctype);
+enum { REMOTE_CAST, REMOTE_AIRPLAY };
+struct remote_dev {
+  int kind; /* REMOTE_* */
+  char name[128];
+  unsigned char ip[4];
+  unsigned short port;
+};
+int media_remote_start(struct media_el *m, const struct remote_dev *dev, const char *ctype);
 void media_remote_stop(struct media_el *m);
 int media_remote_conn(struct media_el *m);
 

@@ -124,7 +124,7 @@ PROTOBUF := user/lib/protobuf/protobuf.o
 # $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
 CAST    := user/lib/cast/cast.o
 # uuid: RFC 9562 UUIDs (v4, v5, v7), parse and format. Bare .o; a consumer also links $(CRYPTO).
-UUID    := user/lib/uuid/uuid.o
+UUID    := user/lib/uuid/uuid.o user/lib/uuid/gen.o
 # plist: Apple property lists (XML and binary) as a value tree. Bare .o; a consumer also links $(BASE64) $(MATH).
 PLIST   := user/lib/plist/plist.o
 # airplay: AirPlay 1 video sender - mDNS discovery + plain HTTP on port 7000 (/play, /rate, /scrub).

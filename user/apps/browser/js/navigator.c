@@ -2,6 +2,7 @@
 
 #include "bindings.h"
 #include "features/clienthints/clienthints.h"
+#include "uuid.h"
 
 /* --- navigator.userAgentData ---------------------------------------------- */
 static js_value uad_brands(js_ctx *ctx, const struct ch_brand *b)
@@ -200,23 +201,15 @@ js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int arg
 }
 js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  unsigned char b[16];
-  char s[37];
-  static const char hx[] = "0123456789abcdef";
-  int i, p = 0;
+  unsigned char rnd[16];
+  uuid_t u;
+  char s[UUID_STR_LEN];
   (void)t;
   (void)args;
   (void)argc;
-  rng_bytes(b, 16);
-  b[6] = (unsigned char)((b[6] & 0x0f) | 0x40); /* version 4 */
-  b[8] = (unsigned char)((b[8] & 0x3f) | 0x80); /* variant 1 */
-  for (i = 0; i < 16; i++) {
-    if (i == 4 || i == 6 || i == 8 || i == 10)
-      s[p++] = '-';
-    s[p++] = hx[b[i] >> 4];
-    s[p++] = hx[b[i] & 15];
-  }
-  s[p] = '\0';
+  rng_bytes(rnd, sizeof rnd);
+  uuid_v4_from(u, rnd);
+  uuid_to_string(u, s, 0);
   return js_mk_cstring(ctx, s);
 }
 

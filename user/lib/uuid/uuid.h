@@ -1,5 +1,6 @@
 /* uuid.h: RFC 9562 UUIDs. Parse and format, compare, and generate version 4 (random), 5 (SHA-1 of a namespace and
- * name) and 7 (Unix-millisecond time plus random, so values sort by creation). Link $(UUID) $(CRYPTO). */
+ * name) and 7 (Unix-millisecond time plus random, so values sort by creation). Link $(UUID) $(CRYPTO). The generators live in gen.c, so a program that supplies its own randomness
+ * can link uuid.o alone. */
 #ifndef OWOS_UUID_H
 #define OWOS_UUID_H
 

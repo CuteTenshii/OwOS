@@ -1,4 +1,4 @@
-/* uuid.c: RFC 9562 UUIDs. See uuid.h. */
+/* uuid.c: RFC 9562 UUIDs without any entropy or clock source. See uuid.h; the generators are in gen.c. */
 #include "uuid.h"
 #include "crypto.h"
 #include "owos.h"
@@ -38,20 +38,6 @@ void uuid_v5(uuid_t out, const uuid_t ns, const void *name, int len)
   sha1_final(&h, d);
   memcpy(out, d, 16);
   stamp(out, 5);
-}
-
-void uuid_generate_v4(uuid_t out)
-{
-  unsigned char r[16];
-  rng_bytes(r, sizeof r);
-  uuid_v4_from(out, r);
-}
-
-void uuid_generate_v7(uuid_t out)
-{
-  unsigned char r[10];
-  rng_bytes(r, sizeof r);
-  uuid_v7_from(out, (unsigned long long)now_ms(), r);
 }
 
 void uuid_to_string(const uuid_t u, char *out, int upper)

@@ -24,6 +24,7 @@ int thread_create_arg(void (*fn)(void *), void *arg, void *top);
 int thread_join(int tid);
 void rng_bytes(void *buf, int len);
 #include "../user/lib/uuid/uuid.c"
+#include "../user/lib/uuid/gen.c"
 #include "../user/lib/airplay/airplay.c"
 #include "test.h"
 #include <stdio.h>

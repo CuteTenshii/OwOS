@@ -28,10 +28,6 @@
 #define KMOD_SHIFT 0x01
 #define KMOD_CTRL 0x02
 
-/* Provided per suite where a library under test draws randomness or reads the clock. */
-void rng_bytes(void *out, int n);
-long long now_ms(void);
-
 /* The guest strdup returns 0 for NULL; the host one would crash. */
 static inline char *owos_strdup(const char *s) { return s ? strdup(s) : 0; }
 #define strdup owos_strdup

@@ -1,6 +1,7 @@
 /* HTMLMediaElement, Remote Playback API (Cast) and Image()/Audio() constructors. */
 #include <stdbool.h>
 
+#include "airplay.h"               /* AirPlay sender: RemotePlayback backend                  */
 #include "cast.h"                  /* Google Cast sender: RemotePlayback backend             */
 #include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "jsint.h"
@@ -397,24 +398,54 @@ static js_value rp_cancel_watch(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* Ask which receiver to cast to; returns false (with *why set) when none is available or the user declines */
-static bool cast_pick(struct cast_device *out, const char **why)
+/* Chromecasts and AirPlay receivers around us, as one list */
+static int remote_list(struct remote_dev *out, int max)
 {
-  struct cast_device list[8];
-  char names[1024];
-  int n = 0, c, row, k = 0;
+  struct cast_device cd[8];
+  struct airplay_device ad[8];
+  int n = 0, nc = 0, na = 0;
   cast_scan_start();
-  for (; n < 8 && cast_scan_get(n, &list[n]); n++)
+  airplay_scan_start();
+  for (; nc < 8 && cast_scan_get(nc, &cd[nc]); nc++)
     ;
-  if (n == 0)
-    n = cast_discover(list, 8, 4000);
-  if (n <= 0) {
+  for (; na < 8 && airplay_scan_get(na, &ad[na]); na++)
+    ;
+  if (nc + na == 0) { /* the scanners have not reported yet */
+    nc = cast_discover(cd, 8, 3000);
+    na = airplay_discover(ad, 8, 3000);
+    nc = nc < 0 ? 0 : nc;
+    na = na < 0 ? 0 : na;
+  }
+  for (int i = 0; i < nc && n < max; i++, n++) {
+    out[n].kind = REMOTE_CAST;
+    strlcpy(out[n].name, cd[i].name[0] ? cd[i].name : "Cast device", sizeof out[n].name);
+    memcpy(out[n].ip, cd[i].ip, 4);
+    out[n].port = cd[i].port;
+  }
+  for (int i = 0; i < na && n < max; i++, n++) {
+    out[n].kind = REMOTE_AIRPLAY;
+    strlcpy(out[n].name, ad[i].name[0] ? ad[i].name : "AirPlay device", sizeof out[n].name);
+    memcpy(out[n].ip, ad[i].ip, 4);
+    out[n].port = ad[i].port;
+  }
+  return n;
+}
+
+/* Ask which receiver to cast to; returns false (with *why set) when none is available or the user declines */
+static bool cast_pick(struct remote_dev *out, const char **why)
+{
+  struct remote_dev list[16];
+  char names[2048];
+  int n = remote_list(list, 16), k = 0, row;
+  if (n == 0) {
     *why = "NotFoundError";
     return false;
   }
   names[0] = '\0';
-  for (c = 0; c < n; c++) {
-    sapp(names, &k, sizeof names, list[c].name[0] ? list[c].name : "Cast device");
+  for (int c = 0; c < n; c++) {
+    sapp(names, &k, sizeof names, list[c].name);
+    if (list[c].kind == REMOTE_AIRPLAY)
+      sapp(names, &k, sizeof names, " (AirPlay)");
     if (c + 1 < n)
       sapp(names, &k, sizeof names, "\n");
   }
@@ -442,7 +473,7 @@ static const char *cast_refusal(struct media_el *m, struct dom_node *n, char *sr
 /* Connect `m` to a receiver of the user's choice; NULL on success, else a DOMException name */
 static const char *cast_start(struct media_el *m, struct dom_node *n, js_object *rp)
 {
-  struct cast_device dev;
+  struct remote_dev dev;
   char src[URL_MAX];
   const char *why = cast_refusal(m, n, src, sizeof src);
   if (why)
