@@ -1,9 +1,9 @@
 /* wasm_test.c: the WebAssembly engine and its JavaScript API.
  *
- * The script in wasm_vectors.h (see tests/wasm/gen.js) is run by the real JS engine. It instantiates modules built
- * from the .wat files in tests/wasm, checks the API against results recorded from V8, and runs a numeric and a SIMD
- * module through every operator, comparing a hash of the outputs with V8's. A collection is forced around each check so
- * a missing GC root shows up as a wrong answer or a crash.
+ * The script (tests/wasm/script.js after tests/wasm/data.js, which tests/wasm/gen.js generates) is run by the real JS
+ * engine. It instantiates modules built from the .wat files in tests/wasm, checks the API against results recorded from
+ * V8, and runs a numeric and a SIMD module through every operator, comparing a hash of the outputs with V8's. A
+ * collection is forced around each check so a missing GC root shows up as a wrong answer or a crash.
  *
  *   tests/run-tests.sh wasm
  */
@@ -17,7 +17,6 @@
 #include "interp.h"
 #include "parser.h"
 #include "value.h"
-#include "wasm_vectors.h"
 
 static void con_print(js_ctx *ctx, int level, const char *s, int len)
 {
@@ -36,20 +35,48 @@ static js_value native_gc(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return js_undef();
 }
 
-static char *join_script(void)
+static char *read_file(const char *path, size_t *len)
 {
-  size_t n = 1;
-  char *src, *p;
-  int i;
-  for (i = 0; k_wasm_script[i]; i++)
-    n += strlen(k_wasm_script[i]);
-  p = src = (char *)malloc(n);
-  for (i = 0; k_wasm_script[i]; i++) {
-    size_t l = strlen(k_wasm_script[i]);
-    memcpy(p, k_wasm_script[i], l);
-    p += l;
+  FILE *f = fopen(path, "rb");
+  char *buf;
+  long n;
+  if (!f)
+    return NULL;
+  fseek(f, 0, SEEK_END);
+  n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  buf = (char *)malloc((size_t)n + 1);
+  *len = fread(buf, 1, (size_t)n, f);
+  fclose(f);
+  return buf;
+}
+
+/* The script is these files in order; the tests run from the repository root. */
+static const char *const script_files[] = {"tests/wasm/data.js", "tests/wasm/script.js"};
+
+/* The first n script files followed by `suffix`, or NULL (after failing the test) if one cannot be read. */
+static char *join_script(size_t n, const char *suffix)
+{
+  char *text[sizeof script_files / sizeof script_files[0]] = {0}, *src = NULL, *p;
+  size_t len[sizeof script_files / sizeof script_files[0]] = {0}, total = strlen(suffix) + 1;
+  int ok = 1;
+
+  for (size_t i = 0; i < n; i++) {
+    text[i] = read_file(script_files[i], &len[i]);
+    ok &= text[i] != NULL;
+    total += len[i];
   }
-  *p = 0;
+  expect(ok);
+  if (ok) {
+    p = src = (char *)malloc(total);
+    for (size_t i = 0; i < n; i++) {
+      memcpy(p, text[i], len[i]);
+      p += len[i];
+    }
+    strcpy(p, suffix);
+  }
+  for (size_t i = 0; i < n; i++)
+    free(text[i]);
   return src;
 }
 
@@ -58,10 +85,12 @@ static void run_script(void)
   js_arena a;
   js_parse_error err = {0, 0};
   js_value result, report;
-  char *src = join_script();
+  char *src = join_script(sizeof script_files / sizeof script_files[0], "");
   js_node *prog;
   js_ctx *ctx;
 
+  if (!src)
+    return;
   js_arena_init(&a);
   ctx = js_ctx_new(con_print);
   ctx->can_block = 1;
@@ -168,6 +197,7 @@ static void *worker_main(void *arg)
 static void threads_share_memory(void)
 {
   struct worker workers[WORKERS] = {{0}};
+  char *script;
   pthread_t threads[WORKERS];
   js_arena arena;
   js_parse_error err = {0, 0};
@@ -179,15 +209,14 @@ static void threads_share_memory(void)
 
   js_arena_init(&arena);
   ctx = js_ctx_new(con_print);
-  {
-    js_value arr = js_new_typedarray(ctx, TA_U8, (int)sizeof k_wasm_counter);
-    memcpy(((js_arraybuffer *)((js_typedarray *)arr.u.obj->host)->buffer->host)->data, k_wasm_counter,
-           sizeof k_wasm_counter);
-    js_def(ctx->global, "bytes", arr, P_WRITABLE);
+  /* data.js defines W, whose counter module the workers instantiate */
+  script = join_script(1, "globalThis.memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });\n"
+                          "globalThis.message = { module: new WebAssembly.Module(W.counter), memory: memory };\n");
+  if (!script) {
+    js_ctx_free(ctx);
+    return;
   }
-  prog = js_parse("globalThis.memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });\n"
-                  "globalThis.message = { module: new WebAssembly.Module(bytes), memory: memory };\n",
-                  &arena, &err);
+  prog = js_parse(script, &arena, &err);
   expect(prog != NULL);
   expect(js_run(ctx, prog, &result) == 0);
   msg = js_get(ctx, js_obj_value(ctx->global), "message");
@@ -212,6 +241,7 @@ static void threads_share_memory(void)
   js_clone_free(clone);
   js_ctx_free(ctx);
   js_arena_free(&arena);
+  free(script);
 }
 
 int main(void)
