@@ -264,6 +264,33 @@ js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value xhr_abort(js_ctx *ctx, js_value t, js_value *args, int argc);
 
+/* One resolved request and its response; fetch(), XMLHttpRequest and a worker's fetch relay all run through fetch_run */
+struct fetch_req {
+  char url[URL_MAX];
+  char method[16];
+  char ctype[160];
+  char *extra_hdrs; /* "Name: value\r\n" block; malloc'd by fetch_req_header (a caller pointing it elsewhere skips fetch_req_free) */
+  int extra_len;
+  const unsigned char *body;
+  int body_len;
+  bool with_creds;
+  int cache_mode; /* enum http_cache_mode */
+};
+struct fetch_res {
+  unsigned char *body; /* malloc'd; NULL on failure */
+  int len;
+  int status;
+  char status_text[64];
+  char ctype[160];
+  char final_url[URL_MAX];
+  char hdr[RESP_HDR_MAX]; /* raw response header block, status line first */
+};
+enum { FETCH_OK = 0, FETCH_ABORTED, FETCH_FAILED };
+int fetch_req_header(struct fetch_req *rq, const char *name, const char *value); /* 0, or -1 when out of memory */
+void fetch_req_free(struct fetch_req *rq);
+int fetch_csp(char *url, int cap); /* connect-src: 1 allowed (url upgraded in place), 0 blocked and logged */
+int fetch_run(const struct fetch_req *rq, struct fetch_res *rs);
+
 /* A script-issued request that returned nothing because the user stopped or navigated away, not a network failure */
 static inline int net_aborted(void) { return B->abort_load || js_irq_stopped(g_ctx->irq); }
 js_value xhr_setheader(js_ctx *ctx, js_value t, js_value *args, int argc);

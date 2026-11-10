@@ -101,7 +101,7 @@ JS(
     this.signal = init.signal || (src ? src.signal : L.newSignal());
     this.credentials = init.credentials || (src ? src.credentials : "same-origin");
     this.mode = init.mode || (src ? src.mode : "cors");
-    this.cache = init.cache || "default";
+    this.cache = init.cache || (src ? src.cache : "default");
     this.redirect = init.redirect || "follow";
     this.referrer = "about:client";
     this.referrerPolicy = init.referrerPolicy || "";
@@ -183,7 +183,7 @@ JS(
       sig = req.signal;
       if (sig.aborted) { reject(sig.reason); return; }
       req.headers.forEach(function (v, k) { hs.push([k, v]); });
-      id = request({ op: "fetch", url: req.url, method: req.method, headers: hs, body: req["@body"] ? req["@body"].slice().buffer : null, credentials: req.credentials }, function (r) {
+      id = request({ op: "fetch", url: req.url, method: req.method, headers: hs, body: req["@body"] ? req["@body"].slice().buffer : null, credentials: req.credentials, cache: req.cache, mode: req.mode }, function (r) {
         sig.removeEventListener("abort", onabort);
         if (!r.ok) { reject(typeError(r.error)); } else { resolve(responseFrom(r, req.url)); }
       });

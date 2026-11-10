@@ -939,6 +939,14 @@ static void test_fetch_cache_modes_validate(void)
   run_script("expect(window.fe===true, 'fetch rejects an unknown cache mode: '+window.fe);\n");
 }
 
+static void test_fetch_data_url(void)
+{
+  run_script("window.fd=null; fetch('data:text/plain,hello').then(function(r){ window.fs=r.status+' '+r.statusText;"
+             " return r.text() }).then(function(t){ window.fd=t });\n");
+  run_script("expect(window.fd==='hello' && window.fs==='200 OK', 'data: URLs go through the shared transport: '+window.fd+' "
+             "'+window.fs);\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -953,6 +961,7 @@ int main(void)
   test("history state and popstate", test_history_state_and_popstate);
   test("scroll metrics follow layout", test_scroll_metrics_follow_layout);
   test("fetch and Request validate the cache mode", test_fetch_cache_modes_validate);
+  test("fetch reads data: URLs", test_fetch_data_url);
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
   test("replaceChildren keeps nodes passed back in", test_replace_children);

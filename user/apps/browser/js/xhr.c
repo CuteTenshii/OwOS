@@ -59,59 +59,42 @@ static js_value xhr_setrt(js_ctx *ctx, js_value t, int state)
 }
 js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char url[URL_MAX], method[16], req_ctype[160], resp_ctype[160];
-  char *reqbody = 0;
-  int reqlen = 0, status = 0, outlen = 0;
-  unsigned char *body;
-  const char *hdrs;
+  struct fetch_req rq = {.method = "GET"};
+  struct fetch_res *rs;
+  js_value h;
+  int rc;
   if (t.type != JV_OBJ)
     return js_undef();
-  strlcpy(url, arg_str(ctx, js_get(ctx, t, "@url")), sizeof url);
-  strlcpy(method, arg_str(ctx, js_get(ctx, t, "@method")), sizeof method);
-  strlcpy(req_ctype, arg_str(ctx, js_get(ctx, t, "@ctype")), sizeof req_ctype);
-  if (B->pg->csp) { /* CSP connect-src */
-    char use[URL_MAX], reason[64];
-    if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
-      js_csp_log("connection to", url, reason);
-      js_set(ctx, t, "status", js_number(0));
-      xhr_setrt(ctx, t, 4);
-      emit_event(t.u.obj, "error", js_undef());
-      emit_event(t.u.obj, "loadend", js_undef());
-      return js_undef();
-    }
-    strlcpy(url, use, sizeof url);
+  strlcpy(rq.url, arg_str(ctx, js_get(ctx, t, "@url")), sizeof rq.url);
+  strlcpy(rq.method, arg_str(ctx, js_get(ctx, t, "@method")), sizeof rq.method);
+  strlcpy(rq.ctype, arg_str(ctx, js_get(ctx, t, "@ctype")), sizeof rq.ctype);
+  if (!fetch_csp(rq.url, sizeof rq.url)) {
+    js_set(ctx, t, "status", js_number(0));
+    xhr_setrt(ctx, t, 4);
+    emit_event(t.u.obj, "error", js_undef());
+    emit_event(t.u.obj, "loadend", js_undef());
+    return js_undef();
   }
   if (argc >= 1 && A(0).type == JV_STR) {
-    reqbody = A(0).u.str->data;
-    reqlen = A(0).u.str->len;
-    if (!req_ctype[0])
-      strlcpy(req_ctype, "text/plain;charset=UTF-8", sizeof req_ctype);
+    rq.body = (const unsigned char *)A(0).u.str->data;
+    rq.body_len = A(0).u.str->len;
+    if (!rq.ctype[0])
+      strlcpy(rq.ctype, "text/plain;charset=UTF-8", sizeof rq.ctype);
   }
-  {
-    js_value h = js_get(ctx, t, "@hdrs");
-    hdrs = h.type == JV_STR ? h.u.str->data : 0;
-  }
-  {
-    bool with_creds = js_to_boolean(js_get(ctx, t, "withCredentials"));
-    struct http_req rq = {0};
-    struct http_resp rs = {0};
-    rq.url = url;
-    rq.method = method[0] ? method : "GET";
-    rq.body = (const unsigned char *)reqbody;
-    rq.body_len = reqlen;
-    rq.ctype = req_ctype[0] ? req_ctype : 0;
-    rq.extra_hdrs = hdrs && hdrs[0] ? hdrs : 0;
-    body = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
-    status = rs.status;
-    outlen = rs.len;
-    strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);
-  }
+  h = js_get(ctx, t, "@hdrs");
+  rq.extra_hdrs = h.type == JV_STR && h.u.str->len ? h.u.str->data : 0; /* borrowed: no fetch_req_free */
+  rq.with_creds = js_to_boolean(js_get(ctx, t, "withCredentials"));
+  rs = malloc(sizeof *rs);
+  if (!rs)
+    return js_undef();
+  rc = fetch_run(&rq, rs);
   gc_push_scope();
   gc_keep(t.u.obj);
-  js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, resp_ctype), 0);
-  js_set(ctx, t, "responseURL", js_mk_cstring(ctx, url));
-  if (!body) {
-    bool aborted = net_aborted();
+  js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, rs->ctype), 0);
+  js_set(ctx, t, "responseURL", js_mk_cstring(ctx, rs->final_url[0] ? rs->final_url : rq.url));
+  if (rc != FETCH_OK) {
+    bool aborted = rc == FETCH_ABORTED;
+    free(rs);
     js_set(ctx, t, "status", js_number(0));
     xhr_setrt(ctx, t, 4);
     emit_event(t.u.obj, aborted ? "abort" : "error", js_undef());
@@ -122,11 +105,12 @@ js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
     return js_undef();
   }
   {
-    js_value text = js_mk_string(ctx, (const char *)body, outlen);
+    js_value text = js_mk_string(ctx, (const char *)rs->body, rs->len);
     gc_keep(text.u.str);
-    free(body);
-    js_set(ctx, t, "status", js_number(status ? status : 200));
-    js_set(ctx, t, "statusText", js_mk_cstring(ctx, status == 200 ? "OK" : status == 204 ? "No Content" : ""));
+    js_set(ctx, t, "status", js_number(rs->status ? rs->status : 200));
+    js_set(ctx, t, "statusText", js_mk_cstring(ctx, rs->status_text));
+    free(rs->body);
+    free(rs);
     js_set(ctx, t, "responseText", text);
     { /* .response honours responseType: "json" parses, else the text */
       js_value rt = js_get(ctx, t, "responseType");

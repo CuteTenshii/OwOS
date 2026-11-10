@@ -1,6 +1,7 @@
 /* fetch(), Headers, Request and Response. */
 
 #include "bindings.h"
+#include "fetchint.h"
 
 /* ------------------------------------------------------- fetch ------------- */
 js_value resp_text(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -150,57 +151,181 @@ int fetch_cache_mode(js_ctx *ctx, js_value input, js_value init, const char **er
   return mode;
 }
 
+static const char *status_text(int status)
+{
+  switch (status) {
+  case 200:
+    return "OK";
+  case 201:
+    return "Created";
+  case 202:
+    return "Accepted";
+  case 204:
+    return "No Content";
+  case 206:
+    return "Partial Content";
+  case 301:
+    return "Moved Permanently";
+  case 302:
+    return "Found";
+  case 303:
+    return "See Other";
+  case 304:
+    return "Not Modified";
+  case 307:
+    return "Temporary Redirect";
+  case 308:
+    return "Permanent Redirect";
+  case 400:
+    return "Bad Request";
+  case 401:
+    return "Unauthorized";
+  case 403:
+    return "Forbidden";
+  case 404:
+    return "Not Found";
+  case 405:
+    return "Method Not Allowed";
+  case 409:
+    return "Conflict";
+  case 410:
+    return "Gone";
+  case 429:
+    return "Too Many Requests";
+  case 500:
+    return "Internal Server Error";
+  case 502:
+    return "Bad Gateway";
+  case 503:
+    return "Service Unavailable";
+  case 504:
+    return "Gateway Timeout";
+  default:
+    return "";
+  }
+}
+
+int fetch_req_header(struct fetch_req *rq, const char *name, const char *value)
+{
+  int need;
+  char *ne;
+  if (streq_ci(name, "content-type")) {
+    strlcpy(rq->ctype, value, sizeof rq->ctype);
+    return 0;
+  }
+  need = (int)(strlen(name) + strlen(value)) + 5;
+  ne = (char *)realloc(rq->extra_hdrs, (unsigned)(rq->extra_len + need));
+  if (!ne)
+    return -1;
+  rq->extra_hdrs = ne;
+  rq->extra_len += snprintf(ne + rq->extra_len, (unsigned)need, "%s: %s\r\n", name, value);
+  return 0;
+}
+
+void fetch_req_free(struct fetch_req *rq)
+{
+  free(rq->extra_hdrs);
+  rq->extra_hdrs = 0;
+}
+
+int fetch_csp(char *url, int cap)
+{
+  char use[URL_MAX], reason[64];
+  if (!B->pg->csp)
+    return 1;
+  if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+    js_csp_log("connection to", url, reason);
+    return 0;
+  }
+  strlcpy(url, use, cap);
+  return 1;
+}
+
+int fetch_run(const struct fetch_req *rq, struct fetch_res *rs)
+{
+  struct http_req hq = {0};
+  struct http_resp hs = {0};
+  hq.url = rq->url;
+  hq.method = rq->method[0] ? rq->method : "GET";
+  hq.body = rq->body;
+  hq.body_len = rq->body_len;
+  hq.ctype = rq->ctype[0] ? rq->ctype : 0;
+  hq.extra_hdrs = rq->extra_hdrs;
+  hq.cache_mode = rq->cache_mode;
+  hs.final_url = rs->final_url;
+  hs.final_cap = sizeof rs->final_url;
+  hs.hdr = rs->hdr;
+  hs.hdr_cap = sizeof rs->hdr;
+  rs->final_url[0] = 0;
+  rs->hdr[0] = 0;
+  rs->status_text[0] = 0;
+  if (starts_ci(rq->url, "data:")) {
+    rs->body = decode_data_url(rq->url, &hs.len, hs.ctype, sizeof hs.ctype);
+    hs.status = rs->body ? 200 : 0;
+    snprintf(rs->hdr, sizeof rs->hdr, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", hs.ctype);
+  } else if (starts_ci(rq->url, "blob:")) {
+    rs->body = browser_fetch(&hq, &hs);
+  } else {
+    rs->body = browser_cors_fetch(g_page_url_buf, rq->with_creds, &hq, &hs);
+  }
+  rs->status = hs.status;
+  rs->len = hs.len;
+  strlcpy(rs->ctype, hs.ctype, sizeof rs->ctype);
+  if (!rs->body)
+    return net_aborted() ? FETCH_ABORTED : FETCH_FAILED;
+  {
+    const char *sp = strchr(rs->hdr, ' '), *eol = strchr(rs->hdr, '\n');
+    if (sp && eol && sp < eol && (sp = strchr(sp + 1, ' ')) && sp < eol) { /* "HTTP/1.1 200 OK": the reason phrase */
+      int l = (int)(eol - sp - 1);
+      while (l > 0 && (sp[l] == '\r' || sp[l] == ' '))
+        l--;
+      if (l > 0 && l < (int)sizeof rs->status_text) {
+        memcpy(rs->status_text, sp + 1, (unsigned)l);
+        rs->status_text[l] = 0;
+      }
+    }
+    if (!rs->status_text[0])
+      strlcpy(rs->status_text, status_text(rs->status), sizeof rs->status_text);
+  }
+  return FETCH_OK;
+}
+
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char url[URL_MAX], method[16], req_ctype[160], resp_ctype[160];
-  char extra_hdrs[1024];
-  const char *reqbody = 0;
-  int reqlen = 0, status = 0, outlen = 0, eh = 0, cache_mode;
-  const char *cache_err;
-  bool with_creds = false;
-  unsigned char *body;
+  struct fetch_req rq = {.method = "GET"};
+  struct fetch_res *rs;
   js_object *resp;
-  js_value rv;
+  js_value rv, in = A(0), init = A(1);
+  const char *s, *cache_err;
   (void)t;
-  { /* input is a URL string or a Request object (fetch(new Request(...))) */
-    js_value in = A(0);
-    const char *s;
-    if (in.type == JV_OBJ) {
-      js_value u = js_get(ctx, in, "url");
-      s = (u.type == JV_STR) ? u.u.str->data : arg_str(ctx, in);
-    } else {
-      s = arg_str(ctx, in);
-    }
-    if (starts_ci(s, "blob:"))
-      strlcpy(url, s, sizeof url);
-    else
-      resolve_url(g_page_url_buf, s, url, sizeof url);
+  if (in.type == JV_OBJ) { /* input is a URL string or a Request object (fetch(new Request(...))) */
+    js_value u = js_get(ctx, in, "url");
+    s = (u.type == JV_STR) ? u.u.str->data : arg_str(ctx, in);
+  } else {
+    s = arg_str(ctx, in);
   }
-  if (B->pg->csp) { /* CSP connect-src */
-    char use[URL_MAX], reason[64];
-    if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
-      js_csp_log("connection to", url, reason);
-      return js_promise_rejected(
-          ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Refused to connect (Content-Security-Policy)"));
-    }
-    strlcpy(url, use, sizeof url); /* use the upgraded URL */
-  }
-  method[0] = '\0';
-  req_ctype[0] = '\0';
-  extra_hdrs[0] = '\0';
-  if (argc >= 2 && A(1).type == JV_OBJ) {
-    js_value m = js_get(ctx, A(1), "method");
-    js_value b = js_get(ctx, A(1), "body");
-    js_value sig = js_get(ctx, A(1), "signal");
-    js_value h = js_get(ctx, A(1), "headers");
+  if (starts_ci(s, "blob:"))
+    strlcpy(rq.url, s, sizeof rq.url);
+  else
+    resolve_url(g_page_url_buf, s, rq.url, sizeof rq.url);
+  if (!fetch_csp(rq.url, sizeof rq.url))
+    return js_promise_rejected(
+        ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Refused to connect (Content-Security-Policy)"));
+  if (in.type == JV_OBJ) { /* method carried on a Request */
+    js_value m = js_get(ctx, in, "method");
     if (m.type == JV_STR)
-      strlcpy(method, m.u.str->data, sizeof method);
-    (void)js_to_boolean(js_get(ctx, A(1), "keepalive")); /* sync fetch: inherently satisfied */
-    {                                                    /* credentials: "include" sends cookies cross-origin */
-      js_value cr = js_get(ctx, A(1), "credentials");
-      if (cr.type == JV_STR && streq(cr.u.str->data, "include"))
-        with_creds = true;
-    }
+      strlcpy(rq.method, m.u.str->data, sizeof rq.method);
+  }
+  if (init.type == JV_OBJ) {
+    js_value m = js_get(ctx, init, "method");
+    js_value b = js_get(ctx, init, "body");
+    js_value sig = js_get(ctx, init, "signal");
+    js_value h = js_get(ctx, init, "headers");
+    js_value cr = js_get(ctx, init, "credentials");
+    if (m.type == JV_STR)
+      strlcpy(rq.method, m.u.str->data, sizeof rq.method);
+    (void)js_to_boolean(js_get(ctx, init, "keepalive")); /* sync fetch: inherently satisfied */
+    rq.with_creds = cr.type == JV_STR && streq(cr.u.str->data, "include"); /* "include" sends cookies cross-origin */
     /* Request headers: a plain { name: value } object (a Headers instance is a plain object here too) */
     if (h.type == JV_OBJ) {
       pmap *pm = &h.u.obj->props;
@@ -211,65 +336,55 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
         if (!k || k[0] == '@' || (pm->e[i].flags & P_ACCESSOR))
           continue;
         v = js_to_string(ctx, js_get(ctx, h, k));
-        if (v.type != JV_STR)
-          continue;
-        if (streq_ci(k, "content-type")) {
-          strlcpy(req_ctype, v.u.str->data, sizeof req_ctype);
-          continue;
+        if (v.type == JV_STR && fetch_req_header(&rq, k, v.u.str->data) < 0) {
+          fetch_req_free(&rq);
+          return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Out of memory"));
         }
-        sapp(extra_hdrs, &eh, sizeof extra_hdrs, k);
-        sapp(extra_hdrs, &eh, sizeof extra_hdrs, ": ");
-        sapp(extra_hdrs, &eh, sizeof extra_hdrs, v.u.str->data);
-        sapp(extra_hdrs, &eh, sizeof extra_hdrs, "\r\n");
       }
     }
     /* An already-aborted signal short-circuits before touching the network */
     if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
       js_value reason = js_get(ctx, sig, "reason");
+      fetch_req_free(&rq);
       if (reason.type == JV_UNDEF)
         reason = dom_exception(ctx, "AbortError", "The operation was aborted");
       return js_promise_rejected(ctx, reason);
     }
     /* Body last, just before the request: body_bytes may hand back a pointer into a transient string */
     if (b.type != JV_UNDEF && b.type != JV_NULL)
-      reqbody = body_bytes(ctx, b, &reqlen, req_ctype,
-                           sizeof req_ctype); /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams */
+      rq.body = (const unsigned char *)body_bytes(ctx, b, &rq.body_len, rq.ctype, sizeof rq.ctype);
   }
-  if (!method[0] && A(0).type == JV_OBJ) { /* method carried on a Request */
-    js_value m = js_get(ctx, A(0), "method");
-    if (m.type == JV_STR)
-      strlcpy(method, m.u.str->data, sizeof method);
-  }
-  cache_mode = fetch_cache_mode(ctx, A(0), A(1), &cache_err);
-  if (cache_mode < 0)
+  rq.cache_mode = fetch_cache_mode(ctx, in, init, &cache_err);
+  if (rq.cache_mode < 0) {
+    fetch_req_free(&rq);
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", cache_err));
-  /* A controlling service worker gets first crack at the request */
-  if (sw_intercept_fetch(ctx, url, method[0] ? method : "GET", &rv))
-    return rv;
-  {
-    struct http_req rq = {0};
-    struct http_resp rs = {0};
-    rq.url = url;
-    rq.method = method[0] ? method : "GET";
-    rq.body = (const unsigned char *)reqbody;
-    rq.body_len = reqlen;
-    rq.ctype = req_ctype[0] ? req_ctype : 0;
-    rq.extra_hdrs = extra_hdrs[0] ? extra_hdrs : 0;
-    rq.cache_mode = cache_mode;
-    body = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
-    status = rs.status;
-    outlen = rs.len;
-    strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);
   }
-  if (!body && net_aborted())
-    return js_promise_rejected(ctx, dom_exception(ctx, "AbortError", "The user aborted a request."));
-  if (!body)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
-  gc_push_scope();
-  resp = (js_object *)gc_keep(
-      make_response(ctx, url, status, status == 200 ? "OK" : "", resp_ctype, (const char *)body, outlen));
-  free(body);
-  rv = js_promise_resolved(ctx, js_obj_value(resp));
-  gc_pop_scope();
+  /* A controlling service worker gets first crack at the request */
+  if (sw_intercept_fetch(ctx, rq.url, rq.method, &rv)) {
+    fetch_req_free(&rq);
+    return rv;
+  }
+  rs = malloc(sizeof *rs);
+  if (!rs) {
+    fetch_req_free(&rq);
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Out of memory"));
+  }
+  switch (fetch_run(&rq, rs)) {
+  case FETCH_ABORTED:
+    rv = js_promise_rejected(ctx, dom_exception(ctx, "AbortError", "The user aborted a request."));
+    break;
+  case FETCH_FAILED:
+    rv = js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
+    break;
+  default:
+    gc_push_scope();
+    resp = (js_object *)gc_keep(make_response(ctx, rs->final_url[0] ? rs->final_url : rq.url, rs->status,
+                                              rs->status_text, rs->ctype, (const char *)rs->body, rs->len));
+    rv = js_promise_resolved(ctx, js_obj_value(resp));
+    gc_pop_scope();
+  }
+  free(rs->body);
+  free(rs);
+  fetch_req_free(&rq);
   return rv;
 }

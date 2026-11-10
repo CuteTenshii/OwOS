@@ -272,6 +272,8 @@ static const char net_worker[] =
     "var D=fetch(\"https://example.com/echo\",{signal:ctl.signal}).then(function(){ out.ab=\"resolved\"; "
     "},function(e){ out.ab=e.name; }); ctl.abort()\n"
     "var E=fetch(\"data:text/plain,inline\").then(function(r){ return r.text(); }).then(function(t){ out.data=t; })\n"
+    "var CM=fetch(\"data:text/plain,x\",{cache:\"bogus\"}).then(function(){ out.cm=\"resolved\"; },function(e){ "
+    "out.cm=e.name+\":\"+e.message; })\n"
     "var F=new Response(JSON.stringify({k:[1,2]}),{status:201,statusText:\"Made\",headers:{\"X-R\":\"1\"}}), "
     "cl=F.clone()\n"
     "var G=F.json().then(function(j){ out.json=j.k.join(); return cl.text(); }).then(function(t){ out.clone=t.length; "
@@ -295,7 +297,7 @@ static const char net_worker[] =
     "})\n"
     "var mc=new MessageChannel(), L=new Promise(function(res){ mc.port1.onmessage=function(e){ "
     "out.mc=e.data.n+\":\"+e.data.m.size; res(); }; mc.port2.postMessage({n:1,m:new Map([[1,2]])}); })\n"
-    "Promise.all([A,B,C,D,E,G,H,I,J,K,L]).then(function(){ out.states=states.join(); postMessage(out); },function(e){ "
+    "Promise.all([A,B,C,D,E,CM,G,H,I,J,K,L]).then(function(){ out.states=states.join(); postMessage(out); },function(e){ "
     "postMessage({fail:String(e)}); });\n";
 
 static js_value test_fixture(js_ctx *ctx, js_value thisv, js_value *args, int argc)
@@ -323,6 +325,7 @@ static void test_worker_network(void)
       "expect(net.bad==='TypeError', 'network failures reject with TypeError: '+net.bad);\n"
       "expect(net.ab==='AbortError', 'abort rejects with AbortError: '+net.ab);\n"
       "expect(net.data==='inline', 'data: URLs');\n"
+      "expect(net.cm==='TypeError:Invalid cache mode', 'a worker fetch validates the cache mode: '+net.cm);\n"
       "expect(net.json==='1,2' && net.clone===11 && net.used===true, 'Response json, clone, bodyUsed: "
       "'+JSON.stringify([net.json,net.clone,net.used]));\n"
       "expect(net.rj==='{\"a\":1}' && net.rm==='PUT' && net.rct.indexOf('application/x-www-form-urlencoded')===0, "
