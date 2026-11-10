@@ -74,7 +74,8 @@ static void test_memory(void)
   check("kfree coalesces and ignores double free", heap_free_bytes() == heap_before);
 }
 
-extern const char user_hello_start[], user_hello_end[], user_fault_start[], user_fault_end[];
+extern const char user_hello_start[], user_hello_end[], user_fault_start[], user_fault_end[], user_sys_start[],
+    user_sys_end[];
 
 static void test_user(void)
 {
@@ -83,6 +84,8 @@ static void test_user(void)
   check("EL0 task: write syscall and exit code", code == 42);
   code = task_run(user_fault_start, (uint32_t)(user_fault_end - user_fault_start));
   check("EL0 task: kernel access faults and is killed", code == -1);
+  code = task_run(user_sys_start, (uint32_t)(user_sys_end - user_sys_start));
+  check("syscalls: errors, unknown numbers, msec/sleep, getpid", code == 0);
   check("task frames released", free_frames() == free_before);
 }
 
@@ -229,14 +232,14 @@ void arch_main(void)
   test_memory();
   sched_init();
 
-  test_user();
-
   gic_init();
   timer_init();
   __asm__ volatile("msr daifclr, #2");
   while (timer_ticks() < 10)
     __asm__ volatile("wfi");
   check("timer interrupts via GIC", timer_ticks() >= 10);
+
+  test_user();
 
   smp_start();
   test_sched();

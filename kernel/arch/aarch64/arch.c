@@ -177,7 +177,7 @@ void arch_exception(struct trap_frame *tf, uint64_t kind)
   uint64_t ec = SYSREG_READ(esr_el1) >> 26;
   if (type == 0 && kind >= 8 && kind < 12) {
     if (ec == 0x15)
-      task_syscall(tf);
+      syscall_dispatch(tf);
     else
       task_fault(tf);
     return;

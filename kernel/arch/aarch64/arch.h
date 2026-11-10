@@ -69,6 +69,11 @@ extern uint64_t kernel_l1[512];
 
 #define USER_BASE 0x100000000UL
 #define USER_END (USER_BASE + 0x200000UL)
+static inline int user_range(uint64_t ptr, uint64_t len)
+{
+  return ptr >= USER_BASE && ptr < USER_END && len <= USER_END - ptr;
+}
+
 #define VM_USER_RX 1
 #define VM_USER_RW 2
 
@@ -80,11 +85,8 @@ void vm_destroy(uint64_t *root);
 
 /* EL0 tasks. task_run returns the exit code, or -1 if the task faulted. */
 int task_run(const void *code, uint32_t len);
-void task_syscall(struct trap_frame *tf);
+void syscall_dispatch(struct trap_frame *tf);
 void task_fault(struct trap_frame *tf);
-
-#define SYS_WRITE 1
-#define SYS_EXIT 2
 
 void arch_exception(struct trap_frame *tf, uint64_t kind);
 void arch_poweroff(void);
