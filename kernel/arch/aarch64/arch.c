@@ -114,6 +114,8 @@ static void irq_dispatch(void)
   }
   if (id < 1020)
     mmio_write32(GICC_BASE + GICC_EOIR, iar);
+  if (id == IRQ_TIMER_PPI)
+    schedule();
 }
 
 static void exception_fatal(struct trap_frame *tf, uint64_t kind)
@@ -173,6 +175,7 @@ uintptr_t context_init(void *stack_top, void (*entry)(void))
   uint64_t *sp = (uint64_t *)((uintptr_t)stack_top - 96);
   for (int i = 0; i < 12; i++)
     sp[i] = 0;
-  sp[11] = (uint64_t)entry; /* x30 */
+  sp[0] = (uint64_t)entry;              /* x19, called by the trampoline */
+  sp[11] = (uint64_t)thread_trampoline; /* x30 */
   return (uintptr_t)sp;
 }

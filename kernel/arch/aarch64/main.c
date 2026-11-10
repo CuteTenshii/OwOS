@@ -5,18 +5,6 @@
 
 extern volatile uint64_t svc_count;
 
-static uintptr_t main_sp, worker_sp;
-static uint8_t worker_stack[4096] __attribute__((aligned(16)));
-static volatile int worker_runs;
-
-static void worker(void)
-{
-  for (;;) {
-    worker_runs++;
-    context_switch(&worker_sp, main_sp);
-  }
-}
-
 static int failures;
 
 static void check(const char *name, int ok)
@@ -97,6 +85,50 @@ static void test_user(void)
   check("task frames released", free_frames() == free_before);
 }
 
+static volatile int stop;
+static volatile uint32_t counters[3];
+
+static void spin0(void)
+{
+  while (!stop)
+    counters[0]++;
+}
+static void spin1(void)
+{
+  while (!stop)
+    counters[1]++;
+}
+static void spin2(void)
+{
+  while (!stop)
+    counters[2]++;
+}
+static void exits_seven(void) { thread_exit(7); }
+
+static void test_sched(void)
+{
+  uint32_t frames = pmm_free_kib();
+  size_t heap = heap_free_bytes();
+  int ids[3] = {thread_create("spin0", spin0), thread_create("spin1", spin1), thread_create("spin2", spin2)};
+  check("threads created", ids[0] > 0 && ids[1] > 0 && ids[2] > 0);
+
+  thread_sleep(30);
+  stop = 1;
+  for (int i = 0; i < 3; i++)
+    thread_join(ids[i]);
+  check("busy threads are preempted and all make progress", counters[0] && counters[1] && counters[2]);
+
+  check("thread_exit code reaches join", thread_join(thread_create("exit7", exits_seven)) == 7);
+
+  int a = thread_create_user("hello1", user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
+  int b = thread_create_user("fault", user_fault_start, (uint32_t)(user_fault_end - user_fault_start));
+  int c = thread_create_user("hello2", user_hello_start, (uint32_t)(user_hello_end - user_hello_start));
+  int ra = thread_join(a), rb = thread_join(b), rc = thread_join(c);
+  check("concurrent EL0 tasks keep separate address spaces and exit codes", ra == 42 && rb == -1 && rc == 42);
+
+  check("scheduler releases frames and stacks", pmm_free_kib() == frames && heap_free_bytes() == heap);
+}
+
 void arch_main(void)
 {
   uart_init();
@@ -115,6 +147,7 @@ void arch_main(void)
 
   test_kstring();
   test_memory();
+  sched_init();
 
   test_user();
 
@@ -125,10 +158,7 @@ void arch_main(void)
     __asm__ volatile("wfi");
   check("timer interrupts via GIC", timer_ticks() >= 10);
 
-  worker_sp = context_init(worker_stack + sizeof worker_stack, worker);
-  for (int i = 0; i < 5; i++)
-    context_switch(&main_sp, worker_sp);
-  check("context switch", worker_runs == 5);
+  test_sched();
 
   uart_puts(failures ? "AARCH64 SELFTEST FAIL\n" : "AARCH64 SELFTEST PASS\n");
   arch_poweroff();

@@ -25,3 +25,13 @@ context_switch:
 	add	sp, sp, #96
 	ret
 .size context_switch, . - context_switch
+
+/* First code a new thread runs: context_init leaves its entry in x19. */
+.global thread_trampoline
+.type thread_trampoline, %function
+thread_trampoline:
+	msr	daifclr, #2
+	blr	x19
+	mov	x0, #0
+	bl	thread_exit
+.size thread_trampoline, . - thread_trampoline

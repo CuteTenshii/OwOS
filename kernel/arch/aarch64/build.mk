@@ -35,7 +35,7 @@ ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
 endif
 
-OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o task.o user.o console.o mem.o kstring.o pmm.o heap.o)
+OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o task.o user.o console.o mem.o kstring.o pmm.o heap.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@

@@ -80,5 +80,17 @@ void arch_poweroff(void);
 void context_switch(uintptr_t *old_sp, uintptr_t new_sp);
 /* Build the initial context for a thread that starts at entry() on first switch. */
 uintptr_t context_init(void *stack_top, void (*entry)(void));
+void thread_trampoline(void);
+
+/* Scheduler: round robin on the 100 Hz tick; threads that return from entry exit with code 0. */
+void sched_init(void);
+void schedule(void);
+int thread_create(const char *name, void (*entry)(void));
+int thread_create_user(const char *name, const void *code, uint32_t len);
+void thread_yield(void);
+void thread_sleep(uint32_t ticks);
+int thread_self(void);
+int thread_join(int id); /* waits for exit, releases the thread, returns its exit code */
+void thread_exit(int code) __attribute__((noreturn));
 
 #endif
