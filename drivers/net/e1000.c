@@ -200,8 +200,52 @@ struct tx_desc {
 
 /* Recognized Intel parts, all using the legacy descriptor ring. */
 static const uint16_t intel_nics[] = {
-    0x100E, 0x100F, 0x10D3, 0x153A, 0x153B, 0x15A0, 0x15A1, 0x15A2, 0x15A3,
-    0x156F, 0x1570, 0x15B7, 0x15B8, 0x15B9, 0x15D6, 0x15D7, 0x15D8, 0x15E3,
+    0x100E,
+    0x100F,
+    0x10D3,
+    /* I217 / I218 (Lynx Point, Wildcat Point) */
+    0x153A,
+    0x153B,
+    0x1559,
+    0x155A,
+    0x15A0,
+    0x15A1,
+    0x15A2,
+    0x15A3,
+    /* I219: Sunrise Point, Kaby Lake, Cannon Point, Ice Point, Comet Lake, Tiger Point, Alder Point */
+    0x156F,
+    0x1570,
+    0x15B7,
+    0x15B8,
+    0x15B9,
+    0x15BB,
+    0x15BC,
+    0x15BD,
+    0x15BE,
+    0x15D6,
+    0x15D7,
+    0x15D8,
+    0x15DF,
+    0x15E0,
+    0x15E1,
+    0x15E2,
+    0x15E3,
+    0x0D4C,
+    0x0D4D,
+    0x0D4E,
+    0x0D4F,
+    0x0D53,
+    0x0D55,
+    0x15F4,
+    0x15F5,
+    0x15F9,
+    0x15FA,
+    0x15FB,
+    0x15FC,
+    0x1A1C,
+    0x1A1D,
+    0x1A1E,
+    0x1A1F,
 };
 
 static volatile uint8_t *mmio;
@@ -291,23 +335,44 @@ static void pch_mdelay(uint32_t ms)
   }
 }
 
+/* Offset of capability `id` in the function's PCI capability list, or 0. */
+static uint8_t pci_find_cap(uint8_t b, uint8_t s, uint8_t f, uint8_t id)
+{
+  if (!(pci_read16(b, s, f, 0x06) & (1u << 4)))
+    return 0;
+  uint8_t cap = pci_read8(b, s, f, 0x34) & 0xFC;
+  for (int i = 0; cap && i < 48; i++) {
+    if (pci_read8(b, s, f, cap) == id)
+      return cap;
+    cap = pci_read8(b, s, f, cap + 1) & 0xFC;
+  }
+  return 0;
+}
+
 /* Bring the function to PCI D0 via its PM capability; a NIC parked in D3 ignores MMIO. */
 static void pci_set_d0(uint8_t b, uint8_t s, uint8_t f)
 {
-  if (!(pci_read16(b, s, f, 0x06) & (1u << 4)))
+  uint8_t cap = pci_find_cap(b, s, f, 0x01);
+  if (!cap)
     return;
-  uint8_t cap = pci_read8(b, s, f, 0x34) & 0xFC;
-  for (int i = 0; cap && i < 48; i++) {
-    if (pci_read8(b, s, f, cap) == 0x01) {
-      uint16_t pmcsr = pci_read16(b, s, f, cap + 4);
-      if ((pmcsr & 0x3) != 0) {
-        pci_write16(b, s, f, cap + 4, pmcsr & ~0x3u);
-        pch_mdelay(10);
-        dlog("  powered up from D3\n");
-      }
-      return;
-    }
-    cap = pci_read8(b, s, f, cap + 1) & 0xFC;
+  uint16_t pmcsr = pci_read16(b, s, f, cap + 4);
+  if ((pmcsr & 0x3) != 0) {
+    pci_write16(b, s, f, cap + 4, pmcsr & ~0x3u);
+    pch_mdelay(10);
+    dlog("  powered up from D3\n");
+  }
+}
+
+/* Clear PCIe ASPM L0s/L1 (Link Control bits 1:0): the I219 drops TX/RX descriptors across link power transitions. */
+static void pci_disable_aspm(uint8_t b, uint8_t s, uint8_t f)
+{
+  uint8_t cap = pci_find_cap(b, s, f, 0x10);
+  if (!cap)
+    return;
+  uint16_t lnkctl = pci_read16(b, s, f, cap + 0x10);
+  if (lnkctl & 0x3) {
+    pci_write16(b, s, f, cap + 0x10, lnkctl & ~0x3u);
+    dlog("  PCIe ASPM disabled\n");
   }
 }
 
@@ -618,6 +683,8 @@ static bool is_pch_spt(uint16_t dev)
   switch (dev) {
   case 0x153A:
   case 0x153B:
+  case 0x1559:
+  case 0x155A:
   case 0x15A0:
   case 0x15A1:
   case 0x15A2:
@@ -794,10 +861,18 @@ static void e1000_send(const uint8_t *frame, uint32_t len)
       ;
   reg_write(E1000_TDT, tx_cur);
 
-  /* Wait for the card to write back DD (bounded spin). */
-  for (int spins = 0; spins < 1000000; spins++)
-    if (tx_ring[i].status & TXD_DD)
-      break;
+  /* Wait for the card to write back DD (bounded spin); on a hung TX unit, rewind the ring and drop the frame. */
+  volatile struct tx_desc *td = &tx_ring[i];
+  int spins = 0;
+  while (!(td->status & TXD_DD) && ++spins < 1000000)
+    ;
+  if (!(td->status & TXD_DD)) {
+    reg_write(E1000_TCTL, reg_read(E1000_TCTL) & ~TCTL_EN);
+    reg_write(E1000_TDH, 0);
+    reg_write(E1000_TDT, 0);
+    tx_cur = 0;
+    reg_write(E1000_TCTL, reg_read(E1000_TCTL) | TCTL_EN);
+  }
 
   irq_restore(fl);
 }
@@ -805,8 +880,8 @@ static void e1000_send(const uint8_t *frame, uint32_t len)
 /* Drain every complete frame the card has DMA'd in. Called from the IRQ. */
 static void rx_poll(void)
 {
-  while (rx_ring[rx_cur].status & RXD_DD) {
-    struct rx_desc *d = &rx_ring[rx_cur];
+  while (((volatile struct rx_desc *)&rx_ring[rx_cur])->status & RXD_DD) {
+    volatile struct rx_desc *d = &rx_ring[rx_cur];
     uint16_t len = d->length;
 
     if ((d->status & RXD_EOP) && d->errors == 0 && len >= 14 && len <= BUF_SIZE)
@@ -849,6 +924,8 @@ static const char *model_name(uint16_t dev)
   case 0x153A:
   case 0x153B:
     return "I217";
+  case 0x1559:
+  case 0x155A:
   case 0x15A0:
   case 0x15A1:
   case 0x15A2:
@@ -919,6 +996,7 @@ static int e1000_probe(void)
       return 0;
     }
     pci_set_d0(bus, slot, func);
+    pci_disable_aspm(bus, slot, func);
   }
 
   /* Enable memory-space decoding (bit 1) and bus-master DMA (bit 2). */
