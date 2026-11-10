@@ -8,7 +8,7 @@ pre-commit:
       stage_fixed: true
     tidy:
       glob: "{kernel,drivers}/**/*.c"
-      run: make tidy TIDY_FILES="{staged_files}"
+      run: make tidy TIDY_FILES="$(echo {staged_files})"
 
 pre-push:
   commands:
