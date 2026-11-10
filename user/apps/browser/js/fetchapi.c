@@ -228,17 +228,38 @@ void fetch_req_free(struct fetch_req *rq)
   rq->extra_hdrs = 0;
 }
 
-int fetch_csp(char *url, int cap)
+int fetch_csp(char *url, int cap, const char *what)
 {
   char use[URL_MAX], reason[64];
   if (!B->pg->csp)
     return 1;
   if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
-    js_csp_log("connection to", url, reason);
+    js_csp_log(what, url, reason);
     return 0;
   }
   strlcpy(url, use, cap);
   return 1;
+}
+
+int fetch_csp_ws(const char *url)
+{
+  char norm[URL_MAX], use[URL_MAX], reason[64];
+  int k = 0;
+  if (!B->pg->csp)
+    return 1;
+  if (starts_ci(url, "wss://")) { /* connect-src matches sockets by their http(s) twin */
+    sapp(norm, &k, sizeof norm, "https://");
+    sapp(norm, &k, sizeof norm, url + 6);
+  } else if (starts_ci(url, "ws://")) {
+    sapp(norm, &k, sizeof norm, "http://");
+    sapp(norm, &k, sizeof norm, url + 5);
+  } else {
+    sapp(norm, &k, sizeof norm, url);
+  }
+  if (csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason))
+    return 1;
+  js_csp_log("WebSocket to", url, reason);
+  return 0;
 }
 
 int fetch_run(const struct fetch_req *rq, struct fetch_res *rs)
@@ -290,6 +311,24 @@ int fetch_run(const struct fetch_req *rq, struct fetch_res *rs)
   return FETCH_OK;
 }
 
+unsigned char *fetch_get(const char *url, int *len)
+{
+  struct fetch_req rq = {.method = "GET"};
+  struct fetch_res *rs = malloc(sizeof *rs);
+  unsigned char *body = 0;
+  if (!rs)
+    return 0;
+  strlcpy(rq.url, url, sizeof rq.url);
+  if (fetch_run(&rq, rs) == FETCH_OK && rs->status >= 200 && rs->status < 300) {
+    body = rs->body;
+    *len = rs->len;
+  } else {
+    free(rs->body);
+  }
+  free(rs);
+  return body;
+}
+
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct fetch_req rq = {.method = "GET"};
@@ -308,7 +347,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     strlcpy(rq.url, s, sizeof rq.url);
   else
     resolve_url(g_page_url_buf, s, rq.url, sizeof rq.url);
-  if (!fetch_csp(rq.url, sizeof rq.url))
+  if (!fetch_csp(rq.url, sizeof rq.url, "connection to"))
     return js_promise_rejected(
         ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Refused to connect (Content-Security-Policy)"));
   if (in.type == JV_OBJ) { /* method carried on a Request */

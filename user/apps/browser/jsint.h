@@ -14,6 +14,35 @@
 extern js_ctx *g_ctx;               /* the engine context for the whole current page  */
 extern int g_page_live;             /* a page context is currently alive              */
 extern js_object *g_response_proto; /* fetch() Response.prototype (fetch + SW share) */
+/* One resolved request and its response; fetch(), XMLHttpRequest and a worker's fetch relay all run through fetch_run */
+struct fetch_req {
+  char url[URL_MAX];
+  char method[16];
+  char ctype[160];
+  char *extra_hdrs; /* "Name: value\r\n" block; malloc'd by fetch_req_header (a caller pointing it elsewhere skips fetch_req_free) */
+  int extra_len;
+  const unsigned char *body;
+  int body_len;
+  bool with_creds;
+  int cache_mode; /* enum http_cache_mode */
+};
+struct fetch_res {
+  unsigned char *body; /* malloc'd; NULL on failure */
+  int len;
+  int status;
+  char status_text[64];
+  char ctype[160];
+  char final_url[URL_MAX];
+  char hdr[RESP_HDR_MAX]; /* raw response header block, status line first */
+};
+enum { FETCH_OK = 0, FETCH_ABORTED, FETCH_FAILED };
+int fetch_req_header(struct fetch_req *rq, const char *name, const char *value); /* 0, or -1 when out of memory */
+void fetch_req_free(struct fetch_req *rq);
+int fetch_csp(char *url, int cap, const char *what); /* connect-src: 1 allowed (url upgraded in place), 0 blocked, logged as `what` */
+int fetch_csp_ws(const char *url);                   /* the same for a ws:// or wss:// URL */
+int fetch_run(const struct fetch_req *rq, struct fetch_res *rs);
+unsigned char *fetch_get(const char *url, int *len); /* GET through the CORS transport: the body (caller frees) of a 2xx response, else NULL */
+
 extern const char *const fetch_cache_names[]; /* indexed by enum http_cache_mode */
 int fetch_cache_mode(js_ctx *ctx, js_value input, js_value init, const char **err);
 extern char g_page_url_buf[];       /* the current page URL (module + SW referrer) */

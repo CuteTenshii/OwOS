@@ -1753,27 +1753,9 @@ static void worker_main(void *arg)
 /* The script's bytes as a NUL-terminated string, or NULL */
 static char *fetch_source(const char *url)
 {
-  unsigned char *body;
-  int len;
+  int len = 0;
   char *src;
-  if (starts_ci(url, "data:")) {
-    char ctype[64];
-    body = decode_data_url(url, &len, ctype, sizeof ctype);
-  } else if (starts_ci(url, "blob:")) {
-    char ctype[64];
-    body = blobstore_get(url, &len, ctype, sizeof ctype);
-  } else {
-    struct http_req rq = {0};
-    struct http_resp rs = {0};
-    rq.url = url;
-    rq.method = "GET";
-    body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
-    len = rs.len;
-    if (body && (rs.status < 200 || rs.status >= 300)) {
-      free(body);
-      return 0;
-    }
-  }
+  unsigned char *body = fetch_get(url, &len);
   if (!body)
     return 0;
   src = (char *)malloc((unsigned)len + 1);
@@ -1877,7 +1859,7 @@ static js_value request_fetch(js_ctx *ctx, int id, js_value req)
   rq.cache_mode = fetch_cache_mode(ctx, js_undef(), req, &cache_err);
   if (rq.cache_mode < 0)
     return reply_error(ctx, id, cache_err);
-  if (!fetch_csp(rq.url, sizeof rq.url))
+  if (!fetch_csp(rq.url, sizeof rq.url, "connection to"))
     return reply_error(ctx, id, "Refused to connect (Content-Security-Policy)");
   headers = js_get(ctx, req, "headers");
   n = headers.type == JV_OBJ ? js_array_len(headers.u.obj) : 0;
@@ -1942,24 +1924,7 @@ static void serve_request(struct wthread *wt, struct wmsg *m)
       reply = request_fetch(g_ctx, id, req);
     else if (op.type == JV_STR && streq(op.u.str->data, "connect")) { /* may a socket be opened to this URL? */
       js_value u = js_get(g_ctx, req, "url");
-      char norm[URL_MAX], use[URL_MAX], reason[64];
-      int ok = 1;
-      if (B->pg->csp && u.type == JV_STR) {
-        const char *url = u.u.str->data;
-        int k = 0;
-        norm[0] = 0;
-        if (starts_ci(url, "wss://")) {
-          sapp(norm, &k, sizeof norm, "https://");
-          sapp(norm, &k, sizeof norm, url + 6);
-        } else if (starts_ci(url, "ws://")) {
-          sapp(norm, &k, sizeof norm, "http://");
-          sapp(norm, &k, sizeof norm, url + 5);
-        } else
-          sapp(norm, &k, sizeof norm, url);
-        ok = csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason);
-        if (!ok)
-          js_csp_log("WebSocket to", url, reason);
-      }
+      int ok = u.type != JV_STR || fetch_csp_ws(u.u.str->data);
       if (ok) {
         js_object *o = js_new_object(g_ctx, g_ctx->object_proto);
         gc_keep(o);

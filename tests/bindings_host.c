@@ -209,11 +209,12 @@ unsigned char *woff_to_sfnt(const unsigned char *d, int n, int *out)
   (void)out;
   return 0;
 }
+/* Like the real transport, serves blob: object URLs from the blob store and nothing else */
 unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 {
-  (void)rq;
-  (void)rs;
-  return 0;
+  unsigned char *body = starts_ci(rq->url, "blob:") ? blobstore_get(rq->url, &rs->len, rs->ctype, sizeof rs->ctype) : 0;
+  rs->status = body ? 200 : 0;
+  return body;
 }
 /* Box every node reports; tests set it to fake a laid-out page (0 = no layout) */
 int test_box_x, test_box_y, test_box_w, test_box_h, test_scroll, test_doc_h;

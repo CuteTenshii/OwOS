@@ -68,7 +68,7 @@ js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
   strlcpy(rq.url, arg_str(ctx, js_get(ctx, t, "@url")), sizeof rq.url);
   strlcpy(rq.method, arg_str(ctx, js_get(ctx, t, "@method")), sizeof rq.method);
   strlcpy(rq.ctype, arg_str(ctx, js_get(ctx, t, "@ctype")), sizeof rq.ctype);
-  if (!fetch_csp(rq.url, sizeof rq.url)) {
+  if (!fetch_csp(rq.url, sizeof rq.url, "connection to")) {
     js_set(ctx, t, "status", js_number(0));
     xhr_setrt(ctx, t, 4);
     emit_event(t.u.obj, "error", js_undef());

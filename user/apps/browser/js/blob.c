@@ -468,14 +468,8 @@ js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (argc < 1)
     return js_bool(0);
   resolve_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
-  if (B->pg->csp) {
-    char use[URL_MAX], reason[64];
-    if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
-      js_csp_log("beacon to", url, reason);
-      return js_bool(0);
-    }
-    strlcpy(url, use, sizeof url);
-  }
+  if (!fetch_csp(url, sizeof url, "beacon to"))
+    return js_bool(0);
   ctype[0] = '\0';
   gc_push_scope();
   if (data.type == JV_OBJ)

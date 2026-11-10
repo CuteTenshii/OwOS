@@ -737,24 +737,26 @@ static int cache_id_of(js_ctx *ctx, js_value t)
 }
 static bool cache_fetch_store(int id, const char *method, const char *url)
 {
-  struct http_req rq = {0};
-  struct http_resp rs = {0};
-  unsigned char *body;
+  struct fetch_req rq = {.method = "GET"};
+  struct fetch_res *rs = malloc(sizeof *rs);
   struct sw_cache *c;
-  rq.url = url;
-  rq.method = method[0] ? method : "GET";
-  body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
-  if (!body || rs.status < 200 || rs.status >= 300) {
-    free(body);
+  bool ok;
+  if (!rs)
     return false;
+  strlcpy(rq.url, url, sizeof rq.url);
+  if (method[0])
+    strlcpy(rq.method, method, sizeof rq.method);
+  ok = fetch_run(&rq, rs) == FETCH_OK && rs->status >= 200 && rs->status < 300;
+  if (ok) {
+    swc_lock();
+    c = sw_cache_by_id(id);
+    if (c)
+      sw_cache_store(c, method, url, rs->status, rs->status_text, rs->ctype, (const char *)rs->body, rs->len);
+    swc_unlock();
   }
-  swc_lock();
-  c = sw_cache_by_id(id);
-  if (c)
-    sw_cache_store(c, method, url, rs.status, rs.status == 200 ? "OK" : "", rs.ctype, (const char *)body, rs.len);
-  swc_unlock();
-  free(body);
-  return true;
+  free(rs->body);
+  free(rs);
+  return ok;
 }
 static js_value cache_add(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1088,22 +1090,19 @@ static js_value reg_update(js_ctx *ctx, js_value t, js_value *args, int argc)
   char org[URL_MAX];
   js_value sc = js_get(ctx, t, "@scope");
   struct sw_reg *r;
-  struct http_req rq = {0};
-  struct http_resp rs = {0};
   unsigned char *body;
+  int blen = 0;
   (void)args;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
   r = sw_reg_find_scope(org, sc.type == JV_STR ? sc.u.str->data : "");
   if (!r)
     return sw_resolve(ctx, t);
-  rq.url = r->script_url;
-  rq.method = "GET";
-  body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
+  body = fetch_get(r->script_url, &blen);
   if (body) {
-    bool changed = !(r->src && r->slen == rs.len && memcmp(r->src, body, (unsigned)rs.len) == 0);
+    bool changed = !(r->src && r->slen == blen && memcmp(r->src, body, (unsigned)blen) == 0);
     if (changed) {
-      sw_reg_set_src(r, (char *)body, rs.len);
+      sw_reg_set_src(r, (char *)body, blen);
       r->installed = false;
     }
     free(body);
@@ -1380,24 +1379,18 @@ static js_value swg_import_scripts(js_ctx *ctx, js_value t, js_value *args, int 
     char url[URL_MAX];
     js_value locv = g_sw_active_scope ? js_get(ctx, js_obj_value(g_sw_active_scope), "location") : js_undef();
     js_value href = locv.type == JV_OBJ ? js_get(ctx, locv, "href") : js_undef();
-    struct http_req rq = {0};
-    struct http_resp rs = {0};
     unsigned char *body;
+    int blen = 0;
     resolve_url(href.type == JV_STR ? href.u.str->data : g_page_url_buf, arg_str(ctx, args[i]), url, sizeof url);
-    rq.url = url;
-    rq.method = "GET";
-    body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
-    if (!body || rs.status < 200 || rs.status >= 300) {
-      if (body)
-        free(body);
+    body = fetch_get(url, &blen);
+    if (!body)
       return js_throw_type(ctx, "importScripts failed");
-    }
     {
-      char *code = (char *)malloc((unsigned)rs.len + 1);
+      char *code = (char *)malloc((unsigned)blen + 1);
       if (code) {
         js_arena *ar;
-        memcpy(code, body, (unsigned)rs.len);
-        code[rs.len] = 0;
+        memcpy(code, body, (unsigned)blen);
+        code[blen] = 0;
         ar = (js_arena *)malloc(sizeof *ar);
         if (ar) {
           js_parse_error pe;
@@ -1534,9 +1527,8 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
   char script[URL_MAX], scope[URL_MAX], org[URL_MAX];
   struct sw_reg *r;
   js_value regobj;
-  struct http_req rq = {0};
-  struct http_resp rs = {0};
   unsigned char *body;
+  int blen = 0;
   bool changed;
   (void)t;
   resolve_url(g_page_url_buf, arg_str(ctx, A(0)), script, sizeof script);
@@ -1551,12 +1543,8 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (!cors_same_origin(g_page_url_buf, script))
     return js_promise_rejected(ctx, dom_exception(ctx, "SecurityError", "ServiceWorker script must be same-origin"));
   cors_origin(g_page_url_buf, org, sizeof org);
-  rq.url = script;
-  rq.method = "GET";
-  body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
-  if (!body || rs.status < 200 || rs.status >= 300) {
-    if (body)
-      free(body);
+  body = fetch_get(script, &blen);
+  if (!body) {
     return js_promise_rejected(
         ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "ServiceWorker script fetch failed"));
   }
@@ -1565,9 +1553,9 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
     free(body);
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "Error", "registration failed"));
   }
-  changed = !(r->src && r->slen == rs.len && memcmp(r->src, body, (unsigned)rs.len) == 0);
+  changed = !(r->src && r->slen == blen && memcmp(r->src, body, (unsigned)blen) == 0);
   if (changed) {
-    sw_reg_set_src(r, (char *)body, rs.len);
+    sw_reg_set_src(r, (char *)body, blen);
     r->installed = false;
   }
   free(body);

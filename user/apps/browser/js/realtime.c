@@ -208,25 +208,7 @@ js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, g_ws_proto));
-  bool ws_blocked = false;
-  if (B->pg->csp) { /* CSP connect-src (ws->http for matching) */
-    char norm[URL_MAX], use[URL_MAX], reason[64];
-    int k = 0;
-    norm[0] = '\0';
-    if (starts_ci(url, "wss://")) {
-      sapp(norm, &k, sizeof norm, "https://");
-      sapp(norm, &k, sizeof norm, url + 6);
-    } else if (starts_ci(url, "ws://")) {
-      sapp(norm, &k, sizeof norm, "http://");
-      sapp(norm, &k, sizeof norm, url + 5);
-    } else {
-      sapp(norm, &k, sizeof norm, url);
-    }
-    if (!csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
-      js_csp_log("WebSocket to", url, reason);
-      ws_blocked = true;
-    }
-  }
+  bool ws_blocked = !fetch_csp_ws(url);
   c = ws_blocked ? 0 : ws_open(url, protos[0] ? protos : 0); /* blocks for connect + handshake */
   o->host = c;
   js_def(o, "url", js_mk_cstring(ctx, url), P_ENUMERABLE);
