@@ -29,6 +29,20 @@ static void check_put_consumes_on_failure(void)
   json_free(obj);
 }
 
+static void check_array_put(void)
+{
+  json_value *arr = json_new_array(), *obj = json_new_object();
+  expect(json_array_put(arr, json_new_number(1)) == 0);
+  expect(json_array_put(arr, json_new_string("b")) == 0);
+  expect(json_array_len(arr) == 2);
+  expect_string(json_as_string(json_array_get(arr, 1)), "b");
+  expect(json_array_put(obj, json_new_string("x")) == -1); /* not an array: the string is freed */
+  expect(json_array_put(0, json_new_string("x")) == -1);
+  expect(json_array_put(arr, 0) == -1);
+  json_free(arr);
+  json_free(obj);
+}
+
 static void check_set_leaves_ownership_on_failure(void)
 {
   json_value *v = json_new_string("kept");
@@ -41,6 +55,7 @@ int main(void)
 {
   test("put inserts and replaces", check_put_inserts_and_replaces);
   test("put frees the value when it fails", check_put_consumes_on_failure);
+  test("array put appends and frees the item when it fails", check_array_put);
   test("set leaves the value with the caller when it fails", check_set_leaves_ownership_on_failure);
   return 0;
 }

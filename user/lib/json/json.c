@@ -122,6 +122,14 @@ int json_array_push(json_value *arr, json_value *item)
   return 0;
 }
 
+int json_array_put(json_value *arr, json_value *item)
+{
+  if (json_array_push(arr, item) == 0)
+    return 0;
+  json_free(item);
+  return -1;
+}
+
 int json_object_set(json_value *obj, const char *key, json_value *val)
 {
   int klen, i;

@@ -585,8 +585,7 @@ static void list_target(const struct page *pg, bool active, void *ctx)
   struct target_list *tl = ctx;
   json_value *o = target_json(tl->host, pg);
   (void)active;
-  if (json_array_push(tl->arr, o) != 0)
-    json_free(o);
+  json_array_put(tl->arr, o);
 }
 
 static void serve_http(int fd, const char *req)
@@ -989,8 +988,8 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
     json_object_put(o, "nodeValue", json_new_string(""));
     json_value *attrs = json_new_array();
     for (struct dom_attr *a = n->attrs; a; a = a->next) {
-      json_array_push(attrs, json_new_string(a->name));
-      json_array_push(attrs, json_new_string(a->value ? a->value : ""));
+      json_array_put(attrs, json_new_string(a->name));
+      json_array_put(attrs, json_new_string(a->value ? a->value : ""));
     }
     json_object_put(o, "attributes", attrs);
   }
@@ -1017,14 +1016,14 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
       json_object_put(d, "name", json_new_string(dt));
       json_object_put(d, "publicId", json_new_string(""));
       json_object_put(d, "systemId", json_new_string(""));
-      json_array_push(kids, d);
+      json_array_put(kids, d);
     }
     for (struct dom_node *c = n->first_child; c; c = c->next) {
       if (!child_shown(c))
         continue;
       json_value *kv = dom_serialize(c, depth + 1, maxdepth, budget);
       if (kv)
-        json_array_push(kids, kv);
+        json_array_put(kids, kv);
       else
         break;
     }
@@ -1087,7 +1086,7 @@ static json_value *cssstyle_from_text(const char *raw)
         json_value *pr = json_new_object();
         json_object_put(pr, "name", json_new_string(nm));
         json_object_put(pr, "value", json_new_string(vl));
-        json_array_push(props, pr);
+        json_array_put(props, pr);
       }
     }
     seg = *e ? e + 1 : e;
@@ -1104,7 +1103,7 @@ static void cs_add(json_value *arr, const char *name, const char *value)
   json_value *p = json_new_object();
   json_object_put(p, "name", json_new_string(name));
   json_object_put(p, "value", json_new_string(value));
-  json_array_push(arr, p);
+  json_array_put(arr, p);
 }
 static void cs_px(json_value *arr, const char *name, int v)
 {
@@ -1252,14 +1251,14 @@ static const char *res_type(const char *ct);
 static json_value *quad(int x, int y, int w, int h)
 {
   json_value *q = json_new_array();
-  json_array_push(q, json_new_number(x));
-  json_array_push(q, json_new_number(y));
-  json_array_push(q, json_new_number(x + w));
-  json_array_push(q, json_new_number(y));
-  json_array_push(q, json_new_number(x + w));
-  json_array_push(q, json_new_number(y + h));
-  json_array_push(q, json_new_number(x));
-  json_array_push(q, json_new_number(y + h));
+  json_array_put(q, json_new_number(x));
+  json_array_put(q, json_new_number(y));
+  json_array_put(q, json_new_number(x + w));
+  json_array_put(q, json_new_number(y));
+  json_array_put(q, json_new_number(x + w));
+  json_array_put(q, json_new_number(y + h));
+  json_array_put(q, json_new_number(x));
+  json_array_put(q, json_new_number(y + h));
   return q;
 }
 
@@ -1289,8 +1288,8 @@ static void add_target_info(const struct page *pg, bool active, void *ctx)
   json_object_put(o, "browserContextId", json_new_string("owos-ctx"));
   if (ti->only)
     ti->one = o;
-  else if (json_array_push(ti->arr, o) != 0)
-    json_free(o);
+  else
+    json_array_put(ti->arr, o);
 }
 
 static json_value *handle_method(struct cdp_session *sess, const char *m, json_value *params)
@@ -1400,7 +1399,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     json_object_put(e, "userTypedURL", json_new_string(B->pg->cur_url));
     json_object_put(e, "title", json_new_string(B->pg->doc_title));
     json_object_put(e, "transitionType", json_new_string("typed"));
-    json_array_push(entries, e);
+    json_array_put(entries, e);
     json_object_put(r, "entries", entries);
     return r;
   }
@@ -1451,7 +1450,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     json_value *ids = json_new_array();
     struct sel_list *l = (n && sel && sel[0]) ? css_sel_parse(sel) : 0;
     for (struct dom_node *c = l ? next_match(l, n, n) : 0; c; c = next_match(l, c, n))
-      json_array_push(ids, json_new_number(node_register(c)));
+      json_array_put(ids, json_new_number(node_register(c)));
     css_sel_free(l);
     json_object_put(r, "nodeIds", ids);
     return r;
@@ -1549,7 +1548,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
         json_value *sels = json_new_array();
         json_value *s1 = json_new_object();
         json_object_put(s1, "text", json_new_string(mm[i].selector));
-        json_array_push(sels, s1);
+        json_array_put(sels, s1);
         json_object_put(sl, "selectors", sels);
         json_object_put(sl, "text", json_new_string(mm[i].selector));
         json_object_put(rule, "selectorList", sl);
@@ -1558,9 +1557,9 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
         json_value *mcr = json_new_object();
         json_object_put(mcr, "rule", rule);
         json_value *msel = json_new_array();
-        json_array_push(msel, json_new_number(0));
+        json_array_put(msel, json_new_number(0));
         json_object_put(mcr, "matchingSelectors", msel);
-        json_array_push(rules, mcr);
+        json_array_put(rules, mcr);
       }
     }
     json_object_put(r, "matchedCSSRules", rules);
@@ -1595,7 +1594,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
       json_object_put(ck, "secure", json_new_bool(0));
       json_object_put(ck, "session", json_new_bool(1));
       json_object_put(ck, "sameSite", json_new_string("Lax"));
-      json_array_push(arr, ck);
+      json_array_put(arr, ck);
     }
     json_object_put(r, "cookies", arr);
     return r;
@@ -1607,9 +1606,9 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     for (int i = 0; (k = storage_key(B->pg->cur_url, !is_local, i)); i++) {
       const char *v = storage_get(B->pg->cur_url, !is_local, k);
       json_value *pair = json_new_array();
-      json_array_push(pair, json_new_string(k));
-      json_array_push(pair, json_new_string(v ? v : ""));
-      json_array_push(entries, pair);
+      json_array_put(pair, json_new_string(k));
+      json_array_put(pair, json_new_string(v ? v : ""));
+      json_array_put(entries, pair);
     }
     json_object_put(r, "entries", entries);
     return r;
@@ -1794,7 +1793,7 @@ void cdp_console_line(int level, const char *text)
   json_value *a0 = json_new_object();
   json_object_put(a0, "type", json_new_string("string"));
   json_object_put(a0, "value", json_new_string(text));
-  json_array_push(args, a0);
+  json_array_put(args, a0);
   json_object_put(p, "args", args);
   json_object_put(p, "executionContextId", json_new_number(1));
   json_object_put(p, "timestamp", json_new_number(0));
