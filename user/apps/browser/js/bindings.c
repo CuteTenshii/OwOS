@@ -2662,6 +2662,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
   def_method(win, "fetch", win_fetch, 2);
+  fetch_headers_install(ctx);
 
   /* WebSocket (RFC 6455 over user/lib/websocket): live */
   def_method(g_ws_proto, "send", ws_send_m, 1);

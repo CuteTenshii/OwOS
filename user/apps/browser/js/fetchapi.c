@@ -39,25 +39,92 @@ js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)argc;
   return t; /* body isn't consumed here, so self works */
 }
-js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc)
+#define JS(...) #__VA_ARGS__
+/* Headers, in JavaScript: the same source runs on the page and in dedicated workers (webworker.c) */
+const char fetch_headers_js[] =
+#include "headers.inc"
+    ;
+
+js_value fetch_headers_install(js_ctx *ctx)
 {
-  const char *name = arg_str(ctx, A(0));
-  (void)argc;
-  if (streq_ci(name, "content-type"))
-    return js_get(ctx, t, "@ctype");
-  return js_null();
-}
-js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_value v = hdr_get(ctx, t, args, argc);
-  return js_bool(v.type == JV_STR);
+  js_arena *ar = (js_arena *)malloc(sizeof *ar);
+  js_parse_error pe;
+  js_node *prog;
+  js_value fn = js_undef(), g = js_obj_value(ctx->global), ctor = js_undef();
+  if (!ar)
+    return ctor;
+  js_arena_init(ar);
+  prog = js_parse(fetch_headers_js, ar, &pe);
+  if (prog && js_run(ctx, prog, &fn) == 0 && js_is_callable(fn))
+    ctor = js_call(ctx, fn, js_undef(), &g, 1);
+  if (!prog || !arenas_push(ar)) {
+    js_arena_free(ar);
+    free(ar);
+  }
+  if (ctor.type == JV_OBJ)
+    js_def(ctx->global, "@Headers", ctor, P_WRITABLE);
+  return ctor;
 }
 
-/* Build a Response on g_response_proto from raw bytes */
-js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, const char *ctype,
-                         const char *body, int len)
+js_value headers_new(js_ctx *ctx, js_value init)
 {
-  js_object *resp, *hdrs;
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "@Headers");
+  return js_is_callable(ctor) ? js_construct(ctx, ctor, &init, init.type == JV_UNDEF ? 0 : 1) : js_undef();
+}
+
+js_value headers_ctype(js_ctx *ctx, js_value h)
+{
+  js_value m = h.type == JV_OBJ ? js_get(ctx, h, "@map") : js_undef();
+  return m.type == JV_OBJ ? js_get(ctx, m, "content-type") : js_undef();
+}
+
+/* Header block ("HTTP/1.1 200 OK" line first) -> [[name, value], ...], set-cookie left out */
+js_value parse_header_block(js_ctx *ctx, const char *hdr)
+{
+  js_object *list = js_new_array(ctx, 0);
+  const char *p = hdr, *eol;
+  gc_push_scope();
+  gc_keep(list);
+  while (*p && (eol = strchr(p, '\n'))) {
+    const char *colon = p, *vs, *ve = eol;
+    while (colon < eol && *colon != ':')
+      colon++;
+    if (colon < eol && p != hdr && colon > p && p[0] != '\r') {
+      char name[128];
+      int nl = (int)(colon - p);
+      js_object *pair;
+      if (nl < (int)sizeof name) {
+        memcpy(name, p, (unsigned)nl);
+        name[nl] = 0;
+        vs = colon + 1;
+        while (vs < ve && (*vs == ' ' || *vs == '\t'))
+          vs++;
+        while (ve > vs && (ve[-1] == '\r' || ve[-1] == ' '))
+          ve--;
+        if (!streq_ci(name, "set-cookie") && !streq_ci(name, "set-cookie2")) {
+          pair = js_new_array(ctx, 0);
+          gc_push_scope();
+          gc_keep(pair);
+          js_array_push(ctx, pair, js_mk_cstring(ctx, name));
+          js_array_push(ctx, pair, js_mk_string(ctx, vs, (int)(ve - vs)));
+          js_array_push(ctx, list, js_obj_value(pair));
+          gc_pop_scope();
+        }
+      }
+    }
+    p = eol + 1;
+  }
+  gc_pop_scope();
+  return js_obj_value(list);
+}
+
+/* Build a Response on g_response_proto from raw bytes. `hdrs` is anything new Headers() takes (or undefined); `ctype`
+ * becomes the Content-Type unless those already carry one. */
+js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, js_value hdrs,
+                         const char *ctype, const char *body, int len)
+{
+  js_object *resp;
+  js_value h;
   gc_push_scope();
   resp = (js_object *)gc_keep(js_new_object(ctx, g_response_proto));
   js_def(resp, "@body", js_mk_string(ctx, body ? body : "", len < 0 ? 0 : len), 0);
@@ -68,11 +135,17 @@ js_object *make_response(js_ctx *ctx, const char *url, int status, const char *s
   js_def(resp, "redirected", js_bool(0), P_ENUMERABLE);
   js_def(resp, "type", js_mk_cstring(ctx, "basic"), P_ENUMERABLE);
   js_def(resp, "bodyUsed", js_bool(0), P_WRITABLE | P_ENUMERABLE);
-  hdrs = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(hdrs, "@ctype", js_mk_cstring(ctx, ctype ? ctype : ""), 0);
-  js_def_native(ctx, hdrs, "get", hdr_get, 1);
-  js_def_native(ctx, hdrs, "has", hdr_has, 1);
-  js_def(resp, "headers", js_obj_value(hdrs), P_ENUMERABLE);
+  h = headers_new(ctx, hdrs);
+  if (h.type == JV_OBJ) {
+    gc_keep(h.u.obj);
+    if (ctype && ctype[0] && headers_ctype(ctx, h).type != JV_STR) {
+      js_value kv[2];
+      kv[0] = js_mk_cstring(ctx, "content-type");
+      kv[1] = js_mk_cstring(ctx, ctype);
+      js_call(ctx, js_get(ctx, h, "set"), h, kv, 2);
+    }
+    js_def(resp, "headers", h, P_ENUMERABLE);
+  }
   gc_pop_scope();
   return resp;
 }
@@ -81,7 +154,7 @@ js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   int status = 200;
   char st[64], ct[160];
-  js_value stream = js_undef(), bstr, rv;
+  js_value stream = js_undef(), bstr, rv, hinit = js_undef();
   js_object *resp;
   (void)thisv;
   strlcpy(st, "", sizeof st);
@@ -100,16 +173,9 @@ js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
       status = (int)s.u.num;
     if (stt.type == JV_STR)
       strlcpy(st, stt.u.str->data, sizeof st);
-    if (h.type == JV_OBJ) {
-      js_value c = js_get(ctx, h, "content-type");
-      js_value cc = js_get(ctx, h, "@ctype");
-      if (c.type == JV_STR)
-        strlcpy(ct, c.u.str->data, sizeof ct);
-      if (cc.type == JV_STR && cc.u.str->len)
-        strlcpy(ct, cc.u.str->data, sizeof ct);
-    }
+    hinit = h;
   }
-  resp = (js_object *)gc_keep(make_response(ctx, "", status, st, ct, bstr.type == JV_STR ? bstr.u.str->data : "",
+  resp = (js_object *)gc_keep(make_response(ctx, "", status, st, hinit, ct, bstr.type == JV_STR ? bstr.u.str->data : "",
                                             bstr.type == JV_STR ? bstr.u.str->len : 0));
   if (stream.type == JV_OBJ)
     js_def(resp, "@source", stream, 0);
@@ -329,12 +395,41 @@ unsigned char *fetch_get(const char *url, int *len)
   return body;
 }
 
+/* Add every header of `src` (anything new Headers() takes) to the request; -1 with the error in *exc */
+static int fetch_req_add_headers(js_ctx *ctx, struct fetch_req *rq, js_value src, js_value *exc)
+{
+  js_value h = headers_new(ctx, src), map, order;
+  unsigned i;
+  int rc = 0;
+  if (ctx->has_exc) {
+    *exc = ctx->exc;
+    ctx->has_exc = 0;
+    ctx->exc_root = 0;
+    return -1;
+  }
+  map = h.type == JV_OBJ ? js_get(ctx, h, "@map") : js_undef();
+  order = h.type == JV_OBJ ? js_get(ctx, h, "@order") : js_undef();
+  if (map.type != JV_OBJ || order.type != JV_OBJ)
+    return 0;
+  gc_push_scope();
+  gc_keep(h.u.obj);
+  for (i = 0; rc == 0 && i < js_array_len(order.u.obj); i++) {
+    js_value k = js_get_index(ctx, order, i), v = k.type == JV_STR ? js_get(ctx, map, k.u.str->data) : js_undef();
+    if (v.type == JV_STR && fetch_req_header(rq, k.u.str->data, v.u.str->data) < 0) {
+      *exc = js_make_error(ctx, ctx->type_error_proto, "TypeError", "Out of memory");
+      rc = -1;
+    }
+  }
+  gc_pop_scope();
+  return rc;
+}
+
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct fetch_req rq = {.method = "GET"};
   struct fetch_res *rs;
   js_object *resp;
-  js_value rv, in = A(0), init = A(1);
+  js_value rv, in = A(0), init = A(1), hsrc, exc;
   const char *s, *cache_err;
   (void)t;
   if (in.type == JV_OBJ) { /* input is a URL string or a Request object (fetch(new Request(...))) */
@@ -355,32 +450,22 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     if (m.type == JV_STR)
       strlcpy(rq.method, m.u.str->data, sizeof rq.method);
   }
+  hsrc = init.type == JV_OBJ ? js_get(ctx, init, "headers") : js_undef();
+  if (hsrc.type == JV_UNDEF && in.type == JV_OBJ)
+    hsrc = js_get(ctx, in, "headers"); /* the headers of a Request input */
+  if (hsrc.type != JV_UNDEF && fetch_req_add_headers(ctx, &rq, hsrc, &exc) < 0) {
+    fetch_req_free(&rq);
+    return js_promise_rejected(ctx, exc);
+  }
   if (init.type == JV_OBJ) {
     js_value m = js_get(ctx, init, "method");
     js_value b = js_get(ctx, init, "body");
     js_value sig = js_get(ctx, init, "signal");
-    js_value h = js_get(ctx, init, "headers");
     js_value cr = js_get(ctx, init, "credentials");
     if (m.type == JV_STR)
       strlcpy(rq.method, m.u.str->data, sizeof rq.method);
     (void)js_to_boolean(js_get(ctx, init, "keepalive")); /* sync fetch: inherently satisfied */
     rq.with_creds = cr.type == JV_STR && streq(cr.u.str->data, "include"); /* "include" sends cookies cross-origin */
-    /* Request headers: a plain { name: value } object (a Headers instance is a plain object here too) */
-    if (h.type == JV_OBJ) {
-      pmap *pm = &h.u.obj->props;
-      int i;
-      for (i = 0; i < pm->n; i++) {
-        const char *k = pm->e[i].key;
-        js_value v;
-        if (!k || k[0] == '@' || (pm->e[i].flags & P_ACCESSOR))
-          continue;
-        v = js_to_string(ctx, js_get(ctx, h, k));
-        if (v.type == JV_STR && fetch_req_header(&rq, k, v.u.str->data) < 0) {
-          fetch_req_free(&rq);
-          return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Out of memory"));
-        }
-      }
-    }
     /* An already-aborted signal short-circuits before touching the network */
     if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
       js_value reason = js_get(ctx, sig, "reason");
@@ -418,7 +503,8 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
   default:
     gc_push_scope();
     resp = (js_object *)gc_keep(make_response(ctx, rs->final_url[0] ? rs->final_url : rq.url, rs->status,
-                                              rs->status_text, rs->ctype, (const char *)rs->body, rs->len));
+                                              rs->status_text, parse_header_block(ctx, rs->hdr), rs->ctype,
+                                              (const char *)rs->body, rs->len));
     rv = js_promise_resolved(ctx, js_obj_value(resp));
     gc_pop_scope();
   }

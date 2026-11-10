@@ -570,7 +570,8 @@ static void sw_input_method(js_ctx *ctx, js_value v, char *out, int cap)
 }
 static js_value sw_make_request(js_ctx *ctx, const char *url, const char *method)
 {
-  js_object *o, *h;
+  js_object *o;
+  js_value hv;
   js_value rv;
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, g_request_proto));
@@ -582,14 +583,19 @@ static js_value sw_make_request(js_ctx *ctx, const char *url, const char *method
   js_def(o, "redirect", js_mk_cstring(ctx, "follow"), P_ENUMERABLE);
   js_def(o, "referrer", js_mk_cstring(ctx, "about:client"), P_ENUMERABLE);
   js_def(o, "destination", js_mk_cstring(ctx, ""), P_ENUMERABLE);
-  h = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(h, "@ctype", js_mk_cstring(ctx, ""), 0);
-  js_def_native(ctx, h, "get", hdr_get, 1);
-  js_def_native(ctx, h, "has", hdr_has, 1);
-  js_def(o, "headers", js_obj_value(h), P_ENUMERABLE);
+  hv = headers_new(ctx, js_undef());
+  if (hv.type == JV_OBJ)
+    js_def(o, "headers", hv, P_ENUMERABLE);
   rv = js_obj_value(o);
   gc_pop_scope();
   return rv;
+}
+/* Give Request `rq` a Headers built from `init` (anything new Headers() takes) */
+static void sw_set_headers(js_ctx *ctx, js_value rq, js_value init)
+{
+  js_value h = headers_new(ctx, init);
+  if (h.type == JV_OBJ)
+    js_def(rq.u.obj, "headers", h, P_ENUMERABLE);
 }
 static js_value req_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -597,15 +603,19 @@ static js_value req_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value u = js_get(ctx, t, "url"), mv = js_get(ctx, t, "method");
   (void)args;
   (void)argc;
+  js_value rv, hv = js_get(ctx, t, "headers");
   strlcpy(m, mv.type == JV_STR ? mv.u.str->data : "GET", sizeof m);
-  return sw_make_request(ctx, u.type == JV_STR ? u.u.str->data : "", m);
+  rv = sw_make_request(ctx, u.type == JV_STR ? u.u.str->data : "", m);
+  if (hv.type == JV_OBJ)
+    sw_set_headers(ctx, rv, hv);
+  return rv;
 }
 static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   char url[URL_MAX], method[16];
   js_value in = A(0);
   const char *s, *err;
-  js_value rv, mv;
+  js_value rv, mv, hv;
   int cm;
   (void)thisv;
   method[0] = 0;
@@ -629,6 +639,11 @@ static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
   gc_push_scope();
   gc_keep(rv.u.obj);
   js_def(rv.u.obj, "cache", js_mk_cstring(ctx, fetch_cache_names[cm]), P_ENUMERABLE);
+  hv = A(1).type == JV_OBJ ? js_get(ctx, A(1), "headers") : js_undef();
+  if (hv.type == JV_UNDEF && in.type == JV_OBJ)
+    hv = js_get(ctx, in, "headers");
+  if (hv.type != JV_UNDEF)
+    sw_set_headers(ctx, rv, hv);
   mv = A(1).type == JV_OBJ ? js_get(ctx, A(1), "mode") : js_undef();
   if (mv.type == JV_UNDEF && in.type == JV_OBJ)
     mv = js_get(ctx, in, "mode");
@@ -658,7 +673,7 @@ static js_value cache_match(js_ctx *ctx, js_value t, js_value *args, int argc)
     return sw_resolve(ctx, js_undef());
   {
     struct sw_c_entry *e = &c->e[i];
-    js_object *r = make_response(ctx, e->url, e->status, e->statustext, e->ctype, (const char *)e->body, e->blen);
+    js_object *r = make_response(ctx, e->url, e->status, e->statustext, js_undef(), e->ctype, (const char *)e->body, e->blen);
     return sw_resolve(ctx, js_obj_value(r));
   }
 }
@@ -680,7 +695,7 @@ static js_value cache_matchall(js_ctx *ctx, js_value t, js_value *args, int argc
       struct sw_c_entry *e = &c->e[i];
       js_array_push(
           ctx, arr,
-          js_obj_value(make_response(ctx, e->url, e->status, e->statustext, e->ctype, (const char *)e->body, e->blen)));
+          js_obj_value(make_response(ctx, e->url, e->status, e->statustext, js_undef(), e->ctype, (const char *)e->body, e->blen)));
     }
   }
   rv = js_promise_resolved(ctx, js_obj_value(arr));
@@ -712,12 +727,8 @@ static js_value cache_put(js_ctx *ctx, js_value t, js_value *args, int argc)
     js_value sv = js_get(ctx, resp, "status");
     js_value sx = js_get(ctx, resp, "statusText");
     js_value h = js_get(ctx, resp, "headers");
-    const char *ct = "";
-    if (h.type == JV_OBJ) {
-      js_value cc = js_get(ctx, h, "@ctype");
-      if (cc.type == JV_STR)
-        ct = cc.u.str->data;
-    }
+    js_value cc = headers_ctype(ctx, h);
+    const char *ct = cc.type == JV_STR ? cc.u.str->data : "";
     sw_cache_store(c, method, url, sv.type == JV_NUM ? (int)sv.u.num : 200, sx.type == JV_STR ? sx.u.str->data : "", ct,
                    b.type == JV_STR ? b.u.str->data : "", b.type == JV_STR ? b.u.str->len : 0);
   }
@@ -872,7 +883,7 @@ static js_value caches_match(js_ctx *ctx, js_value t, js_value *args, int argc)
     k = sw_cache_index(c, url);
     if (k >= 0) {
       struct sw_c_entry *e = &c->e[k];
-      js_object *r = make_response(ctx, e->url, e->status, e->statustext, e->ctype, (const char *)e->body, e->blen);
+      js_object *r = make_response(ctx, e->url, e->status, e->statustext, js_undef(), e->ctype, (const char *)e->body, e->blen);
       return sw_resolve(ctx, js_obj_value(r));
     }
   }

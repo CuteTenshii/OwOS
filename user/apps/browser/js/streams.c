@@ -374,7 +374,7 @@ js_value response_consume(js_ctx *ctx, js_value resp, int kind)
   if (src.type != JV_OBJ || !streams_load(ctx))
     return js_promise_rejected(ctx, js_mk_cstring(ctx, "Response has no stream body"));
   hdrs = js_get(ctx, resp, "headers");
-  type = hdrs.type == JV_OBJ ? js_get(ctx, hdrs, "@ctype") : js_undef();
+  type = headers_ctype(ctx, hdrs);
   gc_push_scope();
   args[0] = src;
   args[1] = js_number(kind);
@@ -414,7 +414,7 @@ static js_value response_blob(js_ctx *ctx, js_value t, js_value *args, int argc)
     return response_consume(ctx, t, CONSUME_BLOB);
   body = js_get(ctx, t, "@body");
   hdrs = js_get(ctx, t, "headers");
-  type = hdrs.type == JV_OBJ ? js_get(ctx, hdrs, "@ctype") : js_undef();
+  type = headers_ctype(ctx, hdrs);
   return js_promise_resolved(ctx, make_blob(ctx, body.type == JV_STR ? body.u.str->data : "",
                                             body.type == JV_STR ? body.u.str->len : 0,
                                             type.type == JV_STR ? type.u.str->data : ""));

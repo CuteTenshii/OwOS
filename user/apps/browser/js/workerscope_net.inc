@@ -101,7 +101,7 @@ JS(
     this.signal = init.signal || (src ? src.signal : L.newSignal());
     this.credentials = init.credentials || (src ? src.credentials : "same-origin");
     this.mode = init.mode || (src ? src.mode : "cors");
-    this.cache = init.cache || (src ? src.cache : "default");
+    this.cache = N.cacheMode({ cache: init.cache !== undefined ? init.cache : src ? src.cache : undefined, mode: this.mode });
     this.redirect = init.redirect || "follow";
     this.referrer = "about:client";
     this.referrerPolicy = init.referrerPolicy || "";

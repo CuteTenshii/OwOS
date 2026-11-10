@@ -1442,6 +1442,27 @@ static bool wt_load_parts(js_ctx *ctx, unsigned upto)
   return ok;
 }
 
+/* N.cacheMode({cache, mode}): the validated cache mode name for a Request, or a TypeError */
+static js_value wt_n_cache_mode(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  const char *err;
+  int mode = fetch_cache_mode(ctx, js_undef(), A(0), &err);
+  (void)t;
+  return mode < 0 ? js_throw_type(ctx, err) : js_mk_cstring(ctx, fetch_cache_names[mode]);
+}
+
+/* N.headers(): define Headers (the source the page runs too) and return it */
+static js_value wt_n_headers(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value fn = js_undef(), g = js_obj_value(ctx->global);
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (!wt_eval(ctx, cur_wt, fetch_headers_js, "headers", 0, &fn) || !js_is_callable(fn))
+    return js_undef();
+  return js_call(ctx, fn, js_undef(), &g, 1);
+}
+
 static js_value wt_n_load_part(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -1461,6 +1482,8 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   l = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(ctx->global, "@L", js_obj_value(l), 0);
   js_def_native(ctx, n, "loadPart", wt_n_load_part, 1);
+  js_def_native(ctx, n, "cacheMode", wt_n_cache_mode, 1);
+  js_def_native(ctx, n, "headers", wt_n_headers, 0);
   js_def_native(ctx, n, "utf8encode", wt_n_utf8encode, 1);
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
@@ -1795,46 +1818,6 @@ static js_value reply_error(js_ctx *ctx, int id, const char *message)
   js_def(o, "error", js_mk_cstring(ctx, message), P_ENUMERABLE);
   gc_pop_scope();
   return ov;
-}
-
-/* Header block ("HTTP/1.1 200 OK" line first) -> [[name, value], ...], set-cookie left out */
-static js_value parse_header_block(js_ctx *ctx, const char *hdr)
-{
-  js_object *list = js_new_array(ctx, 0);
-  const char *p = hdr, *eol;
-  gc_push_scope();
-  gc_keep(list);
-  while (*p && (eol = strchr(p, '\n'))) {
-    const char *colon = p, *vs, *ve = eol;
-    while (colon < eol && *colon != ':')
-      colon++;
-    if (colon < eol && p != hdr && colon > p && p[0] != '\r') {
-      char name[128];
-      int nl = (int)(colon - p);
-      js_object *pair;
-      if (nl < (int)sizeof name) {
-        memcpy(name, p, (unsigned)nl);
-        name[nl] = 0;
-        vs = colon + 1;
-        while (vs < ve && (*vs == ' ' || *vs == '\t'))
-          vs++;
-        while (ve > vs && (ve[-1] == '\r' || ve[-1] == ' '))
-          ve--;
-        if (!streq_ci(name, "set-cookie") && !streq_ci(name, "set-cookie2")) {
-          pair = js_new_array(ctx, 0);
-          gc_push_scope();
-          gc_keep(pair);
-          js_array_push(ctx, pair, js_mk_cstring(ctx, name));
-          js_array_push(ctx, pair, js_mk_string(ctx, vs, (int)(ve - vs)));
-          js_array_push(ctx, list, js_obj_value(pair));
-          gc_pop_scope();
-        }
-      }
-    }
-    p = eol + 1;
-  }
-  gc_pop_scope();
-  return js_obj_value(list);
 }
 
 /* A worker's fetch(): {url, method, headers:[[k,v]], body:ArrayBuffer|null, credentials, cache} -> the response */

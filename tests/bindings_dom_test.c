@@ -947,6 +947,24 @@ static void test_fetch_data_url(void)
              "'+window.fs);\n");
 }
 
+static void test_headers_on_the_page(void)
+{
+  run_script("function thr(f){ try{ f() }catch(e){ return e instanceof TypeError } return false }\n"
+             "var h=new Headers({'X-A':'1'}); h.append('x-a','2'); h.set('Content-Type','text/x');\n"
+             "expect(typeof Headers==='function' && h.get('X-a')==='1, 2' && h.has('content-type'), 'Headers get/set/append');\n"
+             "expect(Array.from(h.keys()).join()==='content-type,x-a' && new Headers([['b','1']]).get('b')==='1', 'sorted keys, pair init');\n"
+             "expect(thr(function(){ new Headers({'bad name':'x'}) }), 'invalid names throw');\n"
+             "var r=new Response('x',{headers:{'X-R':'y'}});\n"
+             "expect(r.headers instanceof Headers && r.headers.get('x-r')==='y', 'Response.headers is a Headers');\n"
+             "expect(r.headers.get('content-type')==='text/plain;charset=UTF-8', 'body-derived content type');\n"
+             "expect(new Response('x',{headers:{'content-type':'a/b'}}).headers.get('content-type')==='a/b', 'explicit type wins');\n"
+             "window.hr=[];\n"
+             "fetch(new Request('https://example.com/echo',{headers:{'X-Q':'req'}})).then(function(r){ return r.text() }).then(function(t){ hr.push(t) });\n"
+             "fetch('https://example.com/echo',{headers:new Headers([['X-U','2']])}).then(function(r){ hr.push(r.headers.get('x-fixture')); return r.text() }).then(function(t){ hr.push(t) });\n");
+  run_script("expect(hr.length===3 && hr[0].indexOf('x-q: req')>0, 'a Request input carries its headers: '+hr);\n"
+             "expect(hr[1]==='yes' && hr[2].indexOf('x-u: 2')>0, 'response headers and Headers init: '+hr);\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -962,6 +980,7 @@ int main(void)
   test("scroll metrics follow layout", test_scroll_metrics_follow_layout);
   test("fetch and Request validate the cache mode", test_fetch_cache_modes_validate);
   test("fetch reads data: URLs", test_fetch_data_url);
+  test("Headers, Response.headers and request headers", test_headers_on_the_page);
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
   test("replaceChildren keeps nodes passed back in", test_replace_children);

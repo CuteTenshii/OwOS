@@ -96,12 +96,15 @@ void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *prot
 /* ---- shared helpers used by the service-worker module (defined in js.c) --- */
 int arenas_push(js_arena *ar);                                       /* keep a script's AST arena alive  */
 js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc); /* no-op native */
-js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.get   */
-js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.has   */
 void js_set_cur_script(const char *label);                           /* current script name for exc attribution */
 js_value make_message_event(js_value data, js_value ports); /* a MessageEvent carrying `data` and the array `ports` */
-js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, const char *ctype,
-                         const char *body, int len); /* fetch Response */
+js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, js_value hdrs,
+                         const char *ctype, const char *body, int len); /* fetch Response; hdrs: anything new Headers() takes */
+extern const char fetch_headers_js[];                /* the Headers source, run on the page and in workers */
+js_value fetch_headers_install(js_ctx *ctx);         /* define Headers on the global; returns the constructor */
+js_value headers_new(js_ctx *ctx, js_value init);    /* new Headers(init) */
+js_value headers_ctype(js_ctx *ctx, js_value h);     /* the Content-Type of a Headers, or undefined */
+js_value parse_header_block(js_ctx *ctx, const char *hdr); /* "HTTP/1.1 200 OK" block -> [[name, value], ...], no Set-Cookie */
 void notif_app_name(char *buf, int cap);             /* the app name for a Notification  */
 int perm_state_now(int feature);                     /* current permission state (PERM_*) */
 const char *perm_state_str(int state);
