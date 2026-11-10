@@ -1,3 +1,4 @@
+#include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
 #include "features/canvas/canvas.h"
 #include "features/cdp/cdp.h"
@@ -358,6 +359,7 @@ void worker_fn(void)
     canvas_flush();
     mediasession_tick(B->pg->doc_title, B->pg->cur_url);
     gamepad_tick();
+    battery_tick();
 
     /* Drive CSS animations/transitions */
     if (!B->loading && anim_active()) {

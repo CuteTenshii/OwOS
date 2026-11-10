@@ -5,6 +5,7 @@
 #include "canvasjs.h"
 #include "classlist.h"
 #include "dom_query.h"
+#include "features/battery/battery.h"
 #include "features/bluetooth/bluetooth.h"
 #include "features/clienthints/clienthints.h"
 #include "features/gamepad/gamepad.h"
@@ -2349,6 +2350,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     }
     mediasession_install(ctx, nav, page_url);
     gamepad_install(ctx, nav);
+    battery_install(ctx, nav, page_url);
     bluetooth_install(ctx, nav, page_url);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
