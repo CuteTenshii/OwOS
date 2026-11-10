@@ -269,13 +269,14 @@ static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc
 }
 
 /* --- performance --- */
+double perf_now_ms(void) { return (double)(msec() - g_perf_origin); }
 static js_value perf_now(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   (void)ctx;
   (void)t;
   (void)a;
   (void)n;
-  return js_number((double)(msec() - g_perf_origin));
+  return js_number(perf_now_ms());
 }
 static js_value perf_noop(js_ctx *ctx, js_value t, js_value *a, int n)
 {

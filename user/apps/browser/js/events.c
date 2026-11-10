@@ -24,6 +24,8 @@ static js_object *listeners_of(js_object *target, int create)
 
 int ev_flag(js_value ev, const char *k) { return js_to_boolean(js_get(g_ctx, ev, k)); }
 
+static void remove_listener(js_ctx *ctx, js_object *obj, const char *type, js_value fn, bool capture);
+
 /* Invoke the listeners on `obj` whose capture flag equals `want_capture` and whose type matches the */
 void ev_fire_on(js_object *obj, js_value ev, int want_capture)
 {
@@ -36,9 +38,9 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
   js_set(g_ctx, ev, "currentTarget", js_obj_value(obj));
   evty = js_get(g_ctx, ev, "type");
   n = list ? js_array_len(list) : 0;
-  for (i = 0; i < n; i++) {
+  for (i = 0; i < n && !ev_flag(ev, "@sip"); i++) {
     js_value e = js_get_index(g_ctx, js_obj_value(list), i);
-    js_value ty, fn, a, src;
+    js_value ty, fn, a, src, sig, hf;
     if (e.type != JV_OBJ)
       continue;
     if (js_to_boolean(js_get(g_ctx, e, "capture")) != want_capture)
@@ -46,13 +48,19 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
     ty = js_get(g_ctx, e, "type");
     if (!(ty.type == JV_STR && evty.type == JV_STR && streq(ty.u.str->data, evty.u.str->data)))
       continue;
-    fn = js_get(g_ctx, e, "fn");
-    if (!js_is_callable(fn))
+    sig = js_get(g_ctx, e, "signal");
+    if (sig.type == JV_OBJ && js_to_boolean(js_get(g_ctx, sig, "aborted")))
       continue;
+    fn = js_get(g_ctx, e, "fn");
+    hf = js_is_callable(fn) ? fn : js_get(g_ctx, fn, "handleEvent");
+    if (!js_is_callable(hf))
+      continue;
+    if (js_to_boolean(js_get(g_ctx, e, "once")))
+      remove_listener(g_ctx, obj, ty.u.str->data, fn, want_capture);
     a = ev;
     src = js_get(g_ctx, e, "src");
     js_set_event_script(evty.type == JV_STR ? evty.u.str->data : 0, src.type == JV_STR ? src.u.str->data : 0);
-    js_call(g_ctx, fn, js_obj_value(obj), &a, 1);
+    js_call(g_ctx, hf, js_is_callable(fn) ? js_obj_value(obj) : fn, &a, 1);
     if (g_ctx->has_exc)
       report_exc_v(g_ctx);
   }
@@ -186,6 +194,16 @@ js_value ev_prevent(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return js_undef();
 }
+js_value ev_stop_immediate(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  if (t.type == JV_OBJ) {
+    js_set(ctx, t, "@sp", js_bool(1));
+    js_set(ctx, t, "@sip", js_bool(1));
+  }
+  return js_undef();
+}
 js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
@@ -224,8 +242,11 @@ js_value make_event(const char *type, int x, int y, js_value init)
   js_def(e, "clientX", js_number(x), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "clientY", js_number(y), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "detail", detail, P_WRITABLE | P_ENUMERABLE);
+  js_def(e, "eventPhase", js_number(0), P_WRITABLE | P_ENUMERABLE);
+  js_def(e, "timeStamp", js_number(perf_now_ms()), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "@dp", js_bool(0), P_WRITABLE);
   js_def(e, "@sp", js_bool(0), P_WRITABLE);
+  js_def(e, "@sip", js_bool(0), P_WRITABLE);
   gc_pop_scope();
   return js_obj_value(e);
 }
@@ -233,30 +254,44 @@ js_value make_event(const char *type, int x, int y, js_value init)
 js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char type[64];
-  js_value fn = A(1);
-  bool capture = false;
-  if (t.type != JV_OBJ || !js_is_callable(fn))
+  js_value fn = A(1), opts = argc >= 3 ? A(2) : js_undef();
+  bool capture = false, once = false;
+  js_object *list;
+  unsigned i, n;
+  if (t.type != JV_OBJ || fn.type != JV_OBJ || !(js_is_callable(fn) || js_is_callable(js_get(ctx, fn, "handleEvent"))))
     return js_undef();
   strlcpy(type, arg_str(ctx, A(0)), sizeof type);
-  if (argc >= 3) {
-    js_value o = A(2);
-    if (o.type == JV_BOOL)
-      capture = o.u.boolean;
-    else if (o.type == JV_OBJ)
-      capture = js_to_boolean(js_get(ctx, o, "capture"));
+  if (opts.type == JV_BOOL) {
+    capture = opts.u.boolean;
+  } else if (opts.type == JV_OBJ) {
+    js_value sig = js_get(ctx, opts, "signal");
+    capture = js_to_boolean(js_get(ctx, opts, "capture"));
+    once = js_to_boolean(js_get(ctx, opts, "once"));
+    if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted")))
+      return js_undef();
   }
   gc_push_scope();
   gc_keep(t.u.obj);
-  if (fn.type == JV_OBJ)
-    gc_keep(fn.u.obj);
+  gc_keep(fn.u.obj);
+  list = listeners_of(t.u.obj, 1);
+  gc_keep(list);
+  n = js_array_len(list);
+  for (i = 0; i < n; i++) { /* the same type, callback and capture is added once */
+    js_value e = js_get_index(ctx, js_obj_value(list), i), ty = js_get(ctx, e, "type");
+    if (ty.type == JV_STR && streq(ty.u.str->data, type) && js_strict_eq(js_get(ctx, e, "fn"), fn) &&
+        js_to_boolean(js_get(ctx, e, "capture")) == capture) {
+      gc_pop_scope();
+      return js_undef();
+    }
+  }
   {
-    js_object *list = listeners_of(t.u.obj, 1);
-    js_object *e;
-    gc_keep(list);
-    e = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_object *e = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
     js_def(e, "type", js_mk_cstring(ctx, type), 0);
     js_def(e, "fn", fn, 0);
     js_def(e, "capture", js_bool(capture), 0);
+    js_def(e, "once", js_bool(once), 0);
+    if (opts.type == JV_OBJ)
+      js_def(e, "signal", js_get(ctx, opts, "signal"), 0);
     js_def(e, "src", js_mk_cstring(ctx, js_cur_script()), 0);
     js_array_push(ctx, list, js_obj_value(e));
   }
@@ -264,28 +299,14 @@ js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
   g_has_listeners = true;
   return js_undef();
 }
-js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
+static void remove_listener(js_ctx *ctx, js_object *obj, const char *type, js_value fn, bool capture)
 {
-  char type[64];
-  js_value fn = A(1);
-  js_object *list, *nl;
+  js_object *list = listeners_of(obj, 0), *nl;
   unsigned i, n;
-  bool capture = false;
-  if (t.type != JV_OBJ)
-    return js_undef();
-  strlcpy(type, arg_str(ctx, A(0)), sizeof type);
-  if (argc >= 3) {
-    js_value o = A(2);
-    if (o.type == JV_BOOL)
-      capture = o.u.boolean;
-    else if (o.type == JV_OBJ)
-      capture = js_to_boolean(js_get(ctx, o, "capture"));
-  }
-  list = listeners_of(t.u.obj, 0);
   if (!list)
-    return js_undef();
+    return;
   gc_push_scope();
-  gc_keep(t.u.obj);
+  gc_keep(obj);
   gc_keep(list);
   if (fn.type == JV_OBJ)
     gc_keep(fn.u.obj);
@@ -299,8 +320,24 @@ js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
     if (!match)
       js_array_push(ctx, nl, e);
   }
-  js_def(t.u.obj, "@ev", js_obj_value(nl), 0);
+  js_def(obj, "@ev", js_obj_value(nl), 0);
   gc_pop_scope();
+}
+js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char type[64];
+  bool capture = false;
+  if (t.type != JV_OBJ)
+    return js_undef();
+  strlcpy(type, arg_str(ctx, A(0)), sizeof type);
+  if (argc >= 3) {
+    js_value o = A(2);
+    if (o.type == JV_BOOL)
+      capture = o.u.boolean;
+    else if (o.type == JV_OBJ)
+      capture = js_to_boolean(js_get(ctx, o, "capture"));
+  }
+  remove_listener(ctx, t.u.obj, type, A(1), capture);
   return js_undef();
 }
 js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -315,6 +352,8 @@ js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   js_value ev;
   (void)thisv;
+  if (argc < 1)
+    return js_throw_type(ctx, "Failed to construct 'Event': 1 argument required, but only 0 present.");
   ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
   js_set(ctx, ev, "composed", js_bool(A(1).type == JV_OBJ && js_to_boolean(js_get(ctx, A(1), "composed"))));
   return ev;
@@ -356,9 +395,11 @@ static const char *const k_event_init_keys[] = {
 /* Constructor shared by every Event subclass */
 js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
-  js_value ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
-  js_value proto = ctx->native_data;
+  js_value ev, proto = ctx->native_data;
   (void)thisv;
+  if (argc < 1)
+    return js_throw_type(ctx, "Failed to construct event: 1 argument required, but only 0 present.");
+  ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
   if (ev.type != JV_OBJ)
     return ev;
   js_set(ctx, ev, "composed", js_bool(A(1).type == JV_OBJ && js_to_boolean(js_get(ctx, A(1), "composed"))));

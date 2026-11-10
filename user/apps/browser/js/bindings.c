@@ -2468,7 +2468,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_event_proto, "preventDefault", ev_prevent, 0);
   def_method(g_event_proto, "composedPath", ev_composed_path, 0);
   def_method(g_event_proto, "stopPropagation", ev_stop, 0);
-  def_method(g_event_proto, "stopImmediatePropagation", ev_stop, 0);
+  def_method(g_event_proto, "stopImmediatePropagation", ev_stop_immediate, 0);
   {
     js_object *ec = js_new_native(ctx, event_ctor, "Event", 1);
     gc_push_scope();
@@ -2524,6 +2524,13 @@ void setup_dom(js_ctx *ctx, const char *page_url)
       ctor->fn->data = js_obj_value(proto); /* the re-parent target */
       js_def(ctor, "prototype", js_obj_value(proto), 0);
       js_def(proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+      if (streq(subs[i].name, "MessageEvent")) { /* the init fields an event without them still reads */
+        js_def(proto, "data", js_null(), P_WRITABLE);
+        js_def(proto, "origin", js_mk_cstring(ctx, ""), P_WRITABLE);
+        js_def(proto, "lastEventId", js_mk_cstring(ctx, ""), P_WRITABLE);
+        js_def(proto, "source", js_null(), P_WRITABLE);
+        js_def(proto, "ports", js_obj_value(js_new_array(ctx, 0)), P_WRITABLE);
+      }
       js_def(win, subs[i].name, js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
       protos[i] = proto; /* reachable via win from here on */
       gc_pop_scope();

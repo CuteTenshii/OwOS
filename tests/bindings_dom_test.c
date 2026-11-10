@@ -341,7 +341,7 @@ static void test_event_target(void)
              "var h=function(e){ log.push(e.type+':'+(e.target===t)+':'+(this===t)); };\n"
              "t.addEventListener('ping',h); t.addEventListener('ping',h);\n"
              "expect(t.dispatchEvent(new Event('ping')), 'dispatch returns true');\n"
-             "expect(log.join()==='ping:true:true,ping:true:true', 'listeners fire with target and this');\n"
+             "expect(log.join()==='ping:true:true', 'an identical listener is added once, and fires with target and this');\n"
              "t.removeEventListener('ping',h); log.length=0; t.dispatchEvent(new Event('ping'));\n"
              "expect(log.length===0, 'removed listener stays silent');\n"
              "var wlog=0; window.addEventListener('ping',function(){ wlog++ });\n"

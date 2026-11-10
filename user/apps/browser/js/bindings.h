@@ -295,6 +295,8 @@ js_value el_get_dataset(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_sheet(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_style(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_prevent(js_ctx *ctx, js_value t, js_value *args, int argc);
+double perf_now_ms(void); /* performance.now() */
+js_value ev_stop_immediate(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_composed_path(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
