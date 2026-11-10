@@ -68,13 +68,13 @@ int arch_mem_init(const void *dtb);
 extern uint64_t kernel_l1[512];
 
 #define USER_BASE 0x100000000UL
-#define USER_END (USER_BASE + 0x200000UL)
+#define USER_END 0x4000000000UL /* 256 GiB; page tables are built on demand */
 static inline int user_range(uint64_t ptr, uint64_t len)
 {
   return ptr >= USER_BASE && ptr < USER_END && len <= USER_END - ptr;
 }
 
-#define USER_STACK_PAGES 4
+#define USER_STACK_PAGES 64
 #define USER_STACK_BOTTOM (USER_END - USER_STACK_PAGES * 0x1000UL)
 
 #define VM_USER_RX 1

@@ -93,6 +93,9 @@ int elf_load(struct user_image *img, const void *file, uint64_t size)
     return -1;
 
   bool entry_ok = false;
+  uint64_t free_pages = (uint64_t)pmm_free_kib() / (PAGE / 1024);
+  uint64_t pages_left =
+      free_pages > USER_STACK_PAGES ? free_pages - USER_STACK_PAGES : 0; /* refuse before exhausting RAM */
   uint64_t next_free = USER_BASE; /* segments must ascend and never share a page */
   for (unsigned i = 0; i < h.phnum; i++) {
     struct elf64_phdr p;
@@ -108,6 +111,9 @@ int elf_load(struct user_image *img, const void *file, uint64_t size)
       goto bad;
 
     uint64_t end = (p.vaddr + p.memsz + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    if ((end - p.vaddr) / PAGE > pages_left)
+      goto bad;
+    pages_left -= (end - p.vaddr) / PAGE;
     for (uint64_t va = p.vaddr; va < end; va += PAGE) {
       uint64_t done = va - p.vaddr;
       uint64_t chunk = done >= p.filesz ? 0 : p.filesz - done < PAGE ? p.filesz - done : PAGE;

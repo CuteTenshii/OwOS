@@ -3,6 +3,7 @@
 
 static int initialized = 1234;
 static char zeroed[8192];
+static char big[4 << 20]; /* a bss bigger than the old 2 MiB window */
 static const char banner[] = "hello from an ELF user program, pid ";
 
 static unsigned fib(unsigned n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
@@ -24,6 +25,11 @@ int main(void)
   initialized++;
   if (initialized != 1235 || zeroed[sizeof zeroed - 1] != 7)
     bad |= 4;
+  for (unsigned i = 0; i < sizeof big; i += 4096) {
+    if (big[i])
+      bad |= 32;
+    big[i] = 1;
+  }
   if (fib(20) != 6765)
     bad |= 8;
 

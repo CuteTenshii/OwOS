@@ -130,7 +130,8 @@ static void test_elf(void)
   check("ELF: writable+executable segment rejected", rejected(ph0 + 4, 7, 4, 0));
   check("ELF: segment below the user window rejected", rejected(ph0 + 16, 0x1000, 8, 0));
   check("ELF: filesz > memsz rejected", rejected(ph0 + 32, 1ULL << 20, 8, 0));
-  check("ELF: segment reaching the stack rejected", rejected(ph0 + 40, 1ULL << 28, 8, 0));
+  check("ELF: segment reaching the stack rejected", rejected(ph0 + 40, 1ULL << 40, 8, 0));
+  check("ELF: segment bigger than free RAM rejected", rejected(ph0 + 40, 1ULL << 30, 8, 0));
   check("ELF: entry outside executable segments rejected", rejected(24, USER_BASE + 0x80000, 8, 0));
   check("ELF: rejects leave no frames behind", free_frames() == frames);
 }
