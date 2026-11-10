@@ -294,13 +294,12 @@ static void fill_out(const struct cache_entry *e, unsigned char **body, int *len
   }
 }
 
-int cache_lookup(const char *method, const char *url, const char *req_hdrs, long now, unsigned char **body, int *len,
-                 char *ctype, int ctype_cap, char *hdr, int hdr_cap, char *cond, int cond_cap)
+int cache_lookup(const char *method, const char *url, const char *req_hdrs, long now, int mode, struct cache_out *out)
 {
-  *body = 0;
-  *len = 0;
-  if (cond && cond_cap)
-    cond[0] = '\0';
+  out->body = 0;
+  out->len = 0;
+  if (out->cond && out->cond_cap)
+    out->cond[0] = '\0';
   if (!is_get(method))
     return CACHE_MISS;
 
@@ -315,24 +314,28 @@ int cache_lookup(const char *method, const char *url, const char *req_hdrs, long
   int has_validator = e->etag || e->last_mod;
   bool fresh = !e->no_cache && entry_current_age(e, now) < e->freshness;
 
-  if (fresh) {
-    fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
-    int ok = *body != 0;
+  bool servable = fresh;
+  if (mode == CACHE_LOOKUP_REVALIDATE)
+    fresh = false;
+  if (fresh || mode == CACHE_LOOKUP_STALE_OK) {
+    fill_out(e, &out->body, &out->len, out->ctype, out->ctype_cap, out->hdr, out->hdr_cap);
+    int ok = out->body != 0;
     mutex_unlock(&g_lock);
     return ok ? CACHE_FRESH : CACHE_MISS;
   }
   if (has_validator) {
     /* without a cond buffer, report a miss but keep the entry */
-    if (cond && cond_cap) {
-      build_cond(e, cond, cond_cap);
+    if (out->cond && out->cond_cap) {
+      build_cond(e, out->cond, out->cond_cap);
       mutex_unlock(&g_lock);
       return CACHE_REVALIDATE;
     }
     mutex_unlock(&g_lock);
     return CACHE_MISS;
   }
-  /* stale with no validator: drop */
-  unlink_free(e);
+  /* stale with no validator: drop (a fresh one just can't be revalidated, the refetch replaces it) */
+  if (!servable)
+    unlink_free(e);
   mutex_unlock(&g_lock);
   return CACHE_MISS;
 }

@@ -14,6 +14,8 @@
 extern js_ctx *g_ctx;               /* the engine context for the whole current page  */
 extern int g_page_live;             /* a page context is currently alive              */
 extern js_object *g_response_proto; /* fetch() Response.prototype (fetch + SW share) */
+extern const char *const fetch_cache_names[]; /* indexed by enum http_cache_mode */
+int fetch_cache_mode(js_ctx *ctx, js_value input, js_value init, const char **err);
 extern char g_page_url_buf[];       /* the current page URL (module + SW referrer) */
 extern js_object *g_media_proto;
 extern js_object *g_remote_proto; /* RemotePlayback.prototype (media.remote) */

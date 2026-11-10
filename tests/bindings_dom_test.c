@@ -925,6 +925,20 @@ static void test_scroll_metrics_follow_layout(void)
              "document.hidden=true; expect(document.hasFocus()===false, 'a hidden page does not'); document.hidden=false;\n");
 }
 
+static void test_fetch_cache_modes_validate(void)
+{
+  run_script("function thr(f){ try{ f() }catch(e){ return e instanceof TypeError } return false }\n"
+             "expect(new Request('/x').cache==='default', 'default cache mode');\n"
+             "expect(new Request('/x',{cache:'no-store'}).cache==='no-store', 'init cache mode');\n"
+             "expect(new Request(new Request('/x',{cache:'reload'})).cache==='reload', 'Request input carries its mode');\n"
+             "expect(thr(function(){ new Request('/x',{cache:'bogus'}) }), 'unknown mode throws');\n"
+             "expect(thr(function(){ new Request('/x',{cache:'only-if-cached'}) }), 'only-if-cached needs same-origin');\n"
+             "expect(new Request('/x',{cache:'only-if-cached',mode:'same-origin'}).cache==='only-if-cached', 'only-if-cached "
+             "with same-origin');\n"
+             "window.fe=null; fetch('/x',{cache:'bogus'}).catch(function(e){ window.fe=e instanceof TypeError });\n");
+  run_script("expect(window.fe===true, 'fetch rejects an unknown cache mode: '+window.fe);\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -938,6 +952,7 @@ int main(void)
   test("pageshow fires after load", test_pageshow_fires_after_load);
   test("history state and popstate", test_history_state_and_popstate);
   test("scroll metrics follow layout", test_scroll_metrics_follow_layout);
+  test("fetch and Request validate the cache mode", test_fetch_cache_modes_validate);
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
   test("replaceChildren keeps nodes passed back in", test_replace_children);

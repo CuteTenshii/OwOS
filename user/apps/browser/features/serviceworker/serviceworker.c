@@ -604,7 +604,9 @@ static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
 {
   char url[URL_MAX], method[16];
   js_value in = A(0);
-  const char *s;
+  const char *s, *err;
+  js_value rv, mv;
+  int cm;
   (void)thisv;
   method[0] = 0;
   if (in.type == JV_OBJ) {
@@ -620,7 +622,20 @@ static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
     if (m.type == JV_STR)
       strlcpy(method, m.u.str->data, sizeof method);
   }
-  return sw_make_request(ctx, url, method);
+  cm = fetch_cache_mode(ctx, A(0), A(1), &err);
+  if (cm < 0)
+    return js_throw_type(ctx, err);
+  rv = sw_make_request(ctx, url, method);
+  gc_push_scope();
+  gc_keep(rv.u.obj);
+  js_def(rv.u.obj, "cache", js_mk_cstring(ctx, fetch_cache_names[cm]), P_ENUMERABLE);
+  mv = A(1).type == JV_OBJ ? js_get(ctx, A(1), "mode") : js_undef();
+  if (mv.type == JV_UNDEF && in.type == JV_OBJ)
+    mv = js_get(ctx, in, "mode");
+  if (mv.type == JV_STR)
+    js_def(rv.u.obj, "mode", mv, P_ENUMERABLE);
+  gc_pop_scope();
+  return rv;
 }
 /* ---- Cache ---- */
 static struct sw_cache *cache_of(js_ctx *ctx, js_value t)

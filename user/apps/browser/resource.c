@@ -875,6 +875,21 @@ static void net_fail(int id, const char *method, const char *url)
   devtools_net_update(id, &e);
 }
 
+/* Request headers a fetch() cache mode adds */
+static const char *cache_mode_hdrs(int cm)
+{
+  if (cm == HC_NO_STORE || cm == HC_RELOAD)
+    return "Cache-Control: no-cache\r\nPragma: no-cache\r\n";
+  return cm == HC_NO_CACHE ? "Cache-Control: max-age=0\r\n" : "";
+}
+
+static int cache_lookup_mode(int cm)
+{
+  if (cm == HC_NO_CACHE)
+    return CACHE_LOOKUP_REVALIDATE;
+  return cm == HC_FORCE_CACHE || cm == HC_ONLY_IF_CACHED ? CACHE_LOOKUP_STALE_OK : CACHE_LOOKUP_NORMAL;
+}
+
 static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_resp *rs)
 {
   const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
@@ -904,6 +919,9 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
 
   /* Cache: only bodyless GETs; fresh hits skip the wire, stale ones revalidate (304 reuses body). */
   bool cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
+  int cm = rq->cache_mode;
+  bool use_cache = cacheable && cm != HC_NO_STORE && cm != HC_RELOAD;
+  bool store_ok = cacheable && cm != HC_NO_STORE;
   long now = (long)rtc_epoch();
   bool revalidating = false;
   char cond[512];
@@ -914,30 +932,43 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
     origurl[0] = '\0';
     sapp(origurl, &k, sizeof origurl, rq->url);
   }
-  struct http_req rqc; /* request copy carrying the cond headers */
+  struct http_req rqc; /* request copy carrying the cache-mode and cond headers */
   char combined[1408];
   char vary_hdrs[VARY_HDRS_MAX];
-  if (cacheable) {
+  vary_hdrs[0] = '\0';
+  if (cacheable)
     vary_req_hdrs(origurl, accept, rq->extra_hdrs, !rq->no_cookies, vary_hdrs);
-    unsigned char *cbody = 0;
-    int clen = 0;
-    int cv = cache_lookup(method, origurl, vary_hdrs, now, &cbody, &clen, rs->ctype, sizeof rs->ctype, rs->hdr,
-                          rs->hdr_cap, cond, sizeof cond);
+  if (use_cache) {
+    struct cache_out co = {.ctype = rs->ctype,
+                           .ctype_cap = sizeof rs->ctype,
+                           .hdr = rs->hdr,
+                           .hdr_cap = rs->hdr_cap,
+                           .cond = cond,
+                           .cond_cap = sizeof cond};
+    int cv = cache_lookup(method, origurl, vary_hdrs, now, cache_lookup_mode(cm), &co);
     if (cv == CACHE_FRESH) {
       rs->status = 200;
-      rs->len = clen;
+      rs->len = co.len;
       rs->from_cache = 1;
       if (rs->final_url && rs->final_cap) {
         int k = 0;
         sapp(rs->final_url, &k, rs->final_cap, origurl);
       }
-      return cbody;
+      return co.body;
     }
-    if (cv == CACHE_REVALIDATE) {
-      revalidating = 1;
+    revalidating = cv == CACHE_REVALIDATE;
+  }
+  if (cm == HC_ONLY_IF_CACHED) { /* no stored response: the spec's synthetic 504 */
+    rs->status = 504;
+    return malloc(1);
+  }
+  {
+    const char *mh = cache_mode_hdrs(cm);
+    if (revalidating || mh[0]) {
       int n = 0;
       if (rq->extra_hdrs && rq->extra_hdrs[0])
         sapp(combined, &n, sizeof combined, rq->extra_hdrs);
+      sapp(combined, &n, sizeof combined, mh);
       sapp(combined, &n, sizeof combined, cond);
       rqc = *rq;
       rqc.extra_hdrs = combined;
@@ -995,7 +1026,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
       /* Entry evicted mid-flight: return the 304 as-is (callers treat non-200 as a miss). */
     }
     /* Store a fresh 200 under the requested URL. */
-    if (cacheable && meta.status == 200)
+    if (store_ok && meta.status == 200)
       cache_store(method, origurl, vary_hdrs, 200, now, rawhdr, meta.ctype, body, blen);
 
     rs->status = meta.status;
@@ -2077,16 +2108,14 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
   long now = (long)rtc_epoch();
   char *chdr = malloc(RESP_HDR_MAX); /* the stored response headers, for the network log */
   for (int i = 0; i < n; i++) {
-    unsigned char *cb = 0;
-    int cl = 0;
     char vh[VARY_HDRS_MAX], ct[160];
+    struct cache_out co = {.ctype = ct, .ctype_cap = sizeof ct, .hdr = chdr, .hdr_cap = chdr ? RESP_HDR_MAX : 0};
     vary_req_hdrs(urls[i], accept, 0, true, vh);
-    if (cache_lookup("GET", urls[i], vh, now, &cb, &cl, ct, sizeof ct, chdr, chdr ? RESP_HDR_MAX : 0, 0, 0) ==
-        CACHE_FRESH) {
-      bodies[i] = cb;
-      lens[i] = cl;
+    if (cache_lookup("GET", urls[i], vh, now, CACHE_LOOKUP_NORMAL, &co) == CACHE_FRESH) {
+      bodies[i] = co.body;
+      lens[i] = co.len;
       handled[i] = true;
-      struct net_log e = {"GET", urls[i], 200, ct, cl, 0, chdr, NET_DONE, 0, 0, cb, cl, 1};
+      struct net_log e = {"GET", urls[i], 200, ct, co.len, 0, chdr, NET_DONE, 0, 0, co.body, co.len, 1};
       devtools_net_add(&e);
     }
   }
@@ -2344,16 +2373,15 @@ static void h2_prefetch(const char *page_url)
     char fav[URL_MAX];
     resolve_url(page_url, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico", fav, sizeof fav);
     /* A fresh cached favicon skips the batch entirely. */
-    unsigned char *fb = 0;
-    int fl = 0;
+    struct cache_out co = {0};
     char vh[VARY_HDRS_MAX];
     vary_req_hdrs(fav, IMG_ACCEPT, 0, true, vh);
-    if (cache_lookup("GET", fav, vh, now, &fb, &fl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
-      if (favicon_decode(fb, fl)) {
+    if (cache_lookup("GET", fav, vh, now, CACHE_LOOKUP_NORMAL, &co) == CACHE_FRESH) {
+      if (favicon_decode(co.body, co.len)) {
         B->pg->favicon_ok = 1;
         B->seq++;
       }
-      free(fb);
+      free(co.body);
     }
     struct purl fu;
     if (!B->pg->favicon_ok && parse_url(fav, &fu) && fu.tls && streq_ci(fu.host, pu.host) && fu.port == pu.port) {
@@ -2428,16 +2456,14 @@ void fetch_inline_images(const char *page_url)
         continue;
       char full[URL_MAX];
       resolve_url(page_url, im->href, full, sizeof full);
-      unsigned char *cb = 0;
-      int cl = 0;
-      char vh[VARY_HDRS_MAX];
+      char vh[VARY_HDRS_MAX], ct[160];
+      struct cache_out co = {.ctype = ct, .ctype_cap = sizeof ct};
       vary_req_hdrs(full, IMG_ACCEPT, 0, true, vh);
-      char ct[160];
-      if (cache_lookup("GET", full, vh, now, &cb, &cl, ct, sizeof ct, 0, 0, 0, 0) == CACHE_FRESH) {
-        commit_image(i, cb, cl, 0x000000);
-        struct net_log e = {"GET", full, 200, ct[0] ? ct : "image/*", cl, 0, 0, NET_DONE, 0, 0, cb, cl, 1};
+      if (cache_lookup("GET", full, vh, now, CACHE_LOOKUP_NORMAL, &co) == CACHE_FRESH) {
+        commit_image(i, co.body, co.len, 0x000000);
+        struct net_log e = {"GET", full, 200, ct[0] ? ct : "image/*", co.len, 0, 0, NET_DONE, 0, 0, co.body, co.len, 1};
         devtools_net_add(&e);
-        free(cb);
+        free(co.body);
       }
     }
   }

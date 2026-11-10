@@ -539,6 +539,9 @@ int html_has_pseudo(struct dom_node *el, int which); /* ::before/::after present
 
 void do_fetch(void);
 
+/* fetch() `cache` request modes */
+enum http_cache_mode { HC_DEFAULT = 0, HC_NO_STORE, HC_RELOAD, HC_NO_CACHE, HC_FORCE_CACHE, HC_ONLY_IF_CACHED };
+
 /* One HTTP request; only `url` is required. `extra_hdrs` is a "Name: value\r\n" blob. */
 struct http_req {
   const char *url;
@@ -549,6 +552,7 @@ struct http_req {
   const char *accept;
   const char *extra_hdrs;
   int no_cookies;
+  int cache_mode; /* enum http_cache_mode */
 };
 
 /* Optional out buffers (`final_url`, `hdr`) are filled only when pointer + cap are given. */

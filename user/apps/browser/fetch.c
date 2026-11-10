@@ -1209,19 +1209,22 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
   g_doc_cond[0] = '\0';
   g_doc_from_cache = false;
   if (is_get) { /* only GET is cacheable / revalidatable */
-    unsigned char *cbody = 0;
-    int clen = 0;
     char vh[DOC_VARY_HDRS_MAX];
+    struct cache_out co = {.ctype = B->pg->ctype,
+                           .ctype_cap = sizeof B->pg->ctype,
+                           .hdr = g_doc_hdr,
+                           .hdr_cap = sizeof g_doc_hdr,
+                           .cond = g_doc_cond,
+                           .cond_cap = sizeof g_doc_cond};
     doc_vary_hdrs(u, vh);
-    int cv = cache_lookup("GET", full_url, vh, now, &cbody, &clen, B->pg->ctype, sizeof B->pg->ctype, g_doc_hdr,
-                          sizeof g_doc_hdr, g_doc_cond, sizeof g_doc_cond);
+    int cv = cache_lookup("GET", full_url, vh, now, CACHE_LOOKUP_NORMAL, &co);
     if (cv == CACHE_FRESH) {
       B->pg->raw_len = 0;
-      if (browser_ensure_raw(clen)) {
-        memcpy(B->pg->raw, cbody, (unsigned)clen);
-        B->pg->raw_len = clen;
+      if (browser_ensure_raw(co.len)) {
+        memcpy(B->pg->raw, co.body, (unsigned)co.len);
+        B->pg->raw_len = co.len;
       }
-      free(cbody);
+      free(co.body);
       g_doc_from_cache = true;
       return 200;
     }

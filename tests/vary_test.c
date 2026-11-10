@@ -49,15 +49,15 @@ static void put(const char *url, const char *req, const char *rhdr, const char *
 /* Lookup; body prefix copied into out[64] (NUL-terminated), conditional lines into cond (if non-NULL). */
 static int look(const char *url, const char *req, long now, char *out, char *cond)
 {
-  unsigned char *b;
-  int n;
-  int v = cache_lookup("GET", url, req, now, &b, &n, 0, 0, 0, 0, cond, cond ? 512 : 0);
+  struct cache_out co = {.cond = cond, .cond_cap = cond ? 512 : 0};
+  int v = cache_lookup("GET", url, req, now, CACHE_LOOKUP_NORMAL, &co);
+  int n = co.len;
   out[0] = '\0';
-  if (b) {
+  if (co.body) {
     n = n < 63 ? n : 63;
-    memcpy(out, b, (size_t)n);
+    memcpy(out, co.body, (size_t)n);
     out[n] = '\0';
-    free(b);
+    free(co.body);
   }
   return v;
 }
@@ -365,6 +365,28 @@ static void variants_persist_with_unique_files_across_a_reload(void)
   expect(strstr(cond, "\"pl\"") != NULL);
 }
 
+static void lookup_modes(void)
+{
+  const char *v = "https://m.test/validated", *p = "https://m.test/plain";
+  struct cache_out co = {.cond = cond, .cond_cap = sizeof cond};
+  put(v, "", "Cache-Control: max-age=10\r\nETag: \"m1\"\r\n", "VB", 100);
+  put(p, "", "Cache-Control: max-age=10\r\n", "PB", 100);
+
+  expect(cache_lookup("GET", v, "", 105, CACHE_LOOKUP_REVALIDATE, &co) == CACHE_REVALIDATE);
+  expect(co.body == NULL && strstr(cond, "\"m1\"") != NULL);
+  expect(cache_lookup("GET", p, "", 105, CACHE_LOOKUP_REVALIDATE, &co) == CACHE_MISS && co.body == NULL);
+
+  expect(cache_lookup("GET", v, "", 500, CACHE_LOOKUP_NORMAL, &co) == CACHE_REVALIDATE);
+  expect(cache_lookup("GET", v, "", 500, CACHE_LOOKUP_STALE_OK, &co) == CACHE_FRESH);
+  expect(co.body != NULL && co.len == 2 && memcmp(co.body, "VB", 2) == 0);
+  free(co.body);
+  expect(cache_lookup("GET", p, "", 500, CACHE_LOOKUP_STALE_OK, &co) == CACHE_FRESH);
+  expect(co.body != NULL && memcmp(co.body, "PB", 2) == 0);
+  free(co.body);
+  expect(cache_lookup("GET", "https://m.test/absent", "", 105, CACHE_LOOKUP_STALE_OK, &co) == CACHE_MISS);
+  expect(co.body == NULL);
+}
+
 int main(void)
 {
   test("Vary parsing", vary_parsing);
@@ -377,5 +399,6 @@ int main(void)
   test("byte accounting survives variant replacement", byte_accounting_survives_variant_replacement);
   test("eviction drops the least recently used variant", eviction_drops_the_least_recently_used_variant);
   test("variants persist with unique files across a reload", variants_persist_with_unique_files_across_a_reload);
+  test("lookup modes: revalidate and stale-ok", lookup_modes);
   return 0;
 }

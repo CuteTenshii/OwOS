@@ -119,12 +119,44 @@ js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
 /* The controlling service worker (if any) answers a fetch() from the page */
 
+const char *const fetch_cache_names[] = {"default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached"};
+
+/* The `cache` mode of fetch/Request(input, init): init wins over a Request input. -1 with *err on a bad value. */
+int fetch_cache_mode(js_ctx *ctx, js_value input, js_value init, const char **err)
+{
+  js_value cv = init.type == JV_OBJ ? js_get(ctx, init, "cache") : js_undef();
+  js_value mv = init.type == JV_OBJ ? js_get(ctx, init, "mode") : js_undef();
+  int mode = HC_DEFAULT;
+  if (input.type == JV_OBJ) {
+    if (cv.type == JV_UNDEF)
+      cv = js_get(ctx, input, "cache");
+    if (mv.type == JV_UNDEF)
+      mv = js_get(ctx, input, "mode");
+  }
+  if (cv.type != JV_UNDEF) {
+    const char *s = arg_str(ctx, cv);
+    for (mode = 0; mode < (int)(sizeof fetch_cache_names / sizeof *fetch_cache_names); mode++)
+      if (streq(s, fetch_cache_names[mode]))
+        break;
+    if (mode == (int)(sizeof fetch_cache_names / sizeof *fetch_cache_names)) {
+      *err = "Invalid cache mode";
+      return -1;
+    }
+  }
+  if (mode == HC_ONLY_IF_CACHED && !(mv.type == JV_STR && streq(mv.u.str->data, "same-origin"))) {
+    *err = "'only-if-cached' can be set only with 'same-origin' mode";
+    return -1;
+  }
+  return mode;
+}
+
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char url[URL_MAX], method[16], req_ctype[160], resp_ctype[160];
   char extra_hdrs[1024];
   const char *reqbody = 0;
-  int reqlen = 0, status = 0, outlen = 0, eh = 0;
+  int reqlen = 0, status = 0, outlen = 0, eh = 0, cache_mode;
+  const char *cache_err;
   bool with_creds = false;
   unsigned char *body;
   js_object *resp;
@@ -208,6 +240,9 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     if (m.type == JV_STR)
       strlcpy(method, m.u.str->data, sizeof method);
   }
+  cache_mode = fetch_cache_mode(ctx, A(0), A(1), &cache_err);
+  if (cache_mode < 0)
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", cache_err));
   /* A controlling service worker gets first crack at the request */
   if (sw_intercept_fetch(ctx, url, method[0] ? method : "GET", &rv))
     return rv;
@@ -220,6 +255,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     rq.body_len = reqlen;
     rq.ctype = req_ctype[0] ? req_ctype : 0;
     rq.extra_hdrs = extra_hdrs[0] ? extra_hdrs : 0;
+    rq.cache_mode = cache_mode;
     body = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
     status = rs.status;
     outlen = rs.len;
