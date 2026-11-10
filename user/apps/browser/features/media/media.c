@@ -2,6 +2,7 @@
  * Audio decodes WAV/MPEG; <video> decodes H.264 only (an MP4's AAC track is silent). */
 #include "media.h" /* user/lib/media: decoder + software mixer */
 #include "browser.h"
+#include "cast.h"
 #include "features/media/bmedia.h"
 
 #define MK_AUDIO 0
@@ -67,6 +68,8 @@ struct media_el {
   long long vclock_origin; /* msec() - position, when self-clocking     */
   long long vpos_ms;       /* shown video position                      */
   unsigned vdur_ms;
+
+  bool rplay_seen; /* remote playback: the receiver has reported PLAYING */
 };
 
 static struct media_el g_media[MEDIA_MAX];
@@ -562,8 +565,11 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
     poster = dom_get_attr(node, "poster");
     if (poster && *poster)
       resolve_url(page_url, poster, m->poster, sizeof m->poster);
-    if (pick_source(node, page_url, abs, sizeof abs))
+    if (pick_source(node, page_url, abs, sizeof abs)) {
       media_set_src(m, abs);
+      if ((starts_ci(abs, "http://") || starts_ci(abs, "https://")) && !dom_get_attr(node, "disableremoteplayback"))
+        cast_scan_start(); /* so the controls can offer a cast button */
+    }
     apply_audio_params(m);
     if (m->autoplay && m->src[0]) {
       m->want_play = true;
@@ -610,11 +616,37 @@ void media_load(struct media_el *m)
     media_kick_load(m, true);
 }
 
+/* Remote playback: one Cast session at a time, driving one element while connected */
+static cast_session *g_rsess;
+static struct media_el *g_rmedia;
+
+static bool remote_on(const struct media_el *m) { return g_rsess && g_rmedia == m; }
+
+int media_remote_conn(struct media_el *m)
+{
+  struct cast_status st;
+  if (!remote_on(m))
+    return CAST_DISCONNECTED;
+  cast_get_status(g_rsess, &st);
+  return st.conn;
+}
+
 void media_play(struct media_el *m)
 {
   if (!m)
     return;
   g_last_played = m;
+  if (remote_on(m)) {
+    cast_play(g_rsess);
+    browser_buf_lock();
+    if (!m->playing_state) {
+      m->ev |= MEV_PLAY;
+      m->playing_state = true;
+    }
+    m->reported_ended = false;
+    browser_buf_unlock();
+    return;
+  }
   if (m->vid && m->vended)
     video_reopen(m); /* replay a finished clip */
   browser_buf_lock();
@@ -646,6 +678,8 @@ void media_pause(struct media_el *m)
 {
   if (!m)
     return;
+  if (remote_on(m))
+    cast_pause(g_rsess);
   browser_buf_lock();
   m->want_play = false;
   if (m->ms)
@@ -663,6 +697,11 @@ int media_paused(struct media_el *m)
 {
   if (!m)
     return 1;
+  if (remote_on(m)) {
+    struct cast_status st;
+    cast_get_status(g_rsess, &st);
+    return st.state == CAST_PAUSED || st.state == CAST_IDLE;
+  }
   return !((m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying));
 }
 
@@ -670,6 +709,8 @@ int media_ended(struct media_el *m)
 {
   if (!m)
     return 0;
+  if (remote_on(m))
+    return m->reported_ended;
   return (m->ms && media_source_ended(m->ms)) || (m->vid && m->vended && !m->ms);
 }
 
@@ -677,6 +718,11 @@ double media_current_time(struct media_el *m)
 {
   if (!m)
     return 0.0;
+  if (remote_on(m)) {
+    struct cast_status st;
+    cast_get_status(g_rsess, &st);
+    return st.current_time;
+  }
   if (m->ms)
     return (double)media_source_position_ms(m->ms) / 1000.0;
   if (m->vid)
@@ -692,7 +738,11 @@ void media_set_current_time(struct media_el *m, double sec)
   if (sec < 0)
     sec = 0;
   ms = (unsigned)(sec * 1000.0);
-  if (m->ms) {
+  if (remote_on(m)) {
+    cast_seek(g_rsess, sec);
+    m->reported_ended = false;
+    m->ev |= MEV_SEEKED | MEV_TIMEUPDATE;
+  } else if (m->ms) {
     media_source_seek_ms(m->ms, ms);
     m->reported_ended = false;
     m->ev |= MEV_SEEKED | MEV_TIMEUPDATE;
@@ -704,7 +754,11 @@ void media_set_current_time(struct media_el *m, double sec)
 double media_duration(struct media_el *m)
 {
   unsigned d = 0;
-  if (m && m->ms)
+  if (m && remote_on(m)) {
+    struct cast_status st;
+    cast_get_status(g_rsess, &st);
+    d = (unsigned)(st.duration * 1000.0);
+  } else if (m && m->ms)
     d = media_source_duration_ms(m->ms);
   else if (m && m->vid)
     d = m->vdur_ms;
@@ -729,6 +783,8 @@ void media_set_volume(struct media_el *m, double v)
     return;
   m->volume = nv;
   apply_audio_params(m);
+  if (remote_on(m))
+    cast_set_volume(g_rsess, (double)nv / 1000.0);
   m->ev |= MEV_VOLCHANGE;
 }
 
@@ -740,6 +796,8 @@ void media_set_muted(struct media_el *m, int on)
     return;
   m->muted = on != 0;
   apply_audio_params(m);
+  if (remote_on(m))
+    cast_set_muted(g_rsess, on != 0);
   m->ev |= MEV_VOLCHANGE;
 }
 
@@ -777,10 +835,92 @@ int media_ready_state(struct media_el *m)
 
 int media_network_state(struct media_el *m) { return m ? m->net : MNS_EMPTY; }
 
+int media_remote_start(struct media_el *m, const struct cast_device *dev, const char *ctype)
+{
+  cast_session *s;
+  double pos;
+  bool was_playing;
+  if (!m || !dev || !m->src[0])
+    return -1;
+  media_remote_stop(g_rmedia);
+  s = cast_connect(dev, 10000);
+  if (!s)
+    return -1;
+  pos = media_current_time(m);
+  was_playing = !media_paused(m);
+  media_pause(m);
+  if (cast_load(s, m->src, ctype, m->src, 8000)) {
+    cast_close(s);
+    if (was_playing)
+      media_play(m);
+    return -1;
+  }
+  if (pos > 0.5)
+    cast_seek(s, pos);
+  browser_buf_lock();
+  g_rsess = s;
+  g_rmedia = m;
+  m->rplay_seen = false;
+  m->reported_ended = false;
+  m->playing_state = true;
+  m->ev |= MEV_PLAY;
+  browser_buf_unlock();
+  return 0;
+}
+
+/* Leave the receiver and carry its position and play state back to the local element */
+void media_remote_stop(struct media_el *m)
+{
+  struct cast_status st;
+  cast_session *d;
+  if (!remote_on(m))
+    return;
+  cast_get_status(g_rsess, &st);
+  browser_buf_lock();
+  d = g_rsess;
+  g_rsess = 0;
+  g_rmedia = 0;
+  m->playing_state = false;
+  m->ev |= MEV_PAUSE;
+  browser_buf_unlock();
+  cast_close(d);
+  media_set_current_time(m, st.current_time);
+  if (st.state == CAST_PLAYING || st.state == CAST_BUFFERING)
+    media_play(m);
+}
+
+/* Receiver-driven transitions: timeupdate, ended, and a receiver that went away */
+static void remote_poll(unsigned now)
+{
+  struct cast_status st;
+  struct media_el *m = g_rmedia;
+  if (!g_rsess || !m)
+    return;
+  cast_get_status(g_rsess, &st);
+  if (st.conn == CAST_DISCONNECTED) {
+    media_remote_stop(m);
+    return;
+  }
+  browser_buf_lock();
+  if (st.state == CAST_PLAYING) {
+    m->rplay_seen = true;
+    if (now - m->last_tu >= 250) {
+      m->ev |= MEV_TIMEUPDATE;
+      m->last_tu = now;
+    }
+  } else if (st.state == CAST_IDLE && m->rplay_seen && !m->reported_ended) {
+    m->reported_ended = true;
+    m->playing_state = false;
+    m->ev |= MEV_ENDED | MEV_TIMEUPDATE;
+  }
+  browser_buf_unlock();
+}
+
 int media_pump(void)
 {
   int i, fired = 0;
   unsigned now = msec();
+  remote_poll(now);
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     unsigned ev;
@@ -812,6 +952,8 @@ int media_pump(void)
           m->last_tu = now;
         }
       }
+    } else if (remote_on(m)) {
+      /* the receiver drives the clock; remote_poll queued its events */
     } else if (m->vid) { /* silent video: drive from vid */
       if (m->vended && !m->reported_ended) {
         m->reported_ended = true;
@@ -941,8 +1083,19 @@ struct mrects {
   int seek_x, seek_y, seek_w, seek_h;
   int vol_x, vol_y, vol_w;
   int fs_x, fs_w; /* fullscreen button (video only; fs_w 0 = none) */
+  int cast_x, cast_w; /* cast button (shown when a receiver is around; cast_w 0 = none) */
   int time_right; /* right edge of the time text */
 };
+
+/* The cast button shows while casting, or when the source is http(s) and a receiver was seen */
+static bool cast_offered(const struct media_el *m)
+{
+  if (remote_on(m))
+    return true;
+  if (!m->node || dom_get_attr(m->node, "disableremoteplayback"))
+    return false;
+  return (starts_ci(m->src, "http://") || starts_ci(m->src, "https://")) && cast_scan_count() > 0;
+}
 
 /* `fsh` > 0: the widget fills a fullscreen pane that tall, instead of the inline size */
 static void media_rects(struct media_el *m, int x0, int y0, int w, int fsh, struct mrects *r)
@@ -962,9 +1115,18 @@ static void media_rects(struct media_el *m, int x0, int y0, int w, int fsh, stru
   r->vol_x = x0 + w - 8 - btn;
   r->vol_y = my;
   /* seek track fills the gap between the play button and the time/volume block */
+  int left = r->vol_x - 8;
   r->fs_w = m->kind == MK_VIDEO ? btn : 0;
-  r->fs_x = r->vol_x - 8 - btn;
-  r->time_right = (r->fs_w ? r->fs_x : r->vol_x) - 8;
+  if (r->fs_w) {
+    r->fs_x = left - btn;
+    left = r->fs_x - 8;
+  }
+  r->cast_w = cast_offered(m) ? btn : 0;
+  if (r->cast_w) {
+    r->cast_x = left - btn;
+    left = r->cast_x - 8;
+  }
+  r->time_right = left;
   r->seek_x = r->play_x + btn + 10;
   r->seek_w = (r->time_right - 102) - r->seek_x; /* leave room for "M:SS / M:SS" */
   if (r->seek_w < 24)
@@ -1119,6 +1281,18 @@ static void media_draw(struct media_el *m, int x0, int y0, int w, int fsh, int c
   }
 
   draw_speaker_glyph(r.vol_x + 3, r.vol_y + 5, m->muted, 0xe6ebf2, ct, cb);
+  if (r.cast_w) {
+    unsigned col = remote_on(m) ? 0x4a90e2 : 0xe6ebf2;
+    int bx = r.cast_x + 4, by = r.vol_y + 5;
+    mfill(bx, by, 14, 1, col, ct, cb); /* screen outline, open at the bottom left */
+    mfill(bx + 13, by, 1, 11, col, ct, cb);
+    mfill(bx, by + 10, 14, 1, col, ct, cb);
+    mfill(bx, by, 1, 4, col, ct, cb);
+    for (int k = 1; k <= 3; k++) { /* receiver waves */
+      mfill(bx, by + 4 + k * 2 + (k - 1), 1, 1, col, ct, cb);
+      mfill(bx + k * 3 - 1, by + 10, 1, 1, col, ct, cb);
+    }
+  }
   if (r.fs_w) {
     int bx = r.fs_x + 5, by = r.vol_y + 5, s = 4; /* four corner brackets */
     for (int cx = 0; cx < 2; cx++)
@@ -1184,7 +1358,7 @@ static void media_post_fs(struct media_el *m, const char *type)
   int k = 0;
   if (B->evt_pending)
     return;
-  B->fs_node = m->node;
+  B->evt_node = m->node;
   sapp(B->evt_type, &k, sizeof B->evt_type, type);
   B->evt_pending = 1;
   B->seq++;
@@ -1199,6 +1373,8 @@ static void media_click(struct media_el *m, int mx, int my, int x0, int y0, int 
   media_rects(m, x0, y0, paw, fsh, &r);
   if (r.fs_w && mx >= r.fs_x && mx < r.fs_x + r.fs_w && my >= r.bar_y && my < r.bar_y + MBAR_H) {
     media_post_fs(m, fsh ? "escape" : "fsenter");
+  } else if (r.cast_w && mx >= r.cast_x && mx < r.cast_x + r.cast_w && my >= r.bar_y && my < r.bar_y + MBAR_H) {
+    media_post_fs(m, "cast");
   } else if (mx >= r.play_x && mx < r.play_x + r.play_w && my >= r.play_y - 4 && my < r.play_y + r.play_w + 4) {
     if (media_paused(m))
       media_play(m);
@@ -1256,6 +1432,12 @@ struct media_el *media_current(void)
 void media_page_teardown(void)
 {
   int i;
+  if (g_rsess) {
+    cast_session *d = g_rsess;
+    g_rsess = 0;
+    g_rmedia = 0;
+    cast_close(d);
+  }
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     if (!m->in_use || m->owner != B->pg)

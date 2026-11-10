@@ -113,6 +113,7 @@ js_object *observer_class(js_ctx *ctx, js_object *win, const char *name, js_nati
 void setup_media_proto(js_ctx *ctx);
 void setup_remote_proto(js_ctx *ctx);
 js_value image_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+void js_cast_toggle(struct dom_node *n); /* controls-bar cast button: connect or disconnect */
 void js_cast_page_end(void); /* tear the page's Cast session down   */
 
 /* Service workers (js_serviceworker.c) */

@@ -272,7 +272,7 @@ struct browser {
 
   /* History API: the main thread owns the tabs[] hist list and nav buttons. */
   volatile int fs_want;   /* worker -> main: 1 = fill the screen with the window, 0 = restore */
-  struct dom_node *fs_node; /* main -> worker: element a "fsenter" event fullscreens */
+  struct dom_node *evt_node; /* main -> worker: the element a "fsenter" or "cast" event is about */
   volatile int hist_go;   /* worker -> main: -1 back, +1 forward, 0 none */
   volatile int hist_nav;  /* worker -> main: a pushState/replaceState URL */
   int hist_replace;       /* the queued hist_nav replaces, not pushes     */

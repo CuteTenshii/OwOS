@@ -5,11 +5,7 @@
 #include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "jsint.h"
 
-/* Single process-wide Cast session state. */
-static cast_session *g_cast;     /* the single active Cast session, or NULL      */
-static js_object *g_cast_remote; /* the RemotePlayback owning g_cast, or NULL */
-static int g_cast_used;          /* a page touched a remote-playback entry point */
-static int g_cast_conn_seen;     /* last connection state delivered by the pump  */
+static int g_cast_used; /* a page touched a remote-playback entry point */
 
 /* ---- HTMLMediaElement ---- */
 static struct media_el *mel_of(js_value t)
@@ -131,6 +127,26 @@ static js_value mel_set_preload(js_ctx *ctx, js_value t, js_value *args, int arg
   struct dom_node *n = node_of(t);
   if (n)
     dom_set_attr(n, "preload", arg_str(ctx, A(0)));
+  return js_undef();
+}
+static js_value mel_get_disable_remote(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_bool(n && dom_get_attr(n, "disableremoteplayback") != 0);
+}
+static js_value mel_set_disable_remote(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  if (n) {
+    if (js_to_boolean(A(0)))
+      dom_set_attr(n, "disableremoteplayback", "");
+    else
+      dom_remove_attr(n, "disableremoteplayback");
+  }
   return js_undef();
 }
 static js_value mel_get_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -262,10 +278,7 @@ static js_value mel_get_remote(js_ctx *ctx, js_value t, js_value *args, int argc
 
 void setup_media_proto(js_ctx *ctx)
 {
-  g_cast = 0;
-  g_cast_remote = 0;
   g_cast_used = 0;
-  g_cast_conn_seen = 0;
   def_acc(g_media_proto, "src", mel_get_src, mel_set_src);
   def_acc(g_media_proto, "currentSrc", mel_get_src, 0);
   def_acc(g_media_proto, "currentTime", mel_get_currentTime, mel_set_currentTime);
@@ -277,6 +290,7 @@ void setup_media_proto(js_ctx *ctx)
   def_acc(g_media_proto, "loop", mel_get_loop, mel_set_loop);
   def_acc(g_media_proto, "autoplay", mel_get_autoplay, mel_set_autoplay);
   def_acc(g_media_proto, "preload", mel_get_preload, mel_set_preload);
+  def_acc(g_media_proto, "disableRemotePlayback", mel_get_disable_remote, mel_set_disable_remote);
   def_acc(g_media_proto, "controls", mel_get_controls, mel_set_controls);
   def_acc(g_media_proto, "readyState", mel_get_readyState, 0);
   def_acc(g_media_proto, "networkState", mel_get_networkState, 0);
@@ -344,15 +358,10 @@ static struct dom_node *remote_node(js_value t) { return (t.type == JV_OBJ) ? (s
 
 static js_value rp_get_state(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  const char *st = "disconnected";
+  struct dom_node *n = remote_node(t);
   (void)args;
   (void)argc;
-  if (t.type == JV_OBJ && t.u.obj == g_cast_remote && g_cast) {
-    struct cast_status s;
-    cast_get_status(g_cast, &s);
-    st = s.conn == CAST_CONNECTED ? "connected" : s.conn == CAST_CONNECTING ? "connecting" : "disconnected";
-  }
-  return js_mk_cstring(ctx, st);
+  return js_mk_cstring(ctx, n && media_remote_conn(media_for_node(n)) == CAST_CONNECTED ? "connected" : "disconnected");
 }
 
 /* watchAvailability(cb): register a monitor; the pump delivers the first value. */
@@ -388,56 +397,93 @@ static js_value rp_cancel_watch(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* prompt(): discover, connect to the first receiver, load and play. */
+/* Ask which receiver to cast to; returns false (with *why set) when none is available or the user declines */
+static bool cast_pick(struct cast_device *out, const char **why)
+{
+  struct cast_device list[8];
+  char names[1024];
+  int n = 0, c, row, k = 0;
+  cast_scan_start();
+  for (; n < 8 && cast_scan_get(n, &list[n]); n++)
+    ;
+  if (n == 0)
+    n = cast_discover(list, 8, 4000);
+  if (n <= 0) {
+    *why = "NotFoundError";
+    return false;
+  }
+  names[0] = '\0';
+  for (c = 0; c < n; c++) {
+    sapp(names, &k, sizeof names, list[c].name[0] ? list[c].name : "Cast device");
+    if (c + 1 < n)
+      sapp(names, &k, sizeof names, "\n");
+  }
+  row = worker_dialog(5, "Cast to:", names, 0, 0);
+  if (row < 0 || row >= n) {
+    *why = "NotAllowedError";
+    return false;
+  }
+  *out = list[row];
+  return true;
+}
+
+/* The reason a remote-playback request on `m` cannot be served, or NULL */
+static const char *cast_refusal(struct media_el *m, struct dom_node *n, char *src, int cap)
+{
+  src[0] = '\0';
+  media_get_src(m, src, cap);
+  if (dom_get_attr(n, "disableremoteplayback"))
+    return "NotSupportedError";
+  if (!starts_ci(src, "http://") && !starts_ci(src, "https://"))
+    return "NotSupportedError"; /* the receiver fetches it itself */
+  return 0;
+}
+
+/* Connect `m` to a receiver of the user's choice; NULL on success, else a DOMException name */
+static const char *cast_start(struct media_el *m, struct dom_node *n, js_object *rp)
+{
+  struct cast_device dev;
+  char src[URL_MAX];
+  const char *why = cast_refusal(m, n, src, sizeof src);
+  if (why)
+    return why;
+  if (media_remote_conn(m) == CAST_CONNECTED)
+    return "InvalidStateError";
+  g_cast_used = 1;
+  if (!cast_pick(&dev, &why))
+    return why;
+  if (rp)
+    emit_event(rp, "connecting", js_undef());
+  if (media_remote_start(m, &dev, cast_ctype_for(src)))
+    return "NotAllowedError";
+  return 0;
+}
+
+static const char *const g_cast_msg[] = {"NotFoundError", "No available Cast devices", "NotAllowedError",
+                                         "The Cast prompt was dismissed or the connection failed", "NotSupportedError",
+                                         "This source cannot be cast", "InvalidStateError", "Already casting"};
+
+static js_value cast_reject(js_ctx *ctx, const char *name)
+{
+  for (int i = 0; i < 8; i += 2)
+    if (streq(name, g_cast_msg[i]))
+      return js_promise_rejected(ctx, dom_exception(ctx, name, g_cast_msg[i + 1]));
+  return js_promise_rejected(ctx, dom_exception(ctx, name, name));
+}
+
+/* prompt(): pick a receiver, then hand the element's playback to it. */
 static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = remote_node(t);
-  struct cast_device dev;
-  bool have = false;
+  const char *why;
   (void)args;
   (void)argc;
-  if (t.type != JV_OBJ)
+  if (t.type != JV_OBJ || !n)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "prompt: bad target"));
-
-  cast_scan_start();
-  g_cast_used = 1;
-  if (cast_scan_count() > 0 && cast_scan_get(0, &dev))
-    have = true;
-  if (!have) {
-    struct cast_device list[8];
-    int c = cast_discover(list, 8, 4000);
-    if (c > 0) {
-      dev = list[0];
-      have = true;
-    }
-  }
-  if (!have)
-    return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "No available Cast devices"));
-
-  if (g_cast) {
-    cast_session *d = g_cast;
-    g_cast = 0;
-    g_cast_remote = 0;
-    cast_close(d);
-  }
-  g_cast_conn_seen = CAST_DISCONNECTED;
-  emit_event(t.u.obj, "connecting", js_undef());
-
-  {
-    cast_session *s = cast_connect(&dev, 10000);
-    if (!s)
-      return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Could not connect to the Cast device"));
-    g_cast = s;
-    g_cast_remote = t.u.obj;
-    g_cast_conn_seen = CAST_CONNECTED;
-  }
-  if (n) {
-    char src[URL_MAX];
-    src[0] = '\0';
-    media_get_src(media_for_node(n), src, sizeof src);
-    if (src[0])
-      cast_load(g_cast, src, cast_ctype_for(src), 0, 8000);
-  }
+  why = cast_start(media_for_node(n), n, t.u.obj);
+  if (why)
+    return cast_reject(ctx, why);
+  js_def(t.u.obj, "@conn", js_number(CAST_CONNECTED), P_WRITABLE);
   emit_event(t.u.obj, "connect", js_undef());
   return js_promise_resolved(ctx, js_undef());
 }
@@ -445,18 +491,31 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
 /* disconnect(): non-standard; stop casting and return to local playback. */
 static js_value rp_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
+  struct dom_node *n = remote_node(t);
+  struct media_el *m = n ? media_for_node(n) : 0;
   (void)ctx;
   (void)args;
   (void)argc;
-  if (t.type == JV_OBJ && g_cast && g_cast_remote == t.u.obj) {
-    cast_session *d = g_cast;
-    g_cast = 0;
-    g_cast_remote = 0;
-    g_cast_conn_seen = CAST_DISCONNECTED;
+  if (m && media_remote_conn(m) == CAST_CONNECTED) {
+    js_def(t.u.obj, "@conn", js_number(CAST_DISCONNECTED), P_WRITABLE);
+    media_remote_stop(m); /* blocks up to ~5 s while the reader unwinds */
     emit_event(t.u.obj, "disconnect", js_undef());
-    cast_close(d); /* blocks up to ~5 s while the reader unwinds */
   }
   return js_undef();
+}
+
+/* The cast button in the controls bar: connect, or disconnect when already casting (worker thread) */
+void js_cast_toggle(struct dom_node *n)
+{
+  struct media_el *m = n ? media_for_node(n) : 0;
+  js_value rp;
+  if (!m || !g_page_live || !g_ctx || !n->wrapper)
+    return;
+  rp = js_get(g_ctx, js_obj_value((js_object *)n->wrapper), "@remote");
+  if (media_remote_conn(m) == CAST_CONNECTED)
+    media_remote_stop(m);
+  else
+    cast_start(m, n, rp.type == JV_OBJ ? rp.u.obj : 0);
 }
 
 /* `remote` accessor: one cached RemotePlayback per element. */
@@ -532,38 +591,23 @@ int js_cast_pump(void)
     }
   }
 
-  if (g_cast && g_cast_remote) {
-    struct cast_status s;
-    cast_get_status(g_cast, &s);
-    if (s.conn != g_cast_conn_seen) {
-      g_cast_conn_seen = s.conn;
-      if (s.conn == CAST_CONNECTING)
-        emit_event(g_cast_remote, "connecting", js_undef());
-      else if (s.conn == CAST_CONNECTED)
-        emit_event(g_cast_remote, "connect", js_undef());
-      else if (s.conn == CAST_DISCONNECTED) {
-        cast_session *dead = g_cast;
-        js_object *rp = g_cast_remote;
-        g_cast = 0;
-        g_cast_remote = 0;
-        emit_event(rp, "disconnect", js_undef());
-        cast_close(dead); /* already unwinding; join is immediate */
-      }
-      fired++;
-    }
+  /* connect / disconnect, including a receiver that went away or the controls-bar button */
+  for (unsigned i = 0; g_remotes && i < js_array_len(g_remotes); i++) {
+    js_value rv = js_get_index(g_ctx, js_obj_value(g_remotes), i);
+    struct dom_node *n = rv.type == JV_OBJ ? (struct dom_node *)rv.u.obj->host : 0;
+    int now, seen;
+    if (!n)
+      continue;
+    now = media_remote_conn(media_for_node(n)) == CAST_CONNECTED ? CAST_CONNECTED : CAST_DISCONNECTED;
+    seen = js_to_int_sat(g_ctx, js_get(g_ctx, rv, "@conn"));
+    if (now == seen)
+      continue;
+    js_def(rv.u.obj, "@conn", js_number(now), P_WRITABLE);
+    emit_event(rv.u.obj, now == CAST_CONNECTED ? "connect" : "disconnect", js_undef());
+    fired++;
   }
   return fired;
 }
 
-/* Close any active session at page teardown (navigation). */
-void js_cast_page_end(void)
-{
-  if (g_cast) {
-    cast_session *d = g_cast;
-    g_cast = 0;
-    g_cast_remote = 0;
-    cast_close(d);
-  }
-  g_cast_used = 0;
-  g_cast_conn_seen = 0;
-}
+/* The media layer closes the session with the page's media; only the pump flag is ours */
+void js_cast_page_end(void) { g_cast_used = 0; }

@@ -180,8 +180,10 @@ static void worker_dispatch_event(void)
     }
     return;
   }
-  if (streq(B->evt_type, "fsenter")) {
-    need_relayout = js_fullscreen_enter(B->fs_node);
+  if (streq(B->evt_type, "cast")) {
+    js_cast_toggle(B->evt_node);
+  } else if (streq(B->evt_type, "fsenter")) {
+    need_relayout = js_fullscreen_enter(B->evt_node);
   } else if (streq(B->evt_type, "escape")) {
     need_relayout = js_escape_key();
   } else if (streq(B->evt_type, "keyinput")) {
