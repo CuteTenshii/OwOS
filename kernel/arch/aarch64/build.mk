@@ -19,7 +19,7 @@ KERNEL  := owos-aarch64.bin
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
 A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
-            -fno-stack-protector -O$(OPT_LEVEL) -Wall -Wextra $(VERSION_DEF) -I$(A64DIR)
+            -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
 A64_EL2 ?= on
 QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2) -cpu cortex-a57 -m 256 -display none -serial stdio -kernel $(KERNEL)
 
@@ -27,12 +27,15 @@ ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
 endif
 
-OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o)
+OBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o) kernel/kstring.o
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(A64DIR)/%.o: $(A64DIR)/%.c $(A64DIR)/arch.h
+	$(CC) $(A64FLAGS) -c $< -o $@
+
+kernel/kstring.o: kernel/kstring.c kernel/kstring.h
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJS) $(A64DIR)/linker.ld

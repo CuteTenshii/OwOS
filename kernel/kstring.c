@@ -14,6 +14,7 @@
  * framebuffer blit/present at -O1 (the compositor copies whole windows). */
 void *memcpy(void *dst, const void *src, uint32_t n)
 {
+#if defined(__i386__) || defined(__x86_64__)
   int d0, d1, d2;
   __asm__ volatile("rep ; movsl\n\t"
                    "movl %4, %%ecx\n\t"
@@ -22,6 +23,12 @@ void *memcpy(void *dst, const void *src, uint32_t n)
                    : "=&c"(d0), "=&D"(d1), "=&S"(d2)
                    : "0"(n >> 2), "g"(n), "1"(dst), "2"(src)
                    : "memory");
+#else
+  uint8_t *d = dst;
+  const uint8_t *s = src;
+  while (n--)
+    *d++ = *s++;
+#endif
   return dst;
 }
 
@@ -46,6 +53,7 @@ void *memmove(void *dst, const void *src, uint32_t n)
 /* The other primitive gcc emits implicitly (e.g. for `struct x = {0}`). */
 void *memset(void *dst, int c, uint32_t n)
 {
+#if defined(__i386__) || defined(__x86_64__)
   int d0, d1;
   unsigned cc = (unsigned char)c;
   unsigned pat = cc | (cc << 8) | (cc << 16) | (cc << 24);
@@ -56,6 +64,11 @@ void *memset(void *dst, int c, uint32_t n)
                    : "=&c"(d0), "=&D"(d1)
                    : "a"(pat), "0"(n >> 2), "g"(n), "1"(dst)
                    : "memory");
+#else
+  uint8_t *d = dst;
+  while (n--)
+    *d++ = (uint8_t)c;
+#endif
   return dst;
 }
 

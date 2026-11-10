@@ -1,5 +1,6 @@
 /* main.c: AArch64 bring-up and boot self-test. */
 #include "arch.h"
+#include "kstring.h"
 
 extern volatile uint64_t svc_count;
 
@@ -26,6 +27,20 @@ static void check(const char *name, int ok)
     failures++;
 }
 
+static void test_kstring(void)
+{
+  char buf[32];
+  char src[] = "abcdefgh";
+  memcpy(buf, src, sizeof src);
+  check("memcpy", memcmp(buf, src, sizeof src) == 0);
+  memmove(buf + 2, buf, 6);
+  check("memmove overlap", memcmp(buf, "ababcdef", 8) == 0);
+  memset(buf, 'z', 5);
+  check("memset", buf[0] == 'z' && buf[4] == 'z' && buf[5] == 'd');
+  ksnprintf(buf, sizeof buf, "%s-%d-%x", "os", 42, 255);
+  check("ksnprintf", streq(buf, "os-42-ff"));
+}
+
 void arch_main(void)
 {
   uart_init();
@@ -41,6 +56,8 @@ void arch_main(void)
   __asm__ volatile("svc #0");
   __asm__ volatile("svc #0");
   check("synchronous exception round trip", svc_count == 2);
+
+  test_kstring();
 
   gic_init();
   timer_init();
