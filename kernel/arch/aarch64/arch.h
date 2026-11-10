@@ -3,7 +3,9 @@
 #define OWOS_ARCH_AARCH64_H
 
 #include "cpu_defs.h"
+#include "fdt.h"
 #include "pmm.h"
+#include "uvm.h"
 #include <stdint.h>
 
 #define UART0_BASE 0x09000000UL
@@ -59,44 +61,8 @@ uint64_t timer_ticks(void);
 
 extern uint64_t boot_dtb;
 
-/* Base and size of the first /memory node. Returns 0 on success, -1 if the blob is invalid. */
-int fdt_memory(const void *fdt, uint64_t *base, uint64_t *size);
-
 /* Size RAM from the DTB, then bring up the frame allocator and the kernel heap. Returns 0 on success. */
 int arch_mem_init(const void *dtb);
-
-extern uint64_t kernel_l1[512];
-
-#define USER_BASE 0x100000000UL
-#define USER_END 0x4000000000UL /* 256 GiB; page tables are built on demand */
-static inline int user_range(uint64_t ptr, uint64_t len)
-{
-  return ptr >= USER_BASE && ptr < USER_END && len <= USER_END - ptr;
-}
-
-#define USER_STACK_PAGES 64
-#define USER_STACK_BOTTOM (USER_END - USER_STACK_PAGES * 0x1000UL)
-
-#define VM_USER_RX 1
-#define VM_USER_RW 2
-#define VM_USER_RO 3
-
-/* Per-process translation tables: the kernel identity map plus a user window at USER_BASE. */
-uint64_t *vm_create(void);
-int vm_map(uint64_t *root, uintptr_t va, uintptr_t pa, int prot);
-void vm_switch(uint64_t *root);
-void vm_destroy(uint64_t *root);
-
-/* A ready-to-run user address space: page tables with the program and stack mapped. */
-struct user_image {
-  uint64_t *root;
-  uint64_t entry, sp;
-};
-
-/* Build an image from a flat code blob mapped at USER_BASE, or from an ELF64 AArch64 executable.
- * Both return 0 on success and leave nothing allocated on failure. */
-int user_image_code(struct user_image *img, const void *code, uint32_t len);
-int elf_load(struct user_image *img, const void *file, uint64_t size);
 
 /* EL0 tasks. task_run returns the exit code, or -1 if the task faulted. */
 int task_run(const void *code, uint32_t len);

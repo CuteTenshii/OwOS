@@ -1,6 +1,6 @@
 /* elf.c: build user address spaces, from flat code or from ELF64 AArch64 executables. */
-#include "arch.h"
 #include "kstring.h"
+#include "uvm.h"
 #include <stdbool.h>
 
 #define PAGE PMM_FRAME_SIZE
@@ -25,24 +25,17 @@ struct elf64_phdr {
   uint64_t offset, vaddr, paddr, filesz, memsz, align;
 };
 
-static void sync_code(uintptr_t frame)
-{
-  for (uintptr_t a = frame; a < frame + PAGE; a += 64)
-    __asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(a) : "memory");
-  __asm__ volatile("dsb ish\n\tisb");
-}
-
 /* Map one zeroed page holding `len` bytes of `src` (src may be null) at `va`. */
 static int map_page(uint64_t *root, uint64_t va, const void *src, uint64_t len, int prot)
 {
   phys_t frame = pmm_alloc_frame();
   if (!frame)
     return -1;
-  memset((void *)frame, 0, PAGE);
+  memset(PHYS_TO_PTR(frame), 0, PAGE);
   if (len)
-    memcpy((void *)frame, src, (uint32_t)len);
+    memcpy(PHYS_TO_PTR(frame), src, (uint32_t)len);
   if (prot == VM_USER_RX)
-    sync_code(frame);
+    vm_sync_code(frame);
   if (vm_map(root, va, frame, prot)) {
     pmm_free_frame(frame);
     return -1;

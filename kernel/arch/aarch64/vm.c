@@ -58,6 +58,13 @@ int vm_map(uint64_t *root, uintptr_t va, uintptr_t pa, int prot)
   return 0;
 }
 
+void vm_sync_code(phys_t frame)
+{
+  for (uintptr_t a = frame; a < frame + PMM_FRAME_SIZE; a += 64)
+    __asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(a) : "memory");
+  __asm__ volatile("dsb ish\n\tisb");
+}
+
 void vm_switch(uint64_t *root)
 {
   SYSREG_WRITE(ttbr0_el1, root);

@@ -67,7 +67,7 @@ install-hooks:
 
 clean:
 	rm -f $(OBJS) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf $(ISO) .arch.*
-	rm -f user/lib/*.o user/lib/*/*.o user/aarch64/*.o user/aarch64/*.elf
+	rm -f user/lib/*.o user/lib/*/*.o user/aarch64/*.o tests/aarch64/*.o tests/aarch64/*.elf
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete
 	rm -rf $(ISODIR)

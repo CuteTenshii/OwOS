@@ -89,6 +89,9 @@ void pmm_begin(uint64_t highest, uint64_t installed_bytes)
   for (uint32_t i = 0; i < BITMAP_DWORDS; i++)
     bitmap[i] = 0xFFFFFFFF;
   used_frames = total_frames;
+  ram_frames = 0;
+  for (uint32_t i = 0; i < total_frames; i++)
+    refs[i] = 0;
 }
 
 void pmm_add_region(uint64_t addr, uint64_t len)
