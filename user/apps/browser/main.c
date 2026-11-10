@@ -298,7 +298,7 @@ int main(int argc, char **argv)
           t->hist[t->hist_i] = dup;
         }
       } else {
-        hist_push(t, B->hist_url);
+        hist_push(t, B->hist_url, B->hist_key);
       }
       textfield_set(&B->addr_tf, B->hist_url);
       B->seq++;
@@ -383,8 +383,16 @@ int main(int argc, char **argv)
       if (B->pg->cur_url[0])                        /* show the resolved URL */
         textfield_set(&B->addr_tf, B->pg->cur_url); /* (incl. the scheme) */
       /* Record the page we landed on, unless this load was itself a Back/Next move */
-      if (!nav_from_history)
-        hist_push(tabs[active_tab], B->pg->cur_url);
+      {
+        struct tab *lt = tabs[active_tab];
+        lt->cur_doc++;
+        if (!nav_from_history)
+          hist_push(lt, B->pg->cur_url, 0);
+        if (lt->hist_n > 0) {
+          lt->hist_doc[lt->hist_i] = lt->cur_doc;
+          lt->hist_key[lt->hist_i] = 0;
+        }
+      }
       nav_from_history = false;
       if (B->pg->favicon_ok && B->pg->cur_url[0]) /* update a saved bookmark's icon */
         bookmark_set_icon(B->pg->cur_url, B->pg->favicon);

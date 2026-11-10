@@ -199,6 +199,12 @@ static void worker_dispatch_event(void)
       js_dispatch_dom_event(f, "input", 0, 0);
       need_relayout = true;
     }
+  } else if (streq(B->evt_type, "rclick")) {
+    struct dom_node *t = html_node_at_offset(B->evt_off);
+    js_dispatch_dom_event(t, "contextmenu", B->evt_x, B->evt_y);
+    js_dispatch_dom_event(t, "auxclick", B->evt_x, B->evt_y);
+  } else if (streq(B->evt_type, "popstate")) {
+    js_history_pop(B->evt_x, B->evt_text);
   } else { /* a click */
     struct dom_node *t = html_node_at_offset(B->evt_off), *ctrl;
     int prevented = js_dispatch_dom_event(t, "click", B->evt_x, B->evt_y);

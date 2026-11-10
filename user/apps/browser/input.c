@@ -439,8 +439,22 @@ void handle_rclick(int mx, int my)
     fy = my;
     fh = 1;
   }
-  if (!tf)
+  if (!tf) {
+    int py, phh, rows, off, k = 0;
+    char res[URL_MAX];
+    pane_metrics(&py, &phh, &rows);
+    if (B->events_live && !B->evt_pending && my >= py && my < py + phh) {
+      pane_hit(mx, my, &off, res, sizeof res, 0);
+      if (off >= 0) {
+        B->evt_off = off;
+        B->evt_x = mx;
+        B->evt_y = my - py;
+        sapp(B->evt_type, &k, sizeof B->evt_type, "rclick");
+        B->evt_pending = 1;
+      }
+    }
     return;
+  }
   int a, b;
   if (!textfield_selection(tf, &a, &b))
     textfield_click(tf, mx, my, fx, fy, fw, fh);

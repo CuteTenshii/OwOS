@@ -39,7 +39,7 @@ MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(LIB)/json/json.c $(wildcard $(B
   drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/video/dpaux.c drivers/video/edidparse.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c \
   $(LIB)/zstd/zstd_common.c $(LIB)/zstd/fse.c $(LIB)/zstd/huf.c $(LIB)/zstd/zstd_enc.c
-BIND_SRCS := $(COMMON_SRCS) $(LIB)/uuid/uuid.c $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
+BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/features/battery/battery.c $(LIB)/uuid/uuid.c $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c
 
 MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_TEST$$' tests/*_test.c)))

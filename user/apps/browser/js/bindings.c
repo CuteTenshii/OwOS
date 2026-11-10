@@ -1280,6 +1280,28 @@ static js_value el_offsetHeight(js_ctx *ctx, js_value t, js_value *args, int arg
   node_box(t, &x, &y, &w, &h);
   return js_number(h);
 }
+static int is_root_el(js_value t)
+{
+  struct dom_node *n = node_of(t);
+  return n && n->type == DOM_ELEMENT && n->tag && streq(n->tag, "html");
+}
+static js_value el_clientHeight(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int vw, vh;
+  if (!is_root_el(t))
+    return el_offsetHeight(ctx, t, args, argc);
+  browser_viewport_px(&vw, &vh);
+  return js_number(vh);
+}
+static js_value el_scrollHeight(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int vw, vh, dh;
+  if (!is_root_el(t))
+    return el_offsetHeight(ctx, t, args, argc);
+  browser_viewport_px(&vw, &vh);
+  dh = browser_doc_height_px();
+  return js_number(dh > vh ? dh : vh);
+}
 static js_value el_offsetTop(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   int x, y, w, h;
@@ -1301,10 +1323,17 @@ static js_value el_offsetLeft(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value el_scrollTop(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_number(is_root_el(t) ? browser_scroll_px() : 0); /* only the page scrolls */
+}
+static js_value el_scrollLeft(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
   (void)t;
   (void)args;
   (void)argc;
-  return js_number(0); /* elements aren't scroll containers; page scroll is window.scrollY */
+  return js_number(0);
 }
 static js_value el_get_bounding_rect(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1504,6 +1533,12 @@ static js_value doc_active_element(js_ctx *ctx, js_value t, js_value *args, int 
   (void)args;
   (void)argc;
   return b ? wrap_node(b) : js_null();
+}
+static js_value doc_has_focus(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return js_bool(!js_to_boolean(js_get(ctx, t, "hidden"))); /* the window has no focus signal; a visible page is the active one */
 }
 static js_value doc_root_el(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2105,11 +2140,11 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(g_element_proto, "offsetTop", el_offsetTop, 0);
   def_acc(g_element_proto, "offsetLeft", el_offsetLeft, 0);
   def_acc(g_element_proto, "clientWidth", el_offsetWidth, 0); /* no borders modeled */
-  def_acc(g_element_proto, "clientHeight", el_offsetHeight, 0);
+  def_acc(g_element_proto, "clientHeight", el_clientHeight, 0);
   def_acc(g_element_proto, "scrollWidth", el_offsetWidth, 0); /* no overflow modeled */
-  def_acc(g_element_proto, "scrollHeight", el_offsetHeight, 0);
+  def_acc(g_element_proto, "scrollHeight", el_scrollHeight, 0);
   def_acc(g_element_proto, "scrollTop", el_scrollTop, 0);
-  def_acc(g_element_proto, "scrollLeft", el_scrollTop, 0);
+  def_acc(g_element_proto, "scrollLeft", el_scrollLeft, 0);
   def_method(g_element_proto, "getAttribute", el_get_attr, 1);
   def_method(g_element_proto, "setAttribute", el_set_attr, 2);
   def_method(g_element_proto, "hasAttribute", el_has_attr, 1);
@@ -2240,7 +2275,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   js_def(g_document, "hidden", js_bool(0), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "currentScript", js_null(), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "referrer", js_mk_cstring(ctx, B->referrer), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
-  def_method(g_document, "hasFocus", el_true, 0);
+  def_method(g_document, "hasFocus", doc_has_focus, 0);
   js_def(g_document, "defaultView", js_obj_value(win), P_CONFIGURABLE | P_ENUMERABLE);
 
   /* window / globals */

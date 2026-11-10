@@ -395,8 +395,11 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
   }
   gc_keep(tgt.u.obj);
   ev = make_event(type, x, y, js_undef());
-  if (ev.type == JV_OBJ)
+  if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
+    if (streq(type, "click") || streq(type, "auxclick") || streq(type, "contextmenu"))
+      js_set(g_ctx, ev, "button", js_number(streq(type, "click") ? 0 : 2));
+  }
   prevented = dispatch_from(tgt.u.obj, ev);
   if (!prevented && streq(type, "click")) {
     popover_click(target);

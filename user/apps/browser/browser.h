@@ -277,6 +277,7 @@ struct browser {
   volatile int hist_nav;  /* worker -> main: a pushState/replaceState URL */
   int hist_replace;       /* the queued hist_nav replaces, not pushes     */
   char hist_url[URL_MAX]; /* its URL                                      */
+  int hist_key;           /* its state key (history.state lookup on popstate) */
   int hist_len;           /* main -> worker: history.length               */
   volatile int loc_nav;   /* worker -> main: location.assign/replace/reload */
   char loc_url[URL_MAX];  /* its target URL                               */
@@ -370,6 +371,7 @@ void js_page_interrupt(void); /* any thread: unwind the running page script (cle
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
 int js_has_listeners(void); /* any listener registered */
 int js_before_unload(void); /* worker: fire beforeunload; 0 if the user chose to stay */
+void js_history_pop(int key, const char *url); /* worker: same-document traversal; fire popstate */
 void js_page_hide(void);    /* worker: page is going away; fire visibilitychange (hidden) */
 bool js_escape_key(void);   /* Escape: leave fullscreen, else close the topmost modal dialog or auto popover */
 bool js_fullscreen_enter(struct dom_node *n); /* worker: make `n` the fullscreen element; false if not in the document */
@@ -399,6 +401,7 @@ int html_node_span(struct dom_node *node, int *start, int *end);
 /* Approximate document-relative px box of a text range (0 if empty); takes browser_buf_lock. */
 int browser_range_box(int start, int end, int *x, int *y, int *w, int *h);
 int browser_scroll_px(void);              /* page vertical scroll, px (window.scrollY) */
+int browser_doc_height_px(void);          /* laid-out document height, px */
 int js_resize_pump(void);                 /* report ResizeObserver size changes; -> # callbacks fired */
 void browser_viewport_px(int *w, int *h); /* content viewport size (innerWidth/Height) */
 

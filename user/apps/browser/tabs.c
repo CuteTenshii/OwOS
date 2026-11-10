@@ -157,11 +157,11 @@ static void hist_clear(struct tab *t)
 }
 
 /* Record `url` as the tab's current page */
-void hist_push(struct tab *t, const char *url)
+void hist_push(struct tab *t, const char *url, int key)
 {
   if (!url || !url[0])
     return;
-  if (t->hist_n > 0 && streq(t->hist[t->hist_i], url))
+  if (!key && t->hist_n > 0 && streq(t->hist[t->hist_i], url))
     return; /* same page */
 
   for (int i = t->hist_i + 1; i < t->hist_n; i++) {
@@ -178,10 +178,15 @@ void hist_push(struct tab *t, const char *url)
 
   if (t->hist_n >= HIST_MAX) { /* full: drop the oldest */
     free(t->hist[0]);
-    for (int i = 1; i < t->hist_n; i++)
+    for (int i = 1; i < t->hist_n; i++) {
       t->hist[i - 1] = t->hist[i];
+      t->hist_doc[i - 1] = t->hist_doc[i];
+      t->hist_key[i - 1] = t->hist_key[i];
+    }
     t->hist_n--;
   }
+  t->hist_doc[t->hist_n] = t->cur_doc;
+  t->hist_key[t->hist_n] = key;
   t->hist[t->hist_n++] = dup;
   t->hist_i = t->hist_n - 1;
 }
@@ -323,26 +328,31 @@ void do_stop(void)
   B->seq++;
 }
 
-/* Navigate to the active tab's previous/next history entry */
-void go_back(void)
+/* Move d entries through the active tab's history; entries of the live document fire popstate instead of loading */
+static void hist_step(int d)
 {
   struct tab *t = tabs[active_tab];
-  if (!hist_can_back(t))
+  int i = t->hist_i + d, k = 0;
+  if (i < 0 || i >= t->hist_n)
     return;
-  t->hist_i--;
+  t->hist_i = i;
+  if (t->hist_doc[i] == t->cur_doc && !B->loading && !B->evt_pending && !t->crashed && B->pg->cur_url[0]) {
+    textfield_set(&B->addr_tf, t->hist[i]);
+    B->evt_x = t->hist_key[i];
+    sapp(B->evt_text, &k, sizeof B->evt_text, t->hist[i]);
+    k = 0;
+    sapp(B->evt_type, &k, sizeof B->evt_type, "popstate");
+    B->evt_pending = 1;
+    B->seq++;
+    return;
+  }
   nav_from_history = true;
-  navigate(t->hist[t->hist_i]);
+  navigate(t->hist[i]);
 }
 
-void go_fwd(void)
-{
-  struct tab *t = tabs[active_tab];
-  if (!hist_can_fwd(t))
-    return;
-  t->hist_i++;
-  nav_from_history = true;
-  navigate(t->hist[t->hist_i]);
-}
+void go_back(void) { hist_step(-1); }
+
+void go_fwd(void) { hist_step(1); }
 
 /* Reset B to an empty page (a fresh/blank tab) without touching the net. */
 static void show_blank(void)

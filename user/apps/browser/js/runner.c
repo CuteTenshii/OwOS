@@ -487,6 +487,16 @@ static void fire_lifecycle(void)
     gc_keep(ev.u.obj);
   dispatch_from(g_ctx->global, ev);
   gc_pop_scope();
+  gc_push_scope();
+  ev = make_event("pageshow", 0, 0, js_undef());
+  if (ev.type == JV_OBJ) {
+    gc_keep(ev.u.obj);
+    js_set(g_ctx, ev, "bubbles", js_bool(0));
+    js_set(g_ctx, ev, "cancelable", js_bool(0));
+    js_set(g_ctx, ev, "persisted", js_bool(0));
+    dispatch_from(g_ctx->global, ev);
+  }
+  gc_pop_scope();
   if (g_ctx->has_exc)
     report_exc(g_ctx);
 }

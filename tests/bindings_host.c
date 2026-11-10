@@ -216,7 +216,7 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
   return 0;
 }
 /* Box every node reports; tests set it to fake a laid-out page (0 = no layout) */
-int test_box_x, test_box_y, test_box_w, test_box_h, test_scroll;
+int test_box_x, test_box_y, test_box_w, test_box_h, test_scroll, test_doc_h;
 int browser_range_box(int s, int e, int *x, int *y, int *w, int *h)
 {
   (void)s;
@@ -228,6 +228,7 @@ int browser_range_box(int s, int e, int *x, int *y, int *w, int *h)
   return test_box_w > 0;
 }
 int browser_scroll_px(void) { return test_scroll; }
+int browser_doc_height_px(void) { return test_doc_h; }
 const char *browser_ua_version(void) { return "5.0 (OwOS)"; }
 const char *browser_ua(void) { return "Mozilla/5.0 (OwOS)"; }
 void browser_viewport_px(int *w, int *h)

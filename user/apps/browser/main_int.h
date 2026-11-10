@@ -90,6 +90,9 @@ struct tab {
   char *hist[HIST_MAX];
   int hist_n; /* number of entries in use                    */
   int hist_i; /* index of the current page (0..hist_n-1)     */
+  int hist_doc[HIST_MAX]; /* document generation each entry belongs to    */
+  int hist_key[HIST_MAX]; /* pushState key of each entry (0 = the load)   */
+  int cur_doc;            /* generation of the loaded document            */
 
   struct dt_view dt; /* this tab's devtools view (panel/scroll/open) */
 
@@ -131,7 +134,7 @@ extern int active_tab;
 extern struct tabbar tab_strip;
 int tabs_init(void);
 extern bool nav_from_history;
-void hist_push(struct tab *t, const char *url);
+void hist_push(struct tab *t, const char *url, int key);
 bool hist_can_back(const struct tab *t);
 bool hist_can_fwd(const struct tab *t);
 void pane_metrics(int *py, int *phh, int *rows);

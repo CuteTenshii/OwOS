@@ -61,7 +61,7 @@ static void fetch_none(char *const *urls, int n, unsigned char **bodies, int *le
 }
 
 static const char page[] = "<html><head><title>t</title></head><body><div id=a class='x "
-                           "y'>hi<span>s</span></div><script>var ready=1</script></body></html>";
+                           "y'>hi<span>s</span></div><script>var ready=1;window.addEventListener('pageshow',function(e){window.shown=e.persisted})</script></body></html>";
 
 static struct dom_node *root;
 
@@ -882,6 +882,49 @@ static void test_web_storage(void)
   }
 }
 
+static void test_pageshow_fires_after_load(void)
+{
+  run_script("expect(window.shown===false, 'pageshow fired once with persisted=false: '+window.shown);\n");
+}
+
+static void test_history_state_and_popstate(void)
+{
+  extern void js_history_pop(int key, const char *url);
+  run_script("window.log=[]; window.addEventListener('popstate', function(e){ log.push(JSON.stringify(e.state)+'@'+location.pathname) });\n"
+             "history.pushState({n:1}, '', '/one');\n"
+             "history.pushState({n:2}, '', '/two');\n"
+             "expect(history.state.n===2 && location.pathname==='/two' && document.URL.slice(-4)==='/two', 'pushState updates "
+             "state and location');\n");
+  expect(B->hist_nav == 1 && B->hist_key == 2 && !B->hist_replace);
+  js_history_pop(1, "https://example.com/one");
+  run_script("expect(log.join()==='{\"n\":1}@/one', 'popstate carries the entry state and the new location: '+log);\n"
+             "expect(history.state.n===1, 'history.state follows the traversal');\n"
+             "history.replaceState({r:1}, '');\n");
+  expect(B->hist_key == 1 && B->hist_replace == 1);
+  js_history_pop(0, "https://example.com/dir/p.html");
+  run_script("expect(history.state===null && location.pathname==='/dir/p.html', 'entry without state reads null');\n"
+             "history.pushState(null);\n");
+  expect(B->hist_key == 3);
+  js_history_pop(1, "https://example.com/one");
+  run_script("expect(history.state.r===1, 'replaceState rewrote the entry state');\n"
+             "expect(log.length===3, 'one popstate per traversal');\n");
+}
+
+static void test_scroll_metrics_follow_layout(void)
+{
+  extern int test_doc_h, test_scroll;
+  test_doc_h = 5000;
+  test_scroll = 120;
+  run_script("var r=document.documentElement;\n"
+             "expect(r.scrollHeight===5000, 'root scrollHeight is the document height: '+r.scrollHeight);\n"
+             "expect(r.clientHeight===innerHeight && r.clientHeight!==r.scrollHeight, 'root clientHeight is the viewport');\n"
+             "expect(r.scrollTop===120 && document.body.scrollTop===0, 'only the root scrolls');\n");
+  test_doc_h = test_scroll = 0;
+  run_script("expect(document.documentElement.scrollHeight===innerHeight, 'short pages fill the viewport');\n"
+             "expect(document.hasFocus()===true, 'a visible page has focus');\n"
+             "document.hidden=true; expect(document.hasFocus()===false, 'a hidden page does not'); document.hidden=false;\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -892,6 +935,9 @@ int main(void)
 
   test("document.cookie reads, writes and hides HttpOnly", test_document_cookie_reads_writes);
   test("document node properties", test_document_node_properties);
+  test("pageshow fires after load", test_pageshow_fires_after_load);
+  test("history state and popstate", test_history_state_and_popstate);
+  test("scroll metrics follow layout", test_scroll_metrics_follow_layout);
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
   test("replaceChildren keeps nodes passed back in", test_replace_children);

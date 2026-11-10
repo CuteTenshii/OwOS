@@ -99,6 +99,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 }
 
 int browser_scroll_px(void) { return B->pg->scroll; } /* window.scrollY (document px) */
+int browser_doc_height_px(void) { return g_fr->doc_h; }
 
 void browser_viewport_px(int *w, int *h)
 {
