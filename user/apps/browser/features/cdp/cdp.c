@@ -202,17 +202,6 @@ static void sess_free(struct cdp_session *s)
   mutex_unlock(&sess_lk);
 }
 
-/* --- small JSON builders --------------------------------------------------- */
-static json_value *jstr(const char *s) { return json_new_string(s ? s : ""); }
-static json_value *jnum(double n) { return json_new_number(n); }
-static json_value *jbool(int b) { return json_new_bool(b); }
-static void oset(json_value *o, const char *k, json_value *v)
-{
-  if (o && v)
-    json_object_set(o, k, v);
-}
-
-/* Reply `{"id":id,"result":result}` to the originating session (takes result). */
 /* Set by a command handler (worker thread only) to answer with a CDP error instead of its result */
 static const char *g_cmd_error;
 
@@ -225,10 +214,10 @@ static void reply_error(struct cdp_session *s, double id, const char *msg)
     json_free(err);
     return;
   }
-  oset(err, "code", jnum(-32000));
-  oset(err, "message", jstr(msg));
-  oset(msg_o, "id", jnum(id));
-  oset(msg_o, "error", err);
+  json_object_put(err, "code", json_new_number(-32000));
+  json_object_put(err, "message", json_new_string(msg));
+  json_object_put(msg_o, "id", json_new_number(id));
+  json_object_put(msg_o, "error", err);
   char *str = json_encode(msg_o, 0, 0);
   json_free(msg_o);
   if (str) {
@@ -238,6 +227,7 @@ static void reply_error(struct cdp_session *s, double id, const char *msg)
   }
 }
 
+/* Reply `{"id":id,"result":result}` to the originating session (takes result). */
 static void reply_result(struct cdp_session *s, double id, json_value *result)
 {
   json_value *msg = json_new_object();
@@ -245,8 +235,8 @@ static void reply_result(struct cdp_session *s, double id, json_value *result)
     json_free(result);
     return;
   }
-  oset(msg, "id", jnum(id));
-  oset(msg, "result", result ? result : json_new_object());
+  json_object_put(msg, "id", json_new_number(id));
+  json_object_put(msg, "result", result ? result : json_new_object());
   char *str = json_encode(msg, 0, 0);
   json_free(msg);
   if (str) {
@@ -264,8 +254,8 @@ static void emit_to_session(struct cdp_session *s, const char *method, json_valu
     json_free(params);
     return;
   }
-  oset(msg, "method", jstr(method));
-  oset(msg, "params", params ? params : json_new_object());
+  json_object_put(msg, "method", json_new_string(method));
+  json_object_put(msg, "params", params ? params : json_new_object());
   char *str = json_encode(msg, 0, 0);
   json_free(msg);
   if (str) {
@@ -287,8 +277,8 @@ static void broadcast_event(int dom, const char *method, json_value *params)
     json_free(params);
     return;
   }
-  oset(msg, "method", jstr(method));
-  oset(msg, "params", params ? params : json_new_object());
+  json_object_put(msg, "method", json_new_string(method));
+  json_object_put(msg, "params", params ? params : json_new_object());
   char *str = json_encode(msg, 0, 0);
   json_free(msg);
   if (!str)
@@ -564,18 +554,18 @@ static json_value *target_json(const char *host)
   sapp(fe, &n, sizeof fe, WS_PATH);
 
   json_value *o = json_new_object();
-  oset(o, "id", jstr(TARGET_ID));
-  oset(o, "type", jstr("page"));
-  oset(o, "title", jstr(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
-  oset(o, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
-  oset(o, "description", jstr(""));
-  oset(o, "webSocketDebuggerUrl", jstr(ws));
+  json_object_put(o, "id", json_new_string(TARGET_ID));
+  json_object_put(o, "type", json_new_string("page"));
+  json_object_put(o, "title", json_new_string(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
+  json_object_put(o, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  json_object_put(o, "description", json_new_string(""));
+  json_object_put(o, "webSocketDebuggerUrl", json_new_string(ws));
   {
     char d[URL_MAX + 64];
     int k = 0;
     sapp(d, &k, sizeof d, "/devtools/inspector.html?ws=");
     sapp(d, &k, sizeof d, fe);
-    oset(o, "devtoolsFrontendUrl", jstr(d));
+    json_object_put(o, "devtoolsFrontendUrl", json_new_string(d));
   }
   return o;
 }
@@ -634,17 +624,17 @@ static void serve_http(int fd, const char *req)
 
   if (starts_ci(path, "/json/version")) {
     json_value *o = json_new_object();
-    oset(o, "Browser", jstr("OwOS-Browser/" OWOS_VERSION));
-    oset(o, "Protocol-Version", jstr("1.3"));
-    oset(o, "User-Agent", jstr(browser_ua()));
-    oset(o, "V8-Version", jstr("0"));
-    oset(o, "WebKit-Version", jstr("0"));
+    json_object_put(o, "Browser", json_new_string("OwOS-Browser/" OWOS_VERSION));
+    json_object_put(o, "Protocol-Version", json_new_string("1.3"));
+    json_object_put(o, "User-Agent", json_new_string(browser_ua()));
+    json_object_put(o, "V8-Version", json_new_string("0"));
+    json_object_put(o, "WebKit-Version", json_new_string("0"));
     char wsurl[URL_MAX];
     int k = 0;
     sapp(wsurl, &k, sizeof wsurl, "ws://");
     sapp(wsurl, &k, sizeof wsurl, host);
     sapp(wsurl, &k, sizeof wsurl, "/devtools/browser/" TARGET_ID);
-    oset(o, "webSocketDebuggerUrl", jstr(wsurl));
+    json_object_put(o, "webSocketDebuggerUrl", json_new_string(wsurl));
     char *body = json_encode(o, 0, 0);
     json_free(o);
     http_send(fd, "200 OK", "application/json; charset=UTF-8", body ? body : "{}");
@@ -786,11 +776,11 @@ static json_value *build_frame(void)
   json_value *f = json_new_object();
   char origin[URL_MAX];
   origin_of(B->pg->cur_url, origin, sizeof origin);
-  oset(f, "id", jstr(FRAME_ID));
-  oset(f, "loaderId", jstr(LOADER_ID));
-  oset(f, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
-  oset(f, "securityOrigin", jstr(origin));
-  oset(f, "mimeType", jstr("text/html"));
+  json_object_put(f, "id", json_new_string(FRAME_ID));
+  json_object_put(f, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(f, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  json_object_put(f, "securityOrigin", json_new_string(origin));
+  json_object_put(f, "mimeType", json_new_string("text/html"));
   return f;
 }
 static json_value *build_context(void)
@@ -798,15 +788,15 @@ static json_value *build_context(void)
   json_value *c = json_new_object();
   char origin[URL_MAX];
   origin_of(B->pg->cur_url, origin, sizeof origin);
-  oset(c, "id", jnum(1));
-  oset(c, "origin", jstr(origin));
-  oset(c, "name", jstr(""));
-  oset(c, "uniqueId", jstr("owos-ctx-1"));
+  json_object_put(c, "id", json_new_number(1));
+  json_object_put(c, "origin", json_new_string(origin));
+  json_object_put(c, "name", json_new_string(""));
+  json_object_put(c, "uniqueId", json_new_string("owos-ctx-1"));
   json_value *aux = json_new_object();
-  oset(aux, "isDefault", jbool(1));
-  oset(aux, "type", jstr("default"));
-  oset(aux, "frameId", jstr(FRAME_ID));
-  oset(c, "auxData", aux);
+  json_object_put(aux, "isDefault", json_new_bool(1));
+  json_object_put(aux, "type", json_new_string("default"));
+  json_object_put(aux, "frameId", json_new_string(FRAME_ID));
+  json_object_put(c, "auxData", aux);
   return c;
 }
 /* Emit Runtime.executionContextCreated. `s` non-NULL -> just that session (a
@@ -815,7 +805,7 @@ static json_value *build_context(void)
 static void emit_context_created(struct cdp_session *s)
 {
   json_value *p = json_new_object();
-  oset(p, "context", build_context());
+  json_object_put(p, "context", build_context());
   if (s)
     emit_to_session(s, "Runtime.executionContextCreated", p);
   else
@@ -854,32 +844,32 @@ static json_value *remote_object(const char *val)
 {
   json_value *o = json_new_object();
   if (!val) {
-    oset(o, "type", jstr("undefined"));
+    json_object_put(o, "type", json_new_string("undefined"));
     return o;
   }
   if (streq(val, "undefined")) {
-    oset(o, "type", jstr("undefined"));
+    json_object_put(o, "type", json_new_string("undefined"));
     return o;
   }
   if (streq(val, "null")) {
-    oset(o, "type", jstr("object"));
-    oset(o, "subtype", jstr("null"));
-    oset(o, "value", json_new_null());
+    json_object_put(o, "type", json_new_string("object"));
+    json_object_put(o, "subtype", json_new_string("null"));
+    json_object_put(o, "value", json_new_null());
     return o;
   }
   if (streq(val, "true") || streq(val, "false")) {
-    oset(o, "type", jstr("boolean"));
-    oset(o, "value", jbool(streq(val, "true")));
+    json_object_put(o, "type", json_new_string("boolean"));
+    json_object_put(o, "value", json_new_bool(streq(val, "true")));
     return o;
   }
   if (looks_numeric(val)) {
-    oset(o, "type", jstr("number"));
-    oset(o, "value", jnum(strtod(val, 0)));
-    oset(o, "description", jstr(val));
+    json_object_put(o, "type", json_new_string("number"));
+    json_object_put(o, "value", json_new_number(strtod(val, 0)));
+    json_object_put(o, "description", json_new_string(val));
     return o;
   }
-  oset(o, "type", jstr("string"));
-  oset(o, "value", jstr(val));
+  json_object_put(o, "type", json_new_string("string"));
+  json_object_put(o, "value", json_new_string(val));
   return o;
 }
 
@@ -950,29 +940,29 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
   int id = node_register(n);
   int is_doc = n->type == DOM_ELEMENT && n->tag[0] == '#'; /* the "#document" root */
   json_value *o = json_new_object();
-  oset(o, "nodeId", jnum(id));
-  oset(o, "backendNodeId", jnum(id));
-  oset(o, "nodeType", jnum(is_doc ? 9 : (n->type == DOM_TEXT ? 3 : 1)));
+  json_object_put(o, "nodeId", json_new_number(id));
+  json_object_put(o, "backendNodeId", json_new_number(id));
+  json_object_put(o, "nodeType", json_new_number(is_doc ? 9 : (n->type == DOM_TEXT ? 3 : 1)));
   if (is_doc) {
-    oset(o, "nodeName", jstr("#document"));
-    oset(o, "localName", jstr(""));
-    oset(o, "nodeValue", jstr(""));
+    json_object_put(o, "nodeName", json_new_string("#document"));
+    json_object_put(o, "localName", json_new_string(""));
+    json_object_put(o, "nodeValue", json_new_string(""));
   } else if (n->type == DOM_TEXT) {
-    oset(o, "nodeName", jstr("#text"));
-    oset(o, "localName", jstr(""));
-    oset(o, "nodeValue", jstr(n->text ? n->text : ""));
+    json_object_put(o, "nodeName", json_new_string("#text"));
+    json_object_put(o, "localName", json_new_string(""));
+    json_object_put(o, "nodeValue", json_new_string(n->text ? n->text : ""));
   } else {
     char up[24];
     upper_tag(n->tag, up, sizeof up);
-    oset(o, "nodeName", jstr(up));
-    oset(o, "localName", jstr(n->tag));
-    oset(o, "nodeValue", jstr(""));
+    json_object_put(o, "nodeName", json_new_string(up));
+    json_object_put(o, "localName", json_new_string(n->tag));
+    json_object_put(o, "nodeValue", json_new_string(""));
     json_value *attrs = json_new_array();
     for (struct dom_attr *a = n->attrs; a; a = a->next) {
-      json_array_push(attrs, jstr(a->name));
-      json_array_push(attrs, jstr(a->value ? a->value : ""));
+      json_array_push(attrs, json_new_string(a->name));
+      json_array_push(attrs, json_new_string(a->value ? a->value : ""));
     }
-    oset(o, "attributes", attrs);
+    json_object_put(o, "attributes", attrs);
   }
 
   /* The <!DOCTYPE> is no DOM node here; it is kept on the document root and shown as a first child (type 10). */
@@ -981,22 +971,22 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
   for (struct dom_node *c = n->first_child; c; c = c->next)
     if (child_shown(c))
       nch++;
-  oset(o, "childNodeCount", jnum(nch));
+  json_object_put(o, "childNodeCount", json_new_number(nch));
 
   if (nch && depth < maxdepth) {
     json_value *kids = json_new_array();
     if (dt) {
       int did = node_register(0); /* no backing node; resolves to nothing */
       json_value *d = json_new_object();
-      oset(d, "nodeId", jnum(did));
-      oset(d, "backendNodeId", jnum(did));
-      oset(d, "nodeType", jnum(10));
-      oset(d, "nodeName", jstr(dt));
-      oset(d, "localName", jstr(""));
-      oset(d, "nodeValue", jstr(""));
-      oset(d, "name", jstr(dt));
-      oset(d, "publicId", jstr(""));
-      oset(d, "systemId", jstr(""));
+      json_object_put(d, "nodeId", json_new_number(did));
+      json_object_put(d, "backendNodeId", json_new_number(did));
+      json_object_put(d, "nodeType", json_new_number(10));
+      json_object_put(d, "nodeName", json_new_string(dt));
+      json_object_put(d, "localName", json_new_string(""));
+      json_object_put(d, "nodeValue", json_new_string(""));
+      json_object_put(d, "name", json_new_string(dt));
+      json_object_put(d, "publicId", json_new_string(""));
+      json_object_put(d, "systemId", json_new_string(""));
       json_array_push(kids, d);
     }
     for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -1008,7 +998,7 @@ static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, in
       else
         break;
     }
-    oset(o, "children", kids);
+    json_object_put(o, "children", kids);
   }
   return o;
 }
@@ -1065,16 +1055,16 @@ static json_value *cssstyle_from_text(const char *raw)
         memcpy(vl, vs, (unsigned)vln);
         vl[vln] = '\0';
         json_value *pr = json_new_object();
-        oset(pr, "name", jstr(nm));
-        oset(pr, "value", jstr(vl));
+        json_object_put(pr, "name", json_new_string(nm));
+        json_object_put(pr, "value", json_new_string(vl));
         json_array_push(props, pr);
       }
     }
     seg = *e ? e + 1 : e;
   }
-  oset(st, "cssProperties", props);
-  oset(st, "shorthandEntries", json_new_array());
-  oset(st, "cssText", jstr(raw ? raw : ""));
+  json_object_put(st, "cssProperties", props);
+  json_object_put(st, "shorthandEntries", json_new_array());
+  json_object_put(st, "cssText", json_new_string(raw ? raw : ""));
   return st;
 }
 
@@ -1082,8 +1072,8 @@ static json_value *cssstyle_from_text(const char *raw)
 static void cs_add(json_value *arr, const char *name, const char *value)
 {
   json_value *p = json_new_object();
-  oset(p, "name", jstr(name));
-  oset(p, "value", jstr(value));
+  json_object_put(p, "name", json_new_string(name));
+  json_object_put(p, "value", json_new_string(value));
   json_array_push(arr, p);
 }
 static void cs_px(json_value *arr, const char *name, int v)
@@ -1232,14 +1222,14 @@ static const char *res_type(const char *ct);
 static json_value *quad(int x, int y, int w, int h)
 {
   json_value *q = json_new_array();
-  json_array_push(q, jnum(x));
-  json_array_push(q, jnum(y));
-  json_array_push(q, jnum(x + w));
-  json_array_push(q, jnum(y));
-  json_array_push(q, jnum(x + w));
-  json_array_push(q, jnum(y + h));
-  json_array_push(q, jnum(x));
-  json_array_push(q, jnum(y + h));
+  json_array_push(q, json_new_number(x));
+  json_array_push(q, json_new_number(y));
+  json_array_push(q, json_new_number(x + w));
+  json_array_push(q, json_new_number(y));
+  json_array_push(q, json_new_number(x + w));
+  json_array_push(q, json_new_number(y + h));
+  json_array_push(q, json_new_number(x));
+  json_array_push(q, json_new_number(y + h));
   return q;
 }
 
@@ -1294,40 +1284,40 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     char *val = expr ? js_page_eval(expr, &is_exc) : 0;
     free(call);
     if (!is_exc)
-      oset(r, "result", remote_object(val ? val : "undefined"));
+      json_object_put(r, "result", remote_object(val ? val : "undefined"));
     if (is_exc) {
       json_value *err = json_new_object();
-      oset(err, "type", jstr("object"));
-      oset(err, "subtype", jstr("error"));
-      oset(err, "className", jstr("Error"));
-      oset(err, "description", jstr(val ? val : "error"));
-      oset(r, "result", err);
+      json_object_put(err, "type", json_new_string("object"));
+      json_object_put(err, "subtype", json_new_string("error"));
+      json_object_put(err, "className", json_new_string("Error"));
+      json_object_put(err, "description", json_new_string(val ? val : "error"));
+      json_object_put(r, "result", err);
       json_value *ed = json_new_object();
-      oset(ed, "exceptionId", jnum(1));
-      oset(ed, "text", jstr("Uncaught"));
-      oset(ed, "lineNumber", jnum(0));
-      oset(ed, "columnNumber", jnum(0));
+      json_object_put(ed, "exceptionId", json_new_number(1));
+      json_object_put(ed, "text", json_new_string("Uncaught"));
+      json_object_put(ed, "lineNumber", json_new_number(0));
+      json_object_put(ed, "columnNumber", json_new_number(0));
       json_value *ex = json_new_object();
-      oset(ex, "type", jstr("object"));
-      oset(ex, "subtype", jstr("error"));
-      oset(ex, "className", jstr("Error"));
-      oset(ex, "description", jstr(val ? val : "error"));
-      oset(ed, "exception", ex);
-      oset(r, "exceptionDetails", ed);
+      json_object_put(ex, "type", json_new_string("object"));
+      json_object_put(ex, "subtype", json_new_string("error"));
+      json_object_put(ex, "className", json_new_string("Error"));
+      json_object_put(ex, "description", json_new_string(val ? val : "error"));
+      json_object_put(ed, "exception", ex);
+      json_object_put(r, "exceptionDetails", ed);
     }
     free(val);
     return r;
   }
   if (streq(m, "Runtime.getProperties")) {
-    oset(r, "result", json_new_array());
+    json_object_put(r, "result", json_new_array());
     return r;
   }
 
   if (streq(m, "Page.navigate")) {
     const char *url = json_as_string(json_object_get(params, "url"));
     cdp_navigate(url);
-    oset(r, "frameId", jstr(FRAME_ID));
-    oset(r, "loaderId", jstr(LOADER_ID));
+    json_object_put(r, "frameId", json_new_string(FRAME_ID));
+    json_object_put(r, "loaderId", json_new_string(LOADER_ID));
     return r;
   }
   if (streq(m, "Page.reload")) {
@@ -1336,38 +1326,38 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
   }
   if (streq(m, "Page.getFrameTree") || streq(m, "Page.getResourceTree")) {
     json_value *tree = json_new_object();
-    oset(tree, "frame", build_frame());
-    oset(tree, "childFrames", json_new_array());
+    json_object_put(tree, "frame", build_frame());
+    json_object_put(tree, "childFrames", json_new_array());
     if (streq(m, "Page.getResourceTree")) {
-      oset(tree, "resources", json_new_array()); /* the browser keeps no subresource registry */
+      json_object_put(tree, "resources", json_new_array()); /* the browser keeps no subresource registry */
     }
-    oset(r, "frameTree", tree);
+    json_object_put(r, "frameTree", tree);
     return r;
   }
   if (streq(m, "Page.getNavigationHistory")) {
-    oset(r, "currentIndex", jnum(0));
+    json_object_put(r, "currentIndex", json_new_number(0));
     json_value *entries = json_new_array();
     json_value *e = json_new_object();
-    oset(e, "id", jnum(0));
-    oset(e, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
-    oset(e, "userTypedURL", jstr(B->pg->cur_url));
-    oset(e, "title", jstr(B->pg->doc_title));
-    oset(e, "transitionType", jstr("typed"));
+    json_object_put(e, "id", json_new_number(0));
+    json_object_put(e, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+    json_object_put(e, "userTypedURL", json_new_string(B->pg->cur_url));
+    json_object_put(e, "title", json_new_string(B->pg->doc_title));
+    json_object_put(e, "transitionType", json_new_string("typed"));
     json_array_push(entries, e);
-    oset(r, "entries", entries);
+    json_object_put(r, "entries", entries);
     return r;
   }
   if (streq(m, "Page.createIsolatedWorld")) {
-    oset(r, "executionContextId", jnum(1));
+    json_object_put(r, "executionContextId", json_new_number(1));
     return r;
   }
   if (streq(m, "Page.getLayoutMetrics")) {
     json_value *cs = json_new_object();
-    oset(cs, "pageX", jnum(0));
-    oset(cs, "pageY", jnum(0));
-    oset(cs, "clientWidth", jnum(1024));
-    oset(cs, "clientHeight", jnum(768));
-    oset(r, "layoutViewport", cs);
+    json_object_put(cs, "pageX", json_new_number(0));
+    json_object_put(cs, "pageY", json_new_number(0));
+    json_object_put(cs, "clientWidth", json_new_number(1024));
+    json_object_put(cs, "clientHeight", json_new_number(768));
+    json_object_put(r, "layoutViewport", cs);
     return r;
   }
 
@@ -1378,15 +1368,15 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     json_value *node = root ? dom_serialize(root, 0, 40, &budget) : 0;
     if (!node) { /* no page yet: a bare document node */
       node = json_new_object();
-      oset(node, "nodeId", jnum(1));
-      oset(node, "backendNodeId", jnum(1));
-      oset(node, "nodeType", jnum(9));
-      oset(node, "nodeName", jstr("#document"));
-      oset(node, "localName", jstr(""));
-      oset(node, "nodeValue", jstr(""));
-      oset(node, "childNodeCount", jnum(0));
+      json_object_put(node, "nodeId", json_new_number(1));
+      json_object_put(node, "backendNodeId", json_new_number(1));
+      json_object_put(node, "nodeType", json_new_number(9));
+      json_object_put(node, "nodeName", json_new_string("#document"));
+      json_object_put(node, "localName", json_new_string(""));
+      json_object_put(node, "nodeValue", json_new_string(""));
+      json_object_put(node, "childNodeCount", json_new_number(0));
     }
-    oset(r, "root", node);
+    json_object_put(r, "root", node);
     return r;
   }
   if (streq(m, "DOM.querySelector")) {
@@ -1395,7 +1385,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     struct sel_list *l = (n && sel && sel[0]) ? css_sel_parse(sel) : 0;
     struct dom_node *found = l ? next_match(l, n, n) : 0;
     css_sel_free(l);
-    oset(r, "nodeId", jnum(found ? node_register(found) : 0));
+    json_object_put(r, "nodeId", json_new_number(found ? node_register(found) : 0));
     return r;
   }
   if (streq(m, "DOM.querySelectorAll")) {
@@ -1404,9 +1394,9 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     json_value *ids = json_new_array();
     struct sel_list *l = (n && sel && sel[0]) ? css_sel_parse(sel) : 0;
     for (struct dom_node *c = l ? next_match(l, n, n) : 0; c; c = next_match(l, c, n))
-      json_array_push(ids, jnum(node_register(c)));
+      json_array_push(ids, json_new_number(node_register(c)));
     css_sel_free(l);
-    oset(r, "nodeIds", ids);
+    json_object_put(r, "nodeIds", ids);
     return r;
   }
   if (streq(m, "DOM.resolveNode")) {
@@ -1415,14 +1405,14 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
       nid = (int)json_as_number(json_object_get(params, "backendNodeId"), -1);
     struct dom_node *n = node_by_id(nid);
     json_value *obj = json_new_object();
-    oset(obj, "type", jstr("object"));
-    oset(obj, "subtype", jstr("node"));
+    json_object_put(obj, "type", json_new_string("object"));
+    json_object_put(obj, "subtype", json_new_string("node"));
     {
       char oid[32];
       int k = 0;
       sapp(oid, &k, sizeof oid, "node-");
       uapp(oid, &k, sizeof oid, (unsigned)nid);
-      oset(obj, "objectId", jstr(oid));
+      json_object_put(obj, "objectId", json_new_string(oid));
     }
     if (n && n->type == DOM_ELEMENT) {
       char desc[128];
@@ -1433,9 +1423,9 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
         sapp(desc, &k, sizeof desc, "#");
         sapp(desc, &k, sizeof desc, id);
       }
-      oset(obj, "description", jstr(desc));
+      json_object_put(obj, "description", json_new_string(desc));
     }
-    oset(r, "object", obj);
+    json_object_put(r, "object", obj);
     return r;
   }
   if (streq(m, "DOM.getBoxModel")) {
@@ -1458,13 +1448,13 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
         /* Content box: use cx/cy/cw/ch from the layout pass. */
         int cx = lb->cx, cy = lb->cy, cw = lb->cw, ch = lb->ch;
         json_value *model = json_new_object();
-        oset(model, "content", quad(cx, cy, cw, ch));
-        oset(model, "padding", quad(sx, sy, sw, sh));
-        oset(model, "border", quad(bx, by, bw, bh));
-        oset(model, "margin", quad(mx, my, mw, mh));
-        oset(model, "width", jnum(cw));
-        oset(model, "height", jnum(ch));
-        oset(r, "model", model);
+        json_object_put(model, "content", quad(cx, cy, cw, ch));
+        json_object_put(model, "padding", quad(sx, sy, sw, sh));
+        json_object_put(model, "border", quad(bx, by, bw, bh));
+        json_object_put(model, "margin", quad(mx, my, mw, mh));
+        json_object_put(model, "width", json_new_number(cw));
+        json_object_put(model, "height", json_new_number(ch));
+        json_object_put(r, "model", model);
       }
     }
     return r;
@@ -1489,7 +1479,7 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     if (n) {
       const char *inl = dom_get_attr(n, "style");
       if (inl && inl[0])
-        oset(r, "inlineStyle", cssstyle_from_text(inl));
+        json_object_put(r, "inlineStyle", cssstyle_from_text(inl));
     }
     /* Rules carry no stylesheet origin in this engine, so none gets a styleSheetId or source range. */
     json_value *rules = json_new_array();
@@ -1501,36 +1491,36 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
         json_value *sl = json_new_object();
         json_value *sels = json_new_array();
         json_value *s1 = json_new_object();
-        oset(s1, "text", jstr(mm[i].selector));
+        json_object_put(s1, "text", json_new_string(mm[i].selector));
         json_array_push(sels, s1);
-        oset(sl, "selectors", sels);
-        oset(sl, "text", jstr(mm[i].selector));
-        oset(rule, "selectorList", sl);
-        oset(rule, "origin", jstr("regular"));
-        oset(rule, "style", cssstyle_from_text(mm[i].raw && mm[i].raw[0] ? mm[i].raw : ""));
+        json_object_put(sl, "selectors", sels);
+        json_object_put(sl, "text", json_new_string(mm[i].selector));
+        json_object_put(rule, "selectorList", sl);
+        json_object_put(rule, "origin", json_new_string("regular"));
+        json_object_put(rule, "style", cssstyle_from_text(mm[i].raw && mm[i].raw[0] ? mm[i].raw : ""));
         json_value *mcr = json_new_object();
-        oset(mcr, "rule", rule);
+        json_object_put(mcr, "rule", rule);
         json_value *msel = json_new_array();
-        json_array_push(msel, jnum(0));
-        oset(mcr, "matchingSelectors", msel);
+        json_array_push(msel, json_new_number(0));
+        json_object_put(mcr, "matchingSelectors", msel);
         json_array_push(rules, mcr);
       }
     }
-    oset(r, "matchedCSSRules", rules);
-    oset(r, "pseudoElements", json_new_array());
-    oset(r, "inherited", json_new_array());
-    oset(r, "cssKeyframesRules", json_new_array());
+    json_object_put(r, "matchedCSSRules", rules);
+    json_object_put(r, "pseudoElements", json_new_array());
+    json_object_put(r, "inherited", json_new_array());
+    json_object_put(r, "cssKeyframesRules", json_new_array());
     return r;
   }
   if (streq(m, "CSS.getInlineStylesForNode")) {
     struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
     const char *inl = n ? dom_get_attr(n, "style") : 0;
-    oset(r, "inlineStyle", cssstyle_from_text(inl && inl[0] ? inl : ""));
+    json_object_put(r, "inlineStyle", cssstyle_from_text(inl && inl[0] ? inl : ""));
     return r;
   }
   if (streq(m, "CSS.getComputedStyleForNode")) {
     struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
-    oset(r, "computedStyle", computed_style(n));
+    json_object_put(r, "computedStyle", computed_style(n));
     return r;
   }
   if (streq(m, "Network.getCookies") || streq(m, "Storage.getCookies")) {
@@ -1538,19 +1528,19 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     for (struct cookie *c = B->cookies; c; c = c->next) {
       json_value *ck = json_new_object();
       int vlen = (c->name ? (int)strlen(c->name) : 0) + (c->val ? (int)strlen(c->val) : 0);
-      oset(ck, "name", jstr(c->name));
-      oset(ck, "value", jstr(c->val));
-      oset(ck, "domain", jstr(c->host));
-      oset(ck, "path", jstr("/"));
-      oset(ck, "expires", jnum(-1));
-      oset(ck, "size", jnum(vlen));
-      oset(ck, "httpOnly", jbool(0));
-      oset(ck, "secure", jbool(0));
-      oset(ck, "session", jbool(1));
-      oset(ck, "sameSite", jstr("Lax"));
+      json_object_put(ck, "name", json_new_string(c->name));
+      json_object_put(ck, "value", json_new_string(c->val));
+      json_object_put(ck, "domain", json_new_string(c->host));
+      json_object_put(ck, "path", json_new_string("/"));
+      json_object_put(ck, "expires", json_new_number(-1));
+      json_object_put(ck, "size", json_new_number(vlen));
+      json_object_put(ck, "httpOnly", json_new_bool(0));
+      json_object_put(ck, "secure", json_new_bool(0));
+      json_object_put(ck, "session", json_new_bool(1));
+      json_object_put(ck, "sameSite", json_new_string("Lax"));
       json_array_push(arr, ck);
     }
-    oset(r, "cookies", arr);
+    json_object_put(r, "cookies", arr);
     return r;
   }
   if (streq(m, "DOMStorage.getDOMStorageItems")) {
@@ -1560,11 +1550,11 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
     for (int i = 0; (k = storage_key(B->pg->cur_url, !is_local, i)); i++) {
       const char *v = storage_get(B->pg->cur_url, !is_local, k);
       json_value *pair = json_new_array();
-      json_array_push(pair, jstr(k));
-      json_array_push(pair, jstr(v ? v : ""));
+      json_array_push(pair, json_new_string(k));
+      json_array_push(pair, json_new_string(v ? v : ""));
       json_array_push(entries, pair);
     }
-    oset(r, "entries", entries);
+    json_object_put(r, "entries", entries);
     return r;
   }
 
@@ -1585,8 +1575,8 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
       g_cmd_error = "No data found for resource with given identifier";
     } else {
       base64_encode(body, n, b64);
-      oset(r, "body", jstr(b64));
-      oset(r, "base64Encoded", jbool(1));
+      json_object_put(r, "body", json_new_string(b64));
+      json_object_put(r, "base64Encoded", json_new_bool(1));
       free(b64);
     }
     free(body);
@@ -1595,35 +1585,35 @@ static json_value *handle_method(struct cdp_session *sess, const char *m, json_v
 
   if (streq(m, "Target.getTargetInfo") || streq(m, "Target.getTargets")) {
     json_value *ti = json_new_object();
-    oset(ti, "targetId", jstr(TARGET_ID));
-    oset(ti, "type", jstr("page"));
-    oset(ti, "title", jstr(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
-    oset(ti, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
-    oset(ti, "attached", jbool(1));
-    oset(ti, "browserContextId", jstr("owos-ctx"));
+    json_object_put(ti, "targetId", json_new_string(TARGET_ID));
+    json_object_put(ti, "type", json_new_string("page"));
+    json_object_put(ti, "title", json_new_string(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
+    json_object_put(ti, "url", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+    json_object_put(ti, "attached", json_new_bool(1));
+    json_object_put(ti, "browserContextId", json_new_string("owos-ctx"));
     if (streq(m, "Target.getTargets")) {
       json_value *a = json_new_array();
       json_array_push(a, ti);
-      oset(r, "targetInfos", a);
+      json_object_put(r, "targetInfos", a);
     } else
-      oset(r, "targetInfo", ti);
+      json_object_put(r, "targetInfo", ti);
     return r;
   }
   if (streq(m, "Target.getBrowserContexts")) {
-    oset(r, "browserContextIds", json_new_array());
+    json_object_put(r, "browserContextIds", json_new_array());
     return r;
   }
 
   if (streq(m, "Browser.getVersion")) {
-    oset(r, "protocolVersion", jstr("1.3"));
-    oset(r, "product", jstr("OwOS-Browser/" OWOS_VERSION));
-    oset(r, "revision", jstr(OWOS_VERSION));
-    oset(r, "userAgent", jstr(browser_ua()));
-    oset(r, "jsVersion", jstr("0"));
+    json_object_put(r, "protocolVersion", json_new_string("1.3"));
+    json_object_put(r, "product", json_new_string("OwOS-Browser/" OWOS_VERSION));
+    json_object_put(r, "revision", json_new_string(OWOS_VERSION));
+    json_object_put(r, "userAgent", json_new_string(browser_ua()));
+    json_object_put(r, "jsVersion", json_new_string("0"));
     return r;
   }
   if (streq(m, "Debugger.enable")) {
-    oset(r, "debuggerId", jstr("owos-dbg-1"));
+    json_object_put(r, "debuggerId", json_new_string("owos-dbg-1"));
     return r;
   }
 
@@ -1675,7 +1665,7 @@ static void lifecycle_tick(void)
     broadcast_event(EV_RUNTIME, "Runtime.executionContextsCleared", json_new_object());
     {
       json_value *p = json_new_object();
-      oset(p, "frame", build_frame());
+      json_object_put(p, "frame", build_frame());
       broadcast_event(EV_PAGE, "Page.frameNavigated", p);
     }
     emit_context_created(0); /* 0 -> broadcast to Runtime-enabled sessions */
@@ -1685,7 +1675,7 @@ static void lifecycle_tick(void)
     if (lc_loading == 1 && B->loading == 0) {
       {
         json_value *p = json_new_object();
-        oset(p, "timestamp", jnum(0));
+        json_object_put(p, "timestamp", json_new_number(0));
         broadcast_event(EV_PAGE, "Page.loadEventFired", p);
       }
       broadcast_event(EV_DOM, "DOM.documentUpdated", json_new_object());
@@ -1712,8 +1702,8 @@ void cdp_worker_tick(void)
     if (n) {
       int nid = node_register(n);
       json_value *p = json_new_object();
-      oset(p, "backendNodeId", jnum(nid));
-      oset(p, "nodeId", jnum(nid));
+      json_object_put(p, "backendNodeId", json_new_number(nid));
+      json_object_put(p, "nodeId", json_new_number(nid));
       emit_to_session(&sessions[cdp_pick_sess], "Overlay.inspectNodeRequested", p);
     }
     cdp_pick_sess = -1;
@@ -1739,15 +1729,15 @@ void cdp_console_line(int level, const char *text)
     return;
   const char *type = level >= 2 ? "error" : (level == 1 ? "warning" : "log");
   json_value *p = json_new_object();
-  oset(p, "type", jstr(type));
+  json_object_put(p, "type", json_new_string(type));
   json_value *args = json_new_array();
   json_value *a0 = json_new_object();
-  oset(a0, "type", jstr("string"));
-  oset(a0, "value", jstr(text));
+  json_object_put(a0, "type", json_new_string("string"));
+  json_object_put(a0, "value", json_new_string(text));
   json_array_push(args, a0);
-  oset(p, "args", args);
-  oset(p, "executionContextId", jnum(1));
-  oset(p, "timestamp", jnum(0));
+  json_object_put(p, "args", args);
+  json_object_put(p, "executionContextId", json_new_number(1));
+  json_object_put(p, "timestamp", json_new_number(0));
   broadcast_event(EV_RUNTIME, "Runtime.consoleAPICalled", p);
 }
 
@@ -1865,20 +1855,20 @@ void cdp_net_begin(int id, const char *method, const char *url, const char *ctyp
   double t0 = cdp_now();
   cdp_ts_set(id, t0);
   json_value *p = json_new_object();
-  oset(p, "requestId", jstr(rid));
-  oset(p, "loaderId", jstr(LOADER_ID));
-  oset(p, "documentURL", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  json_object_put(p, "requestId", json_new_string(rid));
+  json_object_put(p, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(p, "documentURL", json_new_string(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
   json_value *rq = json_new_object();
-  oset(rq, "url", jstr(url ? url : ""));
-  oset(rq, "method", jstr(method ? method : "GET"));
-  oset(rq, "headers", json_new_object());
-  oset(p, "request", rq);
-  oset(p, "timestamp", jnum(t0));
-  oset(p, "wallTime", jnum((double)now_ms() / 1000.0));
+  json_object_put(rq, "url", json_new_string(url ? url : ""));
+  json_object_put(rq, "method", json_new_string(method ? method : "GET"));
+  json_object_put(rq, "headers", json_new_object());
+  json_object_put(p, "request", rq);
+  json_object_put(p, "timestamp", json_new_number(t0));
+  json_object_put(p, "wallTime", json_new_number((double)now_ms() / 1000.0));
   json_value *ini = json_new_object();
-  oset(ini, "type", jstr("other"));
-  oset(p, "initiator", ini);
-  oset(p, "type", jstr(res_type(ctype)));
+  json_object_put(ini, "type", json_new_string("other"));
+  json_object_put(p, "initiator", ini);
+  json_object_put(p, "type", json_new_string(res_type(ctype)));
   broadcast_event(EV_NETWORK, "Network.requestWillBeSent", p);
 }
 
@@ -1908,52 +1898,53 @@ void cdp_net_finish(int id, const struct net_log *e)
   const char *hdrs = e->req_hdr ? strchr(e->req_hdr, '\n') : 0;
   if (hdrs && hdrs[1]) {
     json_value *xi = json_new_object();
-    oset(xi, "requestId", jstr(rid));
-    oset(xi, "associatedCookies", json_new_array());
-    oset(xi, "headers", headers_obj(hdrs + 1));
+    json_object_put(xi, "requestId", json_new_string(rid));
+    json_object_put(xi, "associatedCookies", json_new_array());
+    json_object_put(xi, "headers", headers_obj(hdrs + 1));
     json_value *ct = json_new_object();
-    oset(ct, "requestTime", jnum(t0));
-    oset(xi, "connectTiming", ct);
+    json_object_put(ct, "requestTime", json_new_number(t0));
+    json_object_put(xi, "connectTiming", ct);
     broadcast_event(EV_NETWORK, "Network.requestWillBeSentExtraInfo", xi);
   }
 
   if (e->state == NET_FAILED || e->state == NET_CANCELLED) {
     json_value *p = json_new_object();
-    oset(p, "requestId", jstr(rid));
-    oset(p, "timestamp", jnum(tend));
-    oset(p, "type", jstr(res_type(e->ctype)));
-    oset(p, "errorText",
-         jstr(e->reason ? e->reason : (e->state == NET_CANCELLED ? "net::ERR_ABORTED" : "net::ERR_FAILED")));
-    oset(p, "canceled", jbool(e->state == NET_CANCELLED));
+    json_object_put(p, "requestId", json_new_string(rid));
+    json_object_put(p, "timestamp", json_new_number(tend));
+    json_object_put(p, "type", json_new_string(res_type(e->ctype)));
+    json_object_put(
+        p, "errorText",
+        json_new_string(e->reason ? e->reason : (e->state == NET_CANCELLED ? "net::ERR_ABORTED" : "net::ERR_FAILED")));
+    json_object_put(p, "canceled", json_new_bool(e->state == NET_CANCELLED));
     broadcast_event(EV_NETWORK, "Network.loadingFailed", p);
     return;
   }
 
   json_value *p = json_new_object();
-  oset(p, "requestId", jstr(rid));
-  oset(p, "loaderId", jstr(LOADER_ID));
-  oset(p, "timestamp", jnum(tend));
-  oset(p, "type", jstr(res_type(e->ctype)));
+  json_object_put(p, "requestId", json_new_string(rid));
+  json_object_put(p, "loaderId", json_new_string(LOADER_ID));
+  json_object_put(p, "timestamp", json_new_number(tend));
+  json_object_put(p, "type", json_new_string(res_type(e->ctype)));
   json_value *resp = json_new_object();
-  oset(resp, "url", jstr(e->url ? e->url : ""));
-  oset(resp, "status", jnum(e->status));
-  oset(resp, "statusText", jstr(""));
-  oset(resp, "mimeType", jstr(e->ctype ? e->ctype : ""));
-  oset(resp, "headers", headers_obj(e->resp_hdr));
-  oset(resp, "encodedDataLength", jnum(e->from_cache ? 0 : e->size));
-  oset(resp, "fromDiskCache", jbool(e->from_cache));
-  oset(p, "response", resp);
+  json_object_put(resp, "url", json_new_string(e->url ? e->url : ""));
+  json_object_put(resp, "status", json_new_number(e->status));
+  json_object_put(resp, "statusText", json_new_string(""));
+  json_object_put(resp, "mimeType", json_new_string(e->ctype ? e->ctype : ""));
+  json_object_put(resp, "headers", headers_obj(e->resp_hdr));
+  json_object_put(resp, "encodedDataLength", json_new_number(e->from_cache ? 0 : e->size));
+  json_object_put(resp, "fromDiskCache", json_new_bool(e->from_cache));
+  json_object_put(p, "response", resp);
   if (e->from_cache) { /* DevTools labels the row "(disk cache)" */
     json_value *sc = json_new_object();
-    oset(sc, "requestId", jstr(rid));
+    json_object_put(sc, "requestId", json_new_string(rid));
     broadcast_event(EV_NETWORK, "Network.requestServedFromCache", sc);
   }
   broadcast_event(EV_NETWORK, "Network.responseReceived", p);
 
   json_value *fin = json_new_object();
-  oset(fin, "requestId", jstr(rid));
-  oset(fin, "timestamp", jnum(tend));
-  oset(fin, "encodedDataLength", jnum(e->from_cache ? 0 : e->size));
+  json_object_put(fin, "requestId", json_new_string(rid));
+  json_object_put(fin, "timestamp", json_new_number(tend));
+  json_object_put(fin, "encodedDataLength", json_new_number(e->from_cache ? 0 : e->size));
   broadcast_event(EV_NETWORK, "Network.loadingFinished", fin);
 }
 

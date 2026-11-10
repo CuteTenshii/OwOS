@@ -188,7 +188,7 @@ static json_value *msg_typed(const char *type)
   json_value *o = json_new_object();
   if (!o)
     return 0;
-  if (json_object_set(o, "type", json_new_string(type))) {
+  if (json_object_put(o, "type", json_new_string(type))) {
     json_free(o);
     return 0;
   }
@@ -647,8 +647,8 @@ cast_session *cast_connect(const struct cast_device *dev, int timeout_ms)
     json_value *o = msg_typed("LAUNCH");
     if (!o)
       goto fail;
-    json_object_set(o, "appId", json_new_string(DEFAULT_APP));
-    json_object_set(o, "requestId", json_new_number(1));
+    json_object_put(o, "appId", json_new_string(DEFAULT_APP));
+    json_object_put(o, "requestId", json_new_number(1));
     if (send_msg(s, NS_RECEIVER, PLATFORM_ID, o))
       goto fail;
   }
@@ -698,22 +698,22 @@ int cast_load(cast_session *s, const char *url, const char *content_type, const 
       json_free(media);
     return -1;
   }
-  json_object_set(media, "contentId", json_new_string(url));
-  json_object_set(media, "streamType", json_new_string("BUFFERED"));
+  json_object_put(media, "contentId", json_new_string(url));
+  json_object_put(media, "streamType", json_new_string("BUFFERED"));
   if (content_type && content_type[0])
-    json_object_set(media, "contentType", json_new_string(content_type));
+    json_object_put(media, "contentType", json_new_string(content_type));
   if (title && title[0]) {
     meta = json_new_object();
     if (meta) {
-      json_object_set(meta, "metadataType", json_new_number(0)); /* GENERIC */
-      json_object_set(meta, "title", json_new_string(title));
-      json_object_set(media, "metadata", meta);
+      json_object_put(meta, "metadataType", json_new_number(0)); /* GENERIC */
+      json_object_put(meta, "title", json_new_string(title));
+      json_object_put(media, "metadata", meta);
     }
   }
-  json_object_set(o, "media", media);
-  json_object_set(o, "autoplay", json_new_bool(1));
-  json_object_set(o, "currentTime", json_new_number(0));
-  json_object_set(o, "requestId", json_new_number(next_req(s)));
+  json_object_put(o, "media", media);
+  json_object_put(o, "autoplay", json_new_bool(1));
+  json_object_put(o, "currentTime", json_new_number(0));
+  json_object_put(o, "requestId", json_new_number(next_req(s)));
 
   s->have_media = 0;
   if (send_msg(s, NS_MEDIA, s->transport_id, o))
@@ -738,12 +738,12 @@ static int media_cmd(cast_session *s, const char *type, json_value *extra)
       json_free(extra);
     return -1;
   }
-  json_object_set(o, "mediaSessionId", json_new_number(s->media_session_id));
-  json_object_set(o, "requestId", json_new_number(next_req(s)));
+  json_object_put(o, "mediaSessionId", json_new_number(s->media_session_id));
+  json_object_put(o, "requestId", json_new_number(next_req(s)));
   if (extra) {
     int i, n = json_object_len(extra);
     for (i = 0; i < n; i++)
-      json_object_set(o, json_object_key(extra, i), json_clone(json_object_val(extra, i)));
+      json_object_put(o, json_object_key(extra, i), json_clone(json_object_val(extra, i)));
     json_free(extra);
   }
   return send_msg(s, NS_MEDIA, s->transport_id, o);
@@ -758,7 +758,7 @@ int cast_seek(cast_session *s, double seconds)
   json_value *e = json_new_object();
   if (!e)
     return -1;
-  json_object_set(e, "currentTime", json_new_number(seconds < 0 ? 0 : seconds));
+  json_object_put(e, "currentTime", json_new_number(seconds < 0 ? 0 : seconds));
   return media_cmd(s, "SEEK", e);
 }
 
@@ -780,9 +780,9 @@ int cast_set_volume(cast_session *s, double level)
       json_free(vol);
     return -1;
   }
-  json_object_set(vol, "level", json_new_number(level));
-  json_object_set(o, "volume", vol);
-  json_object_set(o, "requestId", json_new_number(next_req(s)));
+  json_object_put(vol, "level", json_new_number(level));
+  json_object_put(o, "volume", vol);
+  json_object_put(o, "requestId", json_new_number(next_req(s)));
   return send_msg(s, NS_RECEIVER, PLATFORM_ID, o);
 }
 
@@ -800,9 +800,9 @@ int cast_set_muted(cast_session *s, int muted)
       json_free(vol);
     return -1;
   }
-  json_object_set(vol, "muted", json_new_bool(muted ? 1 : 0));
-  json_object_set(o, "volume", vol);
-  json_object_set(o, "requestId", json_new_number(next_req(s)));
+  json_object_put(vol, "muted", json_new_bool(muted ? 1 : 0));
+  json_object_put(o, "volume", vol);
+  json_object_put(o, "requestId", json_new_number(next_req(s)));
   return send_msg(s, NS_RECEIVER, PLATFORM_ID, o);
 }
 
@@ -831,8 +831,8 @@ void cast_close(cast_session *s)
   if (s->conn == CAST_CONNECTED && s->app_session_id[0]) {
     json_value *o = msg_typed("STOP");
     if (o) {
-      json_object_set(o, "sessionId", json_new_string(s->app_session_id));
-      json_object_set(o, "requestId", json_new_number(next_req(s)));
+      json_object_put(o, "sessionId", json_new_string(s->app_session_id));
+      json_object_put(o, "requestId", json_new_number(next_req(s)));
       send_msg(s, NS_RECEIVER, PLATFORM_ID, o);
     }
     send_msg(s, NS_CONNECTION, s->transport_id, msg_typed("CLOSE"));

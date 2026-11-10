@@ -160,6 +160,14 @@ int json_object_set(json_value *obj, const char *key, json_value *val)
   return 0;
 }
 
+int json_object_put(json_value *obj, const char *key, json_value *val)
+{
+  if (json_object_set(obj, key, val) == 0)
+    return 0;
+  json_free(val);
+  return -1;
+}
+
 /* ---------------------------------------------------------------- accessors */
 
 json_type json_typeof(const json_value *v) { return v ? v->type : JSON_NULL; }
