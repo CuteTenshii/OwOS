@@ -27,7 +27,7 @@ SMP ?= 4
 # QEMU host audio backend. Differs by OS: PipeWire on Linux, CoreAudio on macOS
 # (QEMU has no pipewire backend there; see `qemu-system-i386 -audiodev help`). Override
 # with e.g. `make run QEMU_AUDIODEV=pa` (PulseAudio) or `none` to mute.
-ifeq ($(shell uname -s),Darwin)
+ifdef MACOS
   QEMU_AUDIODEV ?= coreaudio
 else
   QEMU_AUDIODEV ?= pipewire
@@ -40,76 +40,68 @@ endif
 # hardware dirty tracking, ~10-50x faster overall. The `:tcg` suffix is a
 # graceful fallback when /dev/kvm is absent or unprivileged. Override with
 # `make run ACCEL=tcg` to force pure emulation.
-ifeq ($(shell uname -s),Darwin)
+ifdef MACOS
   ACCEL ?= hvf:tcg
 else
   ACCEL ?= kvm:tcg
 endif
 
+DISK_IMAGES := $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)
+
+# $(call blank_image,MiB): a zero-filled raw image at $@.
+blank_image = dd if=/dev/zero of=$@ bs=1M count=$(1) status=none
+
+# $(call seeded,commands): run `commands` in a fresh temp directory $$t that is removed afterwards.
+seeded = t=$$(mktemp -d) && trap 'rm -rf "$$t"' EXIT && $(1)
+
+# $(call fat_image,MiB,label,seed variable): a FAT16 image holding the tree that the seed variable's shell
+# commands build under $$t. mtools writes it without root or a loop mount; delete the image to re-seed.
+define fat_image
+$(call blank_image,$(1))
+	mkfs.fat -F 16 -n $(2) $@ >/dev/null
+	$(call seeded,$($(3)) && mcopy -s -i $@ "$$t"/* ::)
+endef
+
 # A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
-# sizes itself to the disk's capacity (capped at 64 MiB in fs.c).
+# sizes itself to the disk's capacity (capped at 64 MiB in fs.c). The NVMe, SCSI
+# and UFS disks stay blank.
 $(DISK):
-	dd if=/dev/zero of=$(DISK) bs=1M count=64 status=none
+	$(call blank_image,64)
+$(NVMEDISK) $(SCSIDISK) $(UFSDISK):
+	$(call blank_image,16)
 
-# The SATA (AHCI) scratch disk doubles as a FAT volume so the read-only FAT
-# driver (kernel/fat.c) has something real to mount. Formatted FAT16 and seeded
-# with a small tree (incl. a long filename and a subdirectory) via mtools, no
-# root/loop-mount needed. Delete sata.img to re-seed. The NVMe disk stays blank.
+# The SATA (AHCI) scratch disk doubles as a FAT volume so the FAT driver
+# (kernel/fat.c) has something real to mount: a long filename and a subdirectory.
+SATA_SEED = mkdir "$$t/docs" && printf 'hello from a FAT16 volume\n' > "$$t/HELLO.TXT" && \
+	printf 'OwOS reads FAT12/16/32, long names and all.\n' > "$$t/A Long File Name.txt" && \
+	cp "$$t/HELLO.TXT" "$$t/docs/README.TXT"
 $(SATADISK):
-	dd if=/dev/zero of=$(SATADISK) bs=1M count=16 status=none
-	mkfs.fat -F 16 -n OWOSFAT $(SATADISK) >/dev/null
-	printf 'hello from a FAT16 volume\n' > /tmp/owos_fat_hello.txt
-	printf 'OwOS reads FAT12/16/32, long names and all.\n' > /tmp/owos_fat_long.txt
-	mmd   -i $(SATADISK) ::docs
-	mcopy -i $(SATADISK) /tmp/owos_fat_hello.txt ::HELLO.TXT
-	mcopy -i $(SATADISK) /tmp/owos_fat_long.txt  '::A Long File Name.txt'
-	mcopy -i $(SATADISK) /tmp/owos_fat_hello.txt ::docs/README.TXT
-	rm -f /tmp/owos_fat_hello.txt /tmp/owos_fat_long.txt
-$(NVMEDISK):
-	dd if=/dev/zero of=$(NVMEDISK) bs=1M count=16 status=none
+	$(call fat_image,16,OWOSFAT,SATA_SEED)
 
-$(SCSIDISK):
-	dd if=/dev/zero of=$(SCSIDISK) bs=1M count=16 status=none
-
-$(UFSDISK):
-	dd if=/dev/zero of=$(UFSDISK) bs=1M count=16 status=none
-
-# A FAT16-formatted image presented as a USB flash drive (qemu-xhci +
-# usb-storage), so the xHCI mass-storage driver (kernel/xhci.c) has a real stick
-# to enumerate, mount at /fat, and eject. Delete usb.img to re-seed.
+# A USB flash drive (qemu-xhci + usb-storage), so the xHCI mass-storage driver
+# (drivers/usb/xhci.c) has a real stick to enumerate, mount and eject.
+USB_SEED = mkdir "$$t/photos" && printf 'hello from a USB stick\n' > "$$t/READID.TXT" && \
+	cp "$$t/READID.TXT" "$$t/photos/NOTES.TXT"
 $(USBDISK):
-	dd if=/dev/zero of=$(USBDISK) bs=1M count=16 status=none
-	mkfs.fat -F 16 -n OWOSUSB $(USBDISK) >/dev/null
-	printf 'hello from a USB stick\n' > /tmp/owos_usb.txt
-	mmd   -i $(USBDISK) ::photos
-	mcopy -i $(USBDISK) /tmp/owos_usb.txt ::READID.TXT
-	mcopy -i $(USBDISK) /tmp/owos_usb.txt ::photos/NOTES.TXT
-	rm -f /tmp/owos_usb.txt
+	$(call fat_image,16,OWOSUSB,USB_SEED)
 
-# A FAT16-formatted image presented as an SD card behind an SDHCI controller
-# (sdhci-pci + sd-card), so the SD/MMC driver (kernel/sd.c) has a real card to
-# bring up and mount at /media. Delete sd.img to re-seed.
+# An SD card behind an SDHCI controller (sdhci-pci + sd-card), so the SD/MMC
+# driver (drivers/storage/sd.c) has a real card to bring up and mount at /media.
+SD_SEED = mkdir "$$t/DCIM" && printf 'hello from an SD card\n' > "$$t/READSD.TXT" && \
+	cp "$$t/READSD.TXT" "$$t/DCIM/NOTES.TXT"
 $(SDDISK):
-	dd if=/dev/zero of=$(SDDISK) bs=1M count=64 status=none
-	mkfs.fat -F 16 -n OWOSSD $(SDDISK) >/dev/null
-	printf 'hello from an SD card\n' > /tmp/owos_sd.txt
-	mmd   -i $(SDDISK) ::DCIM
-	mcopy -i $(SDDISK) /tmp/owos_sd.txt ::READSD.TXT
-	mcopy -i $(SDDISK) /tmp/owos_sd.txt ::DCIM/NOTES.TXT
-	rm -f /tmp/owos_sd.txt
+	$(call fat_image,64,OWOSSD,SD_SEED)
 
 # A real ISO 9660 disc image (with a Joliet name tree, -J) presented as an ATAPI
-# CD-ROM, so the CD/DVD driver (kernel/atapi.c) and ISO filesystem
+# CD-ROM, so the CD/DVD driver (drivers/storage/atapi.c) and ISO filesystem
 # (kernel/iso9660.c) have a disc to read and mount at /media. Built with
 # xorrisofs (from xorriso, already a dependency of grub-mkrescue). Delete cd.iso
 # to re-seed.
 $(CDISK):
-	rm -rf /tmp/owos_cd && mkdir -p /tmp/owos_cd/docs
-	printf 'hello from an ISO 9660 CD-ROM\n' > /tmp/owos_cd/HELLO.TXT
-	printf 'OwOS reads ISO 9660 and Joliet long names.\n' > '/tmp/owos_cd/A Long Disc File.txt'
-	printf 'nested on the disc\n' > /tmp/owos_cd/docs/README.TXT
-	xorrisofs -J -R -V OWOSCD -o $(CDISK) /tmp/owos_cd >/dev/null 2>&1
-	rm -rf /tmp/owos_cd
+	$(call seeded,mkdir "$$t/docs" && printf 'hello from an ISO 9660 CD-ROM\n' > "$$t/HELLO.TXT" && \
+	  printf 'OwOS reads ISO 9660 and Joliet long names.\n' > "$$t/A Long Disc File.txt" && \
+	  printf 'nested on the disc\n' > "$$t/docs/README.TXT" && \
+	  xorrisofs -J -R -V OWOSCD -o $@ "$$t" >/dev/null 2>&1)
 
 # disk.img stays the IDE boot disk (owofs). The SATA disk hangs off an AHCI
 # controller and the NVMe disk off an emulated PCIe SSD, so all three storage
@@ -164,22 +156,20 @@ else
   BOOTDEP := $(KERNEL)
 endif
 
-run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
+# Shared by run and debug. Devices keep this order in both, so each lands in the same PCI slot.
+NETDEV := -netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 \
+	-device $(NIC),netdev=net0
+QEMU_BASE = $(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio
+
+run: $(BOOTDEP) $(DISK_IMAGES)
+	$(QEMU_BASE) $(NETDEV) \
 		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
-		-device sb16,audiodev=snd0 \
-		-device intel-hda -device hda-output,audiodev=snd0 \
-		-usb -device usb-tablet \
-		$(VDAGENT)
+		-device sb16,audiodev=snd0 -device intel-hda -device hda-output,audiodev=snd0 \
+		-usb -device usb-tablet $(VDAGENT)
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
-		-machine accel=$(ACCEL) \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
-		-usb -device usb-tablet \
-		$(VDAGENT)
+debug: $(BOOTDEP) $(DISK_IMAGES)
+	$(QEMU_BASE) -display none -machine accel=$(ACCEL) $(NETDEV) -usb -device usb-tablet $(VDAGENT)
 
 # --- bootable ISO ----------------------------------------------------------
 # QEMU's -kernel is its own Multiboot loader; real VMs (VMware, VirtualBox,
@@ -222,7 +212,7 @@ run-iso: $(ISO)
 # Override OVMF_CODE=/path if your distro puts the firmware elsewhere. Homebrew's
 # qemu ships it under $(brew --prefix qemu)/share/qemu on macOS; most Linux distros
 # put it in /usr/share/edk2 or /usr/share/OVMF.
-ifeq ($(shell uname -s),Darwin)
+ifdef MACOS
   QEMU_SHARE := $(shell brew --prefix qemu 2>/dev/null)/share/qemu
   OVMF_CODE ?= $(QEMU_SHARE)/edk2-x86_64-code.fd
   OVMF_VARS ?= $(QEMU_SHARE)/edk2-i386-vars.fd

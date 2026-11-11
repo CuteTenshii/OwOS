@@ -6,16 +6,7 @@
 #   make ARCH=aarch64 run     boot it headless, serial on the terminal
 #   make ARCH=aarch64 check   boot it and fail unless the self-test passes (A64_GIC=3 for a GICv3 machine)
 
-HOST_OS    := $(shell uname -s)
-OPT_LEVEL  ?= 2
-OWOS_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
-
-ifeq ($(HOST_OS),Darwin)
-  CROSS ?= aarch64-none-elf-
-else
-  CROSS ?=
-endif
+CROSS ?= $(if $(MACOS),aarch64-none-elf-)
 DEVKITA64 := /opt/devkitpro/devkitA64/bin/
 ifeq ($(shell command -v $(CROSS)gcc >/dev/null 2>&1 && echo y),)
   ifneq ($(wildcard $(DEVKITA64)aarch64-none-elf-gcc),)
@@ -38,9 +29,7 @@ A64_SMP ?= 4
 A64_GIC ?= 2
 QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2),gic-version=$(A64_GIC) -cpu cortex-a57 -smp $(A64_SMP) -m 256 -display none -serial stdio -kernel $(KERNEL)
 
-ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
-  $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
-endif
+$(call require_tool,$(CC),Install an aarch64-none-elf toolchain or override CROSS)
 
 A64USER := user/aarch64
 A64TESTS := tests/aarch64

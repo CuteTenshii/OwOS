@@ -1,18 +1,12 @@
 # toolchain.mk: compiler/linker flags and the generic kernel compile rules,
 # shared by every other fragment.
 
-# Version baked in via -DOWOS_VERSION (kernel + user): git describe (tag, else short
-# commit, +-dirty), "dev" outside git. Override: make OWOS_VERSION=1.2.
-OWOS_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
-
 # Target arch: i386 (default, 32-bit) or x86_64 (long mode). One source tree builds
 # both; ARCH selects kernel toolchain, codegen, linker script, object format, output
 # name and QEMU binary.
 #   make             # 32-bit owos.bin
 #   make ARCH=x86_64  # 64-bit owos-x86_64.bin
 ARCH ?= i386
-OPT_LEVEL ?= 2
 ARCH_STAMP := .arch.current
 ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)'; use i386 or x86_64)
@@ -20,20 +14,9 @@ endif
 
 # Linux can use its native GCC with the explicit architecture flags below. macOS
 # needs a cross-toolchain because its native compiler emits Mach-O, not ELF.
-HOST_OS := $(shell uname -s)
-ifeq ($(ARCH),x86_64)
-  ifeq ($(HOST_OS),Darwin)
-    CROSS ?= x86_64-elf-
-  else
-    CROSS ?=
-  endif
-else
-  ifeq ($(HOST_OS),Darwin)
-    CROSS ?= i686-elf-
-  else
-    CROSS ?=
-  endif
-endif
+MACOS_CROSS_i386   := i686-elf-
+MACOS_CROSS_x86_64 := x86_64-elf-
+CROSS ?= $(if $(MACOS),$(MACOS_CROSS_$(ARCH)))
 
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
@@ -41,16 +24,10 @@ OBJCOPY := $(CROSS)objcopy
 
 # Fail early with an actionable message rather than a cryptic "elf_i386" error
 # halfway through the link when the cross-toolchain isn't installed.
-ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
-  $(error C compiler '$(CC)' not found. Install the target ELF toolchain or override CROSS.)
-endif
+$(call require_tool,$(CC),Install the target ELF toolchain or override CROSS)
 
 # User-space programs are always 32-bit ELF because the kernel embeds them as blobs.
-ifeq ($(HOST_OS),Darwin)
-  UCROSS ?= i686-elf-
-else
-  UCROSS ?=
-endif
+UCROSS ?= $(if $(MACOS),$(MACOS_CROSS_i386))
 UCC      := $(UCROSS)gcc
 ULD      := $(UCROSS)ld
 UOBJCOPY := $(UCROSS)objcopy
@@ -79,6 +56,15 @@ else
   QEMU      := qemu-system-i386
   KERNEL    := owos.bin
 endif
+
+# $(call blob,file,name): recipe wrapping `file` into the kernel object $@ as _binary_<name>_{start,end}.
+# objcopy names the symbols after the input path, with every '/', '.' and '-' turned into '_'.
+blob_sym = _binary_$(subst -,_,$(subst .,_,$(subst /,_,$(1))))
+define blob
+$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
+	  --redefine-sym $(call blob_sym,$(1))_start=_binary_$(2)_start \
+	  --redefine-sym $(call blob_sym,$(1))_end=_binary_$(2)_end $(1) $@
+endef
 
 # Freestanding: no host libc/headers, no PIE/stack-protector/red-zone. -mno-sse/
 # -mno-mmx: the kernel never enables SSE, so GCC must not auto-vectorize into xmm/mmx

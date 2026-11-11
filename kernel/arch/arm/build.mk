@@ -5,10 +5,6 @@
 #   make ARCH=arm check       boot it and fail unless the self-test passes (ARM_HYP=on starts the CPU in HYP mode)
 # Builds with clang and ld.lld by default; CROSS=arm-none-eabi- uses a GNU toolchain instead.
 
-OPT_LEVEL  ?= 2
-OWOS_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
-
 CROSS ?=
 ifeq ($(CROSS),)
   CC      := clang --target=armv7a-none-eabi
@@ -24,9 +20,7 @@ else
   ARM_LDFLAGS := --no-warn-rwx-segments
 endif
 
-ifeq ($(shell command -v $(firstword $(CC)) >/dev/null 2>&1 && echo y),)
-  $(error C compiler '$(firstword $(CC))' not found. Install clang and lld, or set CROSS to an arm-none-eabi toolchain.)
-endif
+$(call require_tool,$(CC),Install clang and lld or set CROSS to an arm-none-eabi toolchain)
 
 KERNEL   := owos-arm.bin
 ARMELF   := owos-arm.elf

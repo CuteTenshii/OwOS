@@ -59,9 +59,7 @@ define app_rule
 user/apps/$(1)/$(1).elf: $(call app_objs,$(1)) $(APP_LIBS_$(1)) $(if $(filter $(1),$(GUI_APPS)),$$(GUILIB)) $$(ULIB) user/user.ld
 	$$(ULD) -m elf_i386 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
 kernel/$(1)_blob.o: user/apps/$(1)/$(1).elf
-	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
-	  --redefine-sym _binary_user_apps_$(1)_$(1)_elf_start=_binary_app_$(1)_start \
-	  --redefine-sym _binary_user_apps_$(1)_$(1)_elf_end=_binary_app_$(1)_end $$< $$@
+	$$(call blob,$$<,app_$(1))
 endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
@@ -69,9 +67,7 @@ $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings devhub about
 define desktop_rule
 kernel/$(1)_desktop_blob.o: user/apps/$(1)/$(1).desktop
-	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
-	  --redefine-sym _binary_user_apps_$(1)_$(1)_desktop_start=_binary_desktop_$(1)_start \
-	  --redefine-sym _binary_user_apps_$(1)_$(1)_desktop_end=_binary_desktop_$(1)_end $$< $$@
+	$$(call blob,$$<,desktop_$(1))
 endef
 $(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 
@@ -83,10 +79,7 @@ kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
 	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
-	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
-	  --redefine-sym _binary_kernel_appsyms_dat_start=_binary_appsyms_start \
-	  --redefine-sym _binary_kernel_appsyms_dat_end=_binary_appsyms_end \
-	  kernel/appsyms.dat $@
+	$(call blob,kernel/appsyms.dat,appsyms)
 	@rm -f kernel/appsyms.dat
 
 # Every fonts/*.ttf and *.otf is installed to /etc/fonts at boot; gfx loads them at runtime
@@ -105,6 +98,6 @@ ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver acc
               network-ethernet network-ethernet-disconnected
 define icon_rule
 kernel/icon_$(subst -,_,$(1))_blob.o: icons/$(1).png $(ARCH_STAMP)
-	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) $$< $$@
+	$$(call blob,$$<,icons_$(subst -,_,$(1))_png)
 endef
 $(foreach i,$(ICON_NAMES),$(eval $(call icon_rule,$(i))))
