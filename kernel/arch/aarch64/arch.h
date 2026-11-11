@@ -1,16 +1,13 @@
-/* arch.h: AArch64 support layer interface (QEMU virt machine). */
+/* arch.h: AArch64 support layer interface. */
 #ifndef OWOS_ARCH_AARCH64_H
 #define OWOS_ARCH_AARCH64_H
 
 #include "cpu_defs.h"
 #include "fdt.h"
+#include "plat.h"
 #include "pmm.h"
 #include "uvm.h"
 #include <stdint.h>
-
-#define UART0_BASE 0x09000000UL
-#define GICD_BASE 0x08000000UL
-#define GICC_BASE 0x08010000UL
 
 #define IRQ_TIMER_PPI 30
 #define TICK_HZ 100
@@ -25,6 +22,7 @@ struct trap_frame {
 
 static inline uint32_t mmio_read32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void mmio_write32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+static inline uint64_t mmio_read64(uintptr_t a) { return *(volatile uint64_t *)a; }
 
 #define SYSREG_READ(reg)                                                                                               \
   ({                                                                                                                   \
@@ -37,7 +35,15 @@ static inline void mmio_write32(uintptr_t a, uint32_t v) { *(volatile uint32_t *
 extern uint64_t boot_el;
 extern uint64_t mmu_regs[3]; /* MAIR, TCR, TTBR0 handed to secondary CPUs */
 
-static inline int cpu_id(void) { return (int)(SYSREG_READ(mpidr_el1) & 0xff); }
+/* Index of this CPU in plat.cpu_mpidr; the boot CPU is 0. */
+static inline int cpu_id(void)
+{
+  uint64_t self = SYSREG_READ(mpidr_el1) & FDT_MPIDR_AFFINITY;
+  for (int i = 1; i < plat.ncpus; i++)
+    if (plat.cpu_mpidr[i] == self)
+      return i;
+  return 0;
+}
 
 /* Secondary CPUs: psci_cpu_on starts one at secondary_entry; smp_start returns how many CPUs are online. */
 void secondary_entry(void);
@@ -46,6 +52,9 @@ int psci_cpu_on(int cpu);
 int smp_start(void);
 int smp_online(void);
 void gic_cpu_init(void);
+/* Acknowledge the highest priority interrupt; the low 10 bits are its id, 1020 and up are spurious. */
+uint32_t gic_ack(void);
+void gic_eoi(uint32_t iar);
 void sched_cpu_init(int cpu);
 void sched_new_thread(void);
 

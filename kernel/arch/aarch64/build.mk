@@ -1,7 +1,8 @@
-# kernel/arch/aarch64/build.mk: bare AArch64 support layer for the QEMU virt machine.
+# kernel/arch/aarch64/build.mk: bare AArch64 support layer; the board layout comes from the device tree
+# (QEMU virt, MediaTek MT6765 phones such as the Samsung Galaxy A12).
 #   make ARCH=aarch64         build owos-aarch64.bin
 #   make ARCH=aarch64 run     boot it headless, serial on the terminal
-#   make ARCH=aarch64 check   boot it and fail unless the self-test passes
+#   make ARCH=aarch64 check   boot it and fail unless the self-test passes (A64_GIC=3 for a GICv3 machine)
 
 HOST_OS    := $(shell uname -s)
 OPT_LEVEL  ?= 2
@@ -30,7 +31,8 @@ A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffre
             -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
 A64_EL2 ?= on
 A64_SMP ?= 4
-QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2) -cpu cortex-a57 -smp $(A64_SMP) -m 256 -display none -serial stdio -kernel $(KERNEL)
+A64_GIC ?= 2
+QEMU_A64 := $(QEMU) -M virt,virtualization=$(A64_EL2),gic-version=$(A64_GIC) -cpu cortex-a57 -smp $(A64_SMP) -m 256 -display none -serial stdio -kernel $(KERNEL)
 
 ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
   $(error C compiler '$(CC)' not found. Install an aarch64-none-elf toolchain or override CROSS.)
@@ -43,7 +45,7 @@ A64UFLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffr
 A64PROGS := hello segv nx
 A64UELFS := $(addprefix $(A64TESTS)/,$(addsuffix .elf,$(A64PROGS)))
 
-KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
+KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
 OBJS := $(KOBJS) $(addprefix $(A64TESTS)/,selftest.o snippets.o programs.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S

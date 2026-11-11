@@ -21,7 +21,7 @@ void secondary_main(int cpu)
 int smp_start(void)
 {
   int started = 1;
-  for (int cpu = 1; cpu < MAX_CPUS; cpu++)
+  for (int cpu = 1; cpu < plat.ncpus; cpu++)
     if (psci_cpu_on(cpu) == 0)
       started++;
 

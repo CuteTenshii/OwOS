@@ -14,7 +14,9 @@ struct blob {
   uint32_t st_len;
   char strs[MAXBLOB];
   uint32_t strs_len;
-  uint32_t reg_end; /* struct offset just past the memory node's reg property */
+  uint32_t reg_end;   /* struct offset just past the memory node's reg property */
+  uint64_t rsv[8][2]; /* memory reservation block entries */
+  int nrsv;
 };
 
 static void put32(struct blob *b, uint32_t v)
@@ -97,7 +99,8 @@ static uint8_t *guard_page;
 /* Serialise to the end of a mapping whose next page is inaccessible. */
 static const uint8_t *serialize(const struct blob *b, uint32_t struct_len, uint32_t magic, uint32_t *total_out)
 {
-  uint32_t struct_off = 40, strs_off = 40 + struct_len;
+  uint32_t rsv_len = 16 * (uint32_t)(b->nrsv + 1);
+  uint32_t struct_off = 40 + rsv_len, strs_off = struct_off + struct_len;
   uint32_t total = strs_off + b->strs_len;
   if (!guard_page) {
     guard_page = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -105,10 +108,16 @@ static const uint8_t *serialize(const struct blob *b, uint32_t struct_len, uint3
   }
   uint8_t *p = guard_page + 4096 - total;
   memset(guard_page, 0, 4096);
-  uint32_t hdr[10] = {magic, total, struct_off, strs_off, 0, 17, 16, 0, b->strs_len, struct_len};
+  uint32_t hdr[10] = {magic, total, struct_off, strs_off, 40, 17, 16, 0, b->strs_len, struct_len};
   for (int i = 0; i < 10; i++)
     for (int k = 0; k < 4; k++)
       p[i * 4 + k] = (uint8_t)(hdr[i] >> (8 * (3 - k)));
+  memset(p + 40, 0, rsv_len);
+  for (int i = 0; i < b->nrsv; i++)
+    for (int k = 0; k < 8; k++) {
+      p[40 + 16 * i + k] = (uint8_t)(b->rsv[i][0] >> (8 * (7 - k)));
+      p[48 + 16 * i + k] = (uint8_t)(b->rsv[i][1] >> (8 * (7 - k)));
+    }
   memcpy(p + struct_off, b->st, struct_len);
   memcpy(p + strs_off, b->strs, b->strs_len);
   if (total_out)
@@ -245,6 +254,249 @@ static void check_hostile_lengths(void)
   expect_eq(parse(&b, &base, &size), -1); /* valid tree, no memory node */
 }
 
+static void prop_str(struct blob *b, const char *name, const char *bytes, uint32_t len)
+{
+  put32(b, 3);
+  put32(b, len);
+  put32(b, name_off(b, name));
+  memcpy(b->st + b->st_len, bytes, len);
+  b->st_len += len;
+  pad(b);
+}
+
+static void prop64(struct blob *b, const char *name, uint64_t addr, uint64_t size)
+{
+  uint32_t c[4] = {(uint32_t)(addr >> 32), (uint32_t)addr, (uint32_t)(size >> 32), (uint32_t)size};
+  prop(b, name, c, 4);
+}
+
+/* root { memory, reserved-memory { atf, dynamic (size only), lk }, soc { reserved-memory decoy } } plus memreserve
+ * entries */
+static void build_reserved(struct blob *b)
+{
+  memset(b, 0, sizeof *b);
+  b->rsv[b->nrsv][0] = 0x48000000, b->rsv[b->nrsv++][1] = 0x10000;
+  begin(b, "");
+  prop1(b, "#address-cells", 2);
+  prop1(b, "#size-cells", 2);
+  begin(b, "reserved-memory");
+  prop1(b, "#address-cells", 2);
+  prop1(b, "#size-cells", 2);
+  begin(b, "atf@43000000");
+  prop64(b, "reg", 0x43000000, 0x30000);
+  end_node(b);
+  begin(b, "dynamic");
+  prop1(b, "size", 0x1000000);
+  end_node(b);
+  begin(b, "lk@46000000");
+  uint32_t two[8] = {0, 0x46000000, 0, 0x200000, 0, 0x47000000, 0, 0x1000};
+  prop(b, "reg", two, 8);
+  end_node(b);
+  end_node(b);
+  begin(b, "soc");
+  begin(b, "reserved-memory");
+  begin(b, "decoy@0");
+  prop64(b, "reg", 0, 0x1000);
+  end_node(b);
+  end_node(b);
+  end_node(b);
+  end_node(b);
+  put32(b, 9);
+}
+
+static void check_reserved(void)
+{
+  struct blob b;
+  struct fdt_range r[16];
+  build_reserved(&b);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_reserved(fdt, r, 16), 4);
+  expect_eq(r[0].base, 0x48000000);
+  expect_eq(r[0].size, 0x10000);
+  expect_eq(r[1].base, 0x43000000);
+  expect_eq(r[1].size, 0x30000);
+  expect_eq(r[2].base, 0x46000000);
+  expect_eq(r[2].size, 0x200000);
+  expect_eq(r[3].base, 0x47000000);
+  expect_eq(r[3].size, 0x1000);
+
+  expect_eq(fdt_reserved(fdt, r, 2), 2); /* output is capped, not overrun */
+}
+
+static void check_reserved_cells(void)
+{
+  struct blob b;
+  struct fdt_range r[4];
+  memset(&b, 0, sizeof b);
+  begin(&b, "");
+  prop1(&b, "#address-cells", 2);
+  prop1(&b, "#size-cells", 2);
+  begin(&b, "reserved-memory");
+  prop1(&b, "#address-cells", 1);
+  prop1(&b, "#size-cells", 1);
+  begin(&b, "fw@80000000");
+  uint32_t reg[2] = {0x80000000u, 0x100000};
+  prop(&b, "reg", reg, 2);
+  end_node(&b);
+  end_node(&b);
+  end_node(&b);
+  put32(&b, 9);
+  expect_eq(fdt_reserved(serialize(&b, b.st_len, 0xd00dfeed, 0), r, 4), 1);
+  expect_eq(r[0].base, 0x80000000u);
+  expect_eq(r[0].size, 0x100000);
+}
+
+static void check_reserved_none_and_invalid(void)
+{
+  struct blob b;
+  struct fdt_range r[4];
+  build(&b, 2, 2, "memory@0", 0x1000, 0x1000);
+  expect_eq(fdt_reserved(serialize(&b, b.st_len, 0xd00dfeed, 0), r, 4), 0);
+  expect_eq(fdt_reserved(0, r, 4), -1);
+
+  build_reserved(&b);
+  uint8_t *p = (uint8_t *)serialize(&b, b.st_len, 0xd00dfeed, 0);
+  p[19] = 44; /* reservation block offset not 8-aligned */
+  expect_eq(fdt_reserved(p, r, 4), -1);
+
+  p = (uint8_t *)serialize(&b, b.st_len, 0xd00dfeed, 0);
+  p[19] = 0xf0; /* reservation block starts past the blob */
+  expect_eq(fdt_reserved(p, r, 4), -1);
+
+  uint32_t total;
+  build_reserved(&b);
+  p = (uint8_t *)serialize(&b, b.st_len, 0xd00dfeed, &total);
+  p[19] = (uint8_t)(total - 8); /* block runs off the end before its terminator */
+  expect_eq(fdt_reserved(p, r, 4), -1);
+}
+
+/* A phone-shaped tree: cluster-split cpus, a soc node with its own cell widths, a GICv3 and a UART whose reg follows
+ * compatible. */
+static void build_soc(struct blob *b)
+{
+  memset(b, 0, sizeof *b);
+  begin(b, "");
+  prop1(b, "#address-cells", 2);
+  prop1(b, "#size-cells", 2);
+  begin(b, "cpus");
+  prop1(b, "#address-cells", 1);
+  prop1(b, "#size-cells", 0);
+  static const uint32_t mpidr[] = {0x000, 0x001, 0x100, 0x101};
+  static const char *const names[] = {"cpu@0", "cpu@1", "cpu@100", "cpu@101"};
+  for (int i = 0; i < 4; i++) {
+    begin(b, names[i]);
+    prop_str(b, "device_type", "cpu", 4);
+    prop1(b, "reg", mpidr[i]);
+    end_node(b);
+  }
+  begin(b, "cpu-map");
+  begin(b, "cluster0");
+  prop1(b, "reg", 0xdead);
+  end_node(b);
+  end_node(b);
+  end_node(b);
+  begin(b, "psci");
+  prop_str(b, "compatible", "arm,psci-1.0\0arm,psci-0.2", 27);
+  prop_str(b, "method", "smc", 4);
+  end_node(b);
+  begin(b, "soc");
+  prop1(b, "#address-cells", 2);
+  prop1(b, "#size-cells", 2);
+  begin(b, "interrupt-controller@c000000");
+  prop64(b, "reg", 0x0c000000, 0x40000);
+  prop_str(b, "compatible", "arm,gic-v3", 11);
+  end_node(b);
+  begin(b, "serial@11002000");
+  prop_str(b, "compatible", "mediatek,mt6765-uart\0mediatek,mt6577-uart", 42);
+  prop64(b, "reg", 0x11002000, 0x400);
+  prop_str(b, "status", "okay", 5);
+  end_node(b);
+  begin(b, "serial@11003000");
+  prop_str(b, "compatible", "mediatek,mt6577-uart", 21);
+  prop64(b, "reg", 0x11003000, 0x400);
+  end_node(b);
+  end_node(b);
+  end_node(b);
+  put32(b, 9);
+}
+
+static void check_compat_reg(void)
+{
+  struct blob b;
+  uint64_t base, size;
+  build_soc(&b);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_compat_reg(fdt, "arm,gic-v3", 0, 0, &base, &size), 0);
+  expect_eq(base, 0x0c000000);
+  expect_eq(size, 0x40000);
+  expect_eq(fdt_compat_reg(fdt, "mediatek,mt6577-uart", 0, 0, &base, &size), 0);
+  expect_eq(base, 0x11002000);
+  expect_eq(fdt_compat_reg(fdt, "mediatek,mt6577-uart", 1, 0, &base, &size), 0);
+  expect_eq(base, 0x11003000);
+  expect_eq(fdt_compat_reg(fdt, "mediatek,mt6577-uart", 2, 0, &base, &size), -1);
+  expect_eq(fdt_compat_reg(fdt, "mediatek,mt6765-uart", 0, 1, &base, &size), -1); /* only one reg entry */
+  expect_eq(fdt_compat_reg(fdt, "arm,pl011", 0, 0, &base, &size), -1);
+  expect_eq(fdt_compat_reg(fdt, "mediatek", 0, 0, &base, &size), -1); /* whole strings only */
+  expect_eq(fdt_compat_reg(0, "arm,gic-v3", 0, 0, &base, &size), -1);
+}
+
+static void check_compat_str(void)
+{
+  struct blob b;
+  char buf[8];
+  build_soc(&b);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_compat_str(fdt, "arm,psci-0.2", "method", buf, sizeof buf), 0);
+  expect_eq(strcmp(buf, "smc"), 0);
+  expect_eq(fdt_compat_str(fdt, "arm,psci-0.2", "nothing", buf, sizeof buf), -1);
+  expect_eq(fdt_compat_str(fdt, "arm,psci-0.2", "method", buf, 3), -1); /* does not fit with its NUL */
+  expect_eq(fdt_compat_str(fdt, "arm,pl011", "method", buf, sizeof buf), -1);
+}
+
+static void check_cpu_mpidr(void)
+{
+  struct blob b;
+  uint64_t m;
+  build_soc(&b);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  static const uint64_t want[] = {0x000, 0x001, 0x100, 0x101};
+  for (int i = 0; i < 4; i++) {
+    expect_eq(fdt_cpu_mpidr(fdt, i, &m), 0);
+    expect_eq(m, want[i]);
+  }
+  expect_eq(fdt_cpu_mpidr(fdt, 4, &m), -1); /* cpu-map entries are not cpus */
+  expect_eq(fdt_cpu_mpidr(fdt, -1, &m), -1);
+
+  build(&b, 2, 2, "memory@0", 0x1000, 0x1000);
+  expect_eq(fdt_cpu_mpidr(serialize(&b, b.st_len, 0xd00dfeed, 0), 0, &m), -1);
+}
+
+static void check_find_truncation(void)
+{
+  struct blob b;
+  build_soc(&b);
+  for (uint32_t cut = 0; cut < b.st_len; cut += 4) {
+    uint64_t base, size, m;
+    char buf[8];
+    const uint8_t *fdt = serialize(&b, cut, 0xd00dfeed, 0);
+    (void)fdt_compat_reg(fdt, "mediatek,mt6577-uart", 1, 0, &base, &size);
+    (void)fdt_compat_str(fdt, "arm,psci-1.0", "method", buf, sizeof buf);
+    (void)fdt_cpu_mpidr(fdt, 3, &m);
+    (void)fdt_reserved(fdt, (struct fdt_range[4]){0}, 4);
+  }
+}
+
+static void check_totalsize(void)
+{
+  struct blob b;
+  uint32_t total;
+  build(&b, 2, 2, "memory@0", 0x1000, 0x1000);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, &total);
+  expect_eq(fdt_totalsize(fdt), total);
+  expect_eq(fdt_totalsize(0), 0);
+  expect_eq(fdt_totalsize(serialize(&b, b.st_len, 0xd00dfeee, 0)), 0);
+}
+
 int main(void)
 {
   test("qemu layout", check_qemu_layout);
@@ -253,5 +505,13 @@ int main(void)
   test("invalid headers rejected", check_header_rejects);
   test("truncated struct block never read past", check_truncation);
   test("hostile lengths and tokens rejected", check_hostile_lengths);
+  test("reserved ranges from memreserve and reserved-memory", check_reserved);
+  test("reserved-memory own cell widths", check_reserved_cells);
+  test("reserved ranges: none and invalid blobs", check_reserved_none_and_invalid);
+  test("compatible lookup and reg decoding", check_compat_reg);
+  test("compatible lookup of string properties", check_compat_str);
+  test("cpu mpidr list", check_cpu_mpidr);
+  test("lookups on truncated blobs stay in bounds", check_find_truncation);
+  test("total size", check_totalsize);
   return 0;
 }

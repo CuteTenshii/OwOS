@@ -1,58 +1,6 @@
-/* arch.c: AArch64 platform support for the QEMU virt machine: PL011 UART,
- * stage-1 MMU, GICv2, generic timer and exception dispatch. */
+/* arch.c: AArch64 platform support: stage-1 MMU, generic timer, exception dispatch and PSCI. */
 #include "arch.h"
-#include "spinlock.h"
-
-#define UARTDR 0x00
-#define UARTFR 0x18
-#define UARTFR_TXFF (1u << 5)
-#define UARTIBRD 0x24
-#define UARTFBRD 0x28
-#define UARTLCRH 0x2c
-#define UARTCR 0x30
-
-void uart_init(void)
-{
-  mmio_write32(UART0_BASE + UARTCR, 0);
-  mmio_write32(UART0_BASE + UARTLCRH, 3 << 5); /* 8N1, FIFOs off */
-  mmio_write32(UART0_BASE + UARTCR, (1 << 0) | (1 << 8) | (1 << 9));
-}
-
-static spinlock_t uart_lock;
-
-static void uart_write(char c)
-{
-  if (c == '\n')
-    uart_write('\r');
-  while (mmio_read32(UART0_BASE + UARTFR) & UARTFR_TXFF)
-    ;
-  mmio_write32(UART0_BASE + UARTDR, (uint32_t)c);
-}
-
-void uart_putc(char c)
-{
-  uintptr_t f = spin_lock_irqsave(&uart_lock);
-  uart_write(c);
-  spin_unlock_irqrestore(&uart_lock, f);
-}
-
-void uart_puts(const char *s)
-{
-  uintptr_t f = spin_lock_irqsave(&uart_lock);
-  while (*s)
-    uart_write(*s++);
-  spin_unlock_irqrestore(&uart_lock, f);
-}
-
-void uart_puthex(uint64_t v)
-{
-  uintptr_t f = spin_lock_irqsave(&uart_lock);
-  uart_write('0');
-  uart_write('x');
-  for (int i = 60; i >= 0; i -= 4)
-    uart_write("0123456789abcdef"[(v >> i) & 0xf]);
-  spin_unlock_irqrestore(&uart_lock, f);
-}
+#include <stdbool.h>
 
 #define PTE_BLOCK 0x1ULL
 #define PTE_ATTR(n) ((uint64_t)(n) << 2)
@@ -68,10 +16,13 @@ uint64_t kernel_l1[512] __attribute__((aligned(4096)));
 
 void mmu_init(void)
 {
+  uint64_t ram_base = 0x40000000, ram_size = 1ULL << 30;
+  fdt_memory((const void *)boot_dtb, &ram_base, &ram_size);
   for (int i = 0; i < 4; i++) {
     uint64_t base = (uint64_t)i << 30;
-    kernel_l1[i] = i == 1 ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF)
-                          : (base | PTE_BLOCK | PTE_ATTR(MAIR_DEVICE) | PTE_AF | PTE_XN);
+    bool ram = ram_base < base + (1ULL << 30) && ram_base + ram_size > base;
+    kernel_l1[i] = ram ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF)
+                       : (base | PTE_BLOCK | PTE_ATTR(MAIR_DEVICE) | PTE_AF | PTE_XN);
   }
 
   uint64_t mair = (0xffULL << (8 * MAIR_NORMAL));
@@ -97,30 +48,6 @@ void mmu_init(void)
   __asm__ volatile("isb");
 }
 
-#define GICD_CTLR 0x000
-#define GICD_ISENABLER0 0x100
-#define GICD_IPRIORITYR 0x400
-#define GICC_CTLR 0x000
-#define GICC_PMR 0x004
-#define GICC_IAR 0x00c
-#define GICC_EOIR 0x010
-
-/* Per-CPU part: the PPI enable/priority registers and the CPU interface are banked. */
-void gic_cpu_init(void)
-{
-  mmio_write32(GICD_BASE + GICD_IPRIORITYR + (IRQ_TIMER_PPI & ~3), 0x80u << (8 * (IRQ_TIMER_PPI & 3)));
-  mmio_write32(GICD_BASE + GICD_ISENABLER0, 1u << IRQ_TIMER_PPI);
-  mmio_write32(GICC_BASE + GICC_PMR, 0xff);
-  mmio_write32(GICC_BASE + GICC_CTLR, 1);
-}
-
-void gic_init(void)
-{
-  mmio_write32(GICD_BASE + GICD_CTLR, 0);
-  mmio_write32(GICD_BASE + GICD_CTLR, 1);
-  gic_cpu_init();
-}
-
 static volatile uint64_t ticks;
 static uint64_t tick_interval;
 
@@ -135,7 +62,7 @@ uint64_t timer_ticks(void) { return ticks; }
 
 static void irq_dispatch(void)
 {
-  uint32_t iar = mmio_read32(GICC_BASE + GICC_IAR);
+  uint32_t iar = gic_ack();
   uint32_t id = iar & 0x3ff;
   if (id == IRQ_TIMER_PPI) {
     SYSREG_WRITE(cntp_tval_el0, tick_interval);
@@ -143,7 +70,7 @@ static void irq_dispatch(void)
       ticks++;
   }
   if (id < 1020)
-    mmio_write32(GICC_BASE + GICC_EOIR, iar);
+    gic_eoi(iar);
   if (id == IRQ_TIMER_PPI)
     schedule();
 }
@@ -198,7 +125,7 @@ static int64_t psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
   register uint64_t x1 __asm__("x1") = a1;
   register uint64_t x2 __asm__("x2") = a2;
   register uint64_t x3 __asm__("x3") = a3;
-  if (boot_el == 2)
+  if (plat.psci_smc < 0 ? boot_el == 2 : plat.psci_smc)
     __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
   else
     __asm__ volatile("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
@@ -207,7 +134,7 @@ static int64_t psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 
 int psci_cpu_on(int cpu)
 {
-  return (int)psci_call(PSCI_CPU_ON, (uint64_t)cpu, (uint64_t)(uintptr_t)secondary_entry, (uint64_t)cpu);
+  return (int)psci_call(PSCI_CPU_ON, plat.cpu_mpidr[cpu], (uint64_t)(uintptr_t)secondary_entry, (uint64_t)cpu);
 }
 
 void arch_poweroff(void)

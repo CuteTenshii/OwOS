@@ -11,6 +11,13 @@
 	orr	x0, x0, #3                   /* EL1 may use the physical counter and timer */
 	msr	cnthctl_el2, x0
 	msr	cntvoff_el2, xzr
+	mrs	x0, id_aa64pfr0_el1
+	ubfx	x0, x0, #24, #4
+	cbz	x0, 1f                       /* no GICv3 system registers */
+	mov	x0, #0xf                     /* ICC_SRE_EL2: SRE, DFB, DIB, Enable so EL1 can use them */
+	msr	icc_sre_el2, x0
+	isb
+1:
 	mov	x0, #0x3c5                   /* SPSR: EL1h, DAIF masked */
 	msr	spsr_el2, x0
 	adr	x0, \target
