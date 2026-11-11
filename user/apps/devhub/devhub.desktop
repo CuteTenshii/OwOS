@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Device Hub
+GenericName=Hardware Information
+Comment=See the hardware OwOS detected
+Exec=devhub
+Icon=computer
+Terminal=false
+Categories=System;
+X-OwOS-Order=95

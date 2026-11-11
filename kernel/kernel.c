@@ -491,6 +491,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_ICON("preferences-system-notifications", preferences_system_notifications);
     INSTALL_ICON("preferences-system", preferences_system);
     INSTALL_ICON("help-about", help_about);
+    INSTALL_ICON("computer", computer);
     INSTALL_ICON("application-default", application_default);
     INSTALL_ICON("audio-volume-muted", audio_volume_muted);
     INSTALL_ICON("audio-volume-low", audio_volume_low);
@@ -512,6 +513,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_DESKTOP(calc);
     INSTALL_DESKTOP(notifyd);
     INSTALL_DESKTOP(settings);
+    INSTALL_DESKTOP(devhub);
     INSTALL_DESKTOP(about);
     seed_file("/etc/passwd", "root::0:0:/home/root\n", 21, 0600);
     seed_file("/etc/group", "root:0:\n", 8, 0644);
@@ -544,6 +546,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(torrent);
     INSTALL_APP(player);
     INSTALL_APP(settings);
+    INSTALL_APP(devhub);
     INSTALL_APP(ssh);
     INSTALL_APP(sshd);
     INSTALL_APP(clipd);

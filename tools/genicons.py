@@ -161,6 +161,17 @@ def scene_about():
             (rrect(14.2, 13.4, 17.8, 23.4, 0.8), (50, 110, 210))]
 
 
+def scene_hardware():
+    out = [tile((70, 180, 130), (24, 112, 82))]
+    for i in range(4):
+        p = 10.6 + i * 3.4
+        out += [(rect(p, 5, p + 1.6, 9), W), (rect(p, 23, p + 1.6, 27), W),
+                (rect(5, p, 9, p + 1.6), W), (rect(23, p, 27, p + 1.6), W)]
+    out += [(rrect(8.5, 8.5, 23.5, 23.5, 2), W), (rrect(12, 12, 20, 20, 1), (36, 120, 90)),
+            (circle(10.8, 10.8, 0.9), (36, 120, 90))]
+    return out
+
+
 def scene_default():
     return [tile((160, 166, 180), (110, 116, 132)), (rrect(6, 7, 26, 25, 2), W),
             (rect(6, 7, 26, 11.5), (90, 100, 125)), (rect(9, 14.5, 23, 22), (205, 210, 222))]
@@ -231,7 +242,8 @@ ICONS = {
     'utilities-file-archiver': scene_archiver, 'accessories-text-editor': scene_editor,
     'web-browser': scene_browser, 'multimedia-player': scene_player, 'preferences-system-time': scene_clock,
     'accessories-calculator': scene_calc, 'preferences-system-notifications': scene_notify,
-    'preferences-system': scene_settings, 'help-about': scene_about, 'application-default': scene_default,
+    'preferences-system': scene_settings, 'help-about': scene_about, 'computer': scene_hardware,
+    'application-default': scene_default,
     'audio-volume-muted': scene_vol_muted, 'audio-volume-low': scene_vol_low, 'audio-volume-high': scene_vol_high,
     'battery-low': scene_bat_low, 'battery-medium': scene_bat_medium, 'battery-full': scene_bat_full,
     'battery-charging': scene_bat_charging, 'network-ethernet': scene_net_ethernet,

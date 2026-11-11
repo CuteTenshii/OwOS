@@ -9,7 +9,7 @@
 # The browser includes its own headers by path from its root.
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
 
-GUI_APPS := about archive browser calc cliphist clock compositor editor files imgview notifyd pdfview player settings term
+GUI_APPS := about archive browser calc cliphist clock compositor devhub editor files imgview notifyd pdfview player settings term
 APPS := $(patsubst user/apps/%/,%,$(wildcard user/apps/*/))
 app_objs = $(patsubst %.c,%.o,$(sort $(shell find user/apps/$(1) -name '*.c')))
 
@@ -66,7 +66,7 @@ endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
 # Start menu entries, embedded in the kernel and installed to /usr/share/applications at boot.
-DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings about
+DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings devhub about
 define desktop_rule
 kernel/$(1)_desktop_blob.o: user/apps/$(1)/$(1).desktop
 	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
@@ -78,7 +78,7 @@ $(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 # Combined function-symbol table (one text blob, sections keyed by app name) so
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
-SYM_APPS := browser files archive editor term calc imgview pdfview player settings notifyd about clock cliphist
+SYM_APPS := browser files archive editor term calc imgview pdfview player settings devhub notifyd about clock cliphist
 kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
@@ -99,7 +99,7 @@ kernel/fontstore.c: $(FONT_FILES) tools/genfontstore.sh
 # /usr/share/icons at boot. The symbol base has dashes turned into underscores.
 ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver accessories-text-editor web-browser multimedia-player \
               preferences-system-time accessories-calculator preferences-system-notifications \
-              preferences-system help-about application-default \
+              preferences-system help-about computer application-default \
               audio-volume-muted audio-volume-low audio-volume-high \
               battery-low battery-medium battery-full battery-charging \
               network-ethernet network-ethernet-disconnected

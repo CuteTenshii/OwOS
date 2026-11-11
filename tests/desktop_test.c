@@ -420,8 +420,8 @@ static void check_shipped(void)
   expect(apps != NULL);
   if (!apps)
     return;
-  const char *expect_names[] = {"term",   "files", "archive", "editor",  "browser",  "pdfview",
-                                "player", "clock", "calc",    "notifyd", "settings", "about"};
+  const char *expect_names[] = {"term",  "files", "archive", "editor",   "browser", "pdfview", "player",
+                                "clock", "calc",  "notifyd", "settings", "devhub",  "about"};
   const int nexpect = (int)(sizeof expect_names / sizeof expect_names[0]);
   struct desktop_list l = {0};
   int found = 0;
