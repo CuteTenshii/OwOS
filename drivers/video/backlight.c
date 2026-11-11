@@ -6,24 +6,24 @@
 #include "pci.h"
 #include "spinlock.h"
 
-#define PWM_ENABLE (1u << 31)
+#define PWM_ENABLE (1u << 31u)
 #define PWM_DUTY_MASK 0xFFFFu
 
 #define BLC_PWM_CPU_CTL2 0x48250
 #define BLC_PWM_CPU_CTL 0x48254
 #define BLC_PWM_PCH_CTL1 0xC8250
 #define BLC_PWM_PCH_CTL2 0xC8254
-#define BLM_PCH_POLARITY (1u << 29)
+#define BLM_PCH_POLARITY (1u << 29u)
 
 #define BXT_BLC_PWM_CTL(c) (0xC8250u + 0x100u * (c))
 #define BXT_BLC_PWM_FREQ(c) (0xC8254u + 0x100u * (c))
 #define BXT_BLC_PWM_DUTY(c) (0xC8258u + 0x100u * (c))
-#define BXT_BLC_PWM_POLARITY (1u << 29)
+#define BXT_BLC_PWM_POLARITY (1u << 29u)
 
 #define VLV_DISPLAY_BASE 0x180000u
 #define VLV_BLC_PWM_CTL2(p) (VLV_DISPLAY_BASE + 0x61250u + 0x100u * (p))
 #define VLV_BLC_PWM_CTL(p) (VLV_DISPLAY_BASE + 0x61254u + 0x100u * (p))
-#define BLM_POLARITY_I965 (1u << 28)
+#define BLM_POLARITY_I965 (1u << 28u)
 
 /* Bay Trail's display block sits at 0x180000, past the 1 MiB that covers every PCH register. */
 #define MMIO_MAP_PCH 0x100000u
@@ -70,9 +70,9 @@ static bool find_gpu(uint16_t *gpu_id, uint32_t *bar)
     if (d.vendor != INTEL_VENDOR || d.class_code != 0x03 || d.bus != 0)
       continue;
     uint32_t bar0 = pci_read32(d.bus, d.slot, d.func, 0x10);
-    if (((bar0 >> 1) & 0x3) == 0x2 && pci_read32(d.bus, d.slot, d.func, 0x14) != 0)
+    if (((bar0 >> 1u) & 0x3u) == 0x2u && pci_read32(d.bus, d.slot, d.func, 0x14) != 0)
       return false;
-    if (bar0 & 1) /* an I/O BAR, not MMIO */
+    if (bar0 & 1u) /* an I/O BAR, not MMIO */
       return false;
     *gpu_id = d.device;
     *bar = bar0 & ~0xFu;
@@ -85,11 +85,11 @@ static bool find_gpu(uint16_t *gpu_id, uint32_t *bar)
 static uint16_t pch_id(void)
 {
   uint32_t id = pci_read32(0, PCH_SLOT, 0, 0x00);
-  if ((id & 0xFFFF) != INTEL_VENDOR)
+  if ((id & 0xFFFFu) != INTEL_VENDOR)
     return 0;
-  if ((pci_read32(0, PCH_SLOT, 0, 0x08) >> 16) != 0x0601)
+  if ((pci_read32(0, PCH_SLOT, 0, 0x08) >> 16u) != 0x0601u)
     return 0;
-  return (uint16_t)(id >> 16);
+  return (uint16_t)(id >> 16u);
 }
 
 /* Locate the enabled PWM for the layout and read its period and polarity. False if firmware left it off. */
@@ -100,7 +100,7 @@ static bool adopt_pwm(enum bl_layout layout)
     uint32_t ctl1 = rd(BLC_PWM_PCH_CTL1);
     if (!(ctl1 & PWM_ENABLE) || !(rd(BLC_PWM_CPU_CTL2) & PWM_ENABLE))
       return false;
-    period = rd(BLC_PWM_PCH_CTL2) >> 16;
+    period = rd(BLC_PWM_PCH_CTL2) >> 16u;
     active_low = (ctl1 & BLM_PCH_POLARITY) != 0;
     duty_reg = BLC_PWM_CPU_CTL;
     duty_field16 = true;
@@ -111,7 +111,7 @@ static bool adopt_pwm(enum bl_layout layout)
     uint32_t ctl1 = rd(BLC_PWM_PCH_CTL1);
     if (!(ctl1 & PWM_ENABLE))
       return false;
-    period = rd(BLC_PWM_PCH_CTL2) >> 16;
+    period = rd(BLC_PWM_PCH_CTL2) >> 16u;
     active_low = (ctl1 & BLM_PCH_POLARITY) != 0;
     duty_reg = BLC_PWM_PCH_CTL2;
     duty_field16 = true;
@@ -135,9 +135,9 @@ static bool adopt_pwm(enum bl_layout layout)
     for (uint32_t p = 0; p < 2; p++) {
       uint32_t ctl2 = rd(VLV_BLC_PWM_CTL2(p));
       uint32_t ctl = rd(VLV_BLC_PWM_CTL(p));
-      if (!(ctl2 & PWM_ENABLE) || (ctl >> 16) == 0)
+      if (!(ctl2 & PWM_ENABLE) || (ctl >> 16u) == 0)
         continue;
-      period = ctl >> 16;
+      period = ctl >> 16u;
       active_low = (ctl2 & BLM_POLARITY_I965) != 0;
       duty_reg = VLV_BLC_PWM_CTL(p);
       duty_field16 = true;
