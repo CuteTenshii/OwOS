@@ -14,6 +14,7 @@
 
 extern const struct nic_ops igb_ops;
 extern const struct nic_ops e1000_ops;
+extern const struct nic_ops vmxnet3_ops;
 extern const struct nic_ops rtl8139_ops;
 
 /* Probe order. The Intel gigabit drivers come first so a real machine's onboard
@@ -24,6 +25,7 @@ extern const struct nic_ops rtl8139_ops;
 static const struct nic_ops *const drivers[] = {
     &igb_ops,
     &e1000_ops,
+    &vmxnet3_ops,
     &rtl8139_ops,
 };
 

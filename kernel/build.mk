@@ -35,7 +35,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/uaccess.o \
         kernel/sched.o kernel/switch.o \
         drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/sysfs.o kernel/users.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/btrfs.o kernel/lzo.o kernel/zstd.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o drivers/usb/hub.o drivers/usb/hid.o drivers/usb/hid_desc.o drivers/usb/hid_pad.o drivers/usb/xbox.o drivers/usb/btusb.o drivers/usb/uvc.o drivers/usb/uvc_desc.o drivers/bt/bt_hci.o drivers/bt/bt_l2cap.o drivers/bt/bt_gatt.o drivers/bt/bt_avdtp.o drivers/bt/bt_hid.o drivers/bt/bt_aes.o drivers/bt/bt_smp.o drivers/bt/bt_p256.o drivers/bt/sbc.o \
-        drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/entropy.o \
+        drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o drivers/net/vmxnet3.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/entropy.o \
         kernel/crc32.o kernel/crc32c.o kernel/gzip.o \
         drivers/audio/sb16.o drivers/audio/hda.o \
         kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o kernel/wallclock.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \

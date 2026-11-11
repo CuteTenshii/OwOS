@@ -10,7 +10,7 @@ CDISK    := cd.iso
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
 # exercise an Intel driver, e.g. `make run NIC=e1000` (82540EM) or
 # `make run NIC=igb` (82576, the igb-family proxy for the I210/I211). The
-# rtl8139, e1000, and igb drivers are all built in and the kernel keeps whichever
+# rtl8139, e1000, igb, and vmxnet3 (`NIC=vmxnet3`) drivers are all built in and the kernel keeps whichever
 # is present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
 NIC ?= rtl8139
 

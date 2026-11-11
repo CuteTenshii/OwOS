@@ -19,7 +19,7 @@
 #   --boot-wait N  seconds to wait for boot + DHCP lease before cmd 1 (BOOT_WAIT, default 16)
 #   --gap N        seconds between commands                          (GAP,       default 4)
 #   --drain N      seconds to keep capturing after the last command  (DRAIN,     default 10)
-#   --nic NAME     rtl8139 | e1000 | igb                             (NIC,       default rtl8139)
+#   --nic NAME     rtl8139 | e1000 | igb | vmxnet3                           (NIC,       default rtl8139)
 #   --no-net       boot without a NIC
 #   --smp N        cores                                             (SMP,       default 4)
 #   --kernel PATH  kernel image                                      (KERNEL,    default owos.bin)
