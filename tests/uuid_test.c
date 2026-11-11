@@ -4,9 +4,9 @@
 #define now_ms uuid_test_now_ms
 void rng_bytes(void *out, int n);
 long long now_ms(void);
-#include "../user/lib/uuid/uuid.c"
 #include "../user/lib/uuid/gen.c"
 #include "test.h"
+#include "uuid.h"
 #include <string.h>
 
 long long now_ms(void) { return 0x0123456789ABLL; }
@@ -58,7 +58,8 @@ static void test_parse_forms(void)
   uuid_t want, got;
   char s[UUID_STR_LEN];
   static const char *const ok[] = {"2ED6657D-E927-568B-95E1-2665A8AEA6A2", "2ed6657de927568b95e12665a8aea6a2",
-                                   "{2ed6657d-e927-568b-95e1-2665a8aea6a2}", "urn:uuid:2ed6657d-e927-568b-95e1-2665a8aea6a2"};
+                                   "{2ed6657d-e927-568b-95e1-2665a8aea6a2}",
+                                   "urn:uuid:2ed6657d-e927-568b-95e1-2665a8aea6a2"};
   uuid_v5(want, UUID_NS_DNS, "www.example.com", 15);
   for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
     memset(got, 0, 16);

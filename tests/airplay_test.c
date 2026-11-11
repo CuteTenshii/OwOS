@@ -2,7 +2,6 @@
  * mDNS and thread calls are replaced by the fakes below, and airplay.c is included so its poller can be driven
  * by hand. */
 #define OWOS_SUITE_TEST
-#define rng_bytes airplay_test_rng_bytes
 #define now_ms airplay_test_now_ms
 #define msleep airplay_test_msleep
 #define thread_stack_alloc airplay_test_stack_alloc
@@ -15,6 +14,7 @@
 #define nc_read airplay_test_nc_read
 #define nc_write airplay_test_nc_write
 #define mdns_browse airplay_test_mdns_browse
+#define uuid_generate_v4 airplay_test_uuid_generate_v4
 #include <stddef.h>
 void msleep(unsigned ms);
 void *thread_stack_alloc(int bytes);
@@ -22,11 +22,9 @@ void thread_stack_free(void *p);
 int thread_create(void (*fn)(void), void *top);
 int thread_create_arg(void (*fn)(void *), void *arg, void *top);
 int thread_join(int tid);
-void rng_bytes(void *buf, int len);
-#include "../user/lib/uuid/uuid.c"
-#include "../user/lib/uuid/gen.c"
 #include "../user/lib/airplay/airplay.c"
 #include "test.h"
+#include "uuid.h"
 #include <stdio.h>
 
 static char g_req[4096]; /* every request written, in order */
@@ -57,7 +55,12 @@ int thread_join(int tid)
   (void)tid;
   return 0;
 }
-void rng_bytes(void *buf, int len) { memset(buf, 0x5a, (size_t)len); }
+void uuid_generate_v4(uuid_t out)
+{
+  unsigned char r[16];
+  memset(r, 0x5a, sizeof r);
+  uuid_v4_from(out, r);
+}
 long long now_ms(void) { return 0; }
 
 int mdns_browse(const char *service, struct mdns_service *out, int max, int timeout_ms)
@@ -76,7 +79,8 @@ void nc_close(netconn *c) { (void)c; }
 
 static void respond(int status, const char *body)
 {
-  g_resp_len = snprintf(g_resp, sizeof g_resp, "HTTP/1.1 %d X\r\nContent-Length: %d\r\n\r\n%s", status, (int)strlen(body), body);
+  g_resp_len =
+      snprintf(g_resp, sizeof g_resp, "HTTP/1.1 %d X\r\nContent-Length: %d\r\n\r\n%s", status, (int)strlen(body), body);
   g_resp_pos = 0;
 }
 
@@ -185,13 +189,15 @@ static void test_status_follows_playback_info(void)
   reset();
   s = airplay_connect(&d, 1000);
   s->loaded = 1;
-  g_info = "<plist><dict><key>duration</key><real>60.25</real><key>position</key><real>12.5</real><key>rate</key><real>1.0</real></dict></plist>";
+  g_info = "<plist><dict><key>duration</key><real>60.25</real><key>position</key><real>12.5</real><key>rate</"
+           "key><real>1.0</real></dict></plist>";
   poll_status(s);
   airplay_get_status(s, &st);
   expect_eq(st.state, AIRPLAY_PLAYING);
   expect_eq((int)(st.current_time * 1000), 12500);
   expect_eq((int)(st.duration * 1000), 60250);
-  g_info = "<plist><dict><key>duration</key><real>60.25</real><key>position</key><real>13</real><key>rate</key><real>0.0</real></dict></plist>";
+  g_info = "<plist><dict><key>duration</key><real>60.25</real><key>position</key><real>13</real><key>rate</"
+           "key><real>0.0</real></dict></plist>";
   poll_status(s);
   airplay_get_status(s, &st);
   expect_eq(st.state, AIRPLAY_PAUSED);
@@ -217,7 +223,8 @@ static void test_discovery_keeps_video_capable_receivers(void)
   struct airplay_device out[4];
   int n;
   memset(g_svc, 0, sizeof g_svc);
-  set_svc(0, "Living Room", "deviceid=AA:BB\0features=0x5A7FFFF7,0x1E\0model=AppleTV3,1\0", sizeof("deviceid=AA:BB\0features=0x5A7FFFF7,0x1E\0model=AppleTV3,1\0") - 1);
+  set_svc(0, "Living Room", "deviceid=AA:BB\0features=0x5A7FFFF7,0x1E\0model=AppleTV3,1\0",
+          sizeof("deviceid=AA:BB\0features=0x5A7FFFF7,0x1E\0model=AppleTV3,1\0") - 1);
   set_svc(1, "Speaker", "deviceid=CC:DD\0features=0x4A7FCFD6\0", sizeof("deviceid=CC:DD\0features=0x4A7FCFD6\0") - 1);
   g_nsvc = 2;
   n = airplay_discover(out, 4, 100);
