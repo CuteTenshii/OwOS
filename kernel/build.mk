@@ -41,8 +41,4 @@ $(KERNEL): $(OBJS) $(LINKER)
 # Force a rebuild of every object when the target ARCH changes (see ARCH_STAMP).
 $(OBJS): $(ARCH_STAMP)
 
-# Blob objects have explicit rules in user/apps/build.mk. Keep their generated
-# object format tied to the same architecture stamp as compiled sources.
-$(filter %_blob.o,$(OBJS)): $(ARCH_STAMP)
-
 -include $(OBJS:.o=.d)

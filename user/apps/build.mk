@@ -75,7 +75,7 @@ $(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
 SYM_APPS := browser files archive editor term calc imgview pdfview player settings devhub notifyd about clock cliphist
-kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
+kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
 	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
@@ -97,7 +97,7 @@ ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver acc
               battery-low battery-medium battery-full battery-charging \
               network-ethernet network-ethernet-disconnected
 define icon_rule
-kernel/icon_$(subst -,_,$(1))_blob.o: icons/$(1).png $(ARCH_STAMP)
+kernel/icon_$(subst -,_,$(1))_blob.o: icons/$(1).png
 	$$(call blob,$$<,icons_$(subst -,_,$(1))_png)
 endef
 $(foreach i,$(ICON_NAMES),$(eval $(call icon_rule,$(i))))

@@ -191,8 +191,6 @@ SHLIB  = user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPB
 
 user/lib/start.o: user/lib/start.S $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
-user/lib/lib.o: user/lib/lib.c $(ARCH_STAMP)
-	$(UCC) $(UCFLAGS) -c $< -o $@
 
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.
 user/%.o: user/%.c $(ARCH_STAMP)
