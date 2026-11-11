@@ -67,7 +67,7 @@ EXTRA_a64_elf     := -Ikernel
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/uvc.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
-         $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o $(B)/impl/pmm.o $(B)/impl/a64_elf.o
+         $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o $(B)/impl/pmm.o $(B)/impl/a64_elf.o $(B)/impl/pwrap.o $(B)/impl/fbcon.o $(B)/impl/clk.o $(B)/impl/gpio.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
@@ -136,6 +136,14 @@ $(B)/impl/a64_elf.o: kernel/arch/aarch64/elf.c
 	$(call COMPILE,-Ikernel -include tests/a64_host.h)
 $(B)/impl/browser_js_host.o: tests/browser_js_host.c
 	$(call COMPILE,)
+$(B)/impl/fbcon.o: kernel/arch/aarch64/fbcon.c
+	$(call COMPILE,-Ikernel)
+$(B)/impl/clk.o: kernel/arch/aarch64/clk.c
+	$(call COMPILE,-include tests/clk_host.h)
+$(B)/impl/gpio.o: kernel/arch/aarch64/gpio.c
+	$(call COMPILE,-Ikernel -include tests/gpio_host.h -include tests/spinlock_host.h)
+$(B)/impl/pwrap.o: kernel/arch/aarch64/pwrap.c
+	$(call COMPILE,-Ikernel -include tests/pwrap_host.h)
 $(B)/impl/test_runner.o: tests/test_runner.c
 	$(call COMPILE,)
 

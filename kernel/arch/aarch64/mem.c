@@ -24,6 +24,8 @@ int arch_mem_init(const void *dtb)
   if (nrsv < 0 || nrsv == MAX_RESERVED - 1)
     return -1;
   rsv[nrsv++] = (struct fdt_range){(uintptr_t)dtb, fdt_totalsize(dtb)};
+  if (plat.fb.format != FB_NONE && nrsv < MAX_RESERVED)
+    rsv[nrsv++] = (struct fdt_range){plat.fb.base, (uint64_t)plat.fb.stride * plat.fb.height};
 
   uintptr_t heap_bytes = size / 4 < HEAP_MIN ? HEAP_MIN : size / 4 > HEAP_MAX ? HEAP_MAX : size / 4;
   uintptr_t heap_end = ALIGN_2M((uintptr_t)kernel_end + heap_bytes);

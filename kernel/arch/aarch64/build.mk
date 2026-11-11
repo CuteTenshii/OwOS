@@ -28,7 +28,7 @@ A64ELF  := owos-aarch64.elf
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
 A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
-            -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
+            -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -MMD -MP $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
 A64_EL2 ?= on
 A64_SMP ?= 4
 A64_GIC ?= 2
@@ -45,7 +45,7 @@ A64UFLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffr
 A64PROGS := hello segv nx
 A64UELFS := $(addprefix $(A64TESTS)/,$(addsuffix .elf,$(A64PROGS)))
 
-KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
+KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o pwrap.o clk.o gpio.o fbcon.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
 OBJS := $(KOBJS) $(addprefix $(A64TESTS)/,selftest.o snippets.o programs.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S
@@ -89,5 +89,7 @@ run: $(KERNEL)
 
 check: $(KERNEL)
 	@out=$$(timeout 20 $(QEMU_A64) 2>&1); echo "$$out"; echo "$$out" | ug -q 'AARCH64 SELFTEST PASS'
+
+-include $(OBJS:.o=.d)
 
 .SECONDARY:

@@ -4,6 +4,7 @@
 
 #include "cpu_defs.h"
 #include "fdt.h"
+#include "mmio.h"
 #include "plat.h"
 #include "pmm.h"
 #include "uvm.h"
@@ -19,10 +20,6 @@ struct trap_frame {
   uint64_t elr;
   uint64_t spsr;
 };
-
-static inline uint32_t mmio_read32(uintptr_t a) { return *(volatile uint32_t *)a; }
-static inline void mmio_write32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
-static inline uint64_t mmio_read64(uintptr_t a) { return *(volatile uint64_t *)a; }
 
 #define SYSREG_READ(reg)                                                                                               \
   ({                                                                                                                   \

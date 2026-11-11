@@ -47,6 +47,38 @@ static void find_gic(const void *dtb)
     }
 }
 
+static void find_fb(const void *dtb)
+{
+  uint64_t base, size;
+  uint32_t w, h, stride;
+  char format[16];
+  if (fdt_compat_reg(dtb, "simple-framebuffer", 0, 0, &base, &size) ||
+      fdt_compat_u32(dtb, "simple-framebuffer", "width", &w) ||
+      fdt_compat_u32(dtb, "simple-framebuffer", "height", &h) ||
+      fdt_compat_u32(dtb, "simple-framebuffer", "stride", &stride) ||
+      fdt_compat_str(dtb, "simple-framebuffer", "format", format, sizeof format))
+    return;
+  plat.fb = (struct fb_info){base, w, h, stride, fb_format_parse(format)};
+}
+
+static void find_soc_blocks(const void *dtb)
+{
+  uint64_t base, size;
+  if (!fdt_compat_reg(dtb, "mediatek,mt6765-topckgen", 0, 0, &base, &size))
+    plat.topckgen_base = base;
+  if (!fdt_compat_reg(dtb, "mediatek,mt6765-infracfg", 0, 0, &base, &size))
+    plat.infracfg_base = base;
+  if (!fdt_compat_reg(dtb, "mediatek,mt6765-pinctrl", 0, 0, &base, &size))
+    plat.gpio_base = base;
+}
+
+static void find_pwrap(const void *dtb)
+{
+  uint64_t base, size;
+  if (!fdt_compat_reg(dtb, "mediatek,mt6765-pwrap", 0, 0, &base, &size))
+    plat.pwrap_base = base;
+}
+
 static void find_psci(const void *dtb)
 {
   char method[8];
@@ -83,5 +115,8 @@ void plat_init(const void *dtb)
   find_uart(dtb);
   find_gic(dtb);
   find_psci(dtb);
+  find_pwrap(dtb);
+  find_soc_blocks(dtb);
+  find_fb(dtb);
   find_cpus(dtb);
 }

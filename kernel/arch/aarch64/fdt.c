@@ -325,6 +325,15 @@ int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *
   return 0;
 }
 
+int fdt_compat_u32(const void *fdt, const char *compat, const char *prop, uint32_t *val)
+{
+  struct found n;
+  if (!find_node(fdt, compat, 0, prop, &n) || !n.prop || n.prop_len < 4)
+    return -1;
+  *val = be32(n.prop);
+  return 0;
+}
+
 struct cpu_ctx {
   uint32_t addr_cells;
   bool in_cpus, is_cpu;

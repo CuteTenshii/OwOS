@@ -1,6 +1,9 @@
-/* uart.c: boot console on a PL011 (QEMU virt) or a MediaTek 16550-style UART left configured by the loader. */
+/* uart.c: boot console on a PL011 (QEMU virt) or a MediaTek 16550-style UART left configured by the loader, mirrored to
+ * the framebuffer. */
 #include "arch.h"
+#include "fbcon.h"
 #include "spinlock.h"
+#include <stdbool.h>
 
 #define UARTDR 0x00
 #define UARTFR 0x18
@@ -13,6 +16,7 @@
 #define MTK_THR 0x00
 #define MTK_LSR 0x14
 #define MTK_LSR_THRE (1u << 5)
+#define MTK_TX_POLLS 100000
 
 void uart_init(void)
 {
@@ -25,18 +29,32 @@ void uart_init(void)
 
 static spinlock_t uart_lock;
 
+static bool mtk_dead;
+
+/* A UART the loader left gated never raises THRE: give up on it instead of hanging the boot. */
+static void mtk_write(char c)
+{
+  if (mtk_dead)
+    return;
+  for (int i = 0; i < MTK_TX_POLLS; i++)
+    if (mmio_read32(plat.uart_base + MTK_LSR) & MTK_LSR_THRE) {
+      mmio_write32(plat.uart_base + MTK_THR, (uint32_t)c);
+      return;
+    }
+  mtk_dead = true;
+}
+
 static void uart_write(char c)
 {
   if (c == '\n')
     uart_write('\r');
+  fbcon_putc(c);
   if (plat.uart_kind == UART_PL011) {
     while (mmio_read32(plat.uart_base + UARTFR) & UARTFR_TXFF)
       ;
     mmio_write32(plat.uart_base + UARTDR, (uint32_t)c);
   } else {
-    while (!(mmio_read32(plat.uart_base + MTK_LSR) & MTK_LSR_THRE))
-      ;
-    mmio_write32(plat.uart_base + MTK_THR, (uint32_t)c);
+    mtk_write(c);
   }
 }
 

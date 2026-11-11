@@ -24,6 +24,9 @@ int fdt_compat_reg(const void *fdt, const char *compat, int idx, int entry, uint
 /* String property `prop` of the first node matching compat, copied with its NUL into buf. */
 int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *buf, uint32_t cap);
 
+/* First cell of integer property `prop` of the first node matching compat. */
+int fdt_compat_u32(const void *fdt, const char *compat, const char *prop, uint32_t *val);
+
 /* MPIDR affinity bits of the idx-th /cpus/cpu node, in tree order. */
 #define FDT_MPIDR_AFFINITY 0xff00ffffffULL
 int fdt_cpu_mpidr(const void *fdt, int idx, uint64_t *mpidr);
