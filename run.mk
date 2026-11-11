@@ -1,4 +1,4 @@
-# run.mk — disk images, the QEMU run/debug targets, and the bootable ISO/USB.
+# run.mk: disk images, the QEMU run/debug targets, and the bootable ISO/USB.
 
 DISK     := disk.img
 SATADISK := sata.img
@@ -25,7 +25,7 @@ SCSI ?= virtio-scsi-pci
 SMP ?= 4
 
 # QEMU host audio backend. Differs by OS: PipeWire on Linux, CoreAudio on macOS
-# (QEMU has no pipewire backend there — `qemu-system-i386 -audiodev help`). Override
+# (QEMU has no pipewire backend there; see `qemu-system-i386 -audiodev help`). Override
 # with e.g. `make run QEMU_AUDIODEV=pa` (PulseAudio) or `none` to mute.
 ifeq ($(shell uname -s),Darwin)
   QEMU_AUDIODEV ?= coreaudio
@@ -34,7 +34,7 @@ else
 endif
 
 # Hardware acceleration. Without it QEMU interprets every instruction (TCG), and
-# every framebuffer write takes the dirty-tracking softmmu slow path — measured
+# every framebuffer write takes the dirty-tracking softmmu slow path, measured
 # ~11x the cost of a back-buffer write, which is what makes the desktop feel like
 # a slideshow. KVM (Linux) / HVF (macOS) run the guest on the host CPU with
 # hardware dirty tracking, ~10-50x faster overall. The `:tcg` suffix is a
@@ -189,7 +189,7 @@ debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDI
 # and makes the ISO GPT-hybrid whenever the host has the *-efi GRUB platform
 # modules installed alongside i386-pc. Needs grub-mkrescue + xorriso + mtools.
 #
-# grub.cfg: `insmod all_video` is load-bearing — without a video driver loaded,
+# grub.cfg: `insmod all_video` is load-bearing: without a video driver loaded,
 # GRUB cannot honor the kernel's Multiboot framebuffer request and dies with
 # "no suitable video mode found" on real hardware/UEFI (it pulls in efi_gop /
 # efi_uga on UEFI and vbe / vga on BIOS). We deliberately do NOT set
@@ -198,7 +198,7 @@ debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDI
 # which fb_adopt needs (it only handles 32-bpp XRGB).
 #
 # The kernel command line carries `verbose` so the ISO (the real-VM / bare-metal
-# path) shows the bring-up log on screen by default — the boot output is the
+# path) shows the bring-up log on screen by default, since the boot output is the
 # first thing you want when a real machine misbehaves. The QEMU -kernel targets
 # stay quiet (no `verbose` in their -append); the log is always in the journal.
 $(ISO): $(KERNEL)
@@ -217,7 +217,7 @@ run-iso: $(ISO)
 	$(QEMU) -cdrom $(ISO) -serial stdio
 
 # Boot the SAME ISO through UEFI (OVMF firmware) to prove the hybrid image's
-# UEFI entry works — this is the path a modern VM/laptop firmware takes. OVMF is
+# UEFI entry works; this is the path a modern VM/laptop firmware takes. OVMF is
 # 64-bit; the EFI GRUB it launches still loads our 32-bit multiboot kernel.
 # Override OVMF_CODE=/path if your distro puts the firmware elsewhere. Homebrew's
 # qemu ships it under $(brew --prefix qemu)/share/qemu on macOS; most Linux distros
@@ -257,4 +257,4 @@ usb: $(ISO)
 	echo "Press Ctrl-C to abort, or Enter to continue."; read
 	dd if=$(ISO) of=$(USB) bs=4M oflag=direct status=progress conv=fsync
 	sync
-	@echo "done: $(ISO) written to $(USB) — set BIOS/UEFI to boot from it"
+	@echo "done: $(ISO) written to $(USB); set BIOS/UEFI to boot from it"

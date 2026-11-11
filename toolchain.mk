@@ -1,4 +1,4 @@
-# toolchain.mk — compiler/linker flags and the generic kernel compile rules,
+# toolchain.mk: compiler/linker flags and the generic kernel compile rules,
 # shared by every other fragment.
 
 # Version baked in via -DOWOS_VERSION (kernel + user): git describe (tag, else short
@@ -15,7 +15,7 @@ ARCH ?= i386
 OPT_LEVEL ?= 2
 ARCH_STAMP := .arch.current
 ifeq ($(filter $(ARCH),i386 x86_64),)
-  $(error unsupported ARCH '$(ARCH)' — use i386 or x86_64)
+  $(error unsupported ARCH '$(ARCH)'; use i386 or x86_64)
 endif
 
 # Linux can use its native GCC with the explicit architecture flags below. macOS

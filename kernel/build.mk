@@ -1,4 +1,4 @@
-# kernel/build.mk — the kernel image itself: the object list and the final link.
+# kernel/build.mk: the kernel image, its object list and the final link.
 # Program blobs (kernel/*_blob.o) are built by user/apps/build.mk; the font blobs too.
 
 # Generic kernel compile rules. Defined here, not toolchain.mk, so they come after
