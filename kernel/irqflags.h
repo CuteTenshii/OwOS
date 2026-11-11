@@ -32,6 +32,26 @@ static inline uintptr_t irq_flags(void)
 
 /* Mask interrupts and wait; call in a loop to halt for good. */
 static inline void cpu_halt(void) { __asm__ volatile("msr daifset, #2\n\twfi"); }
+#elif defined(__arm__)
+/* CPSR plays the role of EFLAGS: the I bit set means interrupts off. */
+static inline uintptr_t irq_save(void)
+{
+  uintptr_t f;
+  __asm__ volatile("mrs %0, cpsr\n\tcpsid i" : "=r"(f)::"memory");
+  return f;
+}
+
+/* Writes only the control byte (mode, I, F, T), which irq_save captured in this same mode. */
+static inline void irq_restore(uintptr_t f) { __asm__ volatile("msr cpsr_c, %0" : : "r"(f) : "memory"); }
+
+static inline uintptr_t irq_flags(void)
+{
+  uintptr_t f;
+  __asm__ volatile("mrs %0, cpsr" : "=r"(f)::"memory");
+  return f;
+}
+
+static inline void cpu_halt(void) { __asm__ volatile("cpsid i\n\twfi"); }
 #else
 /* Snapshot the flags register and disable interrupts. Pair with irq_restore. */
 static inline uintptr_t irq_save(void)

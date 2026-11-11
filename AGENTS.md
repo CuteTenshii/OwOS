@@ -26,6 +26,7 @@ make debug                   # Boot headless with serial output in the terminal
 make ARCH=x86_64             # Build the 64-bit kernel image
 make iso                     # Build a GRUB BIOS+UEFI ISO (Linux)
 make ARCH=aarch64 check      # Build the AArch64 bring-up kernel and boot its self-test in QEMU (tests/aarch64)
+make ARCH=arm check          # Build the 32-bit ARMv7-A bring-up kernel and boot its self-test in QEMU (tests/arm)
 make clean                   # Remove build artifacts, keeping disk images
 ```
 

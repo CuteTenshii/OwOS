@@ -9,7 +9,7 @@ static inline uintptr_t spin_lock_irqsave(spinlock_t *lock)
 {
   uintptr_t flags = irq_save();
   while (__sync_lock_test_and_set(lock, 1))
-#ifdef __aarch64__
+#if defined(__aarch64__) || defined(__arm__)
     __asm__ volatile("yield");
 #else
     __asm__ volatile("pause");

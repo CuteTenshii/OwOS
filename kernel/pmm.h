@@ -8,7 +8,7 @@ struct multiboot_info;
 
 #define PMM_FRAME_SIZE 4096
 
-/* Physical address type: 32-bit on x86 (RAM below 4 GiB), pointer-wide on AArch64. */
+/* Physical address type: 32-bit on x86 and 32-bit ARM (RAM below 4 GiB), pointer-wide on AArch64. */
 #ifdef __aarch64__
 typedef uintptr_t phys_t;
 #else

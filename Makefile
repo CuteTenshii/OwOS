@@ -27,9 +27,12 @@ CLANG_TIDY ?= clang-tidy
 TIDY_TARGET = --target=$(if $(filter x86_64,$(ARCH)),x86_64,i386)-none-elf
 TIDY_FILES ?= $(shell find kernel drivers -type f -name '*.c')
 A64_TIDY_TARGET = --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/aarch64 -Ikernel/arch/common
+ARM_TIDY_TARGET = --target=armv7a-none-eabi -mcpu=cortex-a15 -marm -mfloat-abi=soft -Ikernel/arch/arm -Ikernel/arch/common
 
 ifeq ($(ARCH),aarch64)
 include kernel/arch/aarch64/build.mk
+else ifeq ($(ARCH),arm)
+include kernel/arch/arm/build.mk
 else
 include toolchain.mk
 include user/lib/build.mk
@@ -54,11 +57,13 @@ format-check:
 # Kernel and driver sources only: user space has its own per-library include paths.
 tidy:
 	@command -v $(CLANG_TIDY) >/dev/null 2>&1 || { echo "error: $(CLANG_TIDY) not found" >&2; exit 1; }
-	@files='$(filter-out kernel/arch/aarch64/%,$(TIDY_FILES))'; [ -z "$$files" ] || \
+	@files='$(filter-out kernel/arch/aarch64/% kernel/arch/arm/%,$(TIDY_FILES))'; [ -z "$$files" ] || \
 		$(CLANG_TIDY) --quiet $$files -- $(TIDY_TARGET) -std=gnu11 -ffreestanding -Wall -Wextra $(VERSION_DEF) \
 		-Icommon -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
 	@files='$(filter kernel/arch/aarch64/%,$(TIDY_FILES))'; [ -z "$$files" ] || \
 		$(CLANG_TIDY) --quiet $$files -- $(A64_TIDY_TARGET) -std=gnu11 -ffreestanding -Wall -Wextra $(VERSION_DEF) -Icommon -Ikernel
+	@files='$(filter kernel/arch/arm/%,$(TIDY_FILES))'; [ -z "$$files" ] || \
+		$(CLANG_TIDY) --quiet $$files -- $(ARM_TIDY_TARGET) -std=gnu11 -ffreestanding -Wall -Wextra $(VERSION_DEF) -Icommon -Ikernel
 
 install-hooks:
 	@command -v lefthook >/dev/null 2>&1 || { echo "error: lefthook not found" >&2; exit 1; }
@@ -66,8 +71,9 @@ install-hooks:
 	lefthook install
 
 clean:
-	rm -f $(OBJS) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf $(ISO) .arch.*
+	rm -f $(OBJS) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf owos-arm.bin owos-arm.elf $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o user/aarch64/*.o tests/aarch64/*.o tests/aarch64/*.elf kernel/arch/aarch64/*.d tests/aarch64/*.d
+	rm -f kernel/arch/arm/*.o kernel/arch/arm/*.d tests/arm/*.o tests/arm/*.d
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete
 	rm -rf $(ISODIR)
