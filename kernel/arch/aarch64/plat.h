@@ -9,6 +9,14 @@
 enum uart_kind { UART_PL011, UART_MTK };
 enum gic_kind { GIC_V2, GIC_V3 };
 
+#define PLAT_I2C_MAX 8
+
+/* A MediaTek I2C controller node. clock_div is 0 and speed_hz 100 kHz when the tree leaves them out. */
+struct plat_i2c {
+  uintptr_t base, dma_base;
+  uint32_t id, clock_div, speed_hz;
+};
+
 struct plat {
   enum uart_kind uart_kind;
   uintptr_t uart_base;
@@ -20,7 +28,9 @@ struct plat {
   uintptr_t topckgen_base, infracfg_base; /* 0 when absent */
   uintptr_t gpio_base;
   uintptr_t pwrap_base; /* 0 when the device tree has no PMIC wrapper */
-  int psci_smc;         /* -1: pick from the boot exception level */
+  int ni2c;
+  struct plat_i2c i2c[PLAT_I2C_MAX];
+  int psci_smc; /* -1: pick from the boot exception level */
   int ncpus;
   uint64_t cpu_mpidr[MAX_CPUS]; /* affinity bits, boot CPU first */
 };

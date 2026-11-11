@@ -79,6 +79,43 @@ static void find_pwrap(const void *dtb)
     plat.pwrap_base = base;
 }
 
+/* Vendor (ALPS) trees use the generic string; mainline-style trees name the SoC. */
+static const char *const i2c_compat[] = {"mediatek,mt6765-i2c", "mediatek,i2c"};
+
+static int i2c_disabled(const void *dtb, const char *compat, int idx)
+{
+  char status[16];
+  if (fdt_compat_str_at(dtb, compat, idx, "status", status, sizeof status))
+    return 0;
+  return !(status[0] == 'o' && status[1] == 'k');
+}
+
+static int i2c_known(uintptr_t base)
+{
+  for (int i = 0; i < plat.ni2c; i++)
+    if (plat.i2c[i].base == base)
+      return 1;
+  return 0;
+}
+
+static void find_i2c(const void *dtb)
+{
+  for (unsigned c = 0; c < sizeof i2c_compat / sizeof *i2c_compat; c++) {
+    const char *compat = i2c_compat[c];
+    uint64_t base, dma, size;
+    for (int idx = 0; plat.ni2c < PLAT_I2C_MAX && !fdt_compat_reg(dtb, compat, idx, 0, &base, &size); idx++) {
+      if (i2c_known(base) || i2c_disabled(dtb, compat, idx) || fdt_compat_reg(dtb, compat, idx, 1, &dma, &size))
+        continue;
+      struct plat_i2c *p = &plat.i2c[plat.ni2c];
+      *p = (struct plat_i2c){.base = base, .dma_base = dma, .id = (uint32_t)plat.ni2c, .speed_hz = 100000};
+      fdt_compat_u32_at(dtb, compat, idx, "id", &p->id);
+      fdt_compat_u32_at(dtb, compat, idx, "clock-div", &p->clock_div);
+      fdt_compat_u32_at(dtb, compat, idx, "clock-frequency", &p->speed_hz);
+      plat.ni2c++;
+    }
+  }
+}
+
 static void find_psci(const void *dtb)
 {
   char method[8];
@@ -117,6 +154,7 @@ void plat_init(const void *dtb)
   find_psci(dtb);
   find_pwrap(dtb);
   find_soc_blocks(dtb);
+  find_i2c(dtb);
   find_fb(dtb);
   find_cpus(dtb);
 }

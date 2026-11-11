@@ -2,9 +2,62 @@
 #include "arch.h"
 #include "clk.h"
 #include "gpio.h"
+#include "i2c_mtk.h"
+#include "kstring.h"
 #include "pwrap.h"
 
+#define I2C_SRC_HZ 26000000 /* i2c_sel parent 0: the crystal */
+
+_Static_assert(I2C_MTK_DMA_MAX <= PMM_FRAME_SIZE, "an I2C DMA buffer is one frame");
+
 int selftest_run(void);
+
+static struct i2c_mtk i2c_ctl[PLAT_I2C_MAX];
+
+static int i2c_start_one(struct i2c_mtk *ctl, const struct plat_i2c *p)
+{
+  phys_t tx = pmm_alloc_frame(), rx = pmm_alloc_frame();
+  struct i2c_mtk_config cfg = {.base = p->base,
+                               .dma_base = p->dma_base,
+                               .src_hz = I2C_SRC_HZ,
+                               .clock_div = p->clock_div,
+                               .speed_hz = p->speed_hz,
+                               .tx_buf = PHYS_TO_PTR(tx),
+                               .rx_buf = PHYS_TO_PTR(rx)};
+  if (tx && rx && !i2c_mtk_init(ctl, &cfg) && !i2c_register(&ctl->bus, (int)p->id))
+    return 0;
+  if (tx)
+    pmm_free_frame(tx);
+  if (rx)
+    pmm_free_frame(rx);
+  return -1;
+}
+
+/* Bus timing is computed from a known source rate, so the I2C clock is moved to the crystal first. */
+static void i2c_start(void)
+{
+  if (!plat.ni2c)
+    return;
+  if (!plat.topckgen_base || !plat.infracfg_base) {
+    uart_puts("I2C: no clock controller in the DTB, buses left off\n");
+    return;
+  }
+  clk_mux_set_parent(CLK_TOP_I2C_SEL, 0);
+  clk_mux_enable(CLK_TOP_I2C_SEL);
+  clk_ifr_enable(CLK_IFR_I2C_AP);
+  clk_ifr_enable(CLK_IFR_AP_DMA);
+  for (int i = 0; i < plat.ni2c; i++) {
+    const struct plat_i2c *p = &plat.i2c[i];
+    char line[64];
+    if (i2c_start_one(&i2c_ctl[i], p))
+      ksnprintf(line, sizeof line, "I2C%d at %x: not started (clock-div %d, or id in use)\n", (int)p->id,
+                (unsigned)p->base, (int)p->clock_div);
+    else
+      ksnprintf(line, sizeof line, "I2C%d at %x: %d kHz\n", (int)p->id, (unsigned)p->base,
+                (int)(i2c_ctl[i].bus.speed_hz / 1000));
+    uart_puts(line);
+  }
+}
 
 void arch_main(void)
 {
@@ -37,6 +90,7 @@ void arch_main(void)
     uart_puts(pmic ? pmic : "not responding");
     uart_putc('\n');
   }
+  i2c_start();
   uart_puts("RAM free KiB ");
   uart_puthex(pmm_free_kib());
   uart_putc('\n');

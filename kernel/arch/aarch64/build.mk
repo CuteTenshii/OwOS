@@ -45,7 +45,7 @@ A64UFLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffr
 A64PROGS := hello segv nx
 A64UELFS := $(addprefix $(A64TESTS)/,$(addsuffix .elf,$(A64PROGS)))
 
-KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o pwrap.o clk.o gpio.o fbcon.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
+KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o pwrap.o clk.o gpio.o i2c.o i2c_mtk.o fbcon.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
 OBJS := $(KOBJS) $(addprefix $(A64TESTS)/,selftest.o snippets.o programs.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S

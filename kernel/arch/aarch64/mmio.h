@@ -7,5 +7,7 @@
 static inline uint32_t mmio_read32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void mmio_write32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline uint64_t mmio_read64(uintptr_t a) { return *(volatile uint64_t *)a; }
+static inline uint16_t mmio_read16(uintptr_t a) { return *(volatile uint16_t *)a; }
+static inline void mmio_write16(uintptr_t a, uint16_t v) { *(volatile uint16_t *)a = v; }
 
 #endif
