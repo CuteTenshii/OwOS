@@ -88,7 +88,7 @@ run: $(KERNEL)
 	$(QEMU_A64)
 
 check: $(KERNEL)
-	@out=$$(timeout 20 $(QEMU_A64) 2>&1); echo "$$out"; echo "$$out" | ug -q 'AARCH64 SELFTEST PASS'
+	@out=$$(timeout 20 $(QEMU_A64) 2>&1); echo "$$out"; echo "$$out" | grep -qF 'AARCH64 SELFTEST PASS'
 
 -include $(OBJS:.o=.d)
 
