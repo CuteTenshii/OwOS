@@ -68,7 +68,8 @@ EXTRA_a64_elf     := -Ikernel
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/uvc.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
          $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o $(B)/impl/pmm.o $(B)/impl/a64_elf.o $(B)/impl/pwrap.o $(B)/impl/fbcon.o $(B)/impl/clk.o $(B)/impl/gpio.o \
-         $(B)/impl/i2c.o $(B)/impl/i2c_mtk.o
+         $(B)/impl/i2c.o $(B)/impl/i2c_mtk.o $(B)/impl/tegra_car.o $(B)/impl/tegra_gpio.o $(B)/impl/i2c_tegra.o \
+         $(B)/impl/max77620.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
@@ -149,6 +150,14 @@ $(B)/impl/i2c.o: kernel/arch/aarch64/i2c.c
 	$(call COMPILE,-Ikernel -Ikernel/arch/common -include tests/i2c_mtk_host.h)
 $(B)/impl/i2c_mtk.o: kernel/arch/aarch64/i2c_mtk.c
 	$(call COMPILE,-include tests/i2c_mtk_host.h)
+$(B)/impl/tegra_car.o: kernel/arch/aarch64/tegra_car.c
+	$(call COMPILE,-include tests/tegra_host.h)
+$(B)/impl/tegra_gpio.o: kernel/arch/aarch64/tegra_gpio.c
+	$(call COMPILE,-include tests/tegra_host.h)
+$(B)/impl/i2c_tegra.o: kernel/arch/aarch64/i2c_tegra.c
+	$(call COMPILE,-include tests/tegra_host.h)
+$(B)/impl/max77620.o: kernel/arch/aarch64/max77620.c
+	$(call COMPILE,-include tests/tegra_host.h)
 $(B)/impl/test_runner.o: tests/test_runner.c
 	$(call COMPILE,)
 
