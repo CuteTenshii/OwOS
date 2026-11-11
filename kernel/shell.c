@@ -27,6 +27,7 @@
 #include "rtc.h"
 #include "sb16.h"
 #include "sched.h"
+#include "scsi.h"
 #include "serial.h"
 #include "timer.h"
 #include "usb.h"
@@ -276,6 +277,13 @@ static void cmd_storage(void)
     write_capacity(nvme_sectors());
     con_write(" (ns 1) -- read LBA0: ");
     con_write(nvme_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
+    n++;
+  }
+  if (scsi_present()) {
+    con_printf("  SCSI       %s  ", scsi_model());
+    write_capacity(scsi_sectors());
+    con_printf(" (%s) -- read LBA0: ", scsi_hba_name());
+    con_write(scsi_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
     n++;
   }
   if (xhci_msc_present()) {
@@ -1020,7 +1028,7 @@ static const struct builtin builtins[] = {
     {.name = "rm", .fn = cmd_rm, .flags = "rRf", .help = "rm <file>...  delete files"},
     {.name = "mkdir", .fn = cmd_mkdir, .flags = "p", .help = "mkdir <dir>...  create directories"},
     {.name = "rmdir", .fn = cmd_rmdir, .help = "rmdir <dir>...  remove empty directories"},
-    {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe)", .fn0 = cmd_storage},
+    {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe/SCSI)", .fn0 = cmd_storage},
     {.name = "mount",
      .fn = bi_mount,
      .help = "mount [dev [pt]]  mount a removable device (see ls /dev) at "

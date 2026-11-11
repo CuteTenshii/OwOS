@@ -359,6 +359,7 @@ drivers/storage/ata.c    polled ATA PIO disk driver (primary IDE)
 drivers/storage/ahci.c   polled AHCI driver for SATA disks/SSDs (MMIO + DMA)
 drivers/storage/nvme.c   minimal NVMe driver for PCIe SSDs (admin + I/O queues)
 drivers/storage/sd.c     SD/MMC card driver over an SDHCI host controller
+drivers/storage/scsi.c   SCSI disk layer; adapters in vscsi.c (virtio-scsi) and pvscsi.c (VMware PVSCSI)
 drivers/storage/atapi.c  polled ATAPI driver for CD/DVD drives (PACKET command)
 drivers/net/nic.c        link-layer driver dispatch (igb / e1000 / vmxnet3 / rtl8139)
 drivers/net/rtl8139.c    RTL8139 NIC driver (QEMU default)

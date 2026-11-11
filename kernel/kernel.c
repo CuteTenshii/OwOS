@@ -37,6 +37,7 @@
 #include "power.h"
 #include "sb16.h"
 #include "sched.h"
+#include "scsi.h"
 #include "sd.h"
 #include "serial.h"
 #include "shell.h"
@@ -441,6 +442,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   ahci_init();
   nvme_init();
   sd_init();
+  scsi_init();
   atapi_init();
 
   blk_init();

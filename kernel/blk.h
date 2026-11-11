@@ -18,7 +18,7 @@ int blk_use_ram(void);
 
 /* A present removable block device, for the /dev listing and the Files app Devices list. */
 struct blk_devinfo {
-  const char *dev; /* /dev name: "cd0"/"usb0"/"ide0"/"sata0"/"nvme0"/"sd0" */
+  const char *dev; /* /dev name: "cd0"/"usb0"/"ide0"/"sata0"/"nvme0"/"sd0"/"scsi0" */
   const char *kind;
   const char *model;
   int iso; /* reads 2048-byte ATAPI sectors (a CD/DVD)          */

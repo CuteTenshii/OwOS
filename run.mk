@@ -5,6 +5,7 @@ SATADISK := sata.img
 NVMEDISK := nvme.img
 USBDISK  := usb.img
 SDDISK   := sd.img
+SCSIDISK := scsi.img
 CDISK    := cd.iso
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
@@ -13,6 +14,9 @@ CDISK    := cd.iso
 # rtl8139, e1000, igb, and vmxnet3 (`NIC=vmxnet3`) drivers are all built in and the kernel keeps whichever
 # is present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
 NIC ?= rtl8139
+
+# Which SCSI adapter QEMU attaches: virtio-scsi-pci (default) or pvscsi (VMware PVSCSI), e.g. `make run SCSI=pvscsi`.
+SCSI ?= virtio-scsi-pci
 
 # How many CPU cores QEMU exposes to the guest. The kernel discovers them via the
 # ACPI MADT; override with e.g. `make run SMP=8`. Set SMP=1 for the old uniprocessor
@@ -63,6 +67,9 @@ $(SATADISK):
 $(NVMEDISK):
 	dd if=/dev/zero of=$(NVMEDISK) bs=1M count=16 status=none
 
+$(SCSIDISK):
+	dd if=/dev/zero of=$(SCSIDISK) bs=1M count=16 status=none
+
 # A FAT16-formatted image presented as a USB flash drive (qemu-xhci +
 # usb-storage), so the xHCI mass-storage driver (kernel/xhci.c) has a real stick
 # to enumerate, mount at /fat, and eject. Delete usb.img to re-seed.
@@ -110,6 +117,9 @@ STORAGE := -hda $(DISK) \
 	-device ide-hd,drive=satadisk,bus=ahci.0 \
 	-drive id=nvmedisk,file=$(NVMEDISK),if=none,format=raw \
 	-device nvme,drive=nvmedisk,serial=owos-nvme0 \
+	-device $(SCSI),id=scsi0 \
+	-drive id=scsidisk,file=$(SCSIDISK),if=none,format=raw \
+	-device scsi-hd,drive=scsidisk,bus=scsi0.0 \
 	-device qemu-xhci,id=xhci \
 	-drive id=usbdisk,file=$(USBDISK),if=none,format=raw \
 	-device usb-storage,bus=xhci.0,drive=usbdisk \
@@ -147,7 +157,7 @@ else
   BOOTDEP := $(KERNEL)
 endif
 
-run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
+run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
 		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
@@ -157,7 +167,7 @@ run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 		$(VDAGENT)
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
+debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
 		-machine accel=$(ACCEL) \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \

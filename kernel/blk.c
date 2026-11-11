@@ -11,6 +11,7 @@
 #include "nvme.h"
 #include "paging.h"
 #include "pmm.h"
+#include "scsi.h"
 #include "sd.h"
 #include "spinlock.h"
 #include "xhci.h"
@@ -153,6 +154,7 @@ static const struct cand cands[] = {
     {"sata0", "SATA", ahci_present, ahci_model, BK_AHCI, 0, ahci_read_sector, ahci_write_sector},
     {"nvme0", "NVMe", nvme_present, nvme_model, BK_NVME, 0, nvme_read_sector, nvme_write_sector},
     {"sd0", "SD", sd_present, sd_model, BK_SD, 0, sd_read_sector, sd_write_sector},
+    {"scsi0", "SCSI", scsi_present, scsi_model, BK_NONE, 0, scsi_read_sector, scsi_write_sector},
 };
 #define NCAND (int)(sizeof(cands) / sizeof(cands[0]))
 

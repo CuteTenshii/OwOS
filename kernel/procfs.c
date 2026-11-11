@@ -31,6 +31,7 @@
 #include "power.h"
 #include "rtc.h"
 #include "sched.h"
+#include "scsi.h"
 #include "smp.h"
 #include "syscall_path.h"
 #include "timer.h"
@@ -187,6 +188,13 @@ static void gen_storage(struct pb *b)
     pu(b, nvme_sectors());
     pc(b, ' ');
     ps(b, nvme_model());
+    pc(b, '\n');
+  }
+  if (scsi_present()) {
+    ps(b, "SCSI ");
+    pu(b, scsi_sectors());
+    pc(b, ' ');
+    ps(b, scsi_model());
     pc(b, '\n');
   }
 }
