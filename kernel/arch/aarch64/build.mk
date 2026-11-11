@@ -7,12 +7,6 @@
 #   make ARCH=aarch64 check   boot it and fail unless the self-test passes (A64_GIC=3 for a GICv3 machine)
 
 CROSS ?= $(if $(MACOS),aarch64-none-elf-)
-DEVKITA64 := /opt/devkitpro/devkitA64/bin/
-ifeq ($(shell command -v $(CROSS)gcc >/dev/null 2>&1 && echo y),)
-  ifneq ($(wildcard $(DEVKITA64)aarch64-none-elf-gcc),)
-    CROSS := $(DEVKITA64)aarch64-none-elf-
-  endif
-endif
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
