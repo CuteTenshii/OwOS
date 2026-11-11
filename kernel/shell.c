@@ -30,6 +30,7 @@
 #include "scsi.h"
 #include "serial.h"
 #include "timer.h"
+#include "ufs.h"
 #include "usb.h"
 #include "vmtools.h"
 #include "xhci.h"
@@ -284,6 +285,13 @@ static void cmd_storage(void)
     write_capacity(scsi_sectors());
     con_printf(" (%s) -- read LBA0: ", scsi_hba_name());
     con_write(scsi_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
+    n++;
+  }
+  if (ufs_present()) {
+    con_printf("  UFS        %s  ", ufs_model());
+    write_capacity(ufs_sectors());
+    con_printf(" (LUN %u) -- read LBA0: ", ufs_lun());
+    con_write(ufs_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
     n++;
   }
   if (xhci_msc_present()) {
@@ -1028,7 +1036,7 @@ static const struct builtin builtins[] = {
     {.name = "rm", .fn = cmd_rm, .flags = "rRf", .help = "rm <file>...  delete files"},
     {.name = "mkdir", .fn = cmd_mkdir, .flags = "p", .help = "mkdir <dir>...  create directories"},
     {.name = "rmdir", .fn = cmd_rmdir, .help = "rmdir <dir>...  remove empty directories"},
-    {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe/SCSI)", .fn0 = cmd_storage},
+    {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe/SCSI/UFS)", .fn0 = cmd_storage},
     {.name = "mount",
      .fn = bi_mount,
      .help = "mount [dev [pt]]  mount a removable device (see ls /dev) at "

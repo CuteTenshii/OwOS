@@ -45,6 +45,7 @@
 #include "smp.h"
 #include "syscall.h"
 #include "timer.h"
+#include "ufs.h"
 #include "users.h"
 #include "uwin.h"
 #include "virtiogpu.h"
@@ -443,6 +444,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   nvme_init();
   sd_init();
   scsi_init();
+  ufs_init();
   atapi_init();
 
   blk_init();

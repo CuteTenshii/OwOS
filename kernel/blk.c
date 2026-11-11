@@ -14,6 +14,7 @@
 #include "scsi.h"
 #include "sd.h"
 #include "spinlock.h"
+#include "ufs.h"
 #include "xhci.h"
 
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
@@ -155,6 +156,7 @@ static const struct cand cands[] = {
     {"nvme0", "NVMe", nvme_present, nvme_model, BK_NVME, 0, nvme_read_sector, nvme_write_sector},
     {"sd0", "SD", sd_present, sd_model, BK_SD, 0, sd_read_sector, sd_write_sector},
     {"scsi0", "SCSI", scsi_present, scsi_model, BK_NONE, 0, scsi_read_sector, scsi_write_sector},
+    {"ufs0", "UFS", ufs_present, ufs_model, BK_NONE, 0, ufs_read_sector, ufs_write_sector},
 };
 #define NCAND (int)(sizeof(cands) / sizeof(cands[0]))
 

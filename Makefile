@@ -75,4 +75,4 @@ clean:
 # Also remove the disk images (wipes stored files).
 distclean: clean
 	rm -rf build
-	rm -f $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK) $(CDISK)
+	rm -f $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)

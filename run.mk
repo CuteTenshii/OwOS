@@ -6,6 +6,7 @@ NVMEDISK := nvme.img
 USBDISK  := usb.img
 SDDISK   := sd.img
 SCSIDISK := scsi.img
+UFSDISK  := ufs.img
 CDISK    := cd.iso
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
@@ -70,6 +71,9 @@ $(NVMEDISK):
 $(SCSIDISK):
 	dd if=/dev/zero of=$(SCSIDISK) bs=1M count=16 status=none
 
+$(UFSDISK):
+	dd if=/dev/zero of=$(UFSDISK) bs=1M count=16 status=none
+
 # A FAT16-formatted image presented as a USB flash drive (qemu-xhci +
 # usb-storage), so the xHCI mass-storage driver (kernel/xhci.c) has a real stick
 # to enumerate, mount at /fat, and eject. Delete usb.img to re-seed.
@@ -120,6 +124,9 @@ STORAGE := -hda $(DISK) \
 	-device $(SCSI),id=scsi0 \
 	-drive id=scsidisk,file=$(SCSIDISK),if=none,format=raw \
 	-device scsi-hd,drive=scsidisk,bus=scsi0.0 \
+	-device ufs,id=ufs0,serial=owos-ufs0 \
+	-drive id=ufsdisk,file=$(UFSDISK),if=none,format=raw \
+	-device ufs-lu,drive=ufsdisk,bus=ufs0,lun=0 \
 	-device qemu-xhci,id=xhci \
 	-drive id=usbdisk,file=$(USBDISK),if=none,format=raw \
 	-device usb-storage,bus=xhci.0,drive=usbdisk \
@@ -157,7 +164,7 @@ else
   BOOTDEP := $(KERNEL)
 endif
 
-run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK) $(CDISK)
+run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
 		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
@@ -167,7 +174,7 @@ run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK)
 		$(VDAGENT)
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(USBDISK) $(SDDISK) $(CDISK)
+debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(SCSIDISK) $(UFSDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
 		-machine accel=$(ACCEL) \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \

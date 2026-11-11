@@ -35,6 +35,7 @@
 #include "smp.h"
 #include "syscall_path.h"
 #include "timer.h"
+#include "ufs.h"
 #include "usb.h"
 #include "users.h"
 #include "vdagent.h"
@@ -195,6 +196,13 @@ static void gen_storage(struct pb *b)
     pu(b, scsi_sectors());
     pc(b, ' ');
     ps(b, scsi_model());
+    pc(b, '\n');
+  }
+  if (ufs_present()) {
+    ps(b, "UFS ");
+    pu(b, ufs_sectors());
+    pc(b, ' ');
+    ps(b, ufs_model());
     pc(b, '\n');
   }
 }
