@@ -23,12 +23,13 @@ endif
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
+READELF := $(CROSS)readelf
 KERNEL  := owos-aarch64.bin
 A64ELF  := owos-aarch64.elf
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
 # Linux-targeted GCCs default to outline atomics, which call into libgcc.
-A64FLAGS := -mgeneral-regs-only -mstrict-align -mno-outline-atomics -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
+A64FLAGS := -mgeneral-regs-only -mstrict-align -mno-outline-atomics -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fpie \
             -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -MMD -MP $(VERSION_DEF) -I$(A64DIR) -Ikernel/arch/common -Icommon -Ikernel
 A64_EL2 ?= on
 A64_SMP ?= 4
@@ -82,8 +83,12 @@ $(A64USER)/%.o: $(A64USER)/%.S
 $(A64TESTS)/%.elf: $(A64TESTS)/%.o $(A64USER)/start.o $(A64USER)/rt.o $(A64USER)/user.ld
 	$(LD) --no-warn-rwx-segments -nostdlib -z max-page-size=4096 -T $(A64USER)/user.ld -o $@ $< $(A64USER)/start.o $(A64USER)/rt.o
 
+# boot.S applies R_AARCH64_RELATIVE entries and skips R_AARCH64_NONE, so any other dynamic relocation fails the link.
 $(A64ELF): $(OBJS) $(A64DIR)/linker.ld
-	$(LD) --no-warn-rwx-segments -nostdlib -T $(A64DIR)/linker.ld -o $@ $(OBJS)
+	$(LD) --no-warn-rwx-segments -nostdlib -pie --no-dynamic-linker -z notext -T $(A64DIR)/linker.ld -o $@.tmp $(OBJS)
+	@if $(READELF) -rW $@.tmp | awk '/^ *[0-9a-f]+ +[0-9a-f]+ +R_/ && $$3 != "R_AARCH64_RELATIVE" && $$3 != "R_AARCH64_NONE" { bad = 1; print } END { exit !bad }'; then \
+	  echo "$@: dynamic relocations other than R_AARCH64_RELATIVE" >&2; rm -f $@.tmp; exit 1; fi
+	@mv $@.tmp $@
 
 $(KERNEL): $(A64ELF)
 	$(OBJCOPY) -O binary $< $@

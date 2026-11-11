@@ -44,6 +44,26 @@ start_real:
 	and	x0, x0, #0xff
 	cbnz	x0, park
 
+	/* The image is linked at 0, so the load address is the relocation delta. The build allows only RELATIVE and
+	 * NONE (an empty slot ld leaves behind) entries, and nothing below has used an absolute pointer yet. */
+	adr	x21, _start
+	adrp	x0, __rela_start
+	add	x0, x0, :lo12:__rela_start
+	adrp	x1, __rela_end
+	add	x1, x1, :lo12:__rela_end
+	mov	w4, #R_AARCH64_RELATIVE
+1:	cmp	x0, x1
+	b.hs	2f
+	ldp	x2, x3, [x0]                 /* r_offset, r_info */
+	cmp	w3, w4
+	b.ne	3f
+	ldr	x3, [x0, #16]                /* r_addend */
+	add	x3, x3, x21
+	str	x3, [x2, x21]
+3:	add	x0, x0, #24
+	b	1b
+2:
+
 	mrs	x0, CurrentEL
 	lsr	x0, x0, #2
 	adrp	x1, boot_el
