@@ -322,3 +322,163 @@ void h264_intra_chroma(struct h264_decoder *d, int mbx, int mby, int mode)
   chroma_plane(d, d->cur->cb, d->cstride, mbx, mby, mode, aleft, atop, atl);
   chroma_plane(d, d->cur->cr, d->cstride, mbx, mby, mode, aleft, atop, atl);
 }
+
+/* ---- Intra_8x8 ------------------------------------------------------------
+ */
+void h264_intra8x8(struct h264_decoder *d, int mbx, int mby, int blk8, int mode)
+{
+  unsigned char *Y = d->cur->y;
+  int stride = d->ystride, bx = (blk8 & 1) * 8, by = (blk8 >> 1) * 8;
+  int x0 = mbx * 16 + bx, y0 = mby * 16 + by, cur = mby * d->mb_w + mbx;
+  int aleft, atop, atl, atr, i, x, y;
+  int T[17], L[9]; /* T[0] = top-left corner, T[1+x] = p[x,-1]; L[0] = corner, L[1+y] = p[-1,y] */
+  int Tf[17], Lf[9];
+  unsigned char *dst = Y + y0 * stride + x0;
+
+  aleft = bx ? 1 : nbr_intra(d, cur, mbx - 1, mby);
+  atop = by ? 1 : nbr_intra(d, cur, mbx, mby - 1);
+  if (bx && by)
+    atl = 1;
+  else if (!bx && by)
+    atl = nbr_intra(d, cur, mbx - 1, mby);
+  else if (bx && !by)
+    atl = nbr_intra(d, cur, mbx, mby - 1);
+  else
+    atl = nbr_intra(d, cur, mbx - 1, mby - 1);
+  switch (blk8) {
+  case 0:
+    atr = atop;
+    break;
+  case 1:
+    atr = nbr_intra(d, cur, mbx + 1, mby - 1);
+    break;
+  case 2:
+    atr = 1;
+    break;
+  default:
+    atr = 0;
+    break;
+  }
+
+  T[0] = atl ? Y[(y0 - 1) * stride + x0 - 1] : 128;
+  for (x = 0; x < 8; x++)
+    T[1 + x] = atop ? Y[(y0 - 1) * stride + x0 + x] : 128;
+  for (x = 8; x < 16; x++)
+    T[1 + x] = atr ? Y[(y0 - 1) * stride + x0 + x] : atop ? T[8] : 128;
+  L[0] = T[0];
+  for (y = 0; y < 8; y++)
+    L[1 + y] = aleft ? Y[(y0 + y) * stride + x0 - 1] : 128;
+
+  memcpy(Tf, T, sizeof T);
+  memcpy(Lf, L, sizeof L);
+  if (atop) {
+    Tf[1] = atl ? (T[0] + 2 * T[1] + T[2] + 2) >> 2 : (3 * T[1] + T[2] + 2) >> 2;
+    for (x = 1; x < 15; x++)
+      Tf[1 + x] = (T[x] + 2 * T[1 + x] + T[2 + x] + 2) >> 2;
+    Tf[16] = (T[15] + 3 * T[16] + 2) >> 2;
+  }
+  if (atl) {
+    if (!atop || !aleft) {
+      if (atop)
+        Tf[0] = (3 * T[0] + T[1] + 2) >> 2;
+      else if (aleft)
+        Tf[0] = (3 * T[0] + L[1] + 2) >> 2;
+    } else {
+      Tf[0] = (T[1] + 2 * T[0] + L[1] + 2) >> 2;
+    }
+    Lf[0] = Tf[0];
+  }
+  if (aleft) {
+    Lf[1] = atl ? (T[0] + 2 * L[1] + L[2] + 2) >> 2 : (3 * L[1] + L[2] + 2) >> 2;
+    for (y = 1; y < 7; y++)
+      Lf[1 + y] = (L[y] + 2 * L[1 + y] + L[2 + y] + 2) >> 2;
+    Lf[8] = (L[7] + 3 * L[8] + 2) >> 2;
+  }
+#define PT(k) (Tf[(k) + 1]) /* p'[k,-1], k = -1..15 */
+#define PL(k) (Lf[(k) + 1]) /* p'[-1,k], k = -1..7  */
+
+  for (y = 0; y < 8; y++)
+    for (x = 0; x < 8; x++) {
+      int p = 128;
+      switch (mode) {
+      case 0:
+        p = PT(x);
+        break;
+      case 1:
+        p = PL(y);
+        break;
+      case 2: {
+        int s = 0, n = 0;
+        if (atop) {
+          for (i = 0; i < 8; i++)
+            s += PT(i);
+          n++;
+        }
+        if (aleft) {
+          for (i = 0; i < 8; i++)
+            s += PL(i);
+          n++;
+        }
+        p = n == 2 ? (s + 8) >> 4 : n == 1 ? (s + 4) >> 3 : 128;
+        break;
+      }
+      case 3:
+        p = (x == 7 && y == 7) ? (PT(14) + 3 * PT(15) + 2) >> 2
+                               : (PT(x + y) + 2 * PT(x + y + 1) + PT(x + y + 2) + 2) >> 2;
+        break;
+      case 4:
+        if (x > y)
+          p = (PT(x - y - 2) + 2 * PT(x - y - 1) + PT(x - y) + 2) >> 2;
+        else if (x < y)
+          p = (PL(y - x - 2) + 2 * PL(y - x - 1) + PL(y - x) + 2) >> 2;
+        else
+          p = (PT(0) + 2 * PT(-1) + PL(0) + 2) >> 2;
+        break;
+      case 5: {
+        int z = 2 * x - y;
+        if (z >= 0 && (z & 1) == 0)
+          p = (PT(x - (y >> 1) - 1) + PT(x - (y >> 1)) + 1) >> 1;
+        else if (z >= 0)
+          p = (PT(x - (y >> 1) - 2) + 2 * PT(x - (y >> 1) - 1) + PT(x - (y >> 1)) + 2) >> 2;
+        else if (z == -1)
+          p = (PL(0) + 2 * PL(-1) + PT(0) + 2) >> 2;
+        else
+          p = (PL(y - 2 * x - 1) + 2 * PL(y - 2 * x - 2) + PL(y - 2 * x - 3) + 2) >> 2;
+        break;
+      }
+      case 6: {
+        int z = 2 * y - x;
+        if (z >= 0 && (z & 1) == 0)
+          p = (PL(y - (x >> 1) - 1) + PL(y - (x >> 1)) + 1) >> 1;
+        else if (z >= 0)
+          p = (PL(y - (x >> 1) - 2) + 2 * PL(y - (x >> 1) - 1) + PL(y - (x >> 1)) + 2) >> 2;
+        else if (z == -1)
+          p = (PL(0) + 2 * PL(-1) + PT(0) + 2) >> 2;
+        else
+          p = (PT(x - 2 * y - 1) + 2 * PT(x - 2 * y - 2) + PT(x - 2 * y - 3) + 2) >> 2;
+        break;
+      }
+      case 7:
+        if ((y & 1) == 0)
+          p = (PT(x + (y >> 1)) + PT(x + (y >> 1) + 1) + 1) >> 1;
+        else
+          p = (PT(x + (y >> 1)) + 2 * PT(x + (y >> 1) + 1) + PT(x + (y >> 1) + 2) + 2) >> 2;
+        break;
+      case 8: {
+        int z = x + 2 * y;
+        if (z > 13)
+          p = PL(7);
+        else if (z == 13)
+          p = (PL(6) + 3 * PL(7) + 2) >> 2;
+        else if ((z & 1) == 0)
+          p = (PL(y + (x >> 1)) + PL(y + (x >> 1) + 1) + 1) >> 1;
+        else
+          p = (PL(y + (x >> 1)) + 2 * PL(y + (x >> 1) + 1) + PL(y + (x >> 1) + 2) + 2) >> 2;
+        break;
+      }
+      }
+      dst[y * stride + x] = (unsigned char)clip8(p);
+    }
+#undef PT
+#undef PL
+}

@@ -59,12 +59,13 @@ MP4     := user/lib/mp4/mp4.o
 # motion compensation, DCT/IDCT, run/level VLCs. Both directions round-trip through
 # ffmpeg's mpeg1video. Pure computation (x87 doubles for the IDCT), libc-only.
 MPEG    := user/lib/mpeg/decode.o user/lib/mpeg/encode.o
-# h264: from-scratch H.264/AVC Baseline/Main (no B) decoder (CAVLC + CABAC) - NAL/RBSP,
-# SPS/PPS/slice parsing, I/P slices, intra + inter (quarter-pel) prediction, the
-# 4x4 integer transform, and the in-loop deblocking filter. Verified bit-exact
-# against ffmpeg/libx264 (tests/h264_test.c). Consumes an Annex-B stream or an
-# MP4 track's avcC + access units (user/lib/mp4). Pure integer computation,
-# libc-only (needs $(LIBGCC) for the container path's 64-bit ops).
+# h264: from-scratch H.264/AVC decoder (Baseline/Main/High, CAVLC + CABAC) - NAL/RBSP,
+# SPS/PPS/slice parsing, I/P/B slices, intra + inter (quarter-pel, weighted)
+# prediction, 4x4/8x8 integer transforms, the in-loop deblocking filter and DPB
+# reordering. Verified bit-exact against ffmpeg/libx264 (tests/h264_test.c).
+# Consumes an Annex-B stream or an MP4 track's avcC + access units
+# (user/lib/mp4). Pure integer computation, libc-only (needs $(LIBGCC) for the
+# container path's 64-bit ops).
 H264    := user/lib/h264/nal.o user/lib/h264/cavlc.o user/lib/h264/cabac.o user/lib/h264/transform.o \
            user/lib/h264/intra.o user/lib/h264/inter.o user/lib/h264/deblock.o \
            user/lib/h264/slice.o user/lib/h264/h264.o

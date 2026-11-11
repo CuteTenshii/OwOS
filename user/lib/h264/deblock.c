@@ -22,13 +22,12 @@ static const unsigned char beta_tab[52] = {
     6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18,
 };
 static const unsigned char tc0_tab[52][3] = {
-    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},  {0, 0, 0},   {0, 0, 0},   {0, 0, 0},
-    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},  {0, 0, 0},   {0, 0, 0},   {0, 0, 0},
-    {0, 0, 0},    {0, 0, 1},    {0, 0, 1},    {0, 0, 1},    {0, 1, 1},  {0, 1, 1},   {1, 1, 1},   {1, 1, 1},
-    {1, 1, 1},    {1, 1, 1},    {1, 1, 2},    {1, 1, 2},    {1, 1, 2},  {1, 1, 2},   {1, 2, 3},   {1, 2, 3},
-    {2, 2, 3},    {2, 2, 4},    {2, 3, 4},    {2, 3, 4},    {3, 3, 5},  {3, 4, 6},   {3, 4, 6},   {4, 5, 7},
-    {4, 5, 8},    {4, 6, 9},    {5, 7, 10},   {6, 8, 11},   {6, 8, 13}, {7, 10, 14}, {8, 11, 16}, {9, 12, 18},
-    {10, 13, 20}, {11, 15, 23}, {13, 17, 25}, {13, 17, 25},
+    {0, 0, 0},  {0, 0, 0},   {0, 0, 0},   {0, 0, 0},   {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},  {0, 0, 0},
+    {0, 0, 0},  {0, 0, 0},   {0, 0, 0},   {0, 0, 0},   {0, 0, 0},    {0, 0, 0},    {0, 0, 0},    {0, 0, 0},  {0, 0, 1},
+    {0, 0, 1},  {0, 0, 1},   {0, 0, 1},   {0, 1, 1},   {0, 1, 1},    {1, 1, 1},    {1, 1, 1},    {1, 1, 1},  {1, 1, 1},
+    {1, 1, 2},  {1, 1, 2},   {1, 1, 2},   {1, 1, 2},   {1, 2, 3},    {1, 2, 3},    {2, 2, 3},    {2, 2, 4},  {2, 3, 4},
+    {2, 3, 4},  {3, 3, 5},   {3, 4, 6},   {3, 4, 6},   {4, 5, 7},    {4, 5, 8},    {4, 6, 9},    {5, 7, 10}, {6, 8, 11},
+    {6, 8, 13}, {7, 10, 14}, {8, 11, 16}, {9, 12, 18}, {10, 13, 20}, {11, 15, 23}, {13, 17, 25},
 };
 
 static int iabs(int v) { return v < 0 ? -v : v; }
@@ -80,52 +79,90 @@ static void filter_line(unsigned char *q0p, int step, int bS, int alpha, int bet
   }
 }
 
-/* Boundary strength between luma 4x4 block p and q. */
-static int bs_of(h264_mb *mp, int pg, h264_mb *mq, int qg, int mb_boundary)
+static int mv_differs(const short *a, const short *b) { return iabs(a[0] - b[0]) >= 4 || iabs(a[1] - b[1]) >= 4; }
+
+/* Does the transform block containing 4x4 block g of mb carry coefficients? */
+static int has_coefs(const h264_mb *mb, int g)
 {
+  if (mb->t8x8) {
+    int q = ((g >> 3) << 3) | (((g & 3) >> 1) << 1); /* top-left 4x4 of the 8x8 holding g */
+    return mb->nnz_l[q] || mb->nnz_l[q + 1] || mb->nnz_l[q + 4] || mb->nnz_l[q + 5];
+  }
+  return mb->nnz_l[g] > 0;
+}
+
+static int quad_of(int g) { return (g >> 3) * 2 + ((g & 3) >> 1); }
+
+/* Inter boundary strength (0 or 1) from the references and vectors on each side. */
+static int bs_motion(const h264_mot *mp, int pg, const h264_mot *mq, int qg)
+{
+  int p[2], q[2], np, nq, l;
+  for (l = 0; l < 2; l++) {
+    p[l] = mp->refidx[l][pg] >= 0 ? mp->refpic[l][quad_of(pg)] : -1;
+    q[l] = mq->refidx[l][qg] >= 0 ? mq->refpic[l][quad_of(qg)] : -1;
+  }
+  np = (p[0] >= 0) + (p[1] >= 0);
+  nq = (q[0] >= 0) + (q[1] >= 0);
+  if (np != nq)
+    return 1;
+  if (np == 1) {
+    int lp = p[0] >= 0 ? 0 : 1, lq = q[0] >= 0 ? 0 : 1;
+    if (p[lp] != q[lq])
+      return 1;
+    return mv_differs(mp->mv[lp][pg], mq->mv[lq][qg]);
+  }
+  if (!((p[0] == q[0] && p[1] == q[1]) || (p[0] == q[1] && p[1] == q[0])))
+    return 1;
+  if (p[0] != p[1]) {
+    if (p[0] == q[0])
+      return mv_differs(mp->mv[0][pg], mq->mv[0][qg]) || mv_differs(mp->mv[1][pg], mq->mv[1][qg]);
+    return mv_differs(mp->mv[0][pg], mq->mv[1][qg]) || mv_differs(mp->mv[1][pg], mq->mv[0][qg]);
+  }
+  return (mv_differs(mp->mv[0][pg], mq->mv[0][qg]) || mv_differs(mp->mv[1][pg], mq->mv[1][qg])) &&
+         (mv_differs(mp->mv[0][pg], mq->mv[1][qg]) || mv_differs(mp->mv[1][pg], mq->mv[0][qg]));
+}
+
+/* Boundary strength between luma 4x4 block pg of macroblock mp and qg of mq. */
+static int bs_of(struct h264_decoder *d, int paddr, int pg, int qaddr, int qg, int mb_boundary)
+{
+  const h264_mb *mp = &d->mbs[paddr], *mq = &d->mbs[qaddr];
   if (mp->intra || mq->intra)
     return mb_boundary ? 4 : 3;
-  if (mp->nnz_l[pg] > 0 || mq->nnz_l[qg] > 0)
+  if (has_coefs(mp, pg) || has_coefs(mq, qg))
     return 2;
-  if (mp->refidx[pg] != mq->refidx[qg])
-    return 1;
-  if (iabs(mp->mv[pg][0] - mq->mv[qg][0]) >= 4 || iabs(mp->mv[pg][1] - mq->mv[qg][1]) >= 4)
-    return 1;
-  return 0;
+  return bs_motion(&d->cur->mot[paddr], pg, &d->cur->mot[qaddr], qg);
 }
 
 /* Filter all edges of one macroblock (vertical edges first, then horizontal).
  */
 static void filter_mb(struct h264_decoder *d, int mbx, int mby)
 {
-  h264_mb *cur = &d->mbs[mby * d->mb_w + mbx];
   int cur_addr = mby * d->mb_w + mbx;
+  h264_mb *cur = &d->mbs[cur_addr];
   int qpc = cur->qpy;
   int e, seg, row, dir;
   int cb_off = d->cur_pps->chroma_qp_index_offset;
   int cr_off = d->cur_pps->second_chroma_qp_index_offset;
-  int no_slice_edges = (d->sh.disable_deblock == 2);
 
   for (dir = 0; dir < 2; dir++) { /* 0 = vertical edges, 1 = horizontal */
     for (e = 0; e < 4; e++) {
       int is_mb_edge = (e == 0);
       h264_mb *nb = cur;
       int qpP = qpc;
-      int nbx = mbx, nby = mby;
+      int nbx = mbx, nby = mby, paddr = cur_addr;
       if (is_mb_edge) {
         if (dir == 0) {
           nbx = mbx - 1;
         } else {
           nby = mby - 1;
         }
-        if (!h264_mb_avail(d, cur_addr, nbx, nby))
+        nb = h264_mb_at(d, nbx, nby);
+        if (!nb || nb->slice_id < 0 || (cur->dbk_idc == 2 && nb->slice_id != cur->slice_id))
           continue;
-        if (no_slice_edges && d->mbs[nby * d->mb_w + nbx].slice_id != cur->slice_id)
-          continue;
-        nb = &d->mbs[nby * d->mb_w + nbx];
         qpP = nb->qpy;
+        paddr = nby * d->mb_w + nbx;
       }
-      for (seg = 0; seg < 4; seg++) {
+      for (seg = 0; seg < 4 && !(cur->t8x8 && (e & 1)); seg++) {
         int pg, qg, bS, qpav, ia, ib, alpha, beta;
         if (dir == 0) {
           qg = seg * 4 + e;
@@ -134,12 +171,12 @@ static void filter_mb(struct h264_decoder *d, int mbx, int mby)
           qg = e * 4 + seg;
           pg = is_mb_edge ? 3 * 4 + seg : (e - 1) * 4 + seg;
         }
-        bS = bs_of(nb, pg, cur, qg, is_mb_edge);
+        bS = bs_of(d, paddr, pg, cur_addr, qg, is_mb_edge);
         if (bS == 0)
           continue;
         qpav = (qpP + qpc + 1) >> 1;
-        ia = clip3(0, 51, qpav + d->sh.slice_alpha_off);
-        ib = clip3(0, 51, qpav + d->sh.slice_beta_off);
+        ia = clip3(0, 51, qpav + cur->alpha_off);
+        ib = clip3(0, 51, qpav + cur->beta_off);
         alpha = alpha_tab[ia];
         beta = beta_tab[ib];
         if (alpha == 0 || beta == 0)
@@ -173,8 +210,8 @@ static void filter_mb(struct h264_decoder *d, int mbx, int mby)
           int off = comp == 0 ? cb_off : cr_off;
           int qpcP = h264_chroma_qp(qpP, off), qpcQ = h264_chroma_qp(qpc, off);
           int qpav = (qpcP + qpcQ + 1) >> 1;
-          int ia = clip3(0, 51, qpav + d->sh.slice_alpha_off);
-          int ib = clip3(0, 51, qpav + d->sh.slice_beta_off);
+          int ia = clip3(0, 51, qpav + cur->alpha_off);
+          int ib = clip3(0, 51, qpav + cur->beta_off);
           int alpha = alpha_tab[ia], beta = beta_tab[ib];
           if (alpha == 0 || beta == 0)
             continue;
@@ -189,7 +226,7 @@ static void filter_mb(struct h264_decoder *d, int mbx, int mby)
               qg = e * 4 + lseg;
               pg = is_mb_edge ? 3 * 4 + lseg : (e - 1) * 4 + lseg;
             }
-            bS = bs_of(nb, pg, cur, qg, is_mb_edge);
+            bS = bs_of(d, paddr, pg, cur_addr, qg, is_mb_edge);
             if (bS == 0)
               continue;
             if (dir == 0) {
@@ -213,9 +250,8 @@ static void filter_mb(struct h264_decoder *d, int mbx, int mby)
 void h264_deblock_picture(struct h264_decoder *d)
 {
   int mbx, mby;
-  if (d->sh.disable_deblock == 1)
-    return; /* whole picture unfiltered */
   for (mby = 0; mby < d->mb_h; mby++)
     for (mbx = 0; mbx < d->mb_w; mbx++)
-      filter_mb(d, mbx, mby);
+      if (d->mbs[mby * d->mb_w + mbx].dbk_idc != 1)
+        filter_mb(d, mbx, mby);
 }

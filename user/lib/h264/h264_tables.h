@@ -140,7 +140,7 @@ static const unsigned char h264_normadjust[6][3] = {
 
 /* Table 8-15: chroma qP mapping for qPI in 30..51 (qPI<30 maps to itself). */
 static const unsigned char h264_chroma_qp_map[22] = {
-    29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 38, 38, 39, 39, 39, 39, 39, 39,
+    29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
 };
 
 #endif /* OWOS_H264_TABLES_H */

@@ -1,11 +1,11 @@
-/* h264.c — decoder lifetime, the frame store / DPB, POC, reference management,
- * NAL iteration for the Annex-B and avcC front ends, and the public API.
+/* h264.c — decoder lifetime, the frame store / DPB, POC, reference marking and
+ * lists, output ordering, NAL iteration for the Annex-B and avcC front ends, and
+ * the public API.
  *
- * Baseline has no B slices, so decode order is display order: a finished
- * picture is emitted when the next picture's first slice arrives (and the last
- * is flushed at end of stream). Reference pictures are kept in a small DPB
- * managed by the sliding-window rule (drop the oldest short-term reference past
- * max_num_ref).
+ * Decoded pictures wait in the DPB and are released in POC order once the
+ * reorder window (VUI num_reorder_frames, else the level's DPB size) is full,
+ * which is the C.4.5 bumping process. Reference pictures follow the sliding
+ * window or the explicit memory management operations, short- and long-term.
  */
 #include "h264.h"
 #include "h264_priv.h"
@@ -55,6 +55,11 @@ static int pic_alloc(struct h264_decoder *d, h264_pic *p)
   unsigned char *b = (unsigned char *)malloc(ysz + 2 * csz);
   if (!b)
     return H264_ENOMEM;
+  p->mot = (h264_mot *)malloc((unsigned)d->mb_w * d->mb_h * sizeof(h264_mot));
+  if (!p->mot) {
+    free(b);
+    return H264_ENOMEM;
+  }
   memset(b, 0, ysz + 2 * csz);
   p->base = b;
   p->ystride = d->ystride;
@@ -88,100 +93,245 @@ static void pic_extend(struct h264_decoder *d, h264_pic *p)
   plane_extend(p->cr, d->cstride, d->cw, d->ch);
 }
 
-/* Pick a free DPB slot, evicting a picture that is neither a reference nor
- * still awaiting output. Returns NULL if the DPB is (transiently) full. */
+/* A slot is free once nothing references it: not a reference, not waiting for
+ * output, and not the picture the caller is reading or the one being decoded. */
+static void slot_release(struct h264_decoder *d, h264_pic *p)
+{
+  if (p->used && p->ref == 0 && p->out == 0 && p != d->out && p != d->cur)
+    p->used = 0;
+}
+
 static h264_pic *dpb_get_free(struct h264_decoder *d)
 {
   int i;
   for (i = 0; i < d->dpb_size; i++)
     if (!d->dpb[i].used) {
-      if (!d->dpb[i].base && pic_alloc(d, &d->dpb[i]) != H264_OK)
+      h264_pic *p = &d->dpb[i];
+      if (!p->base && pic_alloc(d, p) != H264_OK)
         return 0;
-      d->dpb[i].used = 1;
-      d->dpb[i].is_ref = 0;
-      d->dpb[i].needed_output = 0;
-      return &d->dpb[i];
-    }
-  for (i = 0; i < d->dpb_size; i++)
-    if (d->dpb[i].used && !d->dpb[i].is_ref && !d->dpb[i].needed_output && &d->dpb[i] != d->out) {
-      d->dpb[i].is_ref = 0;
-      return &d->dpb[i];
+      p->used = 1;
+      p->ref = 0;
+      p->out = 0;
+      p->non_existing = 0;
+      return p;
     }
   return 0;
 }
 
-/* Sliding-window: keep at most max_num_ref short-term references. */
-static void dpb_slide(struct h264_decoder *d)
+static int max_frame_num(struct h264_decoder *d) { return 1 << d->cur_sps->log2_max_frame_num; }
+
+static int frame_num_wrap(struct h264_decoder *d, const h264_pic *p)
 {
-  int nref = 0, i, oldest = -1, oldest_num = 0;
-  int maxr = d->cur_sps->max_num_ref_frames;
-  if (maxr < 1)
-    maxr = 1;
-  for (i = 0; i < d->dpb_size; i++)
-    if (d->dpb[i].used && d->dpb[i].is_ref)
-      nref++;
-  while (nref > maxr) {
-    oldest = -1;
-    for (i = 0; i < d->dpb_size; i++) {
-      if (!d->dpb[i].used || !d->dpb[i].is_ref)
-        continue;
-      if (oldest < 0 || d->dpb[i].frame_num < oldest_num) {
-        oldest = i;
-        oldest_num = d->dpb[i].frame_num;
-      }
-    }
-    if (oldest < 0)
-      break;
-    d->dpb[oldest].is_ref = 0;
-    if (!d->dpb[oldest].needed_output && &d->dpb[oldest] != d->out)
-      d->dpb[oldest].used = 0;
-    nref--;
-  }
+  return p->frame_num > d->cur_frame_num ? p->frame_num - max_frame_num(d) : p->frame_num;
 }
 
-static void dpb_clear_refs(struct h264_decoder *d)
+/* ---- output ordering ------------------------------------------------------
+ */
+static int waiting_count(struct h264_decoder *d)
 {
+  int i, n = 0;
+  for (i = 0; i < d->dpb_size; i++)
+    n += d->dpb[i].used && d->dpb[i].out == 1;
+  return n;
+}
+
+/* Move the waiting picture with the smallest POC to the caller's queue. */
+static int bump_one(struct h264_decoder *d)
+{
+  h264_pic *best = 0;
   int i;
   for (i = 0; i < d->dpb_size; i++) {
-    d->dpb[i].is_ref = 0;
-    if (d->dpb[i].used && !d->dpb[i].needed_output && &d->dpb[i] != d->out)
-      d->dpb[i].used = 0;
+    h264_pic *p = &d->dpb[i];
+    if (p->used && p->out == 1 && (!best || p->poc < best->poc))
+      best = p;
+  }
+  if (!best || d->outq_n >= (int)(sizeof d->outq / sizeof d->outq[0]))
+    return 0;
+  best->out = 2;
+  d->outq[d->outq_n++] = best;
+  return 1;
+}
+
+static void flush_output(struct h264_decoder *d)
+{
+  while (bump_one(d)) {
   }
 }
 
-/* Build reference list 0 for a P slice: short-term refs by descending FrameNum.
- */
-void h264_build_ref_list0(struct h264_decoder *d)
+static int occupied(struct h264_decoder *d)
 {
-  int i, j, max_fn = 1 << d->cur_sps->log2_max_frame_num;
-  d->nref0 = 0;
-  for (i = 0; i < d->dpb_size; i++) {
-    if (!d->dpb[i].used || !d->dpb[i].is_ref)
-      continue;
-    if (d->nref0 < 32)
-      d->ref0[d->nref0++] = &d->dpb[i];
-  }
-  /* Sort by descending FrameNumWrap (PicNum) relative to the current frame. */
-  for (i = 0; i < d->nref0; i++)
-    for (j = i + 1; j < d->nref0; j++) {
-      int a = d->ref0[i]->frame_num, b = d->ref0[j]->frame_num;
-      if (a > d->cur_frame_num)
-        a -= max_fn;
-      if (b > d->cur_frame_num)
-        b -= max_fn;
-      if (b > a) {
-        h264_pic *t = d->ref0[i];
-        d->ref0[i] = d->ref0[j];
-        d->ref0[j] = t;
+  int i, n = 0;
+  for (i = 0; i < d->dpb_size; i++)
+    n += d->dpb[i].used && (d->dpb[i].ref || d->dpb[i].out == 1);
+  return n;
+}
+
+static h264_pic *pop_output(struct h264_decoder *d)
+{
+  h264_pic *p;
+  int i;
+  if (d->outq_n == 0)
+    return 0;
+  p = d->outq[0];
+  for (i = 1; i < d->outq_n; i++)
+    d->outq[i - 1] = d->outq[i];
+  d->outq_n--;
+  p->out = 0;
+  d->out = p;
+  d->out_type = p->slice_type;
+  return p;
+}
+
+static void release_out(struct h264_decoder *d)
+{
+  h264_pic *p = d->out;
+  d->out = 0;
+  if (p)
+    slot_release(d, p);
+}
+
+/* ---- reference marking (8.2.5) --------------------------------------------
+ */
+static void unmark(struct h264_decoder *d, h264_pic *p)
+{
+  p->ref = 0;
+  slot_release(d, p);
+}
+
+static void sliding_window(struct h264_decoder *d)
+{
+  int maxr = d->cur_sps->max_num_ref_frames < 1 ? 1 : d->cur_sps->max_num_ref_frames;
+  for (;;) {
+    int i, nshort = 0, nlong = 0, oldest = -1, oldest_w = 0;
+    for (i = 0; i < d->dpb_size; i++) {
+      h264_pic *p = &d->dpb[i];
+      if (!p->used || p == d->cur)
+        continue;
+      if (p->ref == 1) {
+        int w = frame_num_wrap(d, p);
+        nshort++;
+        if (oldest < 0 || w < oldest_w) {
+          oldest = i;
+          oldest_w = w;
+        }
+      } else if (p->ref == 2) {
+        nlong++;
       }
     }
+    if (nshort + nlong < maxr || oldest < 0)
+      return;
+    unmark(d, &d->dpb[oldest]);
+  }
 }
 
-/* ---- POC (type 0; types 1/2 approximated — output is decode order anyway) ---
+static h264_pic *find_short(struct h264_decoder *d, int picnum)
+{
+  int i;
+  for (i = 0; i < d->dpb_size; i++)
+    if (d->dpb[i].used && d->dpb[i].ref == 1 && d->dpb[i].pic_id != d->cur->pic_id &&
+        frame_num_wrap(d, &d->dpb[i]) == picnum)
+      return &d->dpb[i];
+  return 0;
+}
+
+static void free_long_idx(struct h264_decoder *d, int idx, const h264_pic *keep)
+{
+  int i;
+  for (i = 0; i < d->dpb_size; i++)
+    if (d->dpb[i].used && d->dpb[i].ref == 2 && d->dpb[i].long_idx == idx && &d->dpb[i] != keep)
+      unmark(d, &d->dpb[i]);
+}
+
+static void run_mmco(struct h264_decoder *d)
+{
+  const h264_slice *sh = &d->pic_sh;
+  h264_pic *c = d->cur, *p;
+  int k, i;
+  for (k = 0; k < sh->mmco_n; k++) {
+    int a = sh->mmco_a[k], b = sh->mmco_b[k];
+    switch (sh->mmco_op[k]) {
+    case 1:
+      p = find_short(d, d->cur_frame_num - (a + 1));
+      if (p)
+        unmark(d, p);
+      break;
+    case 2:
+      for (i = 0; i < d->dpb_size; i++)
+        if (d->dpb[i].used && d->dpb[i].ref == 2 && d->dpb[i].long_idx == a)
+          unmark(d, &d->dpb[i]);
+      break;
+    case 3:
+      p = find_short(d, d->cur_frame_num - (a + 1));
+      if (p) {
+        free_long_idx(d, b, p);
+        p->ref = 2;
+        p->long_idx = b;
+      }
+      break;
+    case 4:
+      d->max_long_idx = a - 1;
+      for (i = 0; i < d->dpb_size; i++)
+        if (d->dpb[i].used && d->dpb[i].ref == 2 && d->dpb[i].long_idx > d->max_long_idx)
+          unmark(d, &d->dpb[i]);
+      break;
+    case 5:
+      for (i = 0; i < d->dpb_size; i++)
+        if (d->dpb[i].used && &d->dpb[i] != c && d->dpb[i].ref)
+          unmark(d, &d->dpb[i]);
+      d->max_long_idx = -1;
+      d->mmco5 = 1;
+      break;
+    case 6:
+      free_long_idx(d, a, c);
+      c->ref = 2;
+      c->long_idx = a;
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+static void mark_current(struct h264_decoder *d)
+{
+  h264_pic *c = d->cur;
+  const h264_slice *sh = &d->pic_sh;
+  int i;
+  d->mmco5 = 0;
+  if (!d->cur_is_ref) {
+    c->ref = 0;
+    return;
+  }
+  if (sh->idr) {
+    for (i = 0; i < d->dpb_size; i++)
+      if (d->dpb[i].used && &d->dpb[i] != c)
+        unmark(d, &d->dpb[i]);
+    if (sh->long_term_ref_flag) {
+      c->ref = 2;
+      c->long_idx = 0;
+      d->max_long_idx = 0;
+    } else {
+      c->ref = 1;
+      d->max_long_idx = -1;
+    }
+    return;
+  }
+  c->ref = 0;
+  if (sh->adaptive_marking)
+    run_mmco(d);
+  else
+    sliding_window(d);
+  if (c->ref == 0)
+    c->ref = 1;
+}
+
+/* ---- POC (8.2.1) ----------------------------------------------------------
  */
 static void compute_poc(struct h264_decoder *d, const h264_slice *sh)
 {
   h264_sps *s = d->cur_sps;
+  int maxfn = max_frame_num(d), top, bot;
+
   if (s->poc_type == 0) {
     int max_lsb = 1 << s->log2_max_poc_lsb, msb;
     int prev_msb = d->prev_poc_msb, prev_lsb = d->prev_poc_lsb;
@@ -195,14 +345,324 @@ static void compute_poc(struct h264_decoder *d, const h264_slice *sh)
       msb = prev_msb - max_lsb;
     else
       msb = prev_msb;
-    d->cur_poc = msb + sh->poc_lsb;
-    if (sh->nal_ref_idc) {
-      d->prev_poc_msb = msb;
-      d->prev_poc_lsb = sh->poc_lsb;
-    }
+    d->cur_poc_msb = msb;
+    top = msb + sh->poc_lsb;
+    bot = top + sh->delta_poc_bottom;
   } else {
-    d->cur_poc = 2 * d->cur_frame_num; /* monotone in decode order for I/P */
+    int off = d->cur_is_idr
+                  ? 0
+                  : (d->prev_frame_num > sh->frame_num ? d->prev_frame_num_offset + maxfn : d->prev_frame_num_offset);
+    d->cur_fn_offset = off;
+    if (s->poc_type == 1) {
+      int n = s->num_ref_frames_in_poc_cycle, abs_fn = n ? off + sh->frame_num : 0, expected = 0;
+      if (!sh->nal_ref_idc && abs_fn > 0)
+        abs_fn--;
+      if (abs_fn > 0) {
+        int cycle = (abs_fn - 1) / n, in_cycle = (abs_fn - 1) % n, delta = 0, i;
+        for (i = 0; i < n; i++)
+          delta += s->offset_for_ref_frame[i];
+        expected = cycle * delta;
+        for (i = 0; i <= in_cycle; i++)
+          expected += s->offset_for_ref_frame[i];
+      }
+      if (!sh->nal_ref_idc)
+        expected += s->offset_for_non_ref_pic;
+      top = expected + sh->delta_poc[0];
+      bot = top + s->offset_for_top_to_bottom + sh->delta_poc[1];
+    } else {
+      int t = d->cur_is_idr ? 0 : 2 * (off + sh->frame_num) - (sh->nal_ref_idc ? 0 : 1);
+      top = bot = t;
+    }
   }
+  d->cur_top_poc = top;
+  d->cur_bot_poc = bot;
+  d->cur_poc = top < bot ? top : bot;
+}
+
+/* ---- picture assembly -----------------------------------------------------
+ */
+/* Finalise the current picture: deblock, edge-extend, mark references, update
+ * the POC/frame_num history, and place it in the output order. */
+static void finish_picture(struct h264_decoder *d)
+{
+  h264_pic *c = d->cur;
+  int cap_need;
+  if (!d->have_pic)
+    return;
+  h264_deblock_picture(d);
+  pic_extend(d, c);
+
+  mark_current(d);
+  if (d->mmco5) {
+    int temp = d->cur_top_poc < d->cur_bot_poc ? d->cur_top_poc : d->cur_bot_poc;
+    c->frame_num = 0;
+    d->cur_top_poc -= temp;
+    d->cur_bot_poc -= temp;
+    c->poc = d->cur_top_poc < d->cur_bot_poc ? d->cur_top_poc : d->cur_bot_poc;
+  }
+  if (d->cur_sps->poc_type == 0) {
+    if (d->cur_is_ref) {
+      d->prev_poc_msb = d->mmco5 ? 0 : d->cur_poc_msb;
+      d->prev_poc_lsb = d->mmco5 ? d->cur_top_poc : d->pic_sh.poc_lsb;
+    }
+  }
+  d->prev_frame_num = d->mmco5 ? 0 : d->cur_frame_num;
+  d->prev_frame_num_offset = d->mmco5 ? 0 : d->cur_fn_offset;
+  if (d->cur_is_ref)
+    d->prev_ref_frame_num = d->mmco5 ? 0 : d->cur_frame_num;
+  d->seq_started = 1;
+
+  if (d->cur_is_idr || d->mmco5)
+    flush_output(d);
+  c->out = 1;
+  d->have_pic = 0;
+  d->cur = 0;
+
+  cap_need = d->cur_sps->num_reorder_frames;
+  while (cap_need >= 0 && waiting_count(d) > cap_need)
+    if (!bump_one(d))
+      break;
+  while (occupied(d) > d->dpb_cap)
+    if (!bump_one(d))
+      break;
+}
+
+static void mot_reset(h264_pic *p, int n)
+{
+  int i;
+  memset(p->mot, 0, (unsigned)n * sizeof(h264_mot));
+  for (i = 0; i < n; i++)
+    memset(p->mot[i].refidx, -1, sizeof p->mot[i].refidx);
+}
+
+/* Insert a "non-existing" frame for each skipped frame_num (8.2.5.2) so the
+ * sliding window and later reference lists behave as the encoder expects. */
+static int fill_frame_num_gap(struct h264_decoder *d, int frame_num)
+{
+  int maxfn = max_frame_num(d), unused = (d->prev_ref_frame_num + 1) % maxfn, guard = 0;
+  h264_pic *last = 0;
+  int i;
+  while (unused != frame_num && guard++ < maxfn) {
+    h264_pic *p;
+    last = 0;
+    for (i = 0; i < d->dpb_size; i++)
+      if (d->dpb[i].used && d->dpb[i].ref && !d->dpb[i].non_existing && (!last || d->dpb[i].pic_id > last->pic_id))
+        last = &d->dpb[i];
+    p = dpb_get_free(d);
+    if (!p)
+      return H264_ENOMEM;
+    p->frame_num = unused;
+    p->pic_id = ++d->pic_counter;
+    p->non_existing = 1;
+    p->poc = last ? last->poc : 0;
+    p->slice_type = H264_SLICE_P;
+    if (last) {
+      memcpy(p->base, last->base,
+             (unsigned)d->ystride * (d->yh + 2 * H264_BORDER) + 2 * (unsigned)d->cstride * (d->ch + 2 * H264_BORDER));
+      memcpy(p->mot, last->mot, (unsigned)d->mb_w * d->mb_h * sizeof(h264_mot));
+    } else {
+      mot_reset(p, d->mb_w * d->mb_h);
+    }
+    d->cur_frame_num = unused;
+    d->cur = p;
+    sliding_window(d);
+    d->cur = 0;
+    p->ref = 1;
+    d->prev_ref_frame_num = unused;
+    d->prev_frame_num = unused;
+    unused = (unused + 1) % maxfn;
+  }
+  return H264_OK;
+}
+
+/* h264.c-internal: called by slice.c when a slice with first_mb==0 opens a new
+ * picture. Allocates cur and resets the per-picture MB info. Returns 0/err. */
+int h264_start_picture(struct h264_decoder *d, const h264_slice *sh, int nal_ref_idc)
+{
+  h264_pic *p;
+  int i, n;
+  if (sh->idr)
+    d->seq_started = 0;
+  if (d->seq_started && !sh->idr && sh->frame_num != d->prev_ref_frame_num &&
+      sh->frame_num != (d->prev_ref_frame_num + 1) % max_frame_num(d)) {
+    int rc = fill_frame_num_gap(d, sh->frame_num);
+    if (rc != H264_OK)
+      return rc;
+  }
+  d->cur_frame_num = sh->frame_num;
+  d->cur_is_idr = sh->idr;
+  d->cur_slice_type = sh->slice_type;
+  d->cur_is_ref = nal_ref_idc != 0;
+  d->pic_sh = *sh;
+  compute_poc(d, sh);
+  p = dpb_get_free(d);
+  if (!p)
+    return H264_ENOMEM;
+  p->frame_num = sh->frame_num;
+  p->poc = d->cur_poc;
+  p->pic_id = ++d->pic_counter;
+  p->slice_type = sh->slice_type;
+  d->cur = p;
+  d->have_pic = 1;
+  n = d->mb_w * d->mb_h;
+  memset(d->mbs, 0, (unsigned)n * sizeof(h264_mb));
+  for (i = 0; i < n; i++)
+    d->mbs[i].slice_id = -1;
+  mot_reset(p, n);
+  return H264_OK;
+}
+
+/* ---- reference picture lists (8.2.4) --------------------------------------
+ */
+static void sort_pics(h264_pic **v, int n, int *key, int descending)
+{
+  int i, j;
+  for (i = 1; i < n; i++) {
+    h264_pic *t = v[i];
+    int kt = key[i];
+    j = i - 1;
+    while (j >= 0 && (descending ? key[j] < kt : key[j] > kt)) {
+      v[j + 1] = v[j];
+      key[j + 1] = key[j];
+      j--;
+    }
+    v[j + 1] = t;
+    key[j + 1] = kt;
+  }
+}
+
+static int init_list(struct h264_decoder *d, int list, h264_pic **out)
+{
+  h264_pic *sv[H264_MAX_REFS + 2], *lv[H264_MAX_REFS + 2], *lo[H264_MAX_REFS + 2], *hi[H264_MAX_REFS + 2];
+  int sk[H264_MAX_REFS + 2], lk[H264_MAX_REFS + 2], lok[H264_MAX_REFS + 2], hik[H264_MAX_REFS + 2];
+  int ns = 0, nl = 0, nlo = 0, nhi = 0, i, n = 0;
+  int b = d->sh.slice_type == H264_SLICE_B;
+  for (i = 0; i < d->dpb_size; i++) {
+    h264_pic *p = &d->dpb[i];
+    if (!p->used || p == d->cur || !p->ref)
+      continue;
+    if (p->ref == 2) {
+      lv[nl] = p;
+      lk[nl++] = p->long_idx;
+    } else if (!b) {
+      sv[ns] = p;
+      sk[ns++] = frame_num_wrap(d, p);
+    } else if (p->poc <= d->cur_poc) {
+      lo[nlo] = p;
+      lok[nlo++] = p->poc;
+    } else {
+      hi[nhi] = p;
+      hik[nhi++] = p->poc;
+    }
+  }
+  sort_pics(lv, nl, lk, 0);
+  if (!b) {
+    sort_pics(sv, ns, sk, 1);
+    for (i = 0; i < ns; i++)
+      out[n++] = sv[i];
+  } else {
+    sort_pics(lo, nlo, lok, 1);
+    sort_pics(hi, nhi, hik, 0);
+    if (list == 0) {
+      for (i = 0; i < nlo; i++)
+        out[n++] = lo[i];
+      for (i = 0; i < nhi; i++)
+        out[n++] = hi[i];
+    } else {
+      for (i = 0; i < nhi; i++)
+        out[n++] = hi[i];
+      for (i = 0; i < nlo; i++)
+        out[n++] = lo[i];
+    }
+  }
+  for (i = 0; i < nl; i++)
+    out[n++] = lv[i];
+  return n;
+}
+
+static void modify_list(struct h264_decoder *d, int list, int active)
+{
+  const h264_slice *sh = &d->sh;
+  h264_pic **rl = d->reflist[list];
+  int maxfn = max_frame_num(d), pred = d->cur_frame_num, idx = 0, k, i;
+  for (k = 0; k < sh->rm_n[list] && idx < active; k++) {
+    int idc = sh->rm_idc[list][k], val = sh->rm_val[list][k];
+    h264_pic *pic = 0;
+    if (idc < 2) {
+      int no_wrap, picnum;
+      if (idc == 0) {
+        no_wrap = pred - (val + 1);
+        if (no_wrap < 0)
+          no_wrap += maxfn;
+      } else {
+        no_wrap = pred + (val + 1);
+        if (no_wrap >= maxfn)
+          no_wrap -= maxfn;
+      }
+      pred = no_wrap;
+      picnum = no_wrap > d->cur_frame_num ? no_wrap - maxfn : no_wrap;
+      for (i = 0; i < d->dpb_size; i++)
+        if (d->dpb[i].used && d->dpb[i].ref == 1 && &d->dpb[i] != d->cur && frame_num_wrap(d, &d->dpb[i]) == picnum) {
+          pic = &d->dpb[i];
+          break;
+        }
+    } else if (idc == 2) {
+      for (i = 0; i < d->dpb_size; i++)
+        if (d->dpb[i].used && d->dpb[i].ref == 2 && d->dpb[i].long_idx == val) {
+          pic = &d->dpb[i];
+          break;
+        }
+    }
+    if (!pic)
+      continue;
+    for (i = active; i > idx; i--)
+      rl[i] = rl[i - 1];
+    rl[idx++] = pic;
+    {
+      int n = idx;
+      for (i = idx; i <= active; i++)
+        if (rl[i] != pic)
+          rl[n++] = rl[i];
+    }
+  }
+}
+
+int h264_build_ref_lists(struct h264_decoder *d)
+{
+  int nlists = d->sh.slice_type == H264_SLICE_B ? 2 : d->sh.slice_type == H264_SLICE_I ? 0 : 1;
+  int list, i, full[2] = {0, 0};
+  h264_pic *tmp[2][H264_MAX_REFS + 2];
+
+  d->nref[0] = d->nref[1] = 0;
+  for (list = 0; list < nlists; list++)
+    full[list] = init_list(d, list, tmp[list]);
+  if (nlists == 2 && full[1] > 1 && full[0] == full[1]) {
+    for (i = 0; i < full[0] && tmp[0][i] == tmp[1][i]; i++) {
+    }
+    if (i == full[0]) {
+      h264_pic *t = tmp[1][0];
+      tmp[1][0] = tmp[1][1];
+      tmp[1][1] = t;
+    }
+  }
+  for (list = 0; list < nlists; list++) {
+    int active = d->sh.num_ref_idx[list];
+    h264_pic *fallback = 0;
+    memset(d->reflist[list], 0, sizeof d->reflist[list]);
+    for (i = 0; i < full[list] && i < active; i++)
+      d->reflist[list][i] = tmp[list][i];
+    modify_list(d, list, active);
+    for (i = 0; i < active; i++)
+      if (d->reflist[list][i] && !fallback)
+        fallback = d->reflist[list][i];
+    if (!fallback)
+      return H264_EFORMAT;
+    for (i = 0; i < active; i++)
+      if (!d->reflist[list][i])
+        d->reflist[list][i] = fallback;
+    d->nref[list] = active;
+  }
+  return H264_OK;
 }
 
 /* ---- NAL iteration (Annex-B) ----------------------------------------------
@@ -238,62 +698,42 @@ static int next_nal(struct h264_decoder *d, const unsigned char **nal, unsigned 
   return 1;
 }
 
-/* ---- picture assembly -----------------------------------------------------
- */
-/* Finalise the current picture: deblock, edge-extend, run the sliding window,
- * and mark it ready for output. */
-static void finish_picture(struct h264_decoder *d)
+static int level_dpb_mbs(const h264_sps *s)
 {
-  if (!d->have_pic)
-    return;
-  h264_deblock_picture(d);
-  pic_extend(d, d->cur);
-  /* The previous output has been consumed by the caller; release its slot. */
-  if (d->out && d->out != d->cur) {
-    d->out->needed_output = 0;
-    if (!d->out->is_ref)
-      d->out->used = 0;
+  switch (s->level_idc) {
+  case 9:
+  case 10:
+    return 396;
+  case 11:
+    return ((s->constraint_flags & 0x10) && (s->profile_idc == 66 || s->profile_idc == 77 || s->profile_idc == 88))
+               ? 396
+               : 900;
+  case 12:
+  case 13:
+  case 20:
+    return 2376;
+  case 21:
+    return 4752;
+  case 22:
+  case 30:
+    return 8100;
+  case 31:
+    return 18000;
+  case 32:
+    return 20480;
+  case 40:
+  case 41:
+    return 32768;
+  case 42:
+    return 34816;
+  case 50:
+    return 110400;
+  case 51:
+  case 52:
+    return 184320;
+  default:
+    return 696320;
   }
-  /* Only now does the picture become a reference (never during its own decode).
-   */
-  d->cur->is_ref = d->cur_is_ref;
-  if (d->cur->is_ref)
-    dpb_slide(d);
-  d->out = d->cur;
-  d->out_type = d->cur->slice_type;
-  d->cur->needed_output = 1;
-  d->have_pic = 0;
-}
-
-/* h264.c-internal: called by slice.c when a slice with first_mb==0 opens a new
- * picture. Allocates cur and resets the per-picture MB info. Returns 0/err. */
-int h264_start_picture(struct h264_decoder *d, const h264_slice *sh, int nal_ref_idc)
-{
-  h264_pic *p;
-  d->cur_frame_num = sh->frame_num;
-  d->cur_is_idr = sh->idr;
-  d->cur_slice_type = sh->slice_type;
-  if (sh->idr)
-    dpb_clear_refs(d);
-  compute_poc(d, sh);
-  p = dpb_get_free(d);
-  if (!p)
-    return H264_ENOMEM;
-  p->frame_num = sh->frame_num;
-  p->poc = d->cur_poc;
-  p->slice_type = sh->slice_type;
-  p->is_ref = 0; /* not a reference until fully decoded */
-  d->cur_is_ref = nal_ref_idc != 0;
-  p->needed_output = 0;
-  d->cur = p;
-  d->have_pic = 1;
-  memset(d->mbs, 0, (unsigned)d->mb_w * d->mb_h * sizeof(h264_mb));
-  {
-    int i;
-    for (i = 0; i < d->mb_w * d->mb_h; i++)
-      d->mbs[i].slice_id = -1;
-  }
-  return H264_OK;
 }
 
 /* Set the coded/cropped geometry once the active SPS is known. */
@@ -312,26 +752,27 @@ static int setup_geometry(struct h264_decoder *d, h264_sps *s)
   d->width = d->yw - s->crop_l - s->crop_r;
   d->height = d->yh - s->crop_t - s->crop_b;
   if (!d->mbs) {
-    int i;
+    int cap = level_dpb_mbs(s) / (s->mb_w * s->mb_h), minc = s->max_num_ref_frames < 1 ? 1 : s->max_num_ref_frames;
+    if (s->max_dec_frame_buffering >= 0)
+      cap = s->max_dec_frame_buffering;
+    if (cap < minc)
+      cap = minc;
+    if (cap > 16)
+      cap = 16;
     d->mbs = (h264_mb *)malloc((unsigned)d->mb_w * d->mb_h * sizeof(h264_mb));
     if (!d->mbs)
       return H264_ENOMEM;
-    d->dpb_size = s->max_num_ref_frames + 4;
-    if (d->dpb_size < 6)
-      d->dpb_size = 6;
-    if (d->dpb_size > 34)
-      d->dpb_size = 34;
-    d->dpb = (h264_pic *)calloc(d->dpb_size, sizeof(h264_pic));
+    d->dpb_cap = cap;
+    d->dpb_size = 2 * cap + 2;
+    d->dpb = (h264_pic *)calloc((unsigned)d->dpb_size, sizeof(h264_pic));
     if (!d->dpb)
       return H264_ENOMEM;
-    for (i = 0; i < d->dpb_size; i++)
-      d->dpb[i].used = 0;
+    d->max_long_idx = -1;
   }
   return H264_OK;
 }
 
-/* Route one NAL. Returns 1 if a finished picture became ready (in d->out), 0 if
- * not, or a negative H264_E* on error. */
+/* Route one NAL. Returns 0, or a negative H264_E* on error. */
 static int process_nal(struct h264_decoder *d, const unsigned char *nal, unsigned nlen)
 {
   int type, ref_idc, rc;
@@ -355,9 +796,7 @@ static int process_nal(struct h264_decoder *d, const unsigned char *nal, unsigne
   if (type == 1 || type == 5) {
     int emitted = 0;
     rc = h264_decode_slice_dispatch(d, d->rbsp, rlen, type, ref_idc, &emitted);
-    if (rc != H264_OK)
-      return rc;
-    return emitted;
+    return rc;
   }
   return 0; /* SEI, AUD, filler, etc. */
 }
@@ -368,22 +807,25 @@ int h264_decode_frame(h264_decoder *d)
   unsigned nlen;
   if (!d)
     return H264_EFORMAT;
-  if (d->eos)
-    return H264_EEOF;
+  release_out(d);
   for (;;) {
+    if (d->outq_n) {
+      pop_output(d);
+      return H264_OK;
+    }
+    if (d->eos)
+      return H264_EEOF;
     if (!next_nal(d, &nal, &nlen)) {
       d->eos = 1;
-      if (d->have_pic) {
-        finish_picture(d);
-        return H264_OK;
-      }
-      return H264_EEOF;
+      finish_picture(d);
+      flush_output(d);
+      continue;
     }
-    int r = process_nal(d, nal, nlen);
-    if (r < 0)
-      return r;
-    if (r == 1)
-      return H264_OK;
+    {
+      int r = process_nal(d, nal, nlen);
+      if (r < 0)
+        return r;
+    }
   }
 }
 
@@ -399,8 +841,7 @@ int h264_ensure_geometry(struct h264_decoder *d, h264_pps *pps)
   return setup_geometry(d, s);
 }
 
-/* slice.c calls this before decoding a picture's first slice's data, to close
- * any open picture and emit it. Returns 1 if a picture was emitted. */
+/* slice.c calls this before opening a new picture, to finish the previous one. */
 int h264_close_open_picture(struct h264_decoder *d)
 {
   if (!d->have_pic)
@@ -557,9 +998,10 @@ int h264_decoder_open_avcc(const unsigned char *avcc, unsigned len, h264_decoder
 int h264_decode_au(h264_decoder *d, const unsigned char *au, unsigned len, int nal_length_size)
 {
   unsigned p = 0;
-  int emitted = 0, nls = nal_length_size > 0 ? nal_length_size : d->nal_length_size;
+  int nls = nal_length_size > 0 ? nal_length_size : d->nal_length_size;
   if (!d || !au || nls < 1 || nls > 4)
     return H264_EFORMAT;
+  release_out(d);
   while (p + (unsigned)nls <= len) {
     unsigned l = 0, i;
     int r;
@@ -571,22 +1013,26 @@ int h264_decode_au(h264_decoder *d, const unsigned char *au, unsigned len, int n
     r = process_nal(d, au + p, l);
     if (r < 0)
       return r;
-    if (r == 1)
-      emitted = 1;
     p += l;
   }
-  return emitted ? H264_OK : H264_EAGAIN;
+  finish_picture(d);
+  if (!d->outq_n)
+    return H264_EAGAIN;
+  pop_output(d);
+  return H264_OK;
 }
 
 int h264_flush(h264_decoder *d)
 {
   if (!d)
     return H264_EEOF;
-  if (d->have_pic) {
-    finish_picture(d);
-    return H264_OK;
-  }
-  return H264_EEOF;
+  release_out(d);
+  finish_picture(d);
+  flush_output(d);
+  if (!d->outq_n)
+    return H264_EEOF;
+  pop_output(d);
+  return H264_OK;
 }
 
 void h264_decoder_close(h264_decoder *d)
@@ -595,8 +1041,10 @@ void h264_decoder_close(h264_decoder *d)
   if (!d)
     return;
   if (d->dpb) {
-    for (i = 0; i < d->dpb_size; i++)
+    for (i = 0; i < d->dpb_size; i++) {
       free(d->dpb[i].base);
+      free(d->dpb[i].mot);
+    }
     free(d->dpb);
   }
   free(d->mbs);

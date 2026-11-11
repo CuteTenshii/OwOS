@@ -137,6 +137,51 @@ int h264_cabac_mb_type_p(h264_cabac *c)
   return h264_cabac_decision(c, 17) ? 1 : 2;
 }
 
+int h264_cabac_mb_type_b(h264_cabac *c, int inc)
+{
+  int bits;
+  if (!h264_cabac_decision(c, 27 + inc))
+    return 0;
+  if (!h264_cabac_decision(c, 27 + 3))
+    return 1 + h264_cabac_decision(c, 27 + 5);
+  bits = h264_cabac_decision(c, 27 + 4) << 3;
+  bits |= h264_cabac_decision(c, 27 + 5) << 2;
+  bits |= h264_cabac_decision(c, 27 + 5) << 1;
+  bits |= h264_cabac_decision(c, 27 + 5);
+  if (bits < 8)
+    return bits + 3;
+  if (bits == 13) {
+    if (!h264_cabac_decision(c, 32))
+      return 23;
+    if (h264_cabac_terminate(c))
+      return 23 + 25;
+    return 23 + mb_type_i16(c, 32);
+  }
+  if (bits == 14)
+    return 11;
+  if (bits == 15)
+    return 22;
+  bits = (bits << 1) | h264_cabac_decision(c, 27 + 5);
+  return bits - 4;
+}
+
+int h264_cabac_sub_mb_type_b(h264_cabac *c)
+{
+  int type = 3;
+  if (!h264_cabac_decision(c, 36))
+    return 0;
+  if (!h264_cabac_decision(c, 37))
+    return 1 + h264_cabac_decision(c, 39);
+  if (h264_cabac_decision(c, 38)) {
+    if (h264_cabac_decision(c, 39))
+      return 11 + h264_cabac_decision(c, 39);
+    type += 4;
+  }
+  type += 2 * h264_cabac_decision(c, 39);
+  type += h264_cabac_decision(c, 39);
+  return type;
+}
+
 int h264_cabac_sub_mb_type(h264_cabac *c)
 {
   if (h264_cabac_decision(c, 21))
@@ -203,27 +248,42 @@ int h264_cabac_rem_intra4x4(h264_cabac *c)
   return v;
 }
 
+static const unsigned char sig_off_8x8[63] = {
+    0, 1, 2,  3,  4,  5,  5, 4, 4, 3, 3,  4,  4, 4, 5, 5,  4,  4,  4,  4, 3, 3,  6,  7, 7,  7,  8,  9,  10, 9,  8, 7,
+    7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12};
+static const unsigned char last_off_8x8[63] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2,
+                                               2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4,
+                                               4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8};
+
 /* One residual block. `cat` is ctxBlockCat (0 Intra16x16 DC, 1 Intra16x16 AC,
- * 2 luma 4x4, 3 chroma DC, 4 chroma AC); coeff[0..max-1] receives the levels in
- * scan order. Returns the number of non-zero coefficients. */
+ * 2 luma 4x4, 3 chroma DC, 4 chroma AC, 5 luma 8x8, which has no coded_block_flag);
+ * coeff[0..max-1] receives the levels in scan order. Returns the number of
+ * non-zero coefficients. */
 int h264_cabac_residual(h264_cabac *c, int cat, int cbf_inc, int max, int *coeff)
 {
   static const unsigned char cbf_off[5] = {0, 4, 8, 12, 16};
   static const unsigned char sig_off[5] = {0, 15, 29, 44, 47};
   static const unsigned char abs_off[5] = {0, 10, 20, 30, 39};
-  int sig_base = 105 + sig_off[cat], last_base = 166 + sig_off[cat], abs_base = 227 + abs_off[cat];
-  int pos[16], n = 0, i, k, eq1 = 0, gt1 = 0, last = 0;
+  int is8 = cat == 5;
+  int sig_base = is8 ? 402 : 105 + sig_off[cat], last_base = is8 ? 417 : 166 + sig_off[cat];
+  int abs_base = is8 ? 426 : 227 + abs_off[cat];
+  int pos[64], n = 0, i, k, eq1 = 0, gt1 = 0, last = 0;
 
   for (i = 0; i < max; i++)
     coeff[i] = 0;
-  if (!h264_cabac_decision(c, 85 + cbf_off[cat] + cbf_inc))
+  if (!is8 && !h264_cabac_decision(c, 85 + cbf_off[cat] + cbf_inc))
     return 0;
 
   for (i = 0; i < max - 1 && !last; i++) {
     int inc = cat == 3 ? (i < 2 ? i : 2) : i;
+    int linc = inc;
+    if (is8) {
+      inc = sig_off_8x8[i];
+      linc = last_off_8x8[i];
+    }
     if (h264_cabac_decision(c, sig_base + inc)) {
       pos[n++] = i;
-      last = h264_cabac_decision(c, last_base + inc);
+      last = h264_cabac_decision(c, last_base + linc);
     }
   }
   if (!last)

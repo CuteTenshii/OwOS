@@ -10,16 +10,16 @@
  * untrusted, so a malformed or hostile stream can only fault this process,
  * never the kernel. Every field read is bounds-checked against the RBSP length.
  *
- * Scope: Constrained Baseline and Main (without B slices) profile, with CAVLC
- * or CABAC entropy coding. That is: I and P slices; Intra 4x4 / Intra 16x16 /
- * chroma intra prediction; P-macroblock inter prediction with quarter-pel luma
- * (6-tap) + 1/8-pel chroma interpolation, 16x16/16x8/8x16/8x8 partitions and 8x8
- * sub-partitions; the 4x4 integer transform with luma/chroma DC Hadamard; the
- * in-loop deblocking filter; and multi-frame reference management with
- * POC-based output reordering. Not decoded (rejected with H264_EUNSUP): B
- * slices, weighted prediction, the 8x8 transform and scaling lists (High
- * profile), interlaced/field coding, and multiple slice groups (FMO/ASO). 4:2:0
- * chroma only.
+ * Scope: Baseline, Main and High profile progressive 4:2:0 8-bit video, with
+ * CAVLC or CABAC entropy coding. That is: I, P and B slices; Intra 4x4 / 8x8 /
+ * 16x16 / chroma intra prediction; inter prediction with quarter-pel luma
+ * (6-tap) + 1/8-pel chroma interpolation, all partition sizes, multiple
+ * references (short- and long-term, list modification), explicit and implicit
+ * weighted prediction, and spatial and temporal direct modes; the 4x4 and 8x8
+ * integer transforms with scaling matrices; the in-loop deblocking filter; and
+ * POC-based output reordering. Not decoded (rejected with H264_EUNSUP):
+ * interlaced / field / MBAFF coding, multiple slice groups (FMO/ASO), SP/SI
+ * slices, lossless (transform bypass), and non-4:2:0 or high-bit-depth video.
  *
  * Two front ends share one core:
  *   - h264_decoder_open() over a whole in-memory Annex-B elementary stream (00

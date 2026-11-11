@@ -1,25 +1,13 @@
-/* h264_test.c — host-side test for user/lib/h264 (the H.264 baseline decoder).
+/* h264_test.c — host-side test for user/lib/h264 (the H.264 decoder).
  *
  * Decodes an Annex-B H.264 elementary stream and compares each frame's YCbCr
- * planes against the ground truth ffmpeg produces from the same stream, asserting
- * a high PSNR (near-exact: the H.264 transform is integer, so a correct decode is
- * essentially bit-identical, but the deblocking/interpolation leave no tolerance
- * to speak of — a real bug craters the PSNR). Build the vectors, then run:
+ * planes against the ground truth ffmpeg produces from the same stream. H.264
+ * reconstruction is integer-exact, so every frame must match bit for bit (PSNR
+ * 99 dB). tests/h264_vectors.sh builds a set of libx264 streams and runs this:
  *
- *   ffmpeg -y -f lavfi -i testsrc=size=176x144:rate=25:duration=0.24 \
- *          -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p \
- *          -bsf:v h264_mp4toannexb -f h264 /tmp/h264_intra.264
- *   ffmpeg -y -i /tmp/h264_intra.264 -f rawvideo -pix_fmt yuv420p /tmp/h264_intra.yuv
- *   cc -std=c11 -Itests -Iuser/lib/h264 tests/h264_test.c user/lib/h264/*.c \
+ *   cc -std=c11 -Itests -Iuser/lib/h264 tests/h264_test.c user/lib/h264/<all .c> \
  *      -lm -o /tmp/h264_test
- *   /tmp/h264_test /tmp/h264_intra.264 /tmp/h264_intra.yuv 176 144
- *
- * CABAC vectors use the Main profile (no B slices, no weighted prediction) and are
- * kept under 16 frames per GOP; disable deblocking to compare bit-exactly:
- *   ffmpeg -y -f lavfi -i testsrc2=size=176x144:rate=25:duration=0.6 -c:v libx264 \
- *          -profile:v main -bf 0 -weightp 0 -g 15 -refs 3 -crf 22 \
- *          -x264-params no-deblock=1 -pix_fmt yuv420p \
- *          -bsf:v h264_mp4toannexb -f h264 /tmp/h264_cabac.264
+ *   /tmp/h264_test stream.264 truth.yuv 176 144
  */
 #include "h264.h"
 #include <math.h>
@@ -118,7 +106,7 @@ int main(int argc, char **argv)
     if (py < minp)
       minp = py;
     printf("frame %d [%c]  Y %.1f dB  Cb %.1f dB  Cr %.1f dB\n", fi, types[t >= 0 && t < 3 ? t : 2], py, pcb, pcr);
-    if (py < 40.0 || pcb < 40.0 || pcr < 40.0)
+    if (py < 99.0 || pcb < 99.0 || pcr < 99.0)
       fails++;
   }
 
@@ -129,6 +117,6 @@ int main(int argc, char **argv)
     printf("%d failure(s), min Y PSNR %.1f dB\n", fails, minp);
     return 1;
   }
-  printf("all h264 decoder frames within tolerance (min Y %.1f dB)\n", minp);
+  printf("all h264 decoder frames bit-exact (min Y %.1f dB)\n", minp);
   return 0;
 }

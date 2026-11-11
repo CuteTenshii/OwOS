@@ -79,9 +79,16 @@ static void pts_push(struct media_video *v, unsigned ms)
 static unsigned pts_pop(struct media_video *v)
 {
   unsigned ms;
+  unsigned i, min;
   if (v->pts_head == v->pts_tail)
     return v->frame_idx * 40u; /* fallback */
-  ms = v->pts_ms[v->pts_head];
+  /* Frames leave the decoder in presentation order, samples enter in decode order. */
+  min = v->pts_head;
+  for (i = v->pts_head; i != v->pts_tail; i = (i + 1) % PTS_FIFO)
+    if (v->pts_ms[i] < v->pts_ms[min])
+      min = i;
+  ms = v->pts_ms[min];
+  v->pts_ms[min] = v->pts_ms[v->pts_head];
   v->pts_head = (v->pts_head + 1) % PTS_FIFO;
   return ms;
 }

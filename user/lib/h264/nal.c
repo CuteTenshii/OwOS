@@ -4,9 +4,8 @@
  * 00 00 03 xx so the payload can never be mistaken for a start code.
  * h264_rbsp() copies a NAL into the decoder's scratch buffer, dropping those
  * emulation- prevention 03 bytes once, so the bit reader downstream sees clean
- * RBSP. The SPS/PPS parsers then read only the fields the baseline decoder
- * consumes and reject (H264_EUNSUP) any tool outside Constrained Baseline /
- * Baseline CAVLC.
+ * RBSP. The SPS/PPS parsers then read the fields the decoder consumes and
+ * reject (H264_EUNSUP) tools outside progressive 4:2:0 8-bit decoding.
  */
 #include "h264.h"
 #include "h264_priv.h"
@@ -37,12 +36,97 @@ unsigned h264_rbsp(struct h264_decoder *d, const unsigned char *nal, unsigned nl
   return o;
 }
 
-/* Skip the scaling-list syntax we don't support; presence is a hard reject. */
-static int reject_scaling(bitr *b, int count)
+/* scaling_list() (7.3.2.1.1.1): entries in zig-zag order. Returns 0, or -1 on overrun. */
+static int parse_scaling_list(bitr *b, unsigned char *list, int size, unsigned char *use_default)
 {
-  (void)b;
-  (void)count;
-  return H264_EUNSUP;
+  int last = 8, next = 8, j;
+  *use_default = 0;
+  for (j = 0; j < size; j++) {
+    if (next != 0) {
+      next = (last + br_se(b) + 256) % 256;
+      *use_default = (unsigned char)(j == 0 && next == 0);
+    }
+    list[j] = (unsigned char)(next == 0 ? last : next);
+    last = list[j];
+  }
+  return b->overrun ? -1 : 0;
+}
+
+static int parse_scaling_matrix(bitr *b, h264_scaling *sc, int count)
+{
+  int i;
+  for (i = 0; i < count; i++) {
+    sc->present[i] = (unsigned char)br_u(b, 1);
+    if (!sc->present[i])
+      continue;
+    if (i < 6) {
+      if (parse_scaling_list(b, sc->list[i], 16, &sc->use_default[i]) != 0)
+        return -1;
+    } else if (parse_scaling_list(b, sc->list8[i - 6], 64, &sc->use_default[i]) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static void skip_hrd(bitr *b)
+{
+  int n = (int)br_ue(b) + 1, i;
+  br_u(b, 8);
+  for (i = 0; i < n && i < 32 && !b->overrun; i++) {
+    br_ue(b);
+    br_ue(b);
+    br_u(b, 1);
+  }
+  br_u(b, 20);
+}
+
+/* Only bitstream_restriction matters (output reordering); the rest is skipped. */
+static void parse_vui(bitr *b, h264_sps *s)
+{
+  int hrd = 0;
+  if (br_u(b, 1) && br_u(b, 8) == 255)
+    br_u(b, 32);
+  if (br_u(b, 1))
+    br_u(b, 1);
+  if (br_u(b, 1)) {
+    br_u(b, 4);
+    if (br_u(b, 1))
+      br_u(b, 24);
+  }
+  if (br_u(b, 1)) {
+    br_ue(b);
+    br_ue(b);
+  }
+  if (br_u(b, 1)) {
+    br_u(b, 32);
+    br_u(b, 32);
+    br_u(b, 1);
+  }
+  if (br_u(b, 1)) {
+    skip_hrd(b);
+    hrd = 1;
+  }
+  if (br_u(b, 1)) {
+    skip_hrd(b);
+    hrd = 1;
+  }
+  if (hrd)
+    br_u(b, 1);
+  br_u(b, 1);
+  if (br_u(b, 1)) {
+    br_u(b, 1);
+    br_ue(b);
+    br_ue(b);
+    br_ue(b);
+    br_ue(b);
+    s->num_reorder_frames = (int)br_ue(b);
+    s->max_dec_frame_buffering = (int)br_ue(b);
+    if (b->overrun || s->num_reorder_frames > 16 || s->max_dec_frame_buffering > 16) {
+      s->num_reorder_frames = -1;
+      s->max_dec_frame_buffering = -1;
+    }
+  }
 }
 
 int h264_parse_sps(struct h264_decoder *d, const unsigned char *rbsp, unsigned len)
@@ -51,10 +135,12 @@ int h264_parse_sps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
   h264_sps s;
   int sps_id, i, high = 0, crop_unit_x, crop_unit_y;
   memset(&s, 0, sizeof s);
+  s.num_reorder_frames = -1;
+  s.max_dec_frame_buffering = -1;
   br_init(&b, rbsp, len);
 
   s.profile_idc = (int)br_u(&b, 8);
-  br_u(&b, 8); /* constraint flags + reserved            */
+  s.constraint_flags = (int)br_u(&b, 8);
   s.level_idc = (int)br_u(&b, 8);
   sps_id = (int)br_ue(&b);
   if (sps_id < 0 || sps_id > 31)
@@ -90,9 +176,11 @@ int h264_parse_sps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
       return H264_EUNSUP; /* bit_depth_luma_minus8      */
     if (br_ue(&b) != 0)
       return H264_EUNSUP; /* bit_depth_chroma_minus8    */
-    br_u(&b, 1);          /* qpprime_y_zero_transform   */
     if (br_u(&b, 1))
-      return reject_scaling(&b, 8); /* seq_scaling_matrix    */
+      return H264_EUNSUP; /* qpprime_y_zero_transform_bypass (lossless) */
+    s.has_scaling = (int)br_u(&b, 1);
+    if (s.has_scaling && parse_scaling_matrix(&b, &s.scaling, 8) != 0)
+      return H264_EFORMAT;
   }
 
   s.log2_max_frame_num = (int)br_ue(&b) + 4;
@@ -113,7 +201,7 @@ int h264_parse_sps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
   }
 
   s.max_num_ref_frames = (int)br_ue(&b);
-  br_u(&b, 1); /* gaps_in_frame_num allowed  */
+  s.gaps_allowed = (int)br_u(&b, 1);
   s.mb_w = (int)br_ue(&b) + 1;
   {
     int map_units = (int)br_ue(&b) + 1;
@@ -129,10 +217,10 @@ int h264_parse_sps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
     s.crop_t = (int)br_ue(&b);
     s.crop_b = (int)br_ue(&b);
   }
-  /* vui_parameters and the rest are ignored. */
-
-  if (b.overrun)
+  if (b.overrun || s.max_num_ref_frames > 16)
     return H264_EFORMAT;
+  if (br_u(&b, 1))
+    parse_vui(&b, &s);
   if (s.mb_w < 1 || s.mb_h < 1 || s.mb_w > 543 || s.mb_h > 543)
     return H264_EFORMAT;
 
@@ -170,8 +258,8 @@ int h264_parse_pps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
   if (p.num_slice_groups > 1)
     return H264_EUNSUP; /* no FMO                    */
 
-  p.num_ref_idx_l0_default = (int)br_ue(&b) + 1;
-  p.num_ref_idx_l1_default = (int)br_ue(&b) + 1;
+  p.num_ref_idx_default[0] = (int)br_ue(&b) + 1;
+  p.num_ref_idx_default[1] = (int)br_ue(&b) + 1;
   p.weighted_pred = (int)br_u(&b, 1);
   p.weighted_bipred_idc = (int)br_u(&b, 2);
   p.pic_init_qp = (int)br_se(&b) + 26;
@@ -184,15 +272,16 @@ int h264_parse_pps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
 
   if (br_more_rbsp_data(&b)) {
     p.transform_8x8 = (int)br_u(&b, 1);
-    if (br_u(&b, 1))
-      return reject_scaling(&b, 8); /* pic_scaling_matrix    */
+    p.has_scaling = (int)br_u(&b, 1);
+    if (p.has_scaling && parse_scaling_matrix(&b, &p.scaling, 6 + 2 * p.transform_8x8) != 0)
+      return H264_EFORMAT;
     p.second_chroma_qp_index_offset = br_se(&b);
   }
 
   if (b.overrun)
     return H264_EFORMAT;
-  if (p.transform_8x8)
-    return H264_EUNSUP; /* no 8x8 transform          */
+  if (p.num_ref_idx_default[0] > H264_MAX_REFS || p.num_ref_idx_default[1] > H264_MAX_REFS)
+    return H264_EFORMAT;
 
   p.valid = 1;
   d->pps[pps_id] = p;

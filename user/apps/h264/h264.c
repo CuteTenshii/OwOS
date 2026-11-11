@@ -34,19 +34,21 @@ static bool ends_with(const char *s, const char *suf)
   return ls >= lf && streq_ci(s + ls - lf, suf);
 }
 
-static void tally(int t, unsigned *ni, unsigned *np, unsigned *nf)
+static void tally(int t, unsigned *ni, unsigned *np, unsigned *nb, unsigned *nf)
 {
   (*nf)++;
   if (t == H264_SLICE_I)
     (*ni)++;
   else if (t == H264_SLICE_P)
     (*np)++;
+  else if (t == H264_SLICE_B)
+    (*nb)++;
 }
 
 static int info_annexb(const unsigned char *buf, unsigned len)
 {
   h264_decoder *d;
-  unsigned ni = 0, np = 0, nf = 0;
+  unsigned ni = 0, np = 0, nb = 0, nf = 0;
   int rc = h264_decoder_open(buf, len, &d);
   if (rc != H264_OK) {
     printf("h264: not a decodable H.264 stream (%d)\n", rc);
@@ -54,8 +56,8 @@ static int info_annexb(const unsigned char *buf, unsigned len)
   }
   printf("H.264 video %dx%d\n", h264_width(d), h264_height(d));
   while (h264_decode_frame(d) == H264_OK)
-    tally(h264_frame_type(d), &ni, &np, &nf);
-  printf("  %u frames  (I:%u P:%u)\n", nf, ni, np);
+    tally(h264_frame_type(d), &ni, &np, &nb, &nf);
+  printf("  %u frames  (I:%u P:%u B:%u)\n", nf, ni, np, nb);
   h264_decoder_close(d);
   return 0;
 }
@@ -65,7 +67,7 @@ static int info_mp4(const unsigned char *buf, unsigned len)
   mp4 *m;
   const mp4_track *vt;
   h264_decoder *d;
-  unsigned ni = 0, np = 0, nf = 0, i;
+  unsigned ni = 0, np = 0, nb = 0, nf = 0, i;
   int rc = mp4_open(buf, len, &m);
   if (rc != MP4_OK) {
     printf("h264: cannot parse MP4 (%d)\n", rc);
@@ -89,11 +91,11 @@ static int info_mp4(const unsigned char *buf, unsigned len)
     if (!s)
       break;
     if (h264_decode_au(d, s, sz, vt->nal_length_size) == H264_OK)
-      tally(h264_frame_type(d), &ni, &np, &nf);
+      tally(h264_frame_type(d), &ni, &np, &nb, &nf);
   }
   while (h264_flush(d) == H264_OK)
-    tally(h264_frame_type(d), &ni, &np, &nf);
-  printf("  %u frames  (I:%u P:%u)\n", nf, ni, np);
+    tally(h264_frame_type(d), &ni, &np, &nb, &nf);
+  printf("  %u frames  (I:%u P:%u B:%u)\n", nf, ni, np, nb);
   h264_decoder_close(d);
   mp4_close(m);
   return 0;
