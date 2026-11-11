@@ -1,6 +1,6 @@
 /* memmap.h: carve reserved ranges out of RAM. */
-#ifndef OWOS_ARCH_AARCH64_MEMMAP_H
-#define OWOS_ARCH_AARCH64_MEMMAP_H
+#ifndef OWOS_ARCH_MEMMAP_H
+#define OWOS_ARCH_MEMMAP_H
 
 #include "fdt.h"
 

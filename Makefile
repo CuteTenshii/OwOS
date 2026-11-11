@@ -26,7 +26,7 @@ CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy
 TIDY_TARGET = --target=$(if $(filter x86_64,$(ARCH)),x86_64,i386)-none-elf
 TIDY_FILES ?= $(shell find kernel drivers -type f -name '*.c')
-A64_TIDY_TARGET = --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/aarch64
+A64_TIDY_TARGET = --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/aarch64 -Ikernel/arch/common
 
 ifeq ($(ARCH),aarch64)
 include kernel/arch/aarch64/build.mk

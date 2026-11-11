@@ -1,7 +1,7 @@
-/* fdt_test.c: the AArch64 flattened device tree reader (kernel/arch/aarch64/fdt.c) against hand-built blobs,
+/* fdt_test.c: the device tree reader shared by the ARM ports (kernel/arch/common/fdt.c) against hand-built blobs,
  * including truncated and hostile ones. Blobs sit right before a PROT_NONE page so any read past the end faults. */
 #define OWOS_SUITE_TEST
-#include "../kernel/arch/aarch64/fdt.h"
+#include "../kernel/arch/common/fdt.h"
 #include "test.h"
 #include <stdint.h>
 #include <string.h>

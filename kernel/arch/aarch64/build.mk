@@ -28,7 +28,7 @@ A64ELF  := owos-aarch64.elf
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
 A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
-            -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -MMD -MP $(VERSION_DEF) -I$(A64DIR) -Icommon -Ikernel
+            -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -MMD -MP $(VERSION_DEF) -I$(A64DIR) -Ikernel/arch/common -Icommon -Ikernel
 A64_EL2 ?= on
 A64_SMP ?= 4
 A64_GIC ?= 2
@@ -52,6 +52,9 @@ $(A64DIR)/%.o: $(A64DIR)/%.S
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(A64DIR)/%.o: $(A64DIR)/%.c $(A64DIR)/arch.h
+	$(CC) $(A64FLAGS) -c $< -o $@
+
+$(A64DIR)/%.o: kernel/arch/common/%.c
 	$(CC) $(A64FLAGS) -c $< -o $@
 
 $(A64DIR)/%.o: kernel/%.c

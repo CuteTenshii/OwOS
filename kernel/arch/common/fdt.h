@@ -1,6 +1,6 @@
 /* fdt.h: flattened device tree reader. */
-#ifndef OWOS_ARCH_AARCH64_FDT_H
-#define OWOS_ARCH_AARCH64_FDT_H
+#ifndef OWOS_ARCH_FDT_H
+#define OWOS_ARCH_FDT_H
 
 #include <stdint.h>
 

@@ -1,6 +1,6 @@
-/* memmap_test.c: carving reserved ranges out of RAM (kernel/arch/aarch64/memmap.c). */
+/* memmap_test.c: carving reserved ranges out of RAM (kernel/arch/common/memmap.c). */
 #define OWOS_SUITE_TEST
-#include "../kernel/arch/aarch64/memmap.h"
+#include "../kernel/arch/common/memmap.h"
 #include "test.h"
 
 #define MB (1ULL << 20)
