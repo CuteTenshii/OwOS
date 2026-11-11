@@ -27,7 +27,8 @@ KERNEL  := owos-aarch64.bin
 A64ELF  := owos-aarch64.elf
 QEMU    := qemu-system-aarch64
 A64DIR  := kernel/arch/aarch64
-A64FLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
+# Linux-targeted GCCs default to outline atomics, which call into libgcc.
+A64FLAGS := -mgeneral-regs-only -mstrict-align -mno-outline-atomics -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
             -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -MMD -MP $(VERSION_DEF) -I$(A64DIR) -Ikernel/arch/common -Icommon -Ikernel
 A64_EL2 ?= on
 A64_SMP ?= 4
@@ -40,7 +41,7 @@ endif
 
 A64USER := user/aarch64
 A64TESTS := tests/aarch64
-A64UFLAGS := -mgeneral-regs-only -mstrict-align -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
+A64UFLAGS := -mgeneral-regs-only -mstrict-align -mno-outline-atomics -mcpu=cortex-a57 -std=gnu11 -ffreestanding -fno-pie \
              -fno-stack-protector -fno-tree-loop-distribute-patterns -O$(OPT_LEVEL) -Wall -Wextra -Icommon -I$(A64USER)
 A64PROGS := hello segv nx
 A64UELFS := $(addprefix $(A64TESTS)/,$(addsuffix .elf,$(A64PROGS)))
