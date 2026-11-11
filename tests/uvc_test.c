@@ -83,14 +83,23 @@ static void super_speed_plus_companion(void)
   iface(&o, 3, 2, 1, 2);
   iso_ep(&o, 0x82, 1024, 1);
   ss_companion(&o, 15, 0x80, 0);
-  uint8_t big[8] = {8, 0x31, 0, 0, 0x00, 0x00, 0x01, 0}; /* 64 KiB: more than one TD page */
+  uint8_t big[8] = {8, 0x31, 0, 0, 0x00, 0x00, 0x01, 0}; /* 64 KiB, beyond a 16-bit wBytesPerInterval */
   put(&o, big, 8);
+  iface(&o, 3, 3, 1, 2);
+  iso_ep(&o, 0x82, 1024, 1);
+  ss_companion(&o, 15, 0x80, 0);
+  uint8_t huge[8] = {8, 0x31, 0, 0, 0x00, 0x00, 0x08, 0}; /* 512 KiB: more than the host core takes */
+  put(&o, huge, 8);
   expect_eq(uvc_parse_config(o.b, o.n, &c), 0);
-  expect_eq(c.nalts, 1);
+  expect_eq(c.nalts, 2);
   expect_eq(c.alts[0].alt, 1);
   expect_eq(c.alts[0].burst, 3);
   expect_eq(c.alts[0].mult, 0);
   expect_eq(c.alts[0].payload, 3584);
+  expect_eq(c.alts[1].alt, 2);
+  expect_eq(c.alts[1].burst, 15);
+  expect_eq(c.alts[1].mult, 0);
+  expect_eq(c.alts[1].payload, 65536);
 }
 
 static void super_speed_companion(void)
@@ -111,11 +120,15 @@ static void super_speed_companion(void)
   ss_companion(&o, 2, 0, 3072);
   expect_eq(uvc_parse_config(o.b, o.n, &c), 0);
   expect_eq(c.vs_iface, 3);
-  expect_eq(c.nalts, 1);
-  expect_eq(c.alts[0].alt, 2);
+  expect_eq(c.nalts, 2);
+  expect_eq(c.alts[0].alt, 1);
   expect_eq(c.alts[0].burst, 2);
-  expect_eq(c.alts[0].mult, 0);
-  expect_eq(c.alts[0].payload, 3072);
+  expect_eq(c.alts[0].mult, 1);
+  expect_eq(c.alts[0].payload, 6144);
+  expect_eq(c.alts[1].alt, 2);
+  expect_eq(c.alts[1].burst, 2);
+  expect_eq(c.alts[1].mult, 0);
+  expect_eq(c.alts[1].payload, 3072);
   expect_eq(c.formats[0].frames[0].max_bytes, UVC_MAX_FRAME_BYTES);
 }
 

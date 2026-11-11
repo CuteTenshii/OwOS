@@ -28,6 +28,7 @@
 #include "nic.h"
 #include "paging.h"
 #include "pci.h"
+#include "pmm.h"
 #include "sched.h"
 #include "timer.h"
 #include "usb3.h"
@@ -108,6 +109,7 @@
 #define TRB_TYPE(t) ((uint32_t)(t) << 10)
 #define TRB_GET_TYPE(c) (((c) >> 10) & 0x3F)
 #define TRB_ISP (1u << 2)
+#define TRB_CHAIN (1u << 4)
 #define TRB_IOC (1u << 5)    /* interrupt on completion              */
 #define TRB_IDT (1u << 6)    /* immediate data (setup stage)         */
 #define TRB_TOGGLE (1u << 1) /* link TRB: toggle cycle               */
@@ -169,14 +171,25 @@ static volatile bool hc_responsive = true;
 #define XHCI_MAX_SLOTS 256
 #define PIPE_BUFS 2
 
-/* Isochronous IN state: ISOC_DEPTH one-interval TDs kept queued, each with a stride-aligned slice of a buffer page. */
-#define ISOC_DEPTH 96
+/* Isochronous IN state: up to ISOC_MAX_DEPTH one-interval TDs kept queued in one contiguous buffer, fewer for large
+ * payloads so the buffer stays within ISOC_BUDGET. A TD is an Isoch TRB plus chained Normal TRBs, split where the
+ * buffer crosses a 64 KiB boundary (no TRB may). */
+#define ISOC_MAX_DEPTH 96
+#define ISOC_MIN_DEPTH 8
+#define ISOC_BUDGET (2u << 20)
+#define ISOC_TD_TRBS (USBH_ISOC_MAX_PAYLOAD / 0x10000 + 2)
 
 struct isoc {
-  uint8_t *pages[ISOC_DEPTH];
+  uint8_t *buf;
+  uint32_t buf_bytes;
+  /* Per ring TRB: its TD's slot, the TD offset where the TRB's data ends, and the TD's generation when posted. */
   uint8_t trb_slot[RING_TRBS];
-  uint32_t payload, stride, per_page;
-  uint8_t burst, head, tail, queued;
+  uint32_t trb_end[RING_TRBS];
+  uint8_t trb_gen[RING_TRBS];
+  /* Per TD slot: bumped on every post, so a late event for a TD already retired and re-posted is told apart. */
+  uint8_t td_gen[ISOC_MAX_DEPTH];
+  uint32_t payload, stride;
+  uint8_t depth, burst, head, tail, queued;
   usbh_isoc_cb cb;
 };
 
@@ -260,26 +273,43 @@ static void ring_init(struct ring *r)
   link->control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE; /* cycle set on enqueue */
 }
 
-/* Enqueue one TRB (caller fills p0/p1/status and the type/flag bits of control,
- * minus the cycle bit which we apply). Advances the ring, handling the Link. */
-static void ring_push(struct ring *r, uint32_t p0, uint32_t p1, uint32_t status, uint32_t control)
+/* Store one TRB with the producer cycle bit, or its inverse when `hold` (the controller does not own it yet), and
+ * advance the ring, handling the Link. */
+static void ring_store(struct ring *r, uint32_t p0, uint32_t p1, uint32_t status, uint32_t control, bool hold)
 {
   struct trb *t = &r->base[r->enq];
   t->p0 = p0;
   t->p1 = p1;
   t->status = status;
-  t->control = control | (r->cycle ? TRB_CYCLE : 0);
+  t->control = control | ((r->cycle != 0) != hold ? TRB_CYCLE : 0);
 
   r->enq++;
   if (r->enq == RING_TRBS - 1) { /* reached the Link TRB             */
     struct trb *link = &r->base[RING_TRBS - 1];
-    if (r->cycle)
-      link->control |= TRB_CYCLE;
-    else
-      link->control &= ~TRB_CYCLE;
+    /* A TD that wraps continues through the Link TRB, which must then carry the chain bit too. */
+    link->control = (link->control & ~(TRB_CYCLE | TRB_CHAIN)) | (r->cycle ? TRB_CYCLE : 0) | (control & TRB_CHAIN);
     r->enq = 0;
     r->cycle ^= 1;
   }
+}
+
+/* Enqueue one TRB (caller fills p0/p1/status and the type/flag bits of control, minus the cycle bit which we apply). */
+static void ring_push(struct ring *r, uint32_t p0, uint32_t p1, uint32_t status, uint32_t control)
+{
+  ring_store(r, p0, p1, status, control, false);
+}
+
+/* Enqueue a multi-TRB TD; idx[i] receives each TRB's ring index. The first TRB is handed over last, so a running
+ * endpoint never starts a TD whose later TRBs are not written yet (x86 keeps stores in order). */
+static void ring_push_td(struct ring *r, const struct trb *trbs, int n, uint32_t *idx)
+{
+  struct trb *first = &r->base[r->enq];
+  for (int i = 0; i < n; i++) {
+    idx[i] = r->enq;
+    ring_store(r, trbs[i].p0, trbs[i].p1, trbs[i].status, trbs[i].control, i == 0);
+  }
+  __asm__ volatile("" ::: "memory");
+  first->control ^= TRB_CYCLE;
 }
 
 /* Next event off the ring (advances ERDP), or NULL when it is empty. */
@@ -899,6 +929,19 @@ static void slot_set_entries(uint32_t *sctx, int dci)
     sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)dci << 27);
 }
 
+/* Max Burst Size for an endpoint context: the SuperSpeed companion's bMaxBurst, 0 below SuperSpeed or without one.
+ * *esit, when given, gets a periodic endpoint's bytes per service interval. */
+static uint32_t ep_burst(const struct usbdev *d, uint8_t ep_addr, uint16_t mps, uint32_t *esit)
+{
+  struct usb3_ep_comp c;
+  bool ss = d->speed >= USB_SPEED_SUPER && d->cfg && usb3_ep_companion(d->cfg, d->cfg_len, ep_addr, &c) == 0;
+  if (!ss)
+    memset(&c, 0, sizeof c);
+  if (esit)
+    *esit = c.bytes_per_interval ? c.bytes_per_interval : (uint32_t)mps * (c.max_burst + 1u);
+  return c.max_burst;
+}
+
 /* Add the bulk IN/OUT endpoints to the device with a Configure Endpoint
  * command, each backed by its own transfer ring. Returns 0 on success. */
 static int configure_bulk(struct usbdev *d, int port)
@@ -956,19 +999,23 @@ static int configure_bulk(struct usbdev *d, int port)
   slot_set_entries(sctx, max_dci);
 
   /* EP type: bulk OUT = 2, bulk IN = 6, interrupt IN = 7. CErr=3. */
-  epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16);
+  epin[1] =
+      (3u << 1) | (6u << 3) | (ep_burst(d, d->bulk_in, d->bulk_in_mps, NULL) << 8) | ((uint32_t)d->bulk_in_mps << 16);
   epin[2] = (uint32_t)(uintptr_t)net_in_ring.base | 1; /* TR dequeue | DCS      */
   epin[4] = d->bulk_in_mps;                            /* avg TRB length        */
-  epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16);
+  epout[1] = (3u << 1) | (2u << 3) | (ep_burst(d, d->bulk_out, d->bulk_out_mps, NULL) << 8) |
+             ((uint32_t)d->bulk_out_mps << 16);
   epout[2] = (uint32_t)(uintptr_t)net_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
   if (intr_dci) {
     uint32_t *epi = (uint32_t *)(input + ctx_sz * (1 + intr_dci));
     uint32_t iv = d->intr_interval ? d->intr_interval - 1 : 6;
-    epi[0] = iv << 16; /* Interval              */
-    epi[1] = (3u << 1) | (7u << 3) | ((uint32_t)d->intr_in_mps << 16);
+    uint32_t esit;
+    uint32_t burst = ep_burst(d, d->intr_in, d->intr_in_mps, &esit);
+    epi[0] = (iv << 16) | ((esit >> 16) << 24); /* Interval, Max ESIT Payload Hi */
+    epi[1] = (3u << 1) | (7u << 3) | (burst << 8) | ((uint32_t)d->intr_in_mps << 16);
     epi[2] = (uint32_t)(uintptr_t)net_intr_ring.base | 1;
-    epi[4] = d->intr_in_mps;
+    epi[4] = d->intr_in_mps | ((esit & 0xFFFF) << 16);
   }
 
   ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
@@ -1335,10 +1382,12 @@ static int configure_bulk_msc(struct usbdev *d)
     sctx[i] = out_slot[i];
   slot_set_entries(sctx, max_dci);
 
-  epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
+  epin[1] = (3u << 1) | (6u << 3) | (ep_burst(d, d->bulk_in, d->bulk_in_mps, NULL) << 8) |
+            ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
   epin[2] = (uint32_t)(uintptr_t)msc_in_ring.base | 1;
   epin[4] = d->bulk_in_mps;
-  epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
+  epout[1] = (3u << 1) | (2u << 3) | (ep_burst(d, d->bulk_out, d->bulk_out_mps, NULL) << 8) |
+             ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
   epout[2] = (uint32_t)(uintptr_t)msc_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
 
@@ -1813,10 +1862,12 @@ static int configure_bulk_mtp(struct usbdev *d)
     sctx[i] = out_slot[i];
   slot_set_entries(sctx, max_dci);
 
-  epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
+  epin[1] = (3u << 1) | (6u << 3) | (ep_burst(d, d->bulk_in, d->bulk_in_mps, NULL) << 8) |
+            ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
   epin[2] = (uint32_t)(uintptr_t)mtp_in_ring.base | 1;
   epin[4] = d->bulk_in_mps;
-  epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
+  epout[1] = (3u << 1) | (2u << 3) | (ep_burst(d, d->bulk_out, d->bulk_out_mps, NULL) << 8) |
+             ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
   epout[2] = (uint32_t)(uintptr_t)mtp_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
 
@@ -2244,13 +2295,34 @@ static struct usbh_pipe *pipe_find(int slot, int dci)
   return NULL;
 }
 
-static uint8_t *isoc_buf(const struct isoc *s, int i)
+static uint8_t *isoc_buf(const struct isoc *s, int i) { return s->buf + (uint32_t)i * s->stride; }
+
+/* Build the TRBs of the TD for slot i into td; returns their count. TD Size is the packets still to come after each
+ * TRB (xHCI 1.0+), capped at its 5-bit field. */
+static int isoc_td(const struct usbh_pipe *p, int i, uint32_t first_control, struct trb *td, uint32_t *end)
 {
-  return s->pages[i / s->per_page] + (uint32_t)(i % s->per_page) * s->stride;
+  const struct isoc *s = p->iso;
+  uint32_t addr = (uint32_t)(uintptr_t)isoc_buf(s, i), done = 0;
+  int n = 0;
+  while (done < s->payload && n < (int)ISOC_TD_TRBS) {
+    uint32_t len = 0x10000 - ((addr + done) & 0xFFFF);
+    if (len > s->payload - done)
+      len = s->payload - done;
+    done += len;
+    uint32_t left = (s->payload - done + p->mps - 1) / p->mps;
+    td[n].p0 = addr + done - len;
+    td[n].p1 = 0;
+    td[n].status = len | ((left > 31 ? 31 : left) << 17);
+    td[n].control = (n == 0 ? first_control : TRB_TYPE(TRB_NORMAL)) | TRB_ISP | TRB_CHAIN;
+    end[n] = done;
+    n++;
+  }
+  td[n - 1].control = (td[n - 1].control & ~TRB_CHAIN) | TRB_IOC;
+  return n;
 }
 
-/* Queue TDs until ISOC_DEPTH are outstanding and ring the doorbell. Every TD asks to start as soon as possible, so a
- * ring that ran dry resumes at the next interval instead of waiting for a stale frame number. */
+/* Queue TDs until the pipe's depth are outstanding and ring the doorbell. Every TD asks to start as soon as possible,
+ * so a ring that ran dry resumes at the next interval instead of waiting for a stale frame number. */
 static void isoc_post(struct usbh_pipe *p)
 {
   struct isoc *s = p->iso;
@@ -2260,11 +2332,19 @@ static void isoc_post(struct usbh_pipe *p)
     tbc = (packets + s->burst) / (s->burst + 1u) - 1;
     tlbpc = (packets - 1) % (s->burst + 1u);
   }
-  while (s->queued < ISOC_DEPTH) {
-    s->trb_slot[p->ring.enq] = s->tail;
-    ring_push(&p->ring, (uint32_t)(uintptr_t)isoc_buf(s, s->tail), 0, s->payload,
-              TRB_TYPE(TRB_ISOCH) | TRB_IOC | TRB_ISP | TRB_SIA | (tbc << 7) | (tlbpc << 16));
-    s->tail = (s->tail + 1) % ISOC_DEPTH;
+  uint32_t first = TRB_TYPE(TRB_ISOCH) | TRB_SIA | ((tbc & 3) << 7) | ((tlbpc & 0xF) << 16);
+  while (s->queued < s->depth) {
+    struct trb td[ISOC_TD_TRBS];
+    uint32_t end[ISOC_TD_TRBS], idx[ISOC_TD_TRBS];
+    int n = isoc_td(p, s->tail, first, td, end);
+    uint8_t gen = ++s->td_gen[s->tail];
+    ring_push_td(&p->ring, td, n, idx);
+    for (int i = 0; i < n; i++) {
+      s->trb_slot[idx[i]] = s->tail;
+      s->trb_end[idx[i]] = end[i];
+      s->trb_gen[idx[i]] = gen;
+    }
+    s->tail = (uint8_t)((s->tail + 1) % s->depth);
     s->queued++;
     posted = true;
   }
@@ -2283,16 +2363,20 @@ static void isoc_event(struct usbh_pipe *p, struct trb *e)
   if (idx >= RING_TRBS - 1 || (e->p0 & 0xF))
     return;
   uint8_t slot = s->trb_slot[idx];
-  uint8_t done = (uint8_t)((slot + ISOC_DEPTH - s->head) % ISOC_DEPTH + 1);
+  /* A controller may report a short TD twice (its short TRB, then the IOC); the second finds the slot re-posted. */
+  if (slot >= s->depth || s->trb_gen[idx] != s->td_gen[slot])
+    return;
+  uint8_t done = (uint8_t)((slot + s->depth - s->head) % s->depth + 1);
   if (done > s->queued)
     return;
-  s->head = (slot + 1) % ISOC_DEPTH;
+  s->head = (uint8_t)((slot + 1) % s->depth);
   s->queued -= done;
   if (cc == CC_STOPPED || cc == CC_STOPPED_LEN)
     return;
   uint32_t resid = e->status & 0xFFFFFF;
+  uint32_t end = s->trb_end[idx];
   if (cc == CC_SUCCESS || cc == CC_SHORT_PKT)
-    s->cb(p->ctx, isoc_buf(s, slot), resid < s->payload ? (int)(s->payload - resid) : 0, 0);
+    s->cb(p->ctx, isoc_buf(s, slot), resid < end ? (int)(end - resid) : 0, 0);
   else
     s->cb(p->ctx, NULL, 0, cc);
   isoc_post(p);
@@ -2391,14 +2475,15 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
   p->cb = cb;
   p->ctx = ctx;
 
-  uint32_t ep[5] = {0};
+  uint32_t ep[5] = {0}, esit;
+  uint32_t burst = ep_burst(&x->pub, ep_addr, mps, &esit);
   if (ep_type == EP_TYPE_INTR_IN || ep_type == EP_TYPE_INTR_OUT) {
-    ep[0] = usbh_intr_exponent(x->pub.speed, interval) << 16;
-    ep[4] = mps | ((uint32_t)mps << 16);
+    ep[0] = (usbh_intr_exponent(x->pub.speed, interval) << 16) | ((esit >> 16) << 24);
+    ep[4] = mps | ((esit & 0xFFFF) << 16);
   } else {
     ep[4] = mps;
   }
-  ep[1] = (3u << 1) | ((uint32_t)ep_type << 3) | ((uint32_t)mps << 16);
+  ep[1] = (3u << 1) | ((uint32_t)ep_type << 3) | (burst << 8) | ((uint32_t)mps << 16);
   ep[2] = (uint32_t)(uintptr_t)p->ring.base | 1;
   if (config_endpoint(slot, p->dci, ep) != 0) {
     pfree(p->ring.base);
@@ -2436,8 +2521,8 @@ struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps)
 static void pipe_free(struct usbh_pipe *p)
 {
   if (p->iso) {
-    for (int i = 0; i < ISOC_DEPTH && p->iso->pages[i]; i++)
-      pfree(p->iso->pages[i]);
+    if (p->iso->buf)
+      pmm_free_contig((phys_t)(uintptr_t)p->iso->buf, p->iso->buf_bytes);
     kfree(p->iso);
   }
   if (p->ring.base)
@@ -2453,7 +2538,9 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
   if (!payload)
     payload = (uint32_t)mps * (burst + 1u) * (mult + 1u);
-  if (!x || !(ep_addr & 0x80) || mps == 0 || mps > 1024 || payload > 4096 || burst > 15 || mult > 2 || !cb)
+  /* Without LEC the endpoint context can only describe the 48 KiB a SuperSpeed (non-Plus) endpoint moves. */
+  uint32_t max_payload = large_esit ? USBH_ISOC_MAX_PAYLOAD : 3u * 16u * 1024u;
+  if (!x || !(ep_addr & 0x80) || mps == 0 || mps > 1024 || payload > max_payload || burst > 15 || mult > 2 || !cb)
     return NULL;
   struct usbh_pipe *p = kmalloc(sizeof *p);
   if (!p)
@@ -2468,14 +2555,24 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   struct isoc *s = p->iso;
   s->payload = payload;
   s->stride = (payload + 63) & ~63u;
-  s->per_page = 4096 / s->stride;
+  uint32_t depth = ISOC_BUDGET / s->stride;
+  if (depth > ISOC_MAX_DEPTH)
+    depth = ISOC_MAX_DEPTH;
+  uint32_t td_trbs = payload / 0x10000 + 2; /* the most a TD of this size can need */
+  if (depth > (RING_TRBS - 2) / td_trbs)
+    depth = (RING_TRBS - 2) / td_trbs;
+  s->depth = (uint8_t)depth;
   s->burst = burst;
   s->cb = cb;
+  s->buf_bytes = depth * s->stride;
+  phys_t buf = pmm_alloc_contig(s->buf_bytes);
+  if (buf && paging_identity_map((uint32_t)buf, s->buf_bytes) != 0) {
+    pmm_free_contig(buf, s->buf_bytes);
+    buf = 0;
+  }
+  s->buf = (uint8_t *)(uintptr_t)buf;
   ring_init(&p->ring);
-  bool ok = p->ring.base != NULL;
-  for (int i = 0; ok && i < ISOC_DEPTH; i += (int)s->per_page)
-    ok = (s->pages[i / s->per_page] = palloc()) != NULL;
-  if (!ok) {
+  if (!s->buf || !p->ring.base) {
     pipe_free(p);
     return NULL;
   }
@@ -2494,7 +2591,7 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   ep[0] = ((uint32_t)(large_esit ? 0 : mult) << 8) | (exponent << 16) | ((payload >> 16) << 24);
   ep[1] = (5u << 3) | ((uint32_t)burst << 8) | ((uint32_t)mps << 16);
   ep[2] = (uint32_t)(uintptr_t)p->ring.base | 1;
-  ep[4] = payload | ((payload & 0xFFFF) << 16);
+  ep[4] = (payload > 0xFFFF ? 0xFFFF : payload) | ((payload & 0xFFFF) << 16);
   if (config_endpoint(slot, p->dci, ep) != 0) {
     pipe_free(p);
     return NULL;

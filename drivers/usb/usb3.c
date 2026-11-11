@@ -16,6 +16,9 @@
 #define DT_DEVICE_CAPABILITY 0x10
 #define CAP_SUPERSPEED 0x03
 #define CAP_SUPERSPEED_PLUS 0x0A
+#define DT_ENDPOINT 0x05
+#define DT_SS_EP_COMPANION 0x30
+#define DT_SSP_ISO_EP_COMPANION 0x31
 
 #define LP_SUPERSPEED_PLUS 1
 
@@ -185,6 +188,33 @@ int usb3_ext_port_speed(const struct usb3_bos *hub, uint32_t ext_status, uint32_
   }
   *kbps = 5000000;
   return USB_SPEED_SUPER;
+}
+
+int usb3_ep_companion(const uint8_t *cfg, int len, uint8_t ep_addr, struct usb3_ep_comp *out)
+{
+  memset(out, 0, sizeof *out);
+  int i = 0;
+  while (i + 2 <= len) {
+    int n = cfg[i];
+    if (n < 2 || i + n > len)
+      return -1;
+    if (cfg[i + 1] == DT_ENDPOINT && n >= 7 && cfg[i + 2] == ep_addr)
+      break;
+    i += n;
+  }
+  if (i + 2 > len)
+    return -1;
+  i += cfg[i];
+  if (i + 6 > len || cfg[i] < 6 || i + cfg[i] > len || cfg[i + 1] != DT_SS_EP_COMPANION)
+    return -1;
+  out->max_burst = cfg[i + 2] > 15 ? 15 : cfg[i + 2];
+  out->attributes = cfg[i + 3];
+  out->bytes_per_interval = cfg[i + 4] | cfg[i + 5] << 8;
+  i += cfg[i];
+  if ((out->attributes & 0x80) && i + 8 <= len && cfg[i] >= 8 && i + cfg[i] <= len &&
+      cfg[i + 1] == DT_SSP_ISO_EP_COMPANION)
+    out->bytes_per_interval = le32(cfg + i + 4);
+  return 0;
 }
 
 uint32_t usb3_default_kbps(int speed)

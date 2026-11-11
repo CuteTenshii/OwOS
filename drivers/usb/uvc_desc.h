@@ -2,6 +2,7 @@
 #ifndef OWOS_UVC_DESC_H
 #define OWOS_UVC_DESC_H
 
+#include "usbhost.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -15,7 +16,7 @@
 #define UVC_MAX_IVALS 8
 #define UVC_MAX_ALTS 16
 #define UVC_MAX_FRAME_BYTES (1u << 20) /* larger frames are not offered: three of them live in the kernel heap */
-#define UVC_MAX_PAYLOAD 4096           /* one isochronous TD per page */
+#define UVC_MAX_PAYLOAD USBH_ISOC_MAX_PAYLOAD
 
 /* Frame intervals are in 100 ns units. nival == 0 means a continuous range [ival_min, ival_max]. */
 struct uvc_frame {

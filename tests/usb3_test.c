@@ -224,6 +224,66 @@ static void hub_extended_port_status(void)
   expect_eq(usb3_ext_port_speed(&plain, 0x00000011u, &kbps), USB_SPEED_SUPER);
 }
 
+/* A configuration with a bulk pair (SuperSpeed companions), an interrupt endpoint without one, and an isochronous
+ * endpoint with a SuperSpeedPlus companion. */
+static int companion_cfg(uint8_t *c)
+{
+  static const uint8_t d[] = {
+      9, 2,    0,    0,    2,    1,    0,    0x80, 50, /* configuration */
+      9, 4,    0,    0,    3,    8,    6,    0x50, 0,  /* interface     */
+      7, 5,    0x81, 2,    0x00, 4,    0,              /* bulk IN       */
+      6, 0x30, 15,   0,    0,    0,                    /* burst 16      */
+      7, 5,    0x02, 2,    0x00, 4,    0,              /* bulk OUT      */
+      6, 0x30, 3,    0,    0,    0,                    /* burst 4       */
+      7, 5,    0x83, 3,    0x08, 0,    4,              /* interrupt IN  */
+      9, 4,    1,    1,    1,    14,   2,    0,    0,  /* interface     */
+      7, 5,    0x84, 1,    0x00, 4,    1,              /* isochronous   */
+      6, 0x30, 15,   0x80, 0,    0,                    /* SSP follows   */
+      8, 0x31, 0,    0,    0x00, 0x80, 0x01, 0,        /* 96 KiB        */
+  };
+  memcpy(c, d, sizeof d);
+  return (int)sizeof d;
+}
+
+static void endpoint_companions(void)
+{
+  uint8_t c[128];
+  int n = companion_cfg(c);
+  struct usb3_ep_comp e;
+  expect_eq(usb3_ep_companion(c, n, 0x81, &e), 0);
+  expect_eq(e.max_burst, 15);
+  expect_eq(usb3_ep_companion(c, n, 0x02, &e), 0);
+  expect_eq(e.max_burst, 3);
+  expect_eq(usb3_ep_companion(c, n, 0x84, &e), 0);
+  expect_eq(e.max_burst, 15);
+  expect_eq(e.attributes, 0x80);
+  expect_eq(e.bytes_per_interval, 0x18000);
+  /* no companion (a USB 2 endpoint) and no such endpoint both leave out zeroed */
+  e.max_burst = 9;
+  expect_eq(usb3_ep_companion(c, n, 0x83, &e), -1);
+  expect_eq(e.max_burst, 0);
+  expect_eq(usb3_ep_companion(c, n, 0x85, &e), -1);
+}
+
+static void endpoint_companion_malformed(void)
+{
+  uint8_t c[128];
+  int n = companion_cfg(c);
+  struct usb3_ep_comp e;
+  /* an out-of-range bMaxBurst is clamped to the endpoint context's 4-bit field */
+  c[18 + 7 + 2] = 40;
+  expect_eq(usb3_ep_companion(c, n, 0x81, &e), 0);
+  expect_eq(e.max_burst, 15);
+  /* the companion cut off by the end of the buffer is not read */
+  expect_eq(usb3_ep_companion(c, 18 + 7 + 3, 0x81, &e), -1);
+  /* an SSP companion cut off falls back to wBytesPerInterval */
+  expect_eq(usb3_ep_companion(c, n - 2, 0x84, &e), 0);
+  expect_eq(e.bytes_per_interval, 0);
+  /* a zero-length descriptor stops the walk */
+  c[9] = 0;
+  expect_eq(usb3_ep_companion(c, n, 0x81, &e), -1);
+}
+
 static void default_rates(void)
 {
   expect_eq(usb3_default_kbps(USB_SPEED_LOW), 1500);
@@ -259,6 +319,8 @@ int main(void)
   test("bos: SuperSpeed only", bos_without_superspeed_plus);
   test("bos: malformed descriptors", bos_malformed);
   test("hub: extended port status", hub_extended_port_status);
+  test("endpoint: SuperSpeed companions", endpoint_companions);
+  test("endpoint: malformed companions", endpoint_companion_malformed);
   test("default rates by speed class", default_rates);
   test("rate formatting", rate_strings);
   return 0;

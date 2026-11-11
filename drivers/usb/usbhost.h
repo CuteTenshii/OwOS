@@ -72,11 +72,13 @@ struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usb
 struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps);
 int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len);
 
-/* An isochronous IN endpoint kept armed, one TD per service interval of `payload` bytes (at most a page; 0 means
- * mps * (burst + 1) * (mult + 1)). A SuperSpeedPlus isochronous companion's dwBytesPerInterval goes in payload, with
+/* An isochronous IN endpoint kept armed, one TD per service interval of `payload` bytes (0 means
+ * mps * (burst + 1) * (mult + 1)). At most USBH_ISOC_MAX_PAYLOAD, or 48 KiB on a controller without Large ESIT Payload
+ * support. A SuperSpeedPlus isochronous companion's dwBytesPerInterval goes in payload, with
  * mult 0. cb runs per completed interval with the received bytes (they are only valid during the call), or with
  * err != 0 (xHCI completion code, len 0) when the controller missed it. binterval is the descriptor's bInterval. */
 typedef void (*usbh_isoc_cb)(void *ctx, const uint8_t *data, int len, int err);
+#define USBH_ISOC_MAX_PAYLOAD (256u * 1024u)
 struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
                                     uint32_t payload, uint8_t binterval, usbh_isoc_cb cb, void *ctx);
 /* Stop and drop an endpoint opened above (not for a device that is gone: its pipes are freed with the slot). */

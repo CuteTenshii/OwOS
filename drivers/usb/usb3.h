@@ -71,6 +71,17 @@ uint32_t usb3_bos_max_kbps(const struct usb3_bos *b);
  */
 int usb3_ext_port_speed(const struct usb3_bos *hub, uint32_t ext_status, uint32_t *kbps);
 
+/* An endpoint's SuperSpeed companion descriptors. */
+struct usb3_ep_comp {
+  uint8_t max_burst;           /* packets per burst, minus one (0..15)                      */
+  uint8_t attributes;          /* bulk: MaxStreams; isochronous: Mult and the SSP flag (7) */
+  uint32_t bytes_per_interval; /* periodic endpoints; the SSP companion's value if present  */
+};
+
+/* Find the companion of the first endpoint descriptor for ep_addr in a configuration descriptor. Returns 0, or -1
+ * (out zeroed) if the endpoint is absent or has no companion, as on a USB 2 device. */
+int usb3_ep_companion(const uint8_t *cfg, int len, uint8_t ep_addr, struct usb3_ep_comp *out);
+
 /* Bit rate of a speed class when nothing more specific is known. */
 uint32_t usb3_default_kbps(int speed);
 
