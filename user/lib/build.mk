@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png jpeg webp gif imganim canvas2d mp3 ogg sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray zstd archive plist uuid airplay xml upnp
+ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png jpeg webp gif imganim canvas2d mp3 ogg sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray zstd archive plist uuid airplay xml upnp pdf
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -130,6 +130,8 @@ PLIST   := user/lib/plist/plist.o
 # airplay: AirPlay 1 video sender - mDNS discovery + plain HTTP on port 7000 (/play, /rate, /scrub).
 # Bare .o; a consumer also links $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
 AIRPLAY := user/lib/airplay/airplay.o
+# pdf: PDF reader + page renderer onto a canvas2d surface. A consumer also links $(CANVAS2D) $(FONT) $(INFLATE) $(JPEG) $(MATH) $(CRC32).
+PDF     := user/lib/pdf/pdf.o user/lib/pdf/pdffilter.o user/lib/pdf/pdffunc.o user/lib/pdf/pdffont.o user/lib/pdf/pdfrender.o user/lib/pdf/pdftext.o user/lib/pdf/pdfimage.o
 NOTIFY  := user/lib/notify/notify.o   # notifyd client (desktop notifications)
 TRAY    := user/lib/tray/tray.o       # compositor system tray client
 # mediactl: client for the mediad media session service; session.o is the shared codec + policy.

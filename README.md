@@ -294,7 +294,7 @@ Any command's output can be piped into `grep` (`<cmd> | grep <pattern>`) or
 redirected to a file (`<cmd> > <file>`). A bare non-builtin name runs the
 matching `/bin` program, so `curl <url>`, `editor file.txt`, and friends just
 work. Bundled programs: `edit`, `editor`, `curl`, `browser`, `imgview`,
-`files`, `clock`, `about`, `crashme`.
+`pdfview`, `files`, `clock`, `about`, `crashme`.
 
 ---
 
@@ -382,6 +382,7 @@ user/lib/          user libc: syscall wrappers, gfx, inflate, png, url, _start
 user/curl.c        HTTP/1.1 client
 user/browser/      web browser (fetch + HTML + render)
 user/imgview.c     PNG image viewer
+user/pdfview/      PDF viewer (user/lib/pdf: parser + page renderer)
 user/editor.c      windowed text editor (menus, Ctrl+key)
 user/edit.c        ed-style line editor over owofs
 user/files.c       file-browser app

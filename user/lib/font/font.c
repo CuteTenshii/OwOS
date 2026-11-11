@@ -195,14 +195,14 @@ void font_free(struct font *f)
 
 /* ------------------------------------------------ cmap lookup --------------
  */
-int font_glyph_index(const struct font *f, int cp)
+static int cmap_lookup(const struct font *f, unsigned sub, int fmt, int cp)
 {
-  if (!f || !f->cmap_sub || cp < 0)
+  if (!f || !sub || cp < 0)
     return 0;
-  const unsigned char *t = f->d + f->cmap_sub;
+  const unsigned char *t = f->d + sub;
   const unsigned char *end = f->d + f->len;
 
-  if (f->cmap_fmt == 4) {
+  if (fmt == 4) {
     if (t + 14 > end)
       return 0;
     int segX2 = (int)rd16(t + 6);
@@ -232,7 +232,7 @@ int font_glyph_index(const struct font *f, int cp)
     }
     return 0;
   }
-  if (f->cmap_fmt == 12) {
+  if (fmt == 12) {
     if (t + 16 > end)
       return 0;
     unsigned ng = rd32(t + 12);
@@ -248,7 +248,7 @@ int font_glyph_index(const struct font *f, int cp)
     }
     return 0;
   }
-  if (f->cmap_fmt == 6) {
+  if (fmt == 6) {
     if (t + 10 > end)
       return 0;
     int first = (int)rd16(t + 6), count = (int)rd16(t + 8);
@@ -258,12 +258,32 @@ int font_glyph_index(const struct font *f, int cp)
       return 0;
     return (int)rd16(t + 10 + (cp - first) * 2);
   }
-  if (f->cmap_fmt == 0) {
+  if (fmt == 0) {
     if (cp < 0 || cp > 255)
       return 0;
     if (t + 6 + cp + 1 > end)
       return 0;
     return t[6 + cp];
+  }
+  return 0;
+}
+
+int font_glyph_index(const struct font *f, int cp) { return f ? cmap_lookup(f, f->cmap_sub, f->cmap_fmt, cp) : 0; }
+
+int font_glyph_index_enc(const struct font *f, int platform, int encoding, int cp)
+{
+  unsigned cmap = f ? find_table(f->d, f->len, "cmap") : 0;
+  if (!cmap || cmap + 4 > (unsigned)f->len)
+    return 0;
+  const unsigned char *c = f->d + cmap;
+  int n = (int)rd16(c + 2);
+  for (int i = 0; i < n; i++) {
+    const unsigned char *e = c + 4 + i * 8;
+    if (e + 8 > f->d + f->len)
+      break;
+    unsigned off = cmap + rd32(e + 4);
+    if ((int)rd16(e) == platform && (int)rd16(e + 2) == encoding && off + 2 <= (unsigned)f->len)
+      return cmap_lookup(f, off, (int)rd16(f->d + off), cp);
   }
   return 0;
 }

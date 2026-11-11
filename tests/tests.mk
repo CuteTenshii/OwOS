@@ -11,7 +11,7 @@ INCLUDES := -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc -Iuse
             -Iuser/lib/mp4 -Iuser/lib/jpeg -Iuser/lib/media -Iuser/lib/sqlite -Iuser/lib/gfx -Iuser/lib/png -Iuser/lib/webp -Iuser/lib/gif -Iuser/lib/imganim -Iuser/lib/canvas2d -Iuser/lib/font -Iuser/lib/tz -Iuser/lib/desktop \
             -Iuser/lib/ntp -Iuser/lib/netconn -Iuser/lib/notify -Iuser/lib/mediactl -Iuser/apps/browser \
             -Iuser/apps/browser/js -Iuser/lib/cast -Iuser/lib/clipboard -Iuser/lib/websocket \
-            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm -Iuser/lib/zstd -Iuser/lib/archive -Iuser/lib/json -Iuser/lib/plist -Iuser/lib/airplay -Iuser/lib/uuid -Iuser/lib/xml -Iuser/lib/upnp
+            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm -Iuser/lib/zstd -Iuser/lib/archive -Iuser/lib/json -Iuser/lib/plist -Iuser/lib/airplay -Iuser/lib/uuid -Iuser/lib/pdf -Iuser/lib/xml -Iuser/lib/upnp
 CFLAGS_T := -std=gnu11 -O2 $(INCLUDES) -MMD -MP
 
 # Host compressors the btrfs test cross-checks against; each is used only when pkg-config finds it.
@@ -37,7 +37,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
 MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(LIB)/json/json.c $(wildcard $(BROWSER)/features/svg/*.c) $(BROWSER)/imgdec.c $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/gfx/toggle.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/xml/xml.c $(LIB)/xml/xmltree.c $(LIB)/upnp/upnp.c $(LIB)/ntp/ntp.c $(LIB)/plist/plist.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(LIB)/media/tags.c $(LIB)/jpeg/jpeg.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/usb/uvc_desc.c drivers/video/dpaux.c drivers/video/edidparse.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
-  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c \
+  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(wildcard $(LIB)/pdf/*.c) \
   $(LIB)/zstd/zstd_common.c $(LIB)/zstd/fse.c $(LIB)/zstd/huf.c $(LIB)/zstd/zstd_enc.c kernel/arch/aarch64/fdt.c
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/features/battery/battery.c $(LIB)/uuid/uuid.c $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c

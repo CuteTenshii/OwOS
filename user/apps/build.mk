@@ -10,7 +10,7 @@
 # The browser includes its own headers by path from its root.
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
 
-GUI_APPS := about archive browser calc cliphist clock compositor editor files imgview notifyd player settings term
+GUI_APPS := about archive browser calc cliphist clock compositor editor files imgview notifyd pdfview player settings term
 CLI_APPS := aac alac base64 cast chmod chown clipd curl dhcpcd dig edit h264 init json lspci mdnsd mediactl mediad mpeg neofetch notifysend ntpd ping sh smbd ssh sshd stun sudo torrent trayd uname unrar upnpc vmclipd webp
 APPS := $(GUI_APPS) $(CLI_APPS)
 
@@ -44,6 +44,7 @@ APP_LIBS_notifysend := $(NOTIFY)
 APP_LIBS_trayd := $(TRAY)
 APP_LIBS_ntpd := $(RESOLVE) $(NTP)
 APP_LIBS_ping := $(RESOLVE)
+APP_LIBS_pdfview := $(PDF) $(CANVAS2D) $(INFLATE) $(JPEG) $(MATH) $(CRC32) $(FILEPICK) $(DIALOG)
 APP_LIBS_player := $(FILEPICK) $(MEDIA) $(VIDEO) $(JPEG) $(PNGDEC) $(INFLATE) $(WEBP) $(MATH) $(MEDIACTL) $(TRAY)
 APP_LIBS_ssh := $(CRYPTO) $(RESOLVE)
 APP_LIBS_sshd := $(CRYPTO)
@@ -71,7 +72,7 @@ endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
 # Start menu entries, embedded in the kernel and installed to /usr/share/applications at boot.
-DESKTOP_APPS := term files archive editor browser player clock calc notifyd settings about
+DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings about
 define desktop_rule
 kernel/$(1)_desktop_blob.o: user/apps/$(1)/$(1).desktop
 	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
@@ -83,7 +84,7 @@ $(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 # Combined function-symbol table (one text blob, sections keyed by app name) so
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
-SYM_APPS := browser files archive editor term calc imgview player settings notifyd about clock cliphist
+SYM_APPS := browser files archive editor term calc imgview pdfview player settings notifyd about clock cliphist
 kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \

@@ -498,6 +498,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_DESKTOP(archive);
     INSTALL_DESKTOP(editor);
     INSTALL_DESKTOP(browser);
+    INSTALL_DESKTOP(pdfview);
     INSTALL_DESKTOP(player);
     INSTALL_DESKTOP(clock);
     INSTALL_DESKTOP(calc);
@@ -522,6 +523,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(files);
     INSTALL_APP(browser);
     INSTALL_APP(imgview);
+    INSTALL_APP(pdfview);
     INSTALL_APP(term);
     INSTALL_APP(compositor);
     INSTALL_APP(neofetch);

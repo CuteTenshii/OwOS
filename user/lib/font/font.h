@@ -32,6 +32,10 @@ void font_vmetrics(const struct font *f, float px, int *ascent, int *descent, in
 /* Unicode codepoint -> glyph index (0 = .notdef / not present). */
 int font_glyph_index(const struct font *f, int codepoint);
 
+/* Code -> glyph index through the cmap subtable with this platform/encoding id pair (e.g. 1,0 Macintosh Roman,
+ * 3,0 Symbol); 0 if the font has no such subtable. */
+int font_glyph_index_enc(const struct font *f, int platform, int encoding, int code);
+
 /* Glyph `gi`'s horizontal advance + left side bearing in pixels at size `px`.
  */
 void font_glyph_hmetrics(const struct font *f, int gi, float px, int *advance, int *lsb);

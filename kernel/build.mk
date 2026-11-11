@@ -47,7 +47,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/editor_blob.o kernel/about_blob.o \
         kernel/clock_blob.o kernel/calc_blob.o kernel/files_blob.o kernel/browser_blob.o \
         kernel/compositor_blob.o \
-        kernel/imgview_blob.o kernel/term_blob.o \
+        kernel/imgview_blob.o kernel/pdfview_blob.o kernel/term_blob.o \
         kernel/neofetch_blob.o kernel/lspci_blob.o kernel/uname_blob.o \
         kernel/ping_blob.o kernel/dig_blob.o kernel/stun_blob.o kernel/upnpc_blob.o kernel/torrent_blob.o \
         kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o kernel/sshd_blob.o \

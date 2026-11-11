@@ -72,7 +72,10 @@ static int build_cff_font(unsigned char *out, unsigned cs_off)
   };
   unsigned char cff[128], head[54] = {0}, hhea[36] = {0}, maxp[6] = {0, 0, 0x50, 0, 0, 2};
   unsigned char hmtx[8] = {0x01, 0xf4, 0, 0, 0x01, 0xf4, 0, 0};
-  unsigned char cmap[24] = {0, 0, 0, 1, 0, 3, 0, 1, 0, 0, 0, 12, 0, 6, 0, 12, 0, 0, 0, 65, 0, 1, 0, 1};
+  unsigned char cmap[44] = {0, 0, 0, 2,               /* two encodings */
+                            0, 3, 0, 1,  0, 0, 0, 20, /* (3,1): U+0041 -> glyph 1 */
+                            0, 1, 0, 0,  0, 0, 0, 32, /* (1,0): Mac code 0x80 -> glyph 1 */
+                            0, 6, 0, 12, 0, 0, 0, 65, 0, 1, 0, 1, 0, 6, 0, 12, 0, 0, 0, 128, 0, 1, 0, 1};
   int n = 0;
   memcpy(cff, (unsigned char[]){1, 0, 4, 1, /* header */ 0, 1, 1, 1, 5, 'T', 'e', 's', 't'}, 13);
   n = 13;
@@ -145,6 +148,22 @@ static void cff_square(void)
   font_free(f);
 }
 
+static void glyph_index_by_encoding(void)
+{
+  unsigned char buf[512];
+  int len = build_cff_font(buf, 0);
+  struct font *f = font_load(buf, len);
+  expect(f != NULL);
+  if (!f)
+    return;
+  expect_eq(font_glyph_index_enc(f, 1, 0, 128), 1);
+  expect_eq(font_glyph_index_enc(f, 1, 0, 'A'), 0);
+  expect_eq(font_glyph_index_enc(f, 3, 1, 'A'), 1);
+  expect_eq(font_glyph_index_enc(f, 3, 0, 'A'), 0);
+  expect_eq(font_glyph_index(f, 128), 0);
+  font_free(f);
+}
+
 static void cff_bad_charstrings_offset(void)
 {
   unsigned char buf[512];
@@ -159,6 +178,7 @@ int main(void)
   test("truncates", truncates);
   test("woff2", woff2);
   test("cff_square", cff_square);
+  test("glyph_index_by_encoding", glyph_index_by_encoding);
   test("cff_bad_charstrings_offset", cff_bad_charstrings_offset);
   return 0;
 }

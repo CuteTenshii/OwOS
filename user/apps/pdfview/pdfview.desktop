@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PDF Viewer
+GenericName=PDF Viewer
+Comment=Read PDF documents
+Exec=pdfview
+Icon=application-default
+Terminal=false
+Categories=Office;Viewer;
+X-OwOS-Order=45
