@@ -14,8 +14,9 @@
 #include "rtc.h"
 #include "sched.h"
 #include "sysfs.h"
+#include "tmpfs.h"
 
-/* Mount table: removable volumes appear under "/media/<name>"; /dev, /proc and /sys are permanent
+/* Mount table: removable volumes appear under "/media/<name>"; /dev, /proc, /sys and /tmp are permanent
  * mounts hidden from fs_mount_enum/umount. mount_for() longest-prefix matches a path and returns the
  * owning mount plus the path within the volume, or NULL for plain owofs. Writable iff ops expose create(). */
 #define MAX_MOUNTS 12
@@ -841,12 +842,13 @@ static void mnt_attr(struct mnt *m, const char *sub, bool is_dir, uint32_t *mode
     *mode = is_dir ? m->dir_mode : m->file_mode;
 }
 
-/* Graft a permanent pseudo-filesystem into the mount table at `point`. */
-static void mount_pseudo(const char *point, const char *dev, const struct fs_ops *ops)
+/* Graft a permanent filesystem into the mount table at `point`. 1 when mounted, 0 when the point is already
+ * mounted, -1 when the table is full. */
+static int mount_pseudo(const char *point, const char *dev, const struct fs_ops *ops, void *inst)
 {
   for (int i = 0; i < MAX_MOUNTS; i++)
     if (mtab[i].used && s_eq(mtab[i].point, point))
-      return;
+      return 0;
   for (int i = 0; i < MAX_MOUNTS; i++) {
     if (mtab[i].used)
       continue;
@@ -855,17 +857,35 @@ static void mount_pseudo(const char *point, const char *dev, const struct fs_ops
     str_copy(mtab[i].point, point, (int)sizeof mtab[i].point);
     str_copy(mtab[i].dev, dev, (int)sizeof mtab[i].dev);
     mtab[i].ops = ops;
-    mtab[i].inst = NULL;
-    return;
+    mtab[i].inst = inst;
+    return 1;
   }
+  return -1;
 }
 
-/* Mount the three permanent pseudo-filesystems; independent of owofs, so present on a no-disk boot. */
+/* Mount the permanent filesystems; independent of owofs, so present on a no-disk boot. */
 static void fs_mount_pseudo(void)
 {
-  mount_pseudo("/dev", "dev", &devfs_ops);
-  mount_pseudo("/proc", "proc", &procfs_ops);
-  mount_pseudo("/sys", "sys", &sysfs_ops);
+  mount_pseudo("/dev", "dev", &devfs_ops, NULL);
+  mount_pseudo("/proc", "proc", &procfs_ops, NULL);
+  mount_pseudo("/sys", "sys", &sysfs_ops, NULL);
+  void *tmp = tmpfs_new();
+  int rc = tmp ? mount_pseudo("/tmp", "tmp", tmpfs_ops(), tmp) : -1;
+  if (rc != 1 && tmp)
+    tmpfs_ops()->close(tmp);
+  if (rc < 0)
+    con_write("fs: cannot mount /tmp\n");
+}
+
+/* An owofs root entry named like a permanent mount (the on-disk /tmp older kernels made) is hidden behind it. */
+static bool shadowed_by_mount(uint32_t i)
+{
+  if (dir[i].parent != FS_ROOT)
+    return false;
+  for (int k = 0; k < MAX_MOUNTS; k++)
+    if (mtab[k].used && mtab[k].permanent && s_eq(mnt_leaf(&mtab[k]), dir[i].name))
+      return true;
+  return false;
 }
 
 void fs_format(void)
@@ -1080,7 +1100,7 @@ void fs_list(const char *path)
   int parent = (d == FS_SLOT_ROOT) ? (int)FS_ROOT : d;
   int n = 0;
   for (uint32_t i = 0; i < dir_cap; i++)
-    if (dir[i].name[0] && dir[i].parent == (uint16_t)parent) {
+    if (dir[i].name[0] && dir[i].parent == (uint16_t)parent && !shadowed_by_mount(i)) {
       list_row(i);
       n++;
     }
@@ -1967,7 +1987,7 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *si
 
   int count = 0;
   for (uint32_t i = 0; i < dir_cap; i++) {
-    if (!dir[i].name[0] || dir[i].parent != parent)
+    if (!dir[i].name[0] || dir[i].parent != parent || shadowed_by_mount(i))
       continue;
     if (count == idx) {
       int j = 0;

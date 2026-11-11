@@ -460,7 +460,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   /* Install the embedded programs onto the disk if absent. */
   {
     mkdir_mode("/bin", 0755);
-    mkdir_mode("/tmp", 01777);
     mkdir_mode("/home", 0755);
     mkdir_mode("/home/root", 0700);
     mkdir_mode("/home/root/Downloads", 0755);
