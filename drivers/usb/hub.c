@@ -32,11 +32,15 @@
 #define PORT_CHG_CONNECTION 0x0001
 #define PORT_CHG_RESET 0x0010
 
+/* GET_STATUS wValue selecting a SuperSpeedPlus hub's 8-byte extended port status. */
+#define PORT_STATUS_EXT 2
+
 struct hub {
   struct hub *next;
   int slot;
   int nports;
   bool super;
+  bool ssp;                  /* SuperSpeedPlus hub: ports report their sublink speed */
   volatile uint8_t *pending; /* bit n = port n changed (bit 0 = the hub itself) */
 };
 
@@ -77,8 +81,19 @@ static bool has_child(int slot, int port)
   return false;
 }
 
-/* Reset a connected port and return the speed of what enabled, or 0. */
-static int reset_hub_port(struct hub *h, int port)
+/* The negotiated speed behind an enabled SuperSpeed hub port. */
+static int super_port_speed(struct hub *h, int port, uint32_t *kbps)
+{
+  uint8_t st[8];
+  struct usbdev *d = usbh_dev(h->slot);
+  if (h->ssp && d && usbh_control_in(h->slot, 0xA3, REQ_GET_STATUS, PORT_STATUS_EXT, (uint16_t)port, st, 8) == 8)
+    return usb3_ext_port_speed(&d->bos, st[4] | st[5] << 8 | (uint32_t)st[6] << 16 | (uint32_t)st[7] << 24, kbps);
+  *kbps = usb3_default_kbps(USB_SPEED_SUPER);
+  return USB_SPEED_SUPER;
+}
+
+/* Reset a connected port and return the speed of what enabled (and its bit rate), or 0. */
+static int reset_hub_port(struct hub *h, int port, uint32_t *kbps)
 {
   uint16_t status = 0, change = 0;
   port_feature(h->slot, REQ_SET_FEATURE, PORT_FEAT_RESET, port);
@@ -92,10 +107,12 @@ static int reset_hub_port(struct hub *h, int port)
     return 0;
   timer_sleep(10);
   if (h->super)
-    return USB_SPEED_SUPER;
-  if (status & PORT_STAT_LOW_SPEED)
-    return USB_SPEED_LOW;
-  return (status & PORT_STAT_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;
+    return super_port_speed(h, port, kbps);
+  int speed = (status & PORT_STAT_LOW_SPEED)    ? USB_SPEED_LOW
+              : (status & PORT_STAT_HIGH_SPEED) ? USB_SPEED_HIGH
+                                                : USB_SPEED_FULL;
+  *kbps = usb3_default_kbps(speed);
+  return speed;
 }
 
 static void port_changed(struct hub *h, int port)
@@ -120,9 +137,10 @@ static void port_changed(struct hub *h, int port)
   if ((change & PORT_CHG_CONNECTION) || (!connected && has_child(slot, port)))
     usbh_detach_child(slot, port);
   if (connected && !has_child(slot, port)) {
-    int speed = reset_hub_port(h, port);
+    uint32_t kbps = 0;
+    int speed = reset_hub_port(h, port, &kbps);
     if (speed)
-      usbh_attach_child(slot, port, speed);
+      usbh_attach_child(slot, port, speed, kbps);
     else
       con_printf("usbhub: slot %d port %d did not enable\n", slot, port);
   }
@@ -199,6 +217,7 @@ void hub_bind(struct usbdev *d)
   h->slot = d->slot;
   h->nports = nports;
   h->super = super;
+  h->ssp = super && d->bos.ssp;
   h->pending = pending;
   if (!usbh_open_intr(d->slot, ep, mps, interval, hub_irq, h)) {
     kfree(h);
@@ -234,5 +253,5 @@ void hub_print(int slot)
 {
   for (struct hub *h = hubs; h; h = h->next)
     if (h->slot == slot)
-      con_printf(" [hub %d ports%s]", h->nports, h->super ? ", superspeed" : "");
+      con_printf(" [hub %d ports%s]", h->nports, h->ssp ? ", superspeed+" : h->super ? ", superspeed" : "");
 }

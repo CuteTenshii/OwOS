@@ -30,6 +30,7 @@
 #include "pci.h"
 #include "sched.h"
 #include "timer.h"
+#include "usb3.h"
 #include "usbhost.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -45,6 +46,7 @@
 #define XHCI_HCSPARAMS2 0x08 /* scratchpad buffer count (split fields)      */
 #define XHCI_HCCPARAMS1 0x10 /* CSZ[2]=64-byte contexts, xECP[31:16]        */
 #define XHCI_DBOFF 0x14      /* doorbell array offset from base             */
+#define XHCI_HCCPARAMS2 0x1C /* LEC[4]: large ESIT payload capability       */
 #define XHCI_RTSOFF 0x18     /* runtime register offset from base          */
 
 /* ---- operational registers (at base + CAPLENGTH) ------------------------ */
@@ -144,6 +146,13 @@ static volatile uint8_t *rt;  /* runtime registers                       */
 static volatile uint32_t *db; /* doorbell array                          */
 static uint32_t ctx_sz;       /* 32 or 64 bytes per context              */
 static uint32_t max_ports;
+/* xHCI 1.1+ with LEC computes an isochronous endpoint's Mult itself and wants the field zero. */
+static bool large_esit;
+
+/* Root ports by USB revision and speed-id table, from the Supported Protocol capabilities. */
+#define XHCI_MAX_PROTOS 8
+static struct usb3_proto protos[XHCI_MAX_PROTOS];
+static int nprotos;
 
 static uint64_t *dcbaa; /* device context base address array       */
 static struct ring cmd_ring;
@@ -470,6 +479,49 @@ static void xhci_takeover(void)
   }
 }
 
+/* Read every Supported Protocol capability: which root ports are USB 2 or USB 3.x, and what their speed ids mean (a
+ * USB 3.1 port's Gen 2 id need not be the default 5). */
+static void read_protocols(void)
+{
+  uint32_t xecp = (r32(cap, XHCI_HCCPARAMS1) >> 16) & 0xFFFF;
+  volatile uint32_t *p = (volatile uint32_t *)(cap + xecp * 4);
+  nprotos = 0;
+  for (int guard = 0; xecp && guard < 64; guard++) {
+    uint32_t hdr = p[0];
+    if ((hdr & 0xFF) == 2 && nprotos < XHCI_MAX_PROTOS) {
+      uint32_t dw[4 + USB3_MAX_PSI];
+      int ndw = 4 + (int)(p[2] >> 28);
+      for (int i = 0; i < ndw; i++)
+        dw[i] = p[i];
+      struct usb3_proto *pr = &protos[nprotos];
+      if (usb3_proto_parse(dw, ndw, pr) == 0 && pr->port_count) {
+        nprotos++;
+        uint32_t best = 0;
+        for (uint8_t id = 1; id < 16; id++) {
+          uint32_t kbps = 0;
+          if (usb3_port_speed(pr, id, &kbps) && kbps > best)
+            best = kbps;
+        }
+        char rate[16];
+        con_printf("xhci: ports %u-%u USB %u.%u, up to %s\n", pr->port_first, pr->port_first + pr->port_count - 1,
+                   pr->major, pr->minor >> 4, usb3_rate_str(best, rate, sizeof rate));
+      }
+    }
+    uint32_t next = (hdr >> 8) & 0xFF;
+    if (!next)
+      break;
+    p += next;
+  }
+}
+
+static const struct usb3_proto *port_proto(uint32_t port)
+{
+  for (int i = 0; i < nprotos; i++)
+    if (port >= protos[i].port_first && port < (uint32_t)protos[i].port_first + protos[i].port_count)
+      return &protos[i];
+  return NULL;
+}
+
 /* Power every root-hub port and give the ports time to report a connection.
  * Real controllers (with Port Power Control) bring ports up unpowered after a
  * reset, so CCS reads 0 until we set PP; QEMU powers them for us. */
@@ -514,8 +566,7 @@ static void setup_scratchpad(void)
   dcbaa[0] = (uint64_t)(uintptr_t)arr; /* DCBAA slot 0 = scratchpad array   */
 }
 
-/* Reset one connected port and return its speed id, or 0 if it didn't enable.
- */
+/* Reset one connected port and return its PORTSC speed id, or 0 if it didn't enable. */
 static int reset_port(uint32_t p)
 {
   uint32_t sc = r32(op, XHCI_PORTSC(p));
@@ -2397,10 +2448,11 @@ static void pipe_free(struct usbh_pipe *p)
 }
 
 struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
-                                    uint8_t binterval, usbh_isoc_cb cb, void *ctx)
+                                    uint32_t payload, uint8_t binterval, usbh_isoc_cb cb, void *ctx)
 {
   struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
-  uint32_t payload = (uint32_t)mps * (burst + 1u) * (mult + 1u);
+  if (!payload)
+    payload = (uint32_t)mps * (burst + 1u) * (mult + 1u);
   if (!x || !(ep_addr & 0x80) || mps == 0 || mps > 1024 || payload > 4096 || burst > 15 || mult > 2 || !cb)
     return NULL;
   struct usbh_pipe *p = kmalloc(sizeof *p);
@@ -2439,7 +2491,7 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   if (exponent > 15)
     exponent = 15;
   uint32_t ep[5] = {0};
-  ep[0] = ((uint32_t)mult << 8) | (exponent << 16) | ((payload >> 16) << 24);
+  ep[0] = ((uint32_t)(large_esit ? 0 : mult) << 8) | (exponent << 16) | ((payload >> 16) << 24);
   ep[1] = (5u << 3) | ((uint32_t)burst << 8) | ((uint32_t)mps << 16);
   ep[2] = (uint32_t)(uintptr_t)p->ring.base | 1;
   ep[4] = payload | ((payload & 0xFFFF) << 16);
@@ -2577,9 +2629,27 @@ static void remove_device(int slot)
   kfree(x);
 }
 
+static void read_bos(struct usbdev *d)
+{
+  uint8_t hdr[5];
+  if (usbh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, hdr, 5) != 5)
+    return;
+  int total = hdr[2] | (hdr[3] << 8);
+  if (total < 5)
+    return;
+  if (total > 512)
+    total = 512;
+  uint8_t *bos = kmalloc((uint32_t)total);
+  if (!bos)
+    return;
+  if (usbh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, bos, total) == total)
+    usb3_bos_parse(bos, total, &d->bos);
+  kfree(bos);
+}
+
 /* Enable a slot, address the device, read its descriptors, select configuration 1 and bind class drivers; returns
  * the slot or 0. parent_slot 0 means a root-hub port. */
-static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port, int speed)
+static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port, int speed, uint32_t kbps)
 {
   struct xdev *parent = parent_slot ? devs[parent_slot] : NULL;
   if (parent && parent->pub.depth >= 5)
@@ -2599,6 +2669,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   struct usbdev *d = &x->pub;
   d->slot = slot_id;
   d->speed = speed;
+  d->kbps = kbps ? kbps : usb3_default_kbps(speed);
   d->root_port = (uint8_t)root_port;
   d->parent_slot = parent_slot;
   d->parent_port = (uint8_t)parent_port;
@@ -2640,9 +2711,15 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   if (usbh_control_in(slot_id, 0x80, 0x06, 0x0100, 0, desc, 18) != 18)
     goto fail;
 
+  d->bcd_usb = desc[2] | (desc[3] << 8);
   d->vid = desc[8] | (desc[9] << 8);
   d->pid = desc[10] | (desc[11] << 8);
   d->cls = desc[4];
+
+  /* USB 2.1 and later devices carry a BOS; its SuperSpeed capabilities tell what the device could run at, and a hub's
+   * sublink speeds decode its ports. */
+  if (d->bcd_usb >= 0x0201)
+    read_bos(d);
 
   /* Read the config descriptor (9-byte header for wTotalLength, then all), cache it, select it. */
   uint8_t hdr[9];
@@ -2696,10 +2773,10 @@ fail:
   return 0;
 }
 
-int usbh_attach_child(int parent_slot, int port, int speed)
+int usbh_attach_child(int parent_slot, int port, int speed, uint32_t kbps)
 {
   struct xdev *parent = devs[parent_slot];
-  return parent ? enumerate_device(parent_slot, port, parent->pub.root_port, speed) : 0;
+  return parent ? enumerate_device(parent_slot, port, parent->pub.root_port, speed, kbps) : 0;
 }
 
 void usbh_detach_child(int parent_slot, int port)
@@ -2738,8 +2815,12 @@ static int setup_controller(void)
     return -1;
   memset(root_slot, 0, (max_ports + 1) * sizeof *root_slot);
   ctx_sz = (r32(cap, XHCI_HCCPARAMS1) & (1u << 2)) ? 64 : 32;
+  uint32_t version = r32(cap, XHCI_CAPLENGTH) >> 16;
+  large_esit = version > 0x100 && (r32(cap, XHCI_HCCPARAMS2) & (1u << 4));
+  con_printf("xhci: version %x.%02x\n", version >> 8, version & 0xFF);
 
   xhci_takeover();
+  read_protocols();
 
   if (controller_reset() != 0) {
     con_write("xhci: controller reset timed out\n");
@@ -2809,9 +2890,15 @@ static void scan_ports(void)
       root_slot[p] = 0;
     }
     if (sc & PORT_CCS) {
-      int speed = reset_port(p);
+      int psiv = reset_port(p);
+      if (!psiv)
+        continue;
+      uint32_t kbps = 0;
+      int speed = usb3_port_speed(port_proto(p), (uint8_t)psiv, &kbps);
       if (speed)
-        root_slot[p] = enumerate_device(0, 0, p, speed);
+        root_slot[p] = enumerate_device(0, 0, p, speed, kbps);
+      else
+        con_printf("xhci: port %u reports unknown speed id %d\n", p, psiv);
     }
   }
 }

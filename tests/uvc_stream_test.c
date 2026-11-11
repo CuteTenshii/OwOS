@@ -55,6 +55,7 @@ static uint32_t reply_payload;
 static int isoc_opens, bulk_opens, closes;
 static uint8_t isoc_ep, isoc_burst, isoc_mult, isoc_interval, bulk_ep_open;
 static uint16_t isoc_mps, bulk_mps_open;
+static uint32_t isoc_payload;
 static usbh_isoc_cb iso_cb;
 static usbh_pipe_cb blk_cb;
 static int pipe_token;
@@ -116,8 +117,8 @@ int usbh_control_nodata(int slot, uint8_t type, uint8_t req, uint16_t value, uin
   return 0;
 }
 
-struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep, uint16_t mps, uint8_t burst, uint8_t mult, uint8_t binterval,
-                                    usbh_isoc_cb cb, void *ctx)
+struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep, uint16_t mps, uint8_t burst, uint8_t mult, uint32_t payload,
+                                    uint8_t binterval, usbh_isoc_cb cb, void *ctx)
 {
   (void)slot;
   (void)ctx;
@@ -127,6 +128,7 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep, uint16_t mps, uint8_t 
   isoc_mps = mps;
   isoc_burst = burst;
   isoc_mult = mult;
+  isoc_payload = payload;
   isoc_interval = binterval;
   iso_cb = cb;
   int fail = fail_opens > 0 && fail_opens--;
@@ -298,6 +300,7 @@ static void start_negotiates_and_opens_isoc(void)
   expect_eq(isoc_mps, 1023);
   expect_eq(isoc_burst, 0);
   expect_eq(isoc_mult, 0);
+  expect_eq(isoc_payload, 1023);
   expect_eq(isoc_interval, 1);
 
   char t[64];

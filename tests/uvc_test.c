@@ -64,6 +64,35 @@ static void high_bandwidth_endpoint(void)
   expect_eq(c.alts[2].payload, 2048);
 }
 
+/* A SuperSpeedPlus isochronous companion replaces the payload and leaves Mult unused. */
+static void super_speed_plus_companion(void)
+{
+  struct blob o;
+  struct uvc_cfg c;
+  memset(&o, 0, sizeof o);
+  uint8_t cfg[9] = {9, 2, 0, 0, 1, 1, 0, 0x80, 50};
+  put(&o, cfg, 9);
+  iface(&o, 3, 0, 0, 2);
+  format_mjpeg(&o, 1, 1);
+  frame(&o, 7, 1, 1920, 1080, fps30, 1, 0, 0, 4000000);
+  iface(&o, 3, 1, 1, 2);
+  iso_ep(&o, 0x82, 1024, 1);
+  ss_companion(&o, 3, 0x82, 0);
+  uint8_t ssp[8] = {8, 0x31, 0, 0, 0x00, 0x0E, 0, 0}; /* 3584 bytes per interval */
+  put(&o, ssp, 8);
+  iface(&o, 3, 2, 1, 2);
+  iso_ep(&o, 0x82, 1024, 1);
+  ss_companion(&o, 15, 0x80, 0);
+  uint8_t big[8] = {8, 0x31, 0, 0, 0x00, 0x00, 0x01, 0}; /* 64 KiB: more than one TD page */
+  put(&o, big, 8);
+  expect_eq(uvc_parse_config(o.b, o.n, &c), 0);
+  expect_eq(c.nalts, 1);
+  expect_eq(c.alts[0].alt, 1);
+  expect_eq(c.alts[0].burst, 3);
+  expect_eq(c.alts[0].mult, 0);
+  expect_eq(c.alts[0].payload, 3584);
+}
+
 static void super_speed_companion(void)
 {
   struct blob o;
@@ -432,6 +461,7 @@ int main(void)
   test("config: isochronous alternate settings", parse_alts);
   test("config: high-bandwidth endpoints", high_bandwidth_endpoint);
   test("config: SuperSpeed companion overrides the payload", super_speed_companion);
+  test("config: SuperSpeedPlus isochronous companion", super_speed_plus_companion);
   test("config: bulk streaming camera", bulk_streaming);
   test("config: unusable devices are refused", unusable_cameras);
   test("config: frames too large for the heap are not offered", oversized_uncompressed_dropped);

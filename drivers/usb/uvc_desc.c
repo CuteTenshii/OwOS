@@ -18,6 +18,7 @@
 #define DT_ENDPOINT 0x05
 #define DT_CS_INTERFACE 0x24
 #define DT_SS_COMPANION 0x30
+#define DT_SSP_ISO_COMPANION 0x31
 
 #define VC_HEADER 1
 #define VS_FORMAT_UNCOMPRESSED 4
@@ -158,10 +159,13 @@ int uvc_parse_config(const uint8_t *cfg, int len, struct uvc_cfg *out)
     } else if (p[1] == DT_SS_COMPANION && n >= 6 && last_alt >= 0) {
       struct uvc_alt *a = &out->alts[last_alt];
       a->burst = p[2];
-      a->mult = p[3] & 3;
+      /* Bit 7: a SuperSpeedPlus isochronous companion follows with the real size, and Mult is then unused. */
+      a->mult = (p[3] & 0x80) ? 0 : p[3] & 3;
       a->payload = le16(p + 4);
       if (!a->payload)
         a->payload = (uint32_t)a->mps * (a->burst + 1u) * (a->mult + 1u);
+    } else if (p[1] == DT_SSP_ISO_COMPANION && n >= 8 && last_alt >= 0) {
+      out->alts[last_alt].payload = le32(p + 4);
     }
   }
 

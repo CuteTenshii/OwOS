@@ -409,7 +409,12 @@ static void print_device(int slot, const char *path, int depth, int detail_port)
   con_write("xhci: ");
   for (int i = 0; i < depth; i++)
     con_write("  ");
-  con_printf("port %s: %04x:%04x class %02x speed %u", path, d->vid, d->pid, d->cls, d->speed);
+  char rate[16];
+  con_printf("port %s: %04x:%04x class %02x %s", path, d->vid, d->pid, d->cls,
+             usb3_rate_str(d->kbps, rate, sizeof rate));
+  uint32_t capable = usb3_bos_max_kbps(&d->bos);
+  if (capable > d->kbps)
+    con_printf(" (%s capable)", usb3_rate_str(capable, rate, sizeof rate));
   if (d->mac_ok && (d->bound & USBH_BOUND_NET))
     con_write(" [net]");
   if (d->bound & USBH_BOUND_MTP)

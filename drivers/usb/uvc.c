@@ -189,7 +189,8 @@ static int open_stream(const struct uvc_probe *neg)
     if (!a || (tries && a->payload < need))
       break;
     if (usbh_control_nodata(uvc.slot, 0x01, 0x0B, a->alt, uvc.cfg.vs_iface) == 0) {
-      uvc.pipe = usbh_open_isoc_in(uvc.slot, a->ep, a->mps, a->burst, a->mult, a->interval, isoc_chunk, NULL);
+      uvc.pipe =
+          usbh_open_isoc_in(uvc.slot, a->ep, a->mps, a->burst, a->mult, a->payload, a->interval, isoc_chunk, NULL);
       if (uvc.pipe)
         return 0;
       usbh_control_nodata(uvc.slot, 0x01, 0x0B, 0, uvc.cfg.vs_iface);
