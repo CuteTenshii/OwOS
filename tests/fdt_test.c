@@ -527,6 +527,131 @@ static void check_find_truncation(void)
   }
 }
 
+/* A Tegra X1 (Nintendo Switch) shaped tree: console chosen through an alias, two UARTs, and the PMIC as an I2C client
+ * whose bus uses one address cell and no size cells. */
+static void build_tegra(struct blob *b, const char *stdout_path)
+{
+  memset(b, 0, sizeof *b);
+  begin(b, "");
+  prop1(b, "#address-cells", 2);
+  prop1(b, "#size-cells", 2);
+  begin(b, "chosen");
+  if (stdout_path)
+    prop_str(b, "stdout-path", stdout_path, (uint32_t)strlen(stdout_path) + 1);
+  end_node(b);
+  begin(b, "aliases");
+  prop_str(b, "serial1", "/serial@70006040", 17);
+  end_node(b);
+  begin(b, "serial@70006000");
+  prop_str(b, "compatible", "nvidia,tegra210-uart\0nvidia,tegra20-uart", 42);
+  prop64(b, "reg", 0x70006000, 0x40);
+  prop_str(b, "status", "disabled", 9);
+  end_node(b);
+  begin(b, "serial@70006040");
+  prop_str(b, "compatible", "nvidia,tegra210-uart\0nvidia,tegra20-uart", 42);
+  prop64(b, "reg", 0x70006040, 0x40);
+  prop_str(b, "status", "okay", 5);
+  end_node(b);
+  begin(b, "i2c@7000d000");
+  prop_str(b, "compatible", "nvidia,tegra210-i2c", 20);
+  prop64(b, "reg", 0x7000d000, 0x100);
+  prop1(b, "#address-cells", 1);
+  prop1(b, "#size-cells", 0);
+  begin(b, "pmic@3c");
+  prop_str(b, "compatible", "maxim,max77620", 15);
+  prop1(b, "reg", 0x3c);
+  end_node(b);
+  end_node(b);
+  end_node(b);
+  put32(b, 9);
+}
+
+static void check_stdout_path(void)
+{
+  struct blob b;
+  char buf[32];
+  build_tegra(&b, "serial1:115200n8");
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, sizeof buf), 0);
+  expect_eq(strcmp(buf, "/serial@70006040"), 0);
+
+  build_tegra(&b, "/serial@70006000:115200n8");
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, sizeof buf), 0);
+  expect_eq(strcmp(buf, "/serial@70006000"), 0);
+
+  build_tegra(&b, "serial7");
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, sizeof buf), -1); /* no such alias */
+  build_tegra(&b, ":115200");
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, sizeof buf), -1);
+  build_tegra(&b, 0);
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, sizeof buf), -1);
+  build_tegra(&b, "serial1");
+  expect_eq(fdt_stdout_path(serialize(&b, b.st_len, 0xd00dfeed, 0), buf, 8), -1); /* resolved path does not fit */
+}
+
+static void check_path_lookups(void)
+{
+  struct blob b;
+  uint64_t base, size;
+  char buf[16];
+  build_tegra(&b, 0);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_path_reg(fdt, "/serial@70006040", 0, &base, &size), 0);
+  expect_eq(base, 0x70006040);
+  expect_eq(size, 0x40);
+  expect_eq(fdt_path_reg(fdt, "/serial", 0, &base, &size), 0); /* name alone: the first in tree order */
+  expect_eq(base, 0x70006000);
+  expect_eq(fdt_path_reg(fdt, "/serial@70006040", 1, &base, &size), -1);
+  expect_eq(fdt_path_reg(fdt, "/serial@7000604", 0, &base, &size), -1);
+  expect_eq(fdt_path_reg(fdt, "/serial@70006040/x", 0, &base, &size), -1);
+  expect_eq(fdt_path_reg(fdt, "/", 0, &base, &size), -1); /* the root has no reg */
+  expect_eq(fdt_path_reg(fdt, "serial@70006040", 0, &base, &size), -1);
+  expect_eq(fdt_path_reg(fdt, "//serial@70006040", 0, &base, &size), -1);
+  expect_eq(fdt_path_reg(fdt, "/pmic@3c", 0, &base, &size), -1); /* only matches at its own depth */
+
+  expect_eq(fdt_path_str(fdt, "/serial@70006000", "status", buf, sizeof buf), 0);
+  expect_eq(strcmp(buf, "disabled"), 0);
+  expect_eq(fdt_path_str(fdt, "/serial@70006040", "missing", buf, sizeof buf), -1);
+
+  expect_eq(fdt_path_compat(fdt, "/serial@70006040", "nvidia,tegra20-uart"), 1);
+  expect_eq(fdt_path_compat(fdt, "/serial@70006040", "arm,pl011"), 0);
+  expect_eq(fdt_path_compat(fdt, "/i2c/pmic", "maxim,max77620"), 1);
+  expect_eq(fdt_path_compat(fdt, "/chosen", "maxim,max77620"), 0); /* no compatible at all */
+  expect_eq(fdt_path_compat(fdt, "/serial@1", "arm,pl011"), -1);
+}
+
+static void check_parent_reg(void)
+{
+  struct blob b;
+  uint64_t base, size;
+  uint32_t addr;
+  build_tegra(&b, 0);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_compat_parent_reg(fdt, "maxim,max77620", 0, 0, &base, &size), 0);
+  expect_eq(base, 0x7000d000);
+  expect_eq(size, 0x100);
+  expect_eq(fdt_compat_u32(fdt, "maxim,max77620", "reg", &addr), 0);
+  expect_eq(addr, 0x3c);
+  expect_eq(fdt_compat_reg(fdt, "maxim,max77620", 0, 0, &base, &size), -1); /* no size cells on an I2C bus */
+  expect_eq(fdt_compat_parent_reg(fdt, "maxim,max77620", 1, 0, &base, &size), -1);
+  expect_eq(fdt_compat_parent_reg(fdt, "maxim,max77620", 0, 1, &base, &size), -1);
+  expect_eq(fdt_compat_parent_reg(fdt, "nvidia,tegra210-uart", 0, 0, &base, &size), -1); /* parent is the root */
+}
+
+static void check_tegra_truncation(void)
+{
+  struct blob b;
+  build_tegra(&b, "serial1:115200n8");
+  for (uint32_t cut = 0; cut < b.st_len; cut += 4) {
+    uint64_t base, size;
+    char buf[32];
+    const uint8_t *fdt = serialize(&b, cut, 0xd00dfeed, 0);
+    (void)fdt_stdout_path(fdt, buf, sizeof buf);
+    (void)fdt_path_reg(fdt, "/serial@70006040", 0, &base, &size);
+    (void)fdt_path_compat(fdt, "/i2c/pmic", "maxim,max77620");
+    (void)fdt_compat_parent_reg(fdt, "maxim,max77620", 0, 0, &base, &size);
+  }
+}
+
 static void check_totalsize(void)
 {
   struct blob b;
@@ -555,5 +680,9 @@ int main(void)
   test("cpu mpidr list", check_cpu_mpidr);
   test("lookups on truncated blobs stay in bounds", check_find_truncation);
   test("total size", check_totalsize);
+  test("stdout-path through aliases and options", check_stdout_path);
+  test("lookups by absolute path", check_path_lookups);
+  test("reg of a node's parent bus", check_parent_reg);
+  test("path lookups on truncated blobs stay in bounds", check_tegra_truncation);
   return 0;
 }

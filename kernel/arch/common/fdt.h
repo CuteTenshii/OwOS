@@ -31,6 +31,20 @@ int fdt_compat_u32(const void *fdt, const char *compat, const char *prop, uint32
 int fdt_compat_str_at(const void *fdt, const char *compat, int idx, const char *prop, char *buf, uint32_t cap);
 int fdt_compat_u32_at(const void *fdt, const char *compat, int idx, const char *prop, uint32_t *val);
 
+/* Reg entry `entry` of the parent of the idx-th node matching compat: the bus an I2C client sits on. */
+int fdt_compat_parent_reg(const void *fdt, const char *compat, int idx, int entry, uint64_t *base, uint64_t *size);
+
+/* Lookups by absolute path such as "/chosen" or "/serial@70006000". A component without a unit address also matches a
+ * node that has one. */
+int fdt_path_reg(const void *fdt, const char *path, int entry, uint64_t *base, uint64_t *size);
+int fdt_path_str(const void *fdt, const char *path, const char *prop, char *buf, uint32_t cap);
+/* 1 if the node lists compat, 0 if it does not, -1 if there is no such node. */
+int fdt_path_compat(const void *fdt, const char *path, const char *compat);
+
+/* Path of the console node from /chosen stdout-path (or linux,stdout-path), with any ":options" suffix removed and an
+ * alias resolved through /aliases. */
+int fdt_stdout_path(const void *fdt, char *buf, uint32_t cap);
+
 /* MPIDR affinity bits of the idx-th /cpus/cpu node, in tree order. */
 #define FDT_MPIDR_AFFINITY 0xff00ffffffULL
 int fdt_cpu_mpidr(const void *fdt, int idx, uint64_t *mpidr);

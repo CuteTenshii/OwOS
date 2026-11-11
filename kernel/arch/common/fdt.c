@@ -1,4 +1,5 @@
-/* fdt.c: minimal flattened device tree reader: system RAM and reserved ranges. Every read is bounds-checked. */
+/* fdt.c: minimal flattened device tree reader: RAM, reserved ranges, and nodes by compatible or path. Every read is
+ * bounds-checked. */
 #include "fdt.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -235,14 +236,26 @@ struct found {
   const uint8_t *reg, *prop;
   uint32_t reg_len, prop_len;
   struct cells parent;
+  const uint8_t *up_reg; /* the parent node's reg, decoded with up_parent */
+  uint32_t up_reg_len;
+  struct cells up_parent;
 };
 
+struct path_part {
+  const char *s;
+  uint32_t len;
+};
+
+/* Nodes are picked either by compatible string (the want-th match) or by absolute path. */
 struct find_ctx {
   const char *compat, *prop;
+  const struct path_part *path;
+  int path_len;
   int want;
   struct found *out;
   struct cells cells[FDT_MAXDEPTH + 1]; /* widths the children of the node at that depth use */
   bool match[FDT_MAXDEPTH + 1];
+  bool on_path[FDT_MAXDEPTH + 1];
   struct found node[FDT_MAXDEPTH + 1];
 };
 
@@ -259,6 +272,21 @@ static bool compat_listed(const char *want, const uint8_t *val, uint32_t len)
   return false;
 }
 
+/* A path component names a node exactly, or by its name alone when the node also has a unit address. */
+static bool name_matches(const struct path_part *c, const char *name)
+{
+  uint32_t i = 0;
+  for (; i < c->len; i++)
+    if (name[i] != c->s[i])
+      return false;
+  if (name[i] == '\0')
+    return true;
+  for (uint32_t j = 0; j < c->len; j++)
+    if (c->s[j] == '@')
+      return false;
+  return name[i] == '@';
+}
+
 static int find_visit(void *ctx, int depth, const char *name, const char *prop, const uint8_t *val, uint32_t len)
 {
   struct find_ctx *f = ctx;
@@ -267,15 +295,20 @@ static int find_visit(void *ctx, int depth, const char *name, const char *prop, 
   struct found *n = &f->node[depth];
   if (name) {
     f->cells[depth] = (struct cells){2, 1};
-    f->match[depth] = false;
     *n = (struct found){0};
     n->parent = depth > 1 ? f->cells[depth - 1] : f->cells[depth];
+    f->match[depth] = false;
+    if (f->path) {
+      f->on_path[depth] =
+          depth <= 1 || (f->on_path[depth - 1] && depth - 2 < f->path_len && name_matches(&f->path[depth - 2], name));
+      f->match[depth] = f->on_path[depth] && depth - 1 == f->path_len;
+    }
   } else if (prop) {
     if (str_eq(prop, "#address-cells") && len >= 4)
       f->cells[depth].addr = be32(val);
     else if (str_eq(prop, "#size-cells") && len >= 4)
       f->cells[depth].size = be32(val);
-    else if (str_eq(prop, "compatible"))
+    else if (f->compat && str_eq(prop, "compatible"))
       f->match[depth] = compat_listed(f->compat, val, len);
     else if (str_eq(prop, "reg")) {
       n->reg = val;
@@ -287,6 +320,11 @@ static int find_visit(void *ctx, int depth, const char *name, const char *prop, 
     }
   } else if (f->match[depth] && f->want-- == 0) {
     *f->out = *n;
+    if (depth > 1) {
+      f->out->up_reg = f->node[depth - 1].reg;
+      f->out->up_reg_len = f->node[depth - 1].reg_len;
+      f->out->up_parent = f->node[depth - 1].parent;
+    }
     return 1;
   }
   return 0;
@@ -298,31 +336,132 @@ static bool find_node(const void *fdt, const char *compat, int idx, const char *
   return fdt_walk(fdt, find_visit, &f) == 1;
 }
 
+/* Splits an absolute path into its components; "/" has none. Returns the count, or -1 if it is not absolute or too
+ * deep. */
+static int split_path(const char *path, struct path_part *parts)
+{
+  if (!path || path[0] != '/')
+    return -1;
+  int n = 0;
+  for (const char *p = path + 1; *p;) {
+    const char *e = p;
+    while (*e && *e != '/')
+      e++;
+    if (e == p)
+      return -1;
+    if (n == FDT_MAXDEPTH - 1)
+      return -1;
+    parts[n++] = (struct path_part){p, (uint32_t)(e - p)};
+    p = *e ? e + 1 : e;
+  }
+  return n;
+}
+
+static bool find_path(const void *fdt, const char *path, const char *prop, struct found *out)
+{
+  struct path_part parts[FDT_MAXDEPTH];
+  struct find_ctx f = {.prop = prop, .path = parts, .out = out};
+  f.path_len = split_path(path, parts);
+  return f.path_len >= 0 && fdt_walk(fdt, find_visit, &f) == 1;
+}
+
+static int decode_reg(const uint8_t *reg, uint32_t reg_len, const struct cells *c, int entry, uint64_t *base,
+                      uint64_t *size)
+{
+  if (entry < 0 || !reg || !cells_valid(c))
+    return -1;
+  uint64_t stride = 4ULL * (c->addr + c->size);
+  if ((uint64_t)(entry + 1) * stride > reg_len)
+    return -1;
+  const uint8_t *e = reg + (uint64_t)entry * stride;
+  *base = read_cells(e, c->addr);
+  *size = read_cells(e + 4 * c->addr, c->size);
+  return 0;
+}
+
 int fdt_compat_reg(const void *fdt, const char *compat, int idx, int entry, uint64_t *base, uint64_t *size)
 {
   struct found n;
-  if (idx < 0 || entry < 0 || !find_node(fdt, compat, idx, 0, &n) || !n.reg || !cells_valid(&n.parent))
+  if (idx < 0 || !find_node(fdt, compat, idx, 0, &n))
     return -1;
-  uint64_t stride = 4ULL * (n.parent.addr + n.parent.size);
-  if ((uint64_t)(entry + 1) * stride > n.reg_len)
+  return decode_reg(n.reg, n.reg_len, &n.parent, entry, base, size);
+}
+
+int fdt_compat_parent_reg(const void *fdt, const char *compat, int idx, int entry, uint64_t *base, uint64_t *size)
+{
+  struct found n;
+  if (idx < 0 || !find_node(fdt, compat, idx, 0, &n))
     return -1;
-  const uint8_t *e = n.reg + (uint64_t)entry * stride;
-  *base = read_cells(e, n.parent.addr);
-  *size = read_cells(e + 4 * n.parent.addr, n.parent.size);
+  return decode_reg(n.up_reg, n.up_reg_len, &n.up_parent, entry, base, size);
+}
+
+int fdt_path_reg(const void *fdt, const char *path, int entry, uint64_t *base, uint64_t *size)
+{
+  struct found n;
+  if (!find_path(fdt, path, 0, &n))
+    return -1;
+  return decode_reg(n.reg, n.reg_len, &n.parent, entry, base, size);
+}
+
+static int copy_str(const struct found *n, char *buf, uint32_t cap)
+{
+  if (!cap || !n->prop)
+    return -1;
+  long len = str_len(n->prop, n->prop + n->prop_len);
+  if (len < 0 || (uint32_t)len >= cap)
+    return -1;
+  for (long i = 0; i <= len; i++)
+    buf[i] = (char)n->prop[i];
   return 0;
+}
+
+int fdt_path_str(const void *fdt, const char *path, const char *prop, char *buf, uint32_t cap)
+{
+  struct found n;
+  if (!find_path(fdt, path, prop, &n))
+    return -1;
+  return copy_str(&n, buf, cap);
+}
+
+int fdt_path_compat(const void *fdt, const char *path, const char *compat)
+{
+  struct found n;
+  if (!find_path(fdt, path, "compatible", &n))
+    return -1;
+  return n.prop && compat_listed(compat, n.prop, n.prop_len);
+}
+
+int fdt_stdout_path(const void *fdt, char *buf, uint32_t cap)
+{
+  if (fdt_path_str(fdt, "/chosen", "stdout-path", buf, cap) &&
+      fdt_path_str(fdt, "/chosen", "linux,stdout-path", buf, cap))
+    return -1;
+  for (char *p = buf; *p; p++)
+    if (*p == ':') {
+      *p = '\0';
+      break;
+    }
+  if (buf[0] == '/')
+    return 0;
+  char alias[64];
+  uint32_t i = 0;
+  for (; buf[i]; i++) {
+    if (i + 1 >= sizeof alias)
+      return -1;
+    alias[i] = buf[i];
+  }
+  alias[i] = '\0';
+  if (!alias[0] || fdt_path_str(fdt, "/aliases", alias, buf, cap))
+    return -1;
+  return buf[0] == '/' ? 0 : -1;
 }
 
 int fdt_compat_str_at(const void *fdt, const char *compat, int idx, const char *prop, char *buf, uint32_t cap)
 {
   struct found n;
-  if (!cap || idx < 0 || !find_node(fdt, compat, idx, prop, &n) || !n.prop)
+  if (idx < 0 || !find_node(fdt, compat, idx, prop, &n))
     return -1;
-  long len = str_len(n.prop, n.prop + n.prop_len);
-  if (len < 0 || (uint32_t)len >= cap)
-    return -1;
-  for (long i = 0; i <= len; i++)
-    buf[i] = (char)n.prop[i];
-  return 0;
+  return copy_str(&n, buf, cap);
 }
 
 int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *buf, uint32_t cap)
