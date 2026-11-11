@@ -1,6 +1,7 @@
-/* plat.c: discover the UART, interrupt controller, PSCI conduit and CPU list from the device tree. */
+/* plat.c: discover the UART, interrupt controller, PSCI conduit, CPU list and SoC blocks from the device tree. */
 #include "plat.h"
 #include "arch.h"
+#include "tegra_car.h"
 
 struct plat plat = {
     .uart_kind = UART_PL011,
@@ -15,16 +16,51 @@ struct plat plat = {
 static const char *const gic_v2_compat[] = {"arm,cortex-a15-gic", "arm,gic-400", "arm,cortex-a9-gic"};
 static const char *const psci_compat[] = {"arm,psci-1.0", "arm,psci-0.2", "arm,psci"};
 
+static int status_ok(const char *status) { return status[0] == 'o' && status[1] == 'k'; }
+
+/* A node without a status property is enabled. */
+static int node_disabled(const void *dtb, const char *compat, int idx)
+{
+  char status[16];
+  if (fdt_compat_str_at(dtb, compat, idx, "status", status, sizeof status))
+    return 0;
+  return !status_ok(status);
+}
+
+struct uart_compat {
+  const char *compat;
+  enum uart_kind kind;
+};
+
+static const struct uart_compat uart_compat[] = {
+    {"arm,pl011", UART_PL011},
+    {"mediatek,mt6577-uart", UART_16550},
+    {"nvidia,tegra20-uart", UART_16550},
+    {"nvidia,tegra114-hsuart", UART_16550},
+};
+
+/* The loader's console when /chosen names a UART this kernel drives, else the first enabled one it knows, else the
+ * first one at all: vendor trees do not always mark the console okay. */
 static void find_uart(const void *dtb)
 {
   uint64_t base, size;
-  if (!fdt_compat_reg(dtb, "arm,pl011", 0, 0, &base, &size)) {
-    plat.uart_kind = UART_PL011;
-    plat.uart_base = base;
-  } else if (!fdt_compat_reg(dtb, "mediatek,mt6577-uart", 0, 0, &base, &size)) {
-    plat.uart_kind = UART_MTK;
-    plat.uart_base = base;
-  }
+  char path[64], status[16];
+  if (!fdt_stdout_path(dtb, path, sizeof path) && !fdt_path_reg(dtb, path, 0, &base, &size) &&
+      (fdt_path_str(dtb, path, "status", status, sizeof status) || status_ok(status)))
+    for (unsigned i = 0; i < sizeof uart_compat / sizeof *uart_compat; i++)
+      if (fdt_path_compat(dtb, path, uart_compat[i].compat) == 1) {
+        plat.uart_kind = uart_compat[i].kind;
+        plat.uart_base = base;
+        return;
+      }
+  for (int any = 0; any < 2; any++)
+    for (unsigned i = 0; i < sizeof uart_compat / sizeof *uart_compat; i++)
+      for (int idx = 0; !fdt_compat_reg(dtb, uart_compat[i].compat, idx, 0, &base, &size); idx++)
+        if (any || !node_disabled(dtb, uart_compat[i].compat, idx)) {
+          plat.uart_kind = uart_compat[i].kind;
+          plat.uart_base = base;
+          return;
+        }
 }
 
 static void find_gic(const void *dtb)
@@ -82,14 +118,6 @@ static void find_pwrap(const void *dtb)
 /* Vendor (ALPS) trees use the generic string; mainline-style trees name the SoC. */
 static const char *const i2c_compat[] = {"mediatek,mt6765-i2c", "mediatek,i2c"};
 
-static int i2c_disabled(const void *dtb, const char *compat, int idx)
-{
-  char status[16];
-  if (fdt_compat_str_at(dtb, compat, idx, "status", status, sizeof status))
-    return 0;
-  return !(status[0] == 'o' && status[1] == 'k');
-}
-
 static int i2c_known(uintptr_t base)
 {
   for (int i = 0; i < plat.ni2c; i++)
@@ -104,7 +132,7 @@ static void find_i2c(const void *dtb)
     const char *compat = i2c_compat[c];
     uint64_t base, dma, size;
     for (int idx = 0; plat.ni2c < PLAT_I2C_MAX && !fdt_compat_reg(dtb, compat, idx, 0, &base, &size); idx++) {
-      if (i2c_known(base) || i2c_disabled(dtb, compat, idx) || fdt_compat_reg(dtb, compat, idx, 1, &dma, &size))
+      if (i2c_known(base) || node_disabled(dtb, compat, idx) || fdt_compat_reg(dtb, compat, idx, 1, &dma, &size))
         continue;
       struct plat_i2c *p = &plat.i2c[plat.ni2c];
       *p = (struct plat_i2c){.base = base, .dma_base = dma, .id = (uint32_t)plat.ni2c, .speed_hz = 100000};
@@ -113,6 +141,32 @@ static void find_i2c(const void *dtb)
       fdt_compat_u32_at(dtb, compat, idx, "clock-frequency", &p->speed_hz);
       plat.ni2c++;
     }
+  }
+}
+
+static void find_tegra(const void *dtb)
+{
+  static const char i2c[] = "nvidia,tegra210-i2c", pmic[] = "maxim,max77620";
+  uint64_t base, size;
+  uint32_t addr;
+  if (!fdt_compat_reg(dtb, "nvidia,tegra210-car", 0, 0, &base, &size)) {
+    plat.car_base = base;
+    tegra_car_init(base);
+  }
+  if (!fdt_compat_reg(dtb, "nvidia,tegra210-gpio", 0, 0, &base, &size))
+    plat.tegra_gpio_base = base;
+  if (!fdt_compat_reg(dtb, "nvidia,tegra210-pmc", 0, 0, &base, &size))
+    plat.pmc_base = base;
+  for (int idx = 0; plat.ntegra_i2c < PLAT_TEGRA_I2C_MAX && !fdt_compat_reg(dtb, i2c, idx, 0, &base, &size); idx++) {
+    if (node_disabled(dtb, i2c, idx))
+      continue;
+    struct plat_tegra_i2c *p = &plat.tegra_i2c[plat.ntegra_i2c++];
+    *p = (struct plat_tegra_i2c){.base = base, .speed_hz = 100000};
+    fdt_compat_u32_at(dtb, i2c, idx, "clock-frequency", &p->speed_hz);
+  }
+  if (!fdt_compat_parent_reg(dtb, pmic, 0, 0, &base, &size) && !fdt_compat_u32(dtb, pmic, "reg", &addr)) {
+    plat.max77620_bus = base;
+    plat.max77620_addr = addr;
   }
 }
 
@@ -147,14 +201,42 @@ static void find_cpus(const void *dtb)
   plat.ncpus = n;
 }
 
+struct tegra_uart {
+  uintptr_t base;
+  unsigned gate;
+};
+
+static const struct tegra_uart tegra_uarts[] = {
+    {0x70006000, TEGRA_GATE_UARTA},
+    {0x70006040, TEGRA_GATE_UARTB},
+    {0x70006200, TEGRA_GATE_UARTC},
+    {0x70006300, TEGRA_GATE_UARTD},
+};
+
+/* A Tegra UART the loader left unclocked or in reset hangs the bus on first access, so it is not used at all. Without
+ * the CAR its state is unknown and it is not touched either. */
+static void drop_dead_tegra_uart(void)
+{
+  if (plat.uart_kind != UART_16550)
+    return;
+  for (unsigned i = 0; i < sizeof tegra_uarts / sizeof *tegra_uarts; i++)
+    if (plat.uart_base == tegra_uarts[i].base && !(plat.car_base && tegra_periph_live(tegra_uarts[i].gate)))
+      plat.uart_kind = UART_NONE;
+}
+
 void plat_init(const void *dtb)
 {
+  /* With a device tree, the QEMU virt PL011 default is only right if the tree names it. */
+  if (fdt_totalsize(dtb))
+    plat.uart_kind = UART_NONE;
   find_uart(dtb);
   find_gic(dtb);
   find_psci(dtb);
   find_pwrap(dtb);
   find_soc_blocks(dtb);
   find_i2c(dtb);
+  find_tegra(dtb);
+  drop_dead_tegra_uart();
   find_fb(dtb);
   find_cpus(dtb);
 }

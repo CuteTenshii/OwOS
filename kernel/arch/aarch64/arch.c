@@ -137,9 +137,13 @@ int psci_cpu_on(int cpu)
   return (int)psci_call(PSCI_CPU_ON, plat.cpu_mpidr[cpu], (uint64_t)(uintptr_t)secondary_entry, (uint64_t)cpu);
 }
 
+void (*arch_poweroff_fallback)(void);
+
 void arch_poweroff(void)
 {
   psci_call(PSCI_SYSTEM_OFF, 0, 0, 0);
+  if (arch_poweroff_fallback)
+    arch_poweroff_fallback();
   for (;;)
     __asm__ volatile("wfi");
 }

@@ -1,5 +1,7 @@
 # kernel/arch/aarch64/build.mk: bare AArch64 support layer; the board layout comes from the device tree
-# (QEMU virt, MediaTek MT6765 phones such as the Samsung Galaxy A12).
+# (QEMU virt, MediaTek MT6765 phones such as the Samsung Galaxy A12, Tegra X1 boards such as the Nintendo Switch).
+# The image is position independent and runs at any 4 KiB aligned address the loader picks; on the Switch that is
+# hekate chaining L4T U-Boot, which places it at 0x80080000 with booti or at the address a boot script loads it to.
 #   make ARCH=aarch64         build owos-aarch64.bin
 #   make ARCH=aarch64 run     boot it headless, serial on the terminal
 #   make ARCH=aarch64 check   boot it and fail unless the self-test passes (A64_GIC=3 for a GICv3 machine)
@@ -47,7 +49,7 @@ A64UFLAGS := -mgeneral-regs-only -mstrict-align -mno-outline-atomics -mcpu=corte
 A64PROGS := hello segv nx
 A64UELFS := $(addprefix $(A64TESTS)/,$(addsuffix .elf,$(A64PROGS)))
 
-KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o pwrap.o clk.o gpio.o i2c.o i2c_mtk.o fbcon.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
+KOBJS := $(addprefix $(A64DIR)/,boot.o vectors.o switch.o arch.o main.o fdt.o memmap.o plat.o pwrap.o clk.o gpio.o i2c.o i2c_mtk.o tegra_car.o tegra_gpio.o i2c_tegra.o max77620.o fbcon.o uart.o gic.o vm.o thread.o smp.o elf.o task.o syscall.o console.o mem.o kstring.o pmm.o heap.o)
 OBJS := $(KOBJS) $(addprefix $(A64TESTS)/,selftest.o snippets.o programs.o)
 
 $(A64DIR)/%.o: $(A64DIR)/%.S

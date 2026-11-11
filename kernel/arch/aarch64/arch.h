@@ -79,6 +79,8 @@ void task_fault(struct trap_frame *tf);
 
 void arch_exception(struct trap_frame *tf, uint64_t kind);
 void arch_poweroff(void);
+/* Tried by arch_poweroff when PSCI SYSTEM_OFF returns; a board driver such as the PMIC's sets it. */
+extern void (*arch_poweroff_fallback)(void);
 
 /* Switch kernel stacks: saves callee-saved registers on the current stack,
  * stores sp in *old_sp, then resumes the context whose sp is new_sp. */

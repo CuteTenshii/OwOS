@@ -3,8 +3,12 @@
 #include "clk.h"
 #include "gpio.h"
 #include "i2c_mtk.h"
+#include "i2c_tegra.h"
 #include "kstring.h"
+#include "max77620.h"
 #include "pwrap.h"
+#include "tegra_car.h"
+#include "tegra_gpio.h"
 
 #define I2C_SRC_HZ 26000000 /* i2c_sel parent 0: the crystal */
 
@@ -59,6 +63,82 @@ static void i2c_start(void)
   }
 }
 
+#define PMC_PWRGATE_STATUS 0x38
+#define PMC_PARTITION_SOR 17
+#define I2C6_INDEX 5
+
+static struct i2c_tegra tegra_i2c[PLAT_TEGRA_I2C_MAX];
+
+/* I2C6 drives the DPAUX pads in the SOR partition; with the partition gated its registers hang the bus. */
+static int tegra_i2c_powered(int index)
+{
+  if (index != I2C6_INDEX)
+    return 1;
+  return plat.pmc_base && (mmio_read32(plat.pmc_base + PMC_PWRGATE_STATUS) & (1u << PMC_PARTITION_SOR));
+}
+static struct max77620 pmic77620;
+
+static void max77620_off(void) { max77620_poweroff(&pmic77620); }
+
+static void tegra_pmic_start(void)
+{
+  struct i2c_bus *bus = 0;
+  char line[64];
+  for (int i = 0; i < plat.ntegra_i2c; i++)
+    if (tegra_i2c[i].bus.xfer && tegra_i2c[i].base == plat.max77620_bus)
+      bus = &tegra_i2c[i].bus;
+  if (!bus) {
+    uart_puts("PMIC max77620: its I2C bus is not running\n");
+    return;
+  }
+  if (max77620_probe(&pmic77620, bus, (uint16_t)plat.max77620_addr)) {
+    uart_puts("PMIC max77620 not responding\n");
+    return;
+  }
+  arch_poweroff_fallback = max77620_off;
+  ksnprintf(line, sizeof line, "PMIC max77620, OTP %x, ES %x\n", (unsigned)pmic77620.otp, (unsigned)pmic77620.es);
+  uart_puts(line);
+}
+
+static void tegra_start(void)
+{
+  if (!plat.car_base) {
+    if (plat.tegra_gpio_base || plat.ntegra_i2c)
+      uart_puts("Tegra: no clock-and-reset controller in the DTB, SoC drivers left off\n");
+    return;
+  }
+  if (plat.tegra_gpio_base) {
+    tegra_clk_enable(TEGRA_GATE_GPIO);
+    tegra_rst_deassert(TEGRA_GATE_GPIO);
+    tegra_gpio_init(plat.tegra_gpio_base);
+  }
+  for (int i = 0; i < plat.ntegra_i2c; i++) {
+    const struct plat_tegra_i2c *p = &plat.tegra_i2c[i];
+    struct i2c_tegra *d = &tegra_i2c[i];
+    int index = i2c_tegra_index(p->base);
+    char line[64];
+    if (index >= 0 && !tegra_i2c_powered(index)) {
+      ksnprintf(line, sizeof line, "I2C%d at %x: power partition off, not started\n", index + 1, (unsigned)p->base);
+    } else if (index < 0 || i2c_tegra_init(d, p->base, p->speed_hz) || i2c_register(&d->bus, d->index)) {
+      d->bus.xfer = 0;
+      ksnprintf(line, sizeof line, "I2C at %x: not started\n", (unsigned)p->base);
+    } else {
+      ksnprintf(line, sizeof line, "I2C%d at %x: %d kHz\n", index + 1, (unsigned)p->base,
+                (int)(d->bus.speed_hz / 1000));
+    }
+    uart_puts(line);
+  }
+  if (plat.max77620_bus)
+    tegra_pmic_start();
+}
+
+static const char *uart_name(void)
+{
+  return plat.uart_kind == UART_PL011   ? ", uart pl011, "
+         : plat.uart_kind == UART_16550 ? ", uart 16550, "
+                                        : ", no uart, ";
+}
+
 void arch_main(void)
 {
   plat_init((const void *)boot_dtb);
@@ -70,7 +150,7 @@ void arch_main(void)
   uart_putc('\n');
   uart_puts(plat.gic_kind == GIC_V3 ? "GICv3, cpus " : "GICv2, cpus ");
   uart_puthex((uint64_t)plat.ncpus);
-  uart_puts(plat.uart_kind == UART_PL011 ? ", uart pl011, " : ", uart mtk, ");
+  uart_puts(uart_name());
   uart_puts(plat.psci_smc < 0 ? "psci by exception level" : plat.psci_smc ? "psci smc" : "psci hvc");
   uart_putc('\n');
 
@@ -91,6 +171,7 @@ void arch_main(void)
     uart_putc('\n');
   }
   i2c_start();
+  tegra_start();
   uart_puts("RAM free KiB ");
   uart_puthex(pmm_free_kib());
   uart_putc('\n');
