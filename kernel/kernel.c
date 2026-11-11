@@ -8,6 +8,7 @@
 #include "console.h"
 #include "crc32c.h"
 #include "entropy.h"
+#include "es1371.h"
 #include "ext.h"
 #include "fat.h"
 #include "fb.h"
@@ -574,6 +575,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   keyboard_init();
   sb16_init();
   hda_init();
+  es1371_init();
 
   sched_init();
   net_start();

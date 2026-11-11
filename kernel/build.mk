@@ -37,7 +37,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/sysfs.o kernel/users.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/btrfs.o kernel/lzo.o kernel/zstd.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o drivers/usb/hub.o drivers/usb/hid.o drivers/usb/hid_desc.o drivers/usb/hid_pad.o drivers/usb/xbox.o drivers/usb/btusb.o drivers/usb/uvc.o drivers/usb/uvc_desc.o drivers/bt/bt_hci.o drivers/bt/bt_l2cap.o drivers/bt/bt_gatt.o drivers/bt/bt_avdtp.o drivers/bt/bt_hid.o drivers/bt/bt_aes.o drivers/bt/bt_smp.o drivers/bt/bt_p256.o drivers/bt/sbc.o \
         drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o drivers/net/vmxnet3.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/entropy.o \
         kernel/crc32.o kernel/crc32c.o kernel/gzip.o \
-        drivers/audio/sb16.o drivers/audio/hda.o \
+        drivers/audio/sb16.o drivers/audio/hda.o drivers/audio/es1371.o \
         kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o kernel/wallclock.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
         kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o drivers/video/dpaux.o drivers/video/edidparse.o \
         kernel/audio.o kernel/syscall.o kernel/syscall_env.o kernel/env.o kernel/syscall_process.o kernel/syscall_fs.o kernel/syscall_net.o kernel/syscall_window.o kernel/syscall_audio.o kernel/syscall_graphics.o kernel/syscall_io.o kernel/syscall_signal.o kernel/syscall_exec.o kernel/syscall_entropy.o kernel/loader.o kernel/pipe.o kernel/ipc.o \

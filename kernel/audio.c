@@ -2,6 +2,7 @@
 
 #include "audio.h"
 #include "bt.h"
+#include "es1371.h"
 #include "hda.h"
 #include "sb16.h"
 
@@ -10,6 +11,8 @@ static const struct audio_card cards[] = {
     {bt_a2dp_ready, 0, 0, 0, 0, bt_a2dp_open, bt_a2dp_write, bt_a2dp_close},
     {hda_present, hda_volume_step, hda_volume_mute, hda_volume_level, hda_is_muted, hda_stream_open, hda_stream_write,
      hda_stream_close},
+    {es1371_present, es1371_volume_step, es1371_volume_mute, es1371_volume_level, es1371_is_muted, es1371_stream_open,
+     es1371_stream_write, es1371_stream_close},
     {sb16_present, sb16_volume_step, sb16_volume_mute, sb16_volume_level, sb16_is_muted, sb16_stream_open,
      sb16_stream_write, sb16_stream_close},
 };

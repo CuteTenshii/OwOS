@@ -374,6 +374,7 @@ drivers/video/mtrr.c     MTRR/PAT write-combining for the framebuffer
 drivers/video/edid.c     monitor EDID over DDC/I2C (real-HW)
 drivers/audio/sb16.c     Sound Blaster 16 (8-bit PCM over ISA DMA, WAV playback)
 drivers/audio/hda.c      Intel HD Audio + Realtek codec (16-bit PCM, WAV playback)
+drivers/audio/es1371.c   Ensoniq ES1371/ES1373 AudioPCI (AC'97, 16-bit PCM, WAV playback)
 drivers/audio/speaker.c  PC speaker tones (PIT channel 2)
 drivers/acpi/power.c     shutdown / reboot + ACPI table walking
 drivers/acpi/aml.c       tiny AML interpreter (battery methods)
