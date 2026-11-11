@@ -38,8 +38,10 @@ MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(wildcard $(BROWSER)/features/sv
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/features/battery/battery.c $(LIB)/uuid/uuid.c $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c
 
-MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_TEST$$' tests/*_test.c)))
-BIND_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_BINDINGS$$' tests/*_test.c)))
+# Make 4.3+ passes `\#` inside a function call through with its backslash, older versions need it; HASH works in both.
+HASH := \#
+MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^$(HASH)define OWOS_SUITE_TEST$$' tests/*_test.c)))
+BIND_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^$(HASH)define OWOS_SUITE_BINDINGS$$' tests/*_test.c)))
 
 # Per-suite compile flags
 EXTRA_permissions := -DPERM_DB='"$(RUN)/permissions.db"'
@@ -55,15 +57,64 @@ ARCHIVE_HOST_FS   := -Dmkdir=archive_test_mkdir -Dstream_begin=archive_test_stre
 EXTRA_zstd        := $(ZSTD_RENAME)
 EXTRA_a64_elf     := -Ikernel
 
-# Objects whose sources are rebuilt with test-specific defines or a fake system layer
-IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/uvc.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
-         $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
-         $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o $(B)/impl/pmm.o $(B)/impl/a64_elf.o $(B)/impl/pwrap.o $(B)/impl/fbcon.o $(B)/impl/clk.o $(B)/impl/gpio.o \
-         $(B)/impl/i2c.o $(B)/impl/i2c_mtk.o $(B)/impl/tegra_car.o $(B)/impl/tegra_gpio.o $(B)/impl/i2c_tegra.o \
-         $(B)/impl/max77620.o
+# Objects rebuilt with test-specific defines or a fake system layer: impl_<name> := <source> <extra flags>
+# builds $(B)/impl/<name>.o, and bind_<name> the same under $(B)/bind/impl for the bindings binary.
+impl_netconn       := $(LIB)/netconn/netconn.c -I$(LIB)/tls -Dmsec=ncp_msec -Dnet_dial=ncp_dial -Dnet_close=ncp_close \
+  -Dnet_recv_nb=ncp_recv_nb -Dnet_recv=ncp_recv -Dnet_send=ncp_send -Dtls_client=ncp_tls_client \
+  -Dtls_last_error=ncp_tls_last_error -Dtls_read=ncp_tls_read -Dtls_write=ncp_tls_write -Dtls_alpn=ncp_tls_alpn \
+  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close -Dtls_peer_closed=ncp_tls_peer_closed
+impl_h3            := $(LIB)/curl/h3.c -Dquic_connect_early=h3t_connect_early -Dquic_finish_handshake=h3t_finish \
+  -Dquic_handshake_done=h3t_hs_done -Dquic_open=h3t_open -Dquic_send=h3t_send -Dquic_read=h3t_read \
+  -Dquic_stream_done=h3t_done -Dquic_next_uni=h3t_next_uni -Dquic_poll=h3t_poll -Dquic_peer_closed=h3t_peer_closed \
+  -Dquic_streams_left=h3t_left -Dquic_idle_ms=h3t_idle -Dquic_close=h3t_close \
+  -Dnc_idle_put=h3t_idle_put -Dnc_idle_take=h3t_idle_take
+impl_h2            := $(LIB)/curl/h2.c -Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close \
+  -Dnc_peer_closed=h2t_peer_closed -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take
+impl_permissions   := $(BROWSER)/features/permissions/permissions.c -DPERM_DB='"$(RUN)/permissions.db"'
+impl_cache         := $(BROWSER)/features/cache/cache.c -DCACHE_DIR='"$(RUN)/vary-cache"' -Dmkdir=vary_mkdir \
+  -Dunlink=vary_unlink -Dreaddir=vary_readdir -include tests/vary_fs.h
+impl_vary_fs       := tests/vary_fs.c -DCACHE_DIR='"$(RUN)/vary-cache"'
+# The UVC driver against kernel service stand-ins (tests/uvc_host); sched_yield is renamed so the test supplies it
+impl_uvc           := drivers/usb/uvc.c -Itests/uvc_host -Dsched_yield=uvc_host_yield
+impl_tz            := $(LIB)/tz/tz.c -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
+impl_desktop       := $(LIB)/desktop/desktop.c -Dreaddir=desktop_test_readdir -include tests/desktop_fs.h
+impl_filelist      := $(LIB)/gfx/filelist.c -Dreaddir=filelist_test_readdir -include tests/filelist_fs.h
+impl_zstd_dec      := $(LIB)/zstd/zstd_dec.c $(ZSTD_RENAME)
+impl_archive       := $(LIB)/archive/archive.c $(ZSTD_RENAME) $(ARCHIVE_HOST_FS)
+impl_zip           := $(LIB)/archive/zip.c $(ARCHIVE_HOST_FS)
+impl_browser_js_host := tests/browser_js_host.c
+impl_test_runner   := tests/test_runner.c
+impl_brotli_dict   := $(B)/impl/brotli_dict.c
+# Kernel sources behind a host stand-in for their hardware layer (interrupt flags, physical frame access)
+impl_pmm           := kernel/pmm.c -include tests/irqflags_host.h
+impl_a64_elf       := kernel/arch/aarch64/elf.c -Ikernel -include tests/a64_host.h
+impl_fbcon         := kernel/arch/aarch64/fbcon.c -Ikernel
+impl_clk           := kernel/arch/aarch64/clk.c -include tests/clk_host.h
+impl_gpio          := kernel/arch/aarch64/gpio.c -Ikernel -include tests/gpio_host.h -include tests/spinlock_host.h
+impl_pwrap         := kernel/arch/aarch64/pwrap.c -Ikernel -include tests/pwrap_host.h
+impl_i2c           := kernel/arch/aarch64/i2c.c -Ikernel -Ikernel/arch/common -include tests/i2c_mtk_host.h
+impl_i2c_mtk       := kernel/arch/aarch64/i2c_mtk.c -include tests/i2c_mtk_host.h
+impl_tegra_car     := kernel/arch/aarch64/tegra_car.c -include tests/tegra_host.h
+impl_tegra_gpio    := kernel/arch/aarch64/tegra_gpio.c -include tests/tegra_host.h
+impl_i2c_tegra     := kernel/arch/aarch64/i2c_tegra.c -include tests/tegra_host.h
+impl_max77620      := kernel/arch/aarch64/max77620.c -include tests/tegra_host.h
+
+# Suites that link the real browser bindings get their own binary
+BIND_HOST := -include tests/bindings_host.h
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
-BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
-              $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
+$(foreach p,$(BINDINGS_PARTS),$(eval bind_$(p) := $(BROWSER)/js/$(p).c $(BIND_HOST) -Drealloc=poison_realloc))
+bind_jar           := $(BROWSER)/features/jar/jar.c $(BIND_HOST) -Drealloc=poison_realloc
+bind_storage       := $(BROWSER)/features/storage/storage.c $(BIND_HOST) -DSTORAGE_DB='"$(RUN)/bind-localstorage.db"'
+bind_indexeddb     := $(BROWSER)/features/indexeddb/indexeddb.c $(BIND_HOST)
+bind_serviceworker := $(BROWSER)/features/serviceworker/serviceworker.c $(BIND_HOST)
+bind_persist       := $(BROWSER)/features/persist/persist.c $(BIND_HOST) -DPERSIST_PREFIX='"$(RUN)/bind-"'
+bind_clienthints   := $(BROWSER)/features/clienthints/clienthints.c $(BIND_HOST) -Drealloc=poison_realloc
+bind_permissions   := $(BROWSER)/features/permissions/permissions.c -DPERM_DB='"$(RUN)/bind-permissions.db"'
+bind_host          := tests/bindings_host.c
+
+table_names = $(sort $(patsubst $(1)_%,%,$(filter $(1)_%,$(.VARIABLES))))
+IMPLS      := $(patsubst %,$(B)/impl/%.o,$(call table_names,impl))
+BIND_IMPLS := $(patsubst %,$(B)/bind/impl/%.o,$(call table_names,bind)) $(B)/impl/test_runner.o
 
 MAIN_OBJS := $(MAIN_SUITES:%=$(B)/suite/%.o) $(IMPLS) $(MAIN_SRCS:%.c=$(B)/obj/%.o)
 BIND_OBJS := $(BIND_SUITES:%=$(B)/bind/suite/%.o) $(BIND_IMPLS) $(BIND_SRCS:%.c=$(B)/obj/%.o)
@@ -89,94 +140,15 @@ $(B)/suite/%.o: tests/%_test.c
 $(B)/bind/suite/%.o: tests/%_test.c
 	$(call COMPILE,$(SUITE_FLAGS) $(EXTRA_$*))
 
-$(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
-	$(call COMPILE,-I$(LIB)/tls -Dmsec=ncp_msec -Dnet_dial=ncp_dial -Dnet_close=ncp_close -Dnet_recv_nb=ncp_recv_nb \
-	  -Dnet_recv=ncp_recv -Dnet_send=ncp_send -Dtls_client=ncp_tls_client -Dtls_last_error=ncp_tls_last_error \
-	  -Dtls_read=ncp_tls_read -Dtls_write=ncp_tls_write -Dtls_alpn=ncp_tls_alpn \
-	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close -Dtls_peer_closed=ncp_tls_peer_closed)
-$(B)/impl/h3.o: $(LIB)/curl/h3.c
-	$(call COMPILE,-Dquic_connect_early=h3t_connect_early -Dquic_finish_handshake=h3t_finish -Dquic_handshake_done=h3t_hs_done -Dquic_open=h3t_open -Dquic_send=h3t_send -Dquic_read=h3t_read \
-	  -Dquic_stream_done=h3t_done -Dquic_next_uni=h3t_next_uni -Dquic_poll=h3t_poll -Dquic_peer_closed=h3t_peer_closed \
-	  -Dquic_streams_left=h3t_left -Dquic_idle_ms=h3t_idle -Dquic_close=h3t_close \
-	  -Dnc_idle_put=h3t_idle_put -Dnc_idle_take=h3t_idle_take)
-$(B)/impl/h2.o: $(LIB)/curl/h2.c
-	$(call COMPILE,-Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close -Dnc_peer_closed=h2t_peer_closed -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take)
-$(B)/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c
-	$(call COMPILE,-DPERM_DB='"$(RUN)/permissions.db"')
-$(B)/impl/cache.o: $(BROWSER)/features/cache/cache.c
-	$(call COMPILE,-DCACHE_DIR='"$(RUN)/vary-cache"' -Dmkdir=vary_mkdir -Dunlink=vary_unlink -Dreaddir=vary_readdir -include tests/vary_fs.h)
-$(B)/impl/vary_fs.o: tests/vary_fs.c
-	@mkdir -p $(@D) && $(CC) -std=gnu11 -Itests -DCACHE_DIR='"$(RUN)/vary-cache"' -MMD -MP -c $< -o $@
-# The UVC driver against kernel service stand-ins (tests/uvc_host); sched_yield is renamed so the test supplies it
-$(B)/impl/uvc.o: drivers/usb/uvc.c
-	$(call COMPILE,-Itests/uvc_host -Dsched_yield=uvc_host_yield)
-$(B)/impl/tz.o: $(LIB)/tz/tz.c
-	$(call COMPILE,-DTZ_CONFIG_PATH='"$(RUN)/timezone"')
-$(B)/impl/desktop.o: $(LIB)/desktop/desktop.c
-	$(call COMPILE,-Dreaddir=desktop_test_readdir -include tests/desktop_fs.h)
-$(B)/impl/filelist.o: $(LIB)/gfx/filelist.c
-	$(call COMPILE,-Dreaddir=filelist_test_readdir -include tests/filelist_fs.h)
-$(B)/impl/zstd_dec.o: $(LIB)/zstd/zstd_dec.c
-	$(call COMPILE,$(ZSTD_RENAME))
-$(B)/impl/archive.o: $(LIB)/archive/archive.c
-	$(call COMPILE,$(ZSTD_RENAME) $(ARCHIVE_HOST_FS))
-$(B)/impl/zip.o: $(LIB)/archive/zip.c
-	$(call COMPILE,$(ARCHIVE_HOST_FS))
-# Kernel sources behind a host stand-in for their hardware layer (interrupt flags, physical frame access)
-$(B)/impl/pmm.o: kernel/pmm.c
-	$(call COMPILE,-include tests/irqflags_host.h)
-$(B)/impl/a64_elf.o: kernel/arch/aarch64/elf.c
-	$(call COMPILE,-Ikernel -include tests/a64_host.h)
-$(B)/impl/browser_js_host.o: tests/browser_js_host.c
-	$(call COMPILE,)
-$(B)/impl/fbcon.o: kernel/arch/aarch64/fbcon.c
-	$(call COMPILE,-Ikernel)
-$(B)/impl/clk.o: kernel/arch/aarch64/clk.c
-	$(call COMPILE,-include tests/clk_host.h)
-$(B)/impl/gpio.o: kernel/arch/aarch64/gpio.c
-	$(call COMPILE,-Ikernel -include tests/gpio_host.h -include tests/spinlock_host.h)
-$(B)/impl/pwrap.o: kernel/arch/aarch64/pwrap.c
-	$(call COMPILE,-Ikernel -include tests/pwrap_host.h)
-$(B)/impl/i2c.o: kernel/arch/aarch64/i2c.c
-	$(call COMPILE,-Ikernel -Ikernel/arch/common -include tests/i2c_mtk_host.h)
-$(B)/impl/i2c_mtk.o: kernel/arch/aarch64/i2c_mtk.c
-	$(call COMPILE,-include tests/i2c_mtk_host.h)
-$(B)/impl/tegra_car.o: kernel/arch/aarch64/tegra_car.c
-	$(call COMPILE,-include tests/tegra_host.h)
-$(B)/impl/tegra_gpio.o: kernel/arch/aarch64/tegra_gpio.c
-	$(call COMPILE,-include tests/tegra_host.h)
-$(B)/impl/i2c_tegra.o: kernel/arch/aarch64/i2c_tegra.c
-	$(call COMPILE,-include tests/tegra_host.h)
-$(B)/impl/max77620.o: kernel/arch/aarch64/max77620.c
-	$(call COMPILE,-include tests/tegra_host.h)
-$(B)/impl/test_runner.o: tests/test_runner.c
-	$(call COMPILE,)
+# The source is the first word of the object's table entry, the extra flags the rest.
+.SECONDEXPANSION:
+$(IMPLS): $(B)/impl/%.o: $$(firstword $$(impl_$$*))
+	$(call COMPILE,$(wordlist 2,$(words $(impl_$*)),$(impl_$*)))
+$(filter $(B)/bind/%,$(BIND_IMPLS)): $(B)/bind/impl/%.o: $$(firstword $$(bind_$$*))
+	$(call COMPILE,$(wordlist 2,$(words $(bind_$*)),$(bind_$*)))
 
 # The Brotli static dictionary is an objcopy'd blob on the target; embed it as a C array here
 $(B)/impl/brotli_dict.c: $(LIB)/brotli/dictionary.bin
 	@mkdir -p $(@D) && { echo 'const unsigned char _binary_user_lib_brotli_dictionary_bin_start[] = {'; \
 	  od -An -v -tu1 $< | awk '{ for (i = 1; i <= NF; i++) printf "%s,", $$i; print "" }'; echo '};'; } > $@
-$(B)/impl/brotli_dict.o: $(B)/impl/brotli_dict.c
-	$(call COMPILE,)
-
-# Suites that link the real browser bindings get their own binary
-$(BINDINGS_PARTS:%=$(B)/bind/impl/%.o): $(B)/bind/impl/%.o: $(BROWSER)/js/%.c
-	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
-$(B)/bind/impl/jar.o: $(BROWSER)/features/jar/jar.c
-	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
-$(B)/bind/impl/storage.o: $(BROWSER)/features/storage/storage.c
-	$(call COMPILE,-include tests/bindings_host.h -DSTORAGE_DB='"$(RUN)/bind-localstorage.db"')
-$(B)/bind/impl/indexeddb.o: $(BROWSER)/features/indexeddb/indexeddb.c
-	$(call COMPILE,-include tests/bindings_host.h)
-$(B)/bind/impl/serviceworker.o: $(BROWSER)/features/serviceworker/serviceworker.c
-	$(call COMPILE,-include tests/bindings_host.h)
-$(B)/bind/impl/persist.o: $(BROWSER)/features/persist/persist.c
-	$(call COMPILE,-include tests/bindings_host.h -DPERSIST_PREFIX='"$(RUN)/bind-"')
-$(B)/bind/impl/clienthints.o: $(BROWSER)/features/clienthints/clienthints.c
-	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
-$(B)/bind/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c
-	$(call COMPILE,-DPERM_DB='"$(RUN)/bind-permissions.db"')
-$(B)/bind/impl/host.o: tests/bindings_host.c
-	$(call COMPILE,)
-
 -include $(shell find $(B) -name '*.d' 2>/dev/null)
