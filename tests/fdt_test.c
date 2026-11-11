@@ -415,6 +415,18 @@ static void build_soc(struct blob *b)
   prop_str(b, "compatible", "mediatek,mt6577-uart", 21);
   prop64(b, "reg", 0x11003000, 0x400);
   end_node(b);
+  static const uint32_t i2c0_reg[] = {0, 0x11007000, 0, 0x1000, 0, 0x11000080, 0, 0x80};
+  begin(b, "i2c0@11007000");
+  prop_str(b, "compatible", "mediatek,i2c", 13);
+  prop1(b, "id", 3);
+  prop(b, "reg", i2c0_reg, 8);
+  prop1(b, "clock-div", 5);
+  end_node(b);
+  begin(b, "i2c1@11008000");
+  prop_str(b, "compatible", "mediatek,i2c", 13);
+  prop1(b, "clock-frequency", 400000);
+  prop_str(b, "status", "disabled", 9);
+  end_node(b);
   end_node(b);
   end_node(b);
   put32(b, 9);
@@ -471,6 +483,33 @@ static void check_cpu_mpidr(void)
   expect_eq(fdt_cpu_mpidr(serialize(&b, b.st_len, 0xd00dfeed, 0), 0, &m), -1);
 }
 
+static void check_compat_indexed(void)
+{
+  struct blob b;
+  uint64_t base, size;
+  uint32_t v = 0;
+  char buf[16];
+  build_soc(&b);
+  const uint8_t *fdt = serialize(&b, b.st_len, 0xd00dfeed, 0);
+  expect_eq(fdt_compat_reg(fdt, "mediatek,i2c", 0, 1, &base, &size), 0); /* second reg entry: the DMA channel */
+  expect_eq(base, 0x11000080);
+  expect_eq(size, 0x80);
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", 0, "id", &v), 0);
+  expect_eq(v, 3);
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", 0, "clock-div", &v), 0);
+  expect_eq(v, 5);
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", 1, "clock-frequency", &v), 0);
+  expect_eq(v, 400000);
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", 0, "clock-frequency", &v), -1); /* not the next node's */
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", 2, "id", &v), -1);
+  expect_eq(fdt_compat_u32_at(fdt, "mediatek,i2c", -1, "id", &v), -1);
+  expect_eq(fdt_compat_str_at(fdt, "mediatek,i2c", 1, "status", buf, sizeof buf), 0);
+  expect_eq(strcmp(buf, "disabled"), 0);
+  expect_eq(fdt_compat_str_at(fdt, "mediatek,i2c", 0, "status", buf, sizeof buf), -1);
+  expect_eq(fdt_compat_u32(fdt, "mediatek,i2c", "clock-div", &v), 0); /* the unindexed form is node 0 */
+  expect_eq(v, 5);
+}
+
 static void check_find_truncation(void)
 {
   struct blob b;
@@ -481,6 +520,8 @@ static void check_find_truncation(void)
     const uint8_t *fdt = serialize(&b, cut, 0xd00dfeed, 0);
     (void)fdt_compat_reg(fdt, "mediatek,mt6577-uart", 1, 0, &base, &size);
     (void)fdt_compat_str(fdt, "arm,psci-1.0", "method", buf, sizeof buf);
+    (void)fdt_compat_str_at(fdt, "mediatek,i2c", 1, "status", buf, sizeof buf);
+    (void)fdt_compat_u32_at(fdt, "mediatek,i2c", 1, "clock-frequency", (uint32_t[1]){0});
     (void)fdt_cpu_mpidr(fdt, 3, &m);
     (void)fdt_reserved(fdt, (struct fdt_range[4]){0}, 4);
   }
@@ -510,6 +551,7 @@ int main(void)
   test("reserved ranges: none and invalid blobs", check_reserved_none_and_invalid);
   test("compatible lookup and reg decoding", check_compat_reg);
   test("compatible lookup of string properties", check_compat_str);
+  test("indexed property lookups on repeated nodes", check_compat_indexed);
   test("cpu mpidr list", check_cpu_mpidr);
   test("lookups on truncated blobs stay in bounds", check_find_truncation);
   test("total size", check_totalsize);

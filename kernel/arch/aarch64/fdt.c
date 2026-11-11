@@ -312,10 +312,10 @@ int fdt_compat_reg(const void *fdt, const char *compat, int idx, int entry, uint
   return 0;
 }
 
-int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *buf, uint32_t cap)
+int fdt_compat_str_at(const void *fdt, const char *compat, int idx, const char *prop, char *buf, uint32_t cap)
 {
   struct found n;
-  if (!cap || !find_node(fdt, compat, 0, prop, &n) || !n.prop)
+  if (!cap || idx < 0 || !find_node(fdt, compat, idx, prop, &n) || !n.prop)
     return -1;
   long len = str_len(n.prop, n.prop + n.prop_len);
   if (len < 0 || (uint32_t)len >= cap)
@@ -325,13 +325,23 @@ int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *
   return 0;
 }
 
-int fdt_compat_u32(const void *fdt, const char *compat, const char *prop, uint32_t *val)
+int fdt_compat_str(const void *fdt, const char *compat, const char *prop, char *buf, uint32_t cap)
+{
+  return fdt_compat_str_at(fdt, compat, 0, prop, buf, cap);
+}
+
+int fdt_compat_u32_at(const void *fdt, const char *compat, int idx, const char *prop, uint32_t *val)
 {
   struct found n;
-  if (!find_node(fdt, compat, 0, prop, &n) || !n.prop || n.prop_len < 4)
+  if (idx < 0 || !find_node(fdt, compat, idx, prop, &n) || !n.prop || n.prop_len < 4)
     return -1;
   *val = be32(n.prop);
   return 0;
+}
+
+int fdt_compat_u32(const void *fdt, const char *compat, const char *prop, uint32_t *val)
+{
+  return fdt_compat_u32_at(fdt, compat, 0, prop, val);
 }
 
 struct cpu_ctx {
