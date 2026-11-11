@@ -191,8 +191,6 @@ int h264_parse_pps(struct h264_decoder *d, const unsigned char *rbsp, unsigned l
 
   if (b.overrun)
     return H264_EFORMAT;
-  if (p.entropy_cabac)
-    return H264_EUNSUP; /* CAVLC only                */
   if (p.transform_8x8)
     return H264_EUNSUP; /* no 8x8 transform          */
 

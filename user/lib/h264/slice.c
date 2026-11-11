@@ -35,7 +35,7 @@ static int nc_combine(int a, int b)
   return 0;
 }
 
-static int nc_luma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int blk)
+static void nb_luma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int blk, int *pA, int *pB)
 {
   int bx = h264_blk_x[blk] >> 2, by = h264_blk_y[blk] >> 2, nA = -1, nB = -1;
   if (bx > 0)
@@ -46,10 +46,12 @@ static int nc_luma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, 
     nB = cur->nnz_l[(by - 1) * 4 + bx];
   else if (h264_mb_avail(d, cur_addr, mbx, mby - 1))
     nB = h264_mb_at(d, mbx, mby - 1)->nnz_l[3 * 4 + bx];
-  return nc_combine(nA, nB);
+  *pA = nA;
+  *pB = nB;
 }
 
-static int nc_chroma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int comp, int blk)
+static void nb_chroma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int comp, int blk, int *pA,
+                      int *pB)
 {
   unsigned char *cn = comp == 0 ? cur->nnz_cb : cur->nnz_cr;
   int bx = blk & 1, by = blk >> 1, nA = -1, nB = -1;
@@ -65,7 +67,40 @@ static int nc_chroma(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx
     h264_mb *m = h264_mb_at(d, mbx, mby - 1);
     nB = (comp == 0 ? m->nnz_cb : m->nnz_cr)[1 * 2 + bx];
   }
-  return nc_combine(nA, nB);
+  *pA = nA;
+  *pB = nB;
+}
+
+/* CABAC DC coded_block_flag of the left/above MB (-1 if unavailable); `bit` is
+ * the cbf_dc bit (0 luma, 1 Cb, 2 Cr). */
+static void nb_dc(struct h264_decoder *d, int cur_addr, int mbx, int mby, int bit, int *pA, int *pB)
+{
+  *pA = h264_mb_avail(d, cur_addr, mbx - 1, mby) ? (h264_mb_at(d, mbx - 1, mby)->cbf_dc >> bit) & 1 : -1;
+  *pB = h264_mb_avail(d, cur_addr, mbx, mby - 1) ? (h264_mb_at(d, mbx, mby - 1)->cbf_dc >> bit) & 1 : -1;
+}
+
+/* Read one residual block of ctxBlockCat `cat` (0 Intra16x16 DC, 1 Intra16x16 AC, 2 luma 4x4, 3 chroma DC, 4 chroma
+ * AC) with CAVLC or CABAC. Returns the coefficient count, or -1 on error. */
+static int read_res(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int cat, int comp, int blk,
+                    int *coeff)
+{
+  static const unsigned char maxn[5] = {16, 15, 16, 4, 15};
+  int nA = -1, nB = -1, cabac = d->cur_pps->entropy_cabac, tc;
+  if (!cabac && cat == 3)
+    return h264_cavlc_block(&d->br, -1, 4, coeff);
+  if (cabac && (cat == 0 || cat == 3))
+    nb_dc(d, cur_addr, mbx, mby, cat == 0 ? 0 : 1 + comp, &nA, &nB);
+  else if (cat == 4)
+    nb_chroma(d, cur, cur_addr, mbx, mby, comp, blk, &nA, &nB);
+  else
+    nb_luma(d, cur, cur_addr, mbx, mby, blk, &nA, &nB);
+  if (!cabac)
+    return h264_cavlc_block(&d->br, nc_combine(nA, nB), maxn[cat], coeff);
+  tc = h264_cabac_residual(&d->cabac, cat, (nA < 0 ? cur->intra : nA > 0) + 2 * (nB < 0 ? cur->intra : nB > 0),
+                           maxn[cat], coeff);
+  if (tc > 0 && (cat == 0 || cat == 3))
+    cur->cbf_dc |= (unsigned char)(1 << (cat == 0 ? 0 : 1 + comp));
+  return tc;
 }
 
 /* ---- residual reconstruction helpers --------------------------------------
@@ -80,8 +115,7 @@ static int recon_luma_block(struct h264_decoder *d, h264_mb *cur, int cur_addr, 
   unsigned char *dst = d->cur->y + (mby * 16 + h264_blk_y[blk]) * d->ystride + mbx * 16 + h264_blk_x[blk];
   int rpos = (h264_blk_y[blk] >> 2) * 4 + (h264_blk_x[blk] >> 2);
   if (coded) {
-    int nC = nc_luma(d, cur, cur_addr, mbx, mby, blk);
-    tc = h264_cavlc_block(&d->br, nC, dc_sep ? 15 : 16, coeff);
+    tc = read_res(d, cur, cur_addr, mbx, mby, dc_sep ? 1 : 2, 0, blk, coeff);
     if (tc < 0)
       return -1;
     for (k = 0; k < (dc_sep ? 15 : 16); k++)
@@ -108,8 +142,7 @@ static int recon_chroma_block(struct h264_decoder *d, h264_mb *cur, int cur_addr
   unsigned char *dst = plane + (mby * 8 + cy) * d->cstride + mbx * 8 + cx;
   unsigned char *cn = comp == 0 ? cur->nnz_cb : cur->nnz_cr;
   if (coded) {
-    int nC = nc_chroma(d, cur, cur_addr, mbx, mby, comp, blk);
-    tc = h264_cavlc_block(&d->br, nC, 15, coeff);
+    tc = read_res(d, cur, cur_addr, mbx, mby, 4, comp, blk, coeff);
     if (tc < 0)
       return -1;
     for (k = 0; k < 15; k++)
@@ -169,6 +202,16 @@ static void i4_neighbor(struct h264_decoder *d, h264_mb *cur, int cur_addr, int 
   *mode = (m->intra && m->cat == MB_I_4x4) ? m->i4mode[gi] : 2;
 }
 
+static int read_chroma_mode(struct h264_decoder *d, int cur_addr, int mbx, int mby)
+{
+  int a, b;
+  if (!d->cur_pps->entropy_cabac)
+    return (int)br_ue(&d->br);
+  a = h264_mb_avail(d, cur_addr, mbx - 1, mby) && h264_mb_at(d, mbx - 1, mby)->chroma_mode != 0;
+  b = h264_mb_avail(d, cur_addr, mbx, mby - 1) && h264_mb_at(d, mbx, mby - 1)->chroma_mode != 0;
+  return h264_cabac_chroma_pred_mode(&d->cabac, a + b);
+}
+
 /* Parse the intra-prediction section (modes) for an I_NxN / I_16x16 MB. */
 static void parse_intra_pred(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, struct mbinfo *mb)
 {
@@ -180,19 +223,19 @@ static void parse_intra_pred(struct h264_decoder *d, h264_mb *cur, int cur_addr,
       i4_neighbor(d, cur, cur_addr, mbx, mby, 1, bx, by, &availA, &modeA);
       i4_neighbor(d, cur, cur_addr, mbx, mby, 0, bx, by, &availB, &modeB);
       pred = (!availA || !availB) ? 2 : (modeA < modeB ? modeA : modeB);
-      if (br_u1(&d->br))
+      if (d->cur_pps->entropy_cabac ? h264_cabac_decision(&d->cabac, 68) : br_u1(&d->br))
         mode = pred; /* prev_intra4x4_pred_mode_flag */
       else {
-        int rem = (int)br_u(&d->br, 3);
+        int rem = d->cur_pps->entropy_cabac ? h264_cabac_rem_intra4x4(&d->cabac) : (int)br_u(&d->br, 3);
         mode = rem < pred ? rem : rem + 1;
       }
       cur->i4mode[by * 4 + bx] = (signed char)mode;
     }
-    mb->chroma_mode = (int)br_ue(&d->br);
+    mb->chroma_mode = read_chroma_mode(d, cur_addr, mbx, mby);
   } else { /* I_16x16 */
     for (i = 0; i < 16; i++)
       cur->i4mode[i] = 2;
-    mb->chroma_mode = (int)br_ue(&d->br);
+    mb->chroma_mode = read_chroma_mode(d, cur_addr, mbx, mby);
   }
 }
 
@@ -207,8 +250,8 @@ static int recon_mb(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx,
 
   /* Luma DC for Intra_16x16. */
   if (mb->cat == MB_I_16x16) {
-    int coeff[16], k, nC = nc_luma(d, cur, cur_addr, mbx, mby, 0);
-    int tc = h264_cavlc_block(&d->br, nC, 16, coeff);
+    int coeff[16], k;
+    int tc = read_res(d, cur, cur_addr, mbx, mby, 0, 0, 0, coeff);
     if (tc < 0)
       return -1;
     for (k = 0; k < 16; k++)
@@ -240,7 +283,7 @@ static int recon_mb(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx,
     int dcv[2][4] = {{0}}, cc;
     if (cbp_chroma & 3) {
       for (cc = 0; cc < 2; cc++) {
-        int coeff[4], tc = h264_cavlc_block(&d->br, -1, 4, coeff);
+        int coeff[4], tc = read_res(d, cur, cur_addr, mbx, mby, 3, cc, 0, coeff);
         if (tc < 0)
           return -1;
         dcv[cc][0] = coeff[0];
@@ -333,15 +376,53 @@ static void store_inter_mv(h264_mb *cur, int bx4, int by4, int bw4, int bh4, int
     }
 }
 
-/* ref_idx_l0 is te(v): a single inverted bit when the active count is 2, else
- * ue(v); 0 bits when only one reference is active. */
-static int read_ref_idx(struct h264_decoder *d, int num_refs)
+/* ref_idx_l0 is te(v) under CAVLC: a single inverted bit when the active count
+ * is 2, else ue(v); 0 bits when only one reference is active. CABAC codes it in
+ * unary; ref8[] holds the indices already parsed for this MB's 8x8 quadrants. */
+static int read_ref_idx(struct h264_decoder *d, int cur_addr, int mbx, int mby, const int *ref8, int bx4, int by4,
+                        int num_refs)
 {
   if (num_refs <= 1)
     return 0;
+  if (d->cur_pps->entropy_cabac) {
+    h264_mb *mA = h264_mb_avail(d, cur_addr, mbx - 1, mby) ? h264_mb_at(d, mbx - 1, mby) : 0;
+    h264_mb *mB = h264_mb_avail(d, cur_addr, mbx, mby - 1) ? h264_mb_at(d, mbx, mby - 1) : 0;
+    int a = bx4 > 0 ? ref8[(by4 >> 1) * 2 + ((bx4 - 1) >> 1)] > 0 : mA && mA->refidx[by4 * 4 + 3] > 0;
+    int b = by4 > 0 ? ref8[((by4 - 1) >> 1) * 2 + (bx4 >> 1)] > 0 : mB && mB->refidx[12 + bx4] > 0;
+    return h264_cabac_ref_idx(&d->cabac, a + 2 * b);
+  }
   if (num_refs == 2)
     return 1 - (int)br_u1(&d->br);
   return (int)br_ue(&d->br);
+}
+
+/* mvd_l0 of one partition: se(v) pairs under CAVLC; CABAC contexts come from the
+ * neighbouring partitions' |mvd|, which is recorded here for the partitions after it. */
+static void read_mvd(struct h264_decoder *d, h264_mb *cur, int cur_addr, int mbx, int mby, int bx4, int by4, int bw4,
+                     int bh4, int *dx, int *dy)
+{
+  h264_mb *mA, *mB;
+  int c, x, y, v[2];
+  if (!d->cur_pps->entropy_cabac) {
+    *dx = br_se(&d->br);
+    *dy = br_se(&d->br);
+    return;
+  }
+  mA = h264_mb_avail(d, cur_addr, mbx - 1, mby) ? h264_mb_at(d, mbx - 1, mby) : 0;
+  mB = h264_mb_avail(d, cur_addr, mbx, mby - 1) ? h264_mb_at(d, mbx, mby - 1) : 0;
+  for (c = 0; c < 2; c++) {
+    int a = bx4 > 0 ? cur->mvd[by4 * 4 + bx4 - 1][c] : mA ? mA->mvd[by4 * 4 + 3][c] : 0;
+    int b = by4 > 0 ? cur->mvd[(by4 - 1) * 4 + bx4][c] : mB ? mB->mvd[12 + bx4][c] : 0;
+    v[c] = h264_cabac_mvd(&d->cabac, c, a + b);
+  }
+  for (c = 0; c < 2; c++) {
+    int m = v[c] < 0 ? -v[c] : v[c];
+    for (y = 0; y < bh4; y++)
+      for (x = 0; x < bw4; x++)
+        cur->mvd[(by4 + y) * 4 + bx4 + x][c] = (unsigned char)(m > 255 ? 255 : m);
+  }
+  *dx = v[0];
+  *dy = v[1];
 }
 
 /* One sub-block of a P_8x8 sub_mb_type: offsets/size in 4x4 units. */
@@ -364,24 +445,25 @@ static int decode_p_inter(struct h264_decoder *d, h264_mb *cur, int cur_addr, in
   int ref0_forced = mb->i16mode; /* set for P_8x8ref0 */
 
   if (mb->cat == MB_P_8x8) {
-    int sub[4], ref[4], p, s;
+    int sub[4], ref[4] = {0}, p, s;
     for (p = 0; p < 4; p++) {
-      sub[p] = (int)br_ue(&d->br);
+      sub[p] = d->cur_pps->entropy_cabac ? h264_cabac_sub_mb_type(&d->cabac) : (int)br_ue(&d->br);
       if (sub[p] > 3)
         return -1;
     }
     for (p = 0; p < 4; p++)
-      ref[p] = (!ref0_forced) ? read_ref_idx(d, num_refs) : 0;
+      ref[p] = (!ref0_forced) ? read_ref_idx(d, cur_addr, mbx, mby, ref, (p & 1) * 2, (p >> 1) * 2, num_refs) : 0;
     for (p = 0; p < 4; p++) {
       int p8x = (p & 1) * 2, p8y = (p >> 1) * 2; /* 8x8 base in 4x4 units */
       const struct subgeom *g = &sub_geom[sub[p]];
       for (s = 0; s < g->n; s++) {
         int sbx = p8x + g->off[s][0], sby = p8y + g->off[s][1];
         int sw = g->off[s][2], sh = g->off[s][3];
-        int mvx, mvy;
+        int mvx, mvy, dx, dy;
         h264_pred_mv(d, mbx, mby, sbx, sby, sw * 4, sh * 4, ref[p], &mvx, &mvy);
-        mvx += br_se(&d->br);
-        mvy += br_se(&d->br);
+        read_mvd(d, cur, cur_addr, mbx, mby, sbx, sby, sw, sh, &dx, &dy);
+        mvx += dx;
+        mvy += dy;
         store_inter_mv(cur, sbx, sby, sw, sh, mvx, mvy, ref[p]);
         h264_inter_pred(d, mbx, mby, sbx * 4, sby * 4, sw * 4, sh * 4, d->ref0[ref[p] < d->nref0 ? ref[p] : 0], mvx,
                         mvy);
@@ -392,11 +474,17 @@ static int decode_p_inter(struct h264_decoder *d, h264_mb *cur, int cur_addr, in
 
   /* macroblock_prediction: all ref_idx_l0 first, then all mvd_l0. */
   {
-    int pref[2], part2;
-    for (part2 = 0; part2 < p_parts; part2++)
-      pref[part2] = read_ref_idx(d, num_refs);
+    int pref[2], ref8[4] = {0};
     for (part = 0; part < p_parts; part++) {
-      int pw = 16, ph = 16, bx4 = 0, by4 = 0, ref = pref[part], mvx, mvy;
+      int bx4 = mb->cat == MB_P_8x16 ? part * 2 : 0, by4 = mb->cat == MB_P_16x8 ? part * 2 : 0;
+      int x4 = mb->cat == MB_P_8x16 ? 2 : 4, y4 = mb->cat == MB_P_16x8 ? 2 : 4, x, y;
+      pref[part] = read_ref_idx(d, cur_addr, mbx, mby, ref8, bx4, by4, num_refs);
+      for (y = by4 >> 1; y < (by4 + y4) >> 1; y++)
+        for (x = bx4 >> 1; x < (bx4 + x4) >> 1; x++)
+          ref8[y * 2 + x] = pref[part];
+    }
+    for (part = 0; part < p_parts; part++) {
+      int pw = 16, ph = 16, bx4 = 0, by4 = 0, ref = pref[part], mvx, mvy, dx, dy;
       if (mb->cat == MB_P_16x8) {
         pw = 16;
         ph = 8;
@@ -407,8 +495,9 @@ static int decode_p_inter(struct h264_decoder *d, h264_mb *cur, int cur_addr, in
         bx4 = part * 2;
       }
       h264_pred_mv(d, mbx, mby, bx4, by4, pw, ph, ref, &mvx, &mvy);
-      mvx += br_se(&d->br);
-      mvy += br_se(&d->br);
+      read_mvd(d, cur, cur_addr, mbx, mby, bx4, by4, pw / 4, ph / 4, &dx, &dy);
+      mvx += dx;
+      mvy += dy;
       store_inter_mv(cur, bx4, by4, pw / 4, ph / 4, mvx, mvy, ref);
       h264_inter_pred(d, mbx, mby, bx4 * 4, by4 * 4, pw, ph, d->ref0[ref < d->nref0 ? ref : 0], mvx, mvy);
     }
@@ -439,6 +528,12 @@ static int decode_pcm(struct h264_decoder *d, h264_mb *cur, int mbx, int mby)
     }
   }
   cur->qpy = 0;
+  if (d->cur_pps->entropy_cabac) {
+    cur->cbp = 0x2f;
+    cur->cbf_dc = 7;
+    d->cabac.dqp_nz = 0;
+    h264_cabac_start(&d->cabac);
+  }
   return d->br.overrun ? -1 : 0;
 }
 
@@ -456,11 +551,56 @@ static void decode_p_skip(struct h264_decoder *d, int cur_addr, int mbx, int mby
   h264_inter_pred(d, mbx, mby, 0, 0, 16, 16, d->ref0[0], mvx, mvy);
 }
 
+static int cabac_skip(struct h264_decoder *d, int cur_addr, int mbx, int mby)
+{
+  int a = h264_mb_avail(d, cur_addr, mbx - 1, mby) && h264_mb_at(d, mbx - 1, mby)->cat != MB_SKIP;
+  int b = h264_mb_avail(d, cur_addr, mbx, mby - 1) && h264_mb_at(d, mbx, mby - 1)->cat != MB_SKIP;
+  return h264_cabac_decision(&d->cabac, 11 + a + b);
+}
+
+static int read_mb_type(struct h264_decoder *d, int cur_addr, int mbx, int mby)
+{
+  int a, b;
+  if (!d->cur_pps->entropy_cabac)
+    return (int)br_ue(&d->br);
+  if (d->sh.slice_type == H264_SLICE_P)
+    return h264_cabac_mb_type_p(&d->cabac);
+  a = h264_mb_avail(d, cur_addr, mbx - 1, mby) && h264_mb_at(d, mbx - 1, mby)->cat != MB_I_4x4;
+  b = h264_mb_avail(d, cur_addr, mbx, mby - 1) && h264_mb_at(d, mbx, mby - 1)->cat != MB_I_4x4;
+  return h264_cabac_mb_type_i(&d->cabac, a + b);
+}
+
+/* coded_block_pattern of an I_NxN or P macroblock, or -1 on a bad code. */
+static int read_cbp(struct h264_decoder *d, int cur_addr, int mbx, int mby, int intra)
+{
+  h264_mb *mA, *mB;
+  int b8, luma = 0, chroma = 0, a, b;
+  if (!d->cur_pps->entropy_cabac) {
+    int code = (int)br_ue(&d->br);
+    return code >= 48 ? -1 : intra ? cbp_intra[code] : cbp_inter[code];
+  }
+  mA = h264_mb_avail(d, cur_addr, mbx - 1, mby) ? h264_mb_at(d, mbx - 1, mby) : 0;
+  mB = h264_mb_avail(d, cur_addr, mbx, mby - 1) ? h264_mb_at(d, mbx, mby - 1) : 0;
+  for (b8 = 0; b8 < 4; b8++) {
+    a = (b8 & 1) ? !((luma >> (b8 - 1)) & 1) : mA && !((mA->cbp >> (b8 + 1)) & 1);
+    b = (b8 & 2) ? !((luma >> (b8 - 2)) & 1) : mB && !((mB->cbp >> (b8 + 2)) & 1);
+    luma |= h264_cabac_decision(&d->cabac, 73 + a + 2 * b) << b8;
+  }
+  a = mA && (mA->cbp >> 4) != 0;
+  b = mB && (mB->cbp >> 4) != 0;
+  if (h264_cabac_decision(&d->cabac, 77 + a + 2 * b)) {
+    a = mA && (mA->cbp >> 4) == 2;
+    b = mB && (mB->cbp >> 4) == 2;
+    chroma = 1 + h264_cabac_decision(&d->cabac, 77 + 4 + a + 2 * b);
+  }
+  return luma | chroma << 4;
+}
+
 static int decode_mb(struct h264_decoder *d, int cur_addr, int mbx, int mby, int *qp)
 {
   h264_mb *cur = &d->mbs[cur_addr];
   struct mbinfo mb;
-  int mb_type = (int)br_ue(&d->br);
+  int mb_type = read_mb_type(d, cur_addr, mbx, mby);
   int is_pcm = 0, p_parts = 0;
   memset(&mb, 0, sizeof mb);
   cur->slice_id = d->cur_slice_id;
@@ -492,10 +632,9 @@ static int decode_mb(struct h264_decoder *d, int cur_addr, int mbx, int mby, int
   /* coded_block_pattern for I_4x4 and P (I_16x16 already has it from mb_type).
    */
   if (mb.cat == MB_I_4x4 || (!mb.intra)) {
-    int code = (int)br_ue(&d->br);
-    if (code >= 48)
+    mb.cbp = read_cbp(d, cur_addr, mbx, mby, mb.intra);
+    if (mb.cbp < 0)
       return -1;
-    mb.cbp = mb.intra ? cbp_intra[code] : cbp_inter[code];
   }
   cur->cbp = (unsigned char)mb.cbp;
 
@@ -507,8 +646,11 @@ static int decode_mb(struct h264_decoder *d, int cur_addr, int mbx, int mby, int
 
   /* mb_qp_delta present when there are coded coefficients or Intra_16x16. */
   if (mb.cbp != 0 || mb.cat == MB_I_16x16) {
-    int delta = br_se(&d->br);
+    int delta = d->cur_pps->entropy_cabac ? h264_cabac_qp_delta(&d->cabac) : br_se(&d->br);
+    d->cabac.dqp_nz = delta != 0;
     *qp = (*qp + delta + 52) % 52;
+  } else {
+    d->cabac.dqp_nz = 0;
   }
   cur->qpy = (signed char)*qp;
 
@@ -618,6 +760,11 @@ static int parse_slice_header(struct h264_decoder *d, int nal_type, int nal_ref_
     }
   }
 
+  if (p->entropy_cabac && sh->slice_type != H264_SLICE_I && sh->slice_type != H264_SLICE_SI) {
+    sh->cabac_init_idc = (int)br_ue(&d->br);
+    if (sh->cabac_init_idc > 2)
+      return H264_EFORMAT;
+  }
   sh->qp = p->pic_init_qp + br_se(&d->br);
   if (p->deblock_control_present) {
     sh->disable_deblock = (int)br_ue(&d->br);
@@ -662,6 +809,25 @@ int h264_decode_slice_dispatch(struct h264_decoder *d, const unsigned char *rbsp
   total = d->mb_w * d->mb_h;
   addr = d->sh.first_mb;
   qp = d->sh.qp;
+
+  if (d->cur_pps->entropy_cabac) {
+    h264_cabac_init(d);
+    for (;;) {
+      int mbx = addr % d->mb_w, mby = addr / d->mb_w;
+      h264_mb *cur = &d->mbs[addr];
+      cur->slice_id = d->cur_slice_id;
+      if (d->sh.slice_type == H264_SLICE_P && cabac_skip(d, addr, mbx, mby)) {
+        d->cabac.dqp_nz = 0;
+        decode_p_skip(d, addr, mbx, mby, &qp);
+      } else if (decode_mb(d, addr, mbx, mby, &qp) != 0) {
+        return H264_EFORMAT;
+      }
+      addr++;
+      if (h264_cabac_terminate(&d->cabac) || addr >= total)
+        break;
+    }
+    return d->br.overrun ? H264_EFORMAT : H264_OK;
+  }
 
   if (d->sh.slice_type == H264_SLICE_I) {
     while (addr < total) {

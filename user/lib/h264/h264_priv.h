@@ -52,7 +52,18 @@ typedef struct {
   short mv[16][2];           /* per-4x4 list-0 motion vector, quarter-pel   */
   signed char refidx[16];    /* per-4x4 list-0 reference index (-1 = intra) */
   unsigned char field;       /* always 0 (frame-only decoding)              */
+  unsigned char cbf_dc;      /* CABAC coded_block_flag: bit0 luma DC, 1/2 Cb/Cr DC */
+  unsigned char mvd[16][2];  /* per-4x4 |mvd| (saturated), CABAC contexts   */
 } h264_mb;
+
+/* CABAC arithmetic decoder (9.3): range/offset registers and one
+ * (pStateIdx << 1 | valMPS) byte per context. */
+typedef struct {
+  bitr *br;
+  unsigned range, offset;
+  int dqp_nz; /* previous MB in decoding order had a non-zero mb_qp_delta */
+  unsigned char st[460];
+} h264_cabac;
 
 /* A decoded picture in the frame store / DPB. The plane pointers address sample
  * (0,0); H264_BORDER samples of edge-extended padding surround each plane. */
@@ -90,7 +101,7 @@ typedef struct {
 typedef struct {
   int valid;
   int sps_id;
-  int entropy_cabac; /* 1 = CABAC (unsupported)                      */
+  int entropy_cabac; /* 1 = CABAC, 0 = CAVLC                         */
   int bottom_field_poc_present;
   int num_slice_groups; /* >1 unsupported                              */
   int num_ref_idx_l0_default, num_ref_idx_l1_default;
@@ -117,6 +128,7 @@ typedef struct {
   int delta_poc_bottom;
   int delta_poc[2];
   int num_ref_idx_l0;
+  int cabac_init_idc;
   int qp;              /* SliceQPY                                     */
   int disable_deblock; /* disable_deblocking_filter_idc                */
   int slice_alpha_off, slice_beta_off;
@@ -177,6 +189,7 @@ struct h264_decoder {
   int cur_slice_id; /* id stamped on this slice's macroblocks          */
   int cur_is_ref;   /* will the current picture become a reference?     */
   bitr br;
+  h264_cabac cabac;
 };
 
 /* ---- cross-file entry points --------------------------------------------- */
@@ -203,6 +216,23 @@ void h264_build_ref_list0(struct h264_decoder *d);
  * 15 or 4). `nC` selects the coeff_token table (-1 = chroma DC). Returns
  * TotalCoeff, or -1 on error. */
 int h264_cavlc_block(bitr *b, int nC, int max, int *coeff /*[max]*/);
+
+/* cabac.c: engine + the context-coded syntax elements (9.3). The caller derives
+ * every neighbour-dependent ctxIdxInc; the *_start calls consume the 9-bit
+ * offset at the current bit position. */
+void h264_cabac_init(struct h264_decoder *d); /* byte-align, init contexts, start */
+void h264_cabac_start(h264_cabac *c);         /* re-start the engine (after I_PCM) */
+int h264_cabac_decision(h264_cabac *c, int ctx);
+int h264_cabac_terminate(h264_cabac *c);
+int h264_cabac_mb_type_i(h264_cabac *c, int inc); /* I slice: 0..25 */
+int h264_cabac_mb_type_p(h264_cabac *c);          /* P slice: 0..3, or 5 + intra type */
+int h264_cabac_sub_mb_type(h264_cabac *c);        /* 0..3 */
+int h264_cabac_ref_idx(h264_cabac *c, int inc);
+int h264_cabac_mvd(h264_cabac *c, int comp, int sum); /* sum = |mvdA| + |mvdB| */
+int h264_cabac_qp_delta(h264_cabac *c);
+int h264_cabac_chroma_pred_mode(h264_cabac *c, int inc);
+int h264_cabac_rem_intra4x4(h264_cabac *c);
+int h264_cabac_residual(h264_cabac *c, int cat, int cbf_inc, int max, int *coeff);
 
 /* transform.c */
 void h264_idct4x4_add(const int blk[16], unsigned char *dst, int stride);

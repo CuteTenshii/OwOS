@@ -13,6 +13,13 @@
  *   cc -std=c11 -Itests -Iuser/lib/h264 tests/h264_test.c user/lib/h264/*.c \
  *      -lm -o /tmp/h264_test
  *   /tmp/h264_test /tmp/h264_intra.264 /tmp/h264_intra.yuv 176 144
+ *
+ * CABAC vectors use the Main profile (no B slices, no weighted prediction) and are
+ * kept under 16 frames per GOP; disable deblocking to compare bit-exactly:
+ *   ffmpeg -y -f lavfi -i testsrc2=size=176x144:rate=25:duration=0.6 -c:v libx264 \
+ *          -profile:v main -bf 0 -weightp 0 -g 15 -refs 3 -crf 22 \
+ *          -x264-params no-deblock=1 -pix_fmt yuv420p \
+ *          -bsf:v h264_mp4toannexb -f h264 /tmp/h264_cabac.264
  */
 #include "h264.h"
 #include <math.h>
