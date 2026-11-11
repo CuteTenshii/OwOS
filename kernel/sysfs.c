@@ -29,6 +29,7 @@
  */
 
 #include "sysfs.h"
+#include "audio.h"
 #include "battery.h"
 #include "blk.h"
 #include "bt.h"
@@ -43,7 +44,6 @@
 #include "net.h"
 #include "nic.h"
 #include "pci.h"
-#include "sb16.h"
 #include "smbios.h"
 #include "uvc.h"
 #include <stdint.h>
@@ -55,21 +55,6 @@ static bool gamepad_present(void)
 {
   char probe[2];
   return hid_gamepad_state(probe, sizeof probe) >= 0;
-}
-
-static bool sound_present(void) { return hda_present() || sb16_present(); }
-
-/* Master volume as 0..SB_VOL_MAX from whichever card owns the keys' output. */
-static int snd_level(void) { return hda_present() ? hda_volume_level() : sb16_volume_level(); }
-static bool snd_muted(void) { return hda_present() ? hda_is_muted() : sb16_is_muted(); }
-
-static void snd_set_level(int level)
-{
-  for (int d = level - snd_level(); d; d += d < 0 ? 1 : -1)
-    if (hda_present())
-      hda_volume_step(d < 0 ? -1 : 1);
-    else
-      sb16_volume_step(d < 0 ? -1 : 1);
 }
 
 static int parse_percent(const char *p)
@@ -317,7 +302,7 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
   if (eq(seg[0], "class")) {
     if (n == 2)
       return (eq(seg[1], "input") || eq(seg[1], "net") || eq(seg[1], "block") || eq(seg[1], "graphics") ||
-              eq(seg[1], "dmi") || (eq(seg[1], "sound") && sound_present()) ||
+              eq(seg[1], "dmi") || (eq(seg[1], "sound") && audio_volume_present()) ||
               (eq(seg[1], "bluetooth") && bt_present()) || (eq(seg[1], "video") && uvc_present()))
                  ? S_DIR
                  : S_NONE;
@@ -406,7 +391,7 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
       return S_NONE;
     }
     if (eq(seg[1], "sound")) {
-      if (!sound_present())
+      if (!audio_volume_present())
         return S_NONE;
       if (n == 3)
         return eq(seg[2], "card0") ? S_DIR : S_NONE;
@@ -676,12 +661,12 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
     if (eq(seg[1], "sound")) {
       char nm[48];
       if (eq(seg[3], "volume")) { /* 0..100 */
-        pu(b, (uint32_t)((snd_level() * 100 + SB_VOL_MAX / 2) / SB_VOL_MAX));
+        pu(b, (uint32_t)((audio_volume_level() * 100 + AUDIO_VOL_MAX / 2) / AUDIO_VOL_MAX));
         pc(b, '\n');
         return;
       }
       if (eq(seg[3], "muted")) {
-        ps(b, snd_muted() ? "1" : "0");
+        ps(b, audio_volume_muted() ? "1" : "0");
         pc(b, '\n');
         return;
       }
@@ -828,7 +813,7 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
     int v = parse_percent(arg);
     if (v < 0)
       return -1;
-    snd_set_level((v * SB_VOL_MAX + 50) / 100);
+    audio_volume_set((v * AUDIO_VOL_MAX + 50) / 100);
     return 0;
   }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "brightness")) {
@@ -915,7 +900,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (block_name(0, tmp))
       kids[k++] = "block";
     kids[k++] = "graphics";
-    if (sound_present())
+    if (audio_volume_present())
       kids[k++] = "sound";
     if (bt_present())
       kids[k++] = "bluetooth";
@@ -1019,7 +1004,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 2 && eq(seg[0], "class") && eq(seg[1], "sound")) {
-    if (!sound_present() || idx != 0)
+    if (!audio_volume_present() || idx != 0)
       return 0;
     cpy(name, "card0", max);
     if (is_dir)

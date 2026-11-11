@@ -1,12 +1,11 @@
 /* keyboard.c - translate PS/2 scancodes (set 1, US QWERTY) and echo them. */
 
 #include "keyboard.h"
+#include "audio.h"
 #include "fb.h"
-#include "hda.h"
 #include "io.h"
 #include "irq.h"
 #include "keymap.h"
-#include "sb16.h"
 #include "serial.h"
 #include "spinlock.h"
 #include <stdbool.h>
@@ -258,29 +257,18 @@ int keyboard_take_screenshot(void)
  */
 void keyboard_signal_interrupt(void) { int_pending = true; }
 
-static void volume_step(int dir)
-{
-  if (hda_present())
-    hda_volume_step(dir);
-  else
-    sb16_volume_step(dir);
-}
-
 /* Volume and brightness act here so they work without a compositor; every special key is also queued for the OSD. */
 static void special_key(uint8_t key)
 {
   switch (key) {
   case KEY_MUTE:
-    if (hda_present())
-      hda_volume_mute();
-    else
-      sb16_volume_mute();
+    audio_volume_mute();
     break;
   case KEY_VOL_DOWN:
-    volume_step(-1);
+    audio_volume_step(-1);
     break;
   case KEY_VOL_UP:
-    volume_step(+1);
+    audio_volume_step(+1);
     break;
   case KEY_BRIGHT_DOWN:
     fb_brightness_step(-1);

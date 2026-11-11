@@ -7,10 +7,11 @@
 #ifndef OWOS_SB16_H
 #define OWOS_SB16_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
-void sb16_init(void);   /* probe + claim IRQ 5 (silent if no card)     */
-int sb16_present(void); /* 1 if a card was detected                     */
+void sb16_init(void);    /* probe + claim IRQ 5 (silent if no card)     */
+bool sb16_present(void); /* a card was detected                          */
 
 /* Master-volume control, driven by the keyboard's media keys (Fn / volume
  * keys). Levels run 0..SB_VOL_MAX; the SB16 mixer attenuates the analog output

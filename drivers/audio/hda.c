@@ -683,7 +683,7 @@ void hda_init(void)
   con_printf("hda: HD Audio ready (%d outputs, codec %u, dac nid %u, pin nid %u)\n", n_outs, codec, dac_nid, pin_nid);
 }
 
-int hda_present(void) { return present; }
+bool hda_present(void) { return present; }
 
 #define FMT_48K_S16_STEREO 0x0011 /* base48k, x1, 16-bit, 2ch              */
 #define STREAM_TAG 1

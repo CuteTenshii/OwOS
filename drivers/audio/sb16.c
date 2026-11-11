@@ -134,7 +134,7 @@ void sb16_init(void)
   con_write("sb16: Sound Blaster 16 ready (io 0x220 irq 5 dma 1)\n");
 }
 
-int sb16_present(void) { return present; }
+bool sb16_present(void) { return present; }
 
 /* Program 8237 ch 1 for auto-init over the whole buffer so the card streams continuously. */
 static void dma_setup_autoinit(uint32_t phys, uint32_t count)

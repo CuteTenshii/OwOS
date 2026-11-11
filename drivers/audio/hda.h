@@ -17,8 +17,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-void hda_init(void);   /* probe + bring up the controller/codec        */
-int hda_present(void); /* 1 if a controller + usable codec was found   */
+void hda_init(void);    /* probe + bring up the controller/codec        */
+bool hda_present(void); /* a controller + usable codec was found        */
 
 /* Master-volume control on the output path's amp, driven by the keyboard's
  * media keys — the HDA counterpart to sb16_volume_*. Same 0..HDA_VOL_MAX scale
