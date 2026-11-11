@@ -149,6 +149,9 @@ struct rctx {
   struct arena ar, tmp;
   int depth;
   long ops;
+  int no_paint;
+  struct pdf_glyph *text;
+  int ntext, text_cap;
   struct gcache_ent glyphs[256];
   struct {
     const void *res;
@@ -175,6 +178,7 @@ struct glyph_ref {
   const struct font *f;
   int gid;
   int ok;
+  int uni;
 };
 /* Next character code of `s` (1 or 2 bytes by font kind); width in 1/1000 em; glyph to draw. */
 int pdf_font_next(struct pdf *d, struct pfont *pf, const unsigned char *s, int n, int *code, double *w,

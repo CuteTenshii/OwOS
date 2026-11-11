@@ -95,6 +95,40 @@ static void draw_glyph(struct rctx *rc, const struct glyph_ref *gr)
   free(tile);
 }
 
+static void record_glyph(struct rctx *rc, const struct glyph_ref *gr, double w)
+{
+  struct gstate *g = &rc->gs;
+  if (!gr->uni || gr->uni == ' ' || gr->uni == 0xa0)
+    return;
+  struct c2d_mat tm = {(float)rc->tm[0], (float)rc->tm[1], (float)rc->tm[2],
+                       (float)rc->tm[3], (float)rc->tm[4], (float)rc->tm[5]};
+  struct c2d_mat s = {(float)(g->fs * g->th), 0, 0, (float)g->fs, 0, (float)g->rise};
+  struct c2d_mat m = c2d_mat_mul(c2d_mat_mul(g->ctm, tm), s);
+  float xs[4], ys[4], we = (float)(w / 1000);
+  c2d_mat_apply(&m, 0, -0.2f, &xs[0], &ys[0]);
+  c2d_mat_apply(&m, we, -0.2f, &xs[1], &ys[1]);
+  c2d_mat_apply(&m, 0, 0.8f, &xs[2], &ys[2]);
+  c2d_mat_apply(&m, we, 0.8f, &xs[3], &ys[3]);
+  struct pdf_glyph gl = {xs[0], ys[0], xs[0], ys[0], (unsigned)gr->uni};
+  for (int i = 1; i < 4; i++) {
+    gl.x0 = xs[i] < gl.x0 ? xs[i] : gl.x0;
+    gl.x1 = xs[i] > gl.x1 ? xs[i] : gl.x1;
+    gl.y0 = ys[i] < gl.y0 ? ys[i] : gl.y0;
+    gl.y1 = ys[i] > gl.y1 ? ys[i] : gl.y1;
+  }
+  if (gl.x0 - gl.x0 != 0 || gl.y0 - gl.y0 != 0 || gl.x1 - gl.x1 != 0 || gl.y1 - gl.y1 != 0)
+    return;
+  if (rc->ntext == rc->text_cap) {
+    int cap = rc->text_cap ? rc->text_cap * 2 : 1024;
+    struct pdf_glyph *nt = realloc(rc->text, (unsigned)cap * sizeof *nt);
+    if (!nt || cap > (1 << 22))
+      return;
+    rc->text = nt;
+    rc->text_cap = cap;
+  }
+  rc->text[rc->ntext++] = gl;
+}
+
 void pdf_show_text(struct rctx *rc, const unsigned char *s, int n)
 {
   struct gstate *g = &rc->gs;
@@ -108,8 +142,12 @@ void pdf_show_text(struct rctx *rc, const unsigned char *s, int n)
     int used = pdf_font_next(rc->d, pf, s, n, &code, &w, &gr, &space);
     s += used;
     n -= used;
-    if (gr.ok && g->fs != 0)
-      draw_glyph(rc, &gr);
+    if (g->fs != 0) {
+      if (rc->no_paint)
+        record_glyph(rc, &gr, w);
+      else if (gr.ok)
+        draw_glyph(rc, &gr);
+    }
     double tx = (w / 1000 * g->fs + g->tc + (space ? g->tw : 0)) * g->th;
     rc->tm[4] += tx * rc->tm[0];
     rc->tm[5] += tx * rc->tm[1];

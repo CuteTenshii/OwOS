@@ -554,6 +554,36 @@ static void text_embedded_and_fallback(void)
   done(&s, &d);
 }
 
+static void extracts_text(void)
+{
+  struct doc d;
+  page(&d, 200, 100, "/Font << /F1 5 0 R >>", "",
+       "BT /F1 20 Tf 10 70 Td (Hi) Tj 40 0 Td (yo) Tj ET BT /F1 20 Tf 10 30 Td [(a)-2000(b)] TJ ET");
+  obj(&d, 5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
+  finish(&d, "");
+  load_fonts();
+  struct pdf *p;
+  expect_eq(pdf_open(d.b, d.n, &p), PDF_OK);
+  pdf_set_fonts(p, g_sans, g_mono);
+  struct pdf_glyph *g = 0;
+  int n = 0;
+  expect_eq(pdf_page_text(p, 0, &g, &n), 0);
+  expect_eq(pdf_page_text(p, 3, &g, &n), -1);
+  char got[32] = "";
+  for (int i = 0; i < n && i < 30; i++)
+    got[i] = (char)g[i].ch;
+  /* Hi, a gap before yo, a line break, then a and b with the TJ adjustment opening a gap */
+  expect_string(got, "Hi yo\na b");
+  if (n >= 2) {
+    expect(g[0].x0 > 9.5f && g[0].x0 < 10.5f);
+    expect(g[0].y0 > 10 && g[0].y1 < 40 && g[0].y1 > g[0].y0);
+    expect(g[1].x0 >= g[0].x1 - 0.01f);
+  }
+  free(g);
+  pdf_close(p);
+  free(d.b);
+}
+
 static void survives_corruption(void)
 {
   struct doc d;
@@ -612,6 +642,7 @@ int main(void)
   test("shading", shading);
   test("annotations", annotations);
   test("text_embedded_and_fallback", text_embedded_and_fallback);
+  test("extracts_text", extracts_text);
   test("survives_corruption", survives_corruption);
   return 0;
 }

@@ -604,6 +604,9 @@ static void inline_image(struct run *r)
   free(data);
 }
 
+/* Text still counts as visible while only collecting text, where every run starts "hidden" from painting */
+static int text_hidden(const struct run *r) { return r->hidden > (r->rc->no_paint ? 1 : 0); }
+
 static void exec_op(struct run *r, const char *op, struct pobj *ops, int n)
 {
   struct rctx *rc = r->rc;
@@ -754,7 +757,7 @@ static void exec_op(struct run *r, const char *op, struct pobj *ops, int n)
     memcpy(rc->tm, rc->tlm, sizeof rc->tm);
     break;
   case K2('T', 'j'):
-    if (n >= 1 && ops[0].t == PO_STR && !r->hidden)
+    if (n >= 1 && ops[0].t == PO_STR && !text_hidden(r))
       pdf_show_text(rc, (const unsigned char *)ops[0].u.s, ops[0].n);
     break;
   case K1('\''):
@@ -766,7 +769,7 @@ static void exec_op(struct run *r, const char *op, struct pobj *ops, int n)
     rc->tlm[4] += -g->tl * rc->tlm[2];
     rc->tlm[5] += -g->tl * rc->tlm[3];
     memcpy(rc->tm, rc->tlm, sizeof rc->tm);
-    if (n >= 1 && ops[n - 1].t == PO_STR && !r->hidden)
+    if (n >= 1 && ops[n - 1].t == PO_STR && !text_hidden(r))
       pdf_show_text(rc, (const unsigned char *)ops[n - 1].u.s, ops[n - 1].n);
     break;
   case K2('T', 'J'):
@@ -774,7 +777,7 @@ static void exec_op(struct run *r, const char *op, struct pobj *ops, int n)
       for (int i = 0; i < ops[0].n; i++) {
         struct pobj e = ops[0].u.a[i];
         if (e.t == PO_STR) {
-          if (!r->hidden)
+          if (!text_hidden(r))
             pdf_show_text(rc, (const unsigned char *)e.u.s, e.n);
         } else {
           double adj = -pdf_num(e, 0) / 1000 * g->fs * g->th;
@@ -823,7 +826,7 @@ static void exec_op(struct run *r, const char *op, struct pobj *ops, int n)
     break;
   case K2('D', 'o'):
     if (n >= 1 && ops[0].t == PO_NAME)
-      do_xobject(rc, ops[0].u.s, r->hidden);
+      do_xobject(rc, ops[0].u.s, text_hidden(r));
     break;
   case K2('B', 'I'):
     inline_image(r);
@@ -853,6 +856,7 @@ void pdf_run_content(struct rctx *rc, const unsigned char *data, int len)
   struct run r;
   memset(&r, 0, sizeof r);
   r.rc = rc;
+  r.hidden = rc->no_paint;
   r.l = (struct lex){data, len, 0, &r.tmp, 0};
   struct pobj t, ops[MAX_OPERANDS];
   int n = 0;
@@ -962,7 +966,8 @@ static void draw_annots(struct rctx *rc, struct pobj page, struct c2d_mat base)
   }
 }
 
-int pdf_render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox, int oy)
+static int render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox, int oy, struct pdf_glyph **text,
+                       int *ntext)
 {
   if (page < 0 || page >= d->npages || scale <= 0)
     return -1;
@@ -991,6 +996,7 @@ int pdf_render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox,
   rc->d = d;
   rc->c = c;
   rc->base = base;
+  rc->no_paint = text != 0;
   c2d_reset_state(c);
   c2d_set_paint_color(&c->st[0].fill, 255, 255, 255, 255);
   c2d_fill_rect(c, 0, 0, (float)c->w, (float)c->h);
@@ -1025,8 +1031,55 @@ int pdf_render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox,
   draw_annots(rc, pg->dict, base);
   c2d_reset_state(c);
   pdf_glyphs_free(rc);
+  if (text) {
+    *text = rc->text;
+    *ntext = rc->ntext;
+  } else
+    free(rc->text);
   c2d_path_free(&rc->path);
   arena_free(&rc->ar);
   free(rc);
+  return 0;
+}
+
+int pdf_render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox, int oy)
+{
+  return render_page(d, page, c, scale, ox, oy, 0, 0);
+}
+
+static float fmaxf_(float a, float b) { return a > b ? a : b; }
+
+int pdf_page_text(struct pdf *d, int page, struct pdf_glyph **out, int *n)
+{
+  struct pdf_glyph *raw = 0, *res;
+  int nraw = 0;
+  struct c2d *c = c2d_new(1, 1);
+  if (!c)
+    return -1;
+  int rc = render_page(d, page, c, 1.0f, 0, 0, &raw, &nraw);
+  c2d_free(c);
+  if (rc)
+    return -1;
+  res = malloc((unsigned)(nraw * 2 + 1) * sizeof *res);
+  if (!res) {
+    free(raw);
+    return -1;
+  }
+  int m = 0;
+  for (int i = 0; i < nraw; i++) {
+    if (i) {
+      const struct pdf_glyph *a = &raw[i - 1], *b = &raw[i];
+      float h = fmaxf_(a->y1 - a->y0, b->y1 - b->y0);
+      float ay = (a->y0 + a->y1) / 2, by = (b->y0 + b->y1) / 2;
+      if (fabs(ay - by) > 0.6f * h || b->x1 < a->x0 - h)
+        res[m++] = (struct pdf_glyph){a->x1, a->y0, a->x1, a->y1, '\n'};
+      else if (b->x0 - a->x1 > 0.2f * h)
+        res[m++] = (struct pdf_glyph){a->x1, a->y0, b->x0, a->y1, ' '};
+    }
+    res[m++] = raw[i];
+  }
+  free(raw);
+  *out = res;
+  *n = m;
   return 0;
 }

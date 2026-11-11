@@ -572,6 +572,7 @@ int pdf_font_next(struct pdf *d, struct pfont *pf, const unsigned char *s, int n
   g->f = 0;
   g->gid = 0;
   g->ok = 0;
+  g->uni = 0;
   int used = pf->composite ? (n >= 2 ? 2 : 1) : 1;
   int c = used == 2 ? s[0] << 8 | s[1] : s[0];
   *code = c;
@@ -579,6 +580,7 @@ int pdf_font_next(struct pdf *d, struct pfont *pf, const unsigned char *s, int n
   int uni;
   if (pf->composite) {
     *w = pf->dw;
+    g->uni = tounicode_lookup(pf, c);
     for (int i = 0; i < pf->ncw; i++)
       if (c >= pf->cw[i].lo && c <= pf->cw[i].hi) {
         *w = pf->cw[i].w;
@@ -596,6 +598,7 @@ int pdf_font_next(struct pdf *d, struct pfont *pf, const unsigned char *s, int n
     return used;
   }
   uni = pf->uni[c];
+  g->uni = uni;
   if (pf->face && !pf->type3) {
     int gid = uni ? font_glyph_index(pf->face, uni) : 0;
     if (!gid && pf->embedded) {

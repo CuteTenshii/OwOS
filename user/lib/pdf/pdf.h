@@ -39,4 +39,15 @@ int pdf_page_size(struct pdf *d, int page, float *w, float *h);
  * Returns 0, or -1 for a bad page index. */
 int pdf_render_page(struct pdf *d, int page, struct c2d *c, float scale, int ox, int oy);
 
+/* One drawn character: its box in page points (after /Rotate, origin top-left, y down) and its Unicode code point.
+ * Line breaks and word gaps are synthesized as glyphs with ch '\n' / ' ' and a zero-width or gap-wide box. */
+struct pdf_glyph {
+  float x0, y0, x1, y1;
+  unsigned ch;
+};
+
+/* The page's text in reading (content stream) order, malloc'd; *n gets the count. Free with free(). Characters
+ * whose font gives no Unicode mapping are left out. Returns 0, or -1 for a bad page index or no memory. */
+int pdf_page_text(struct pdf *d, int page, struct pdf_glyph **out, int *n);
+
 #endif

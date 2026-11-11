@@ -1,5 +1,6 @@
 /* pdfview.c, a windowed PDF viewer: one page at a time, zoom, scroll, drag to pan */
 #include "canvas2d.h"
+#include "clipboard.h"
 #include "dialog.h"
 #include "font.h"
 #include "fontstore.h"
@@ -42,8 +43,14 @@ static const struct font *sans, *mono;
 static unsigned char *sans_data, *mono_data;
 
 static int prompt_on;
-static char prompt_buf[16];
-static int prompt_len;
+static char prompt_buf[48];
+static int prompt_len, prompt_kind; /* 0: go to page, 1: find */
+static struct pdf_glyph *gl;
+static int ngl, gl_page = -1;
+static int sel_a = -1, sel_b = -1, selecting;
+static char query[48];
+static int qlen;
+static const char *note;
 static struct status_bar sbar;
 static int drag_x, drag_y;
 
@@ -133,6 +140,11 @@ static void close_doc(void)
   file_data = 0;
   npages = 0;
   surf_page = -1;
+  free(gl);
+  gl = 0;
+  ngl = 0;
+  gl_page = -1;
+  sel_a = sel_b = -1;
 }
 
 static void show_page(int n)
@@ -144,6 +156,7 @@ static void show_page(int n)
   if (n >= npages)
     n = npages - 1;
   page = n;
+  sel_a = sel_b = -1;
   pdf_page_size(doc, page, &page_w, &page_h);
   if (page_w < 1 || page_h < 1)
     page_w = page_h = 1;
@@ -226,6 +239,114 @@ static void ensure_surface(void)
   surf_oy = oy;
 }
 
+static void ensure_text(int p)
+{
+  if (!doc || gl_page == p)
+    return;
+  free(gl);
+  gl = 0;
+  ngl = 0;
+  if (pdf_page_text(doc, p, &gl, &ngl) != 0) {
+    gl = 0;
+    ngl = 0;
+  }
+  gl_page = p;
+}
+
+static unsigned fold(unsigned c) { return c >= 'A' && c <= 'Z' ? c + 32 : c == '\n' ? ' ' : c; }
+
+/* End index (exclusive) of a match of the query starting at glyph i, or -1 */
+static int match_at(int i)
+{
+  int k = 0, j = i;
+  while (k < qlen && j < ngl) {
+    if (fold(gl[j].ch) != fold((unsigned char)query[k]))
+      return -1;
+    k++;
+    j++;
+  }
+  return k == qlen ? j : -1;
+}
+
+/* Where the page sits in the view: top-left of the page and the scroll offset into it */
+static void page_origin(int *px0, int *py0, int *ox, int *oy)
+{
+  int cw = content_w(), ch = content_h();
+  *px0 = cw < W ? (W - cw) / 2 : 0;
+  *py0 = ch < view_h() ? (view_h() - ch) / 2 : 0;
+  *ox = cw < W ? 0 : sx;
+  *oy = ch < view_h() ? 0 : sy;
+}
+
+/* Glyph nearest the view point (mx,my); *exact says whether the point is inside its box */
+static int glyph_at(int mx, int my, int *exact)
+{
+  int px0, py0, ox, oy, best = -1;
+  float bd = 1e30f;
+  page_origin(&px0, &py0, &ox, &oy);
+  float gx = (mx - px0 + ox) / scale, gy = (my - MENU_H - py0 + oy) / scale;
+  *exact = 0;
+  ensure_text(page);
+  for (int i = 0; i < ngl; i++) {
+    if (gl[i].ch == '\n')
+      continue;
+    float dx = gx < gl[i].x0 ? gl[i].x0 - gx : gx > gl[i].x1 ? gx - gl[i].x1 : 0;
+    float dy = gy < gl[i].y0 ? gl[i].y0 - gy : gy > gl[i].y1 ? gy - gl[i].y1 : 0;
+    if (dx * dx + dy * dy < bd) {
+      bd = dx * dx + dy * dy;
+      best = i;
+      *exact = bd == 0 && gl[i].ch != ' ';
+    }
+  }
+  return best;
+}
+
+static void tint(int x0, int y0, int x1, int y1, unsigned rgb, unsigned a)
+{
+  unsigned *fb = win_fb();
+  int px0, py0, ox, oy;
+  page_origin(&px0, &py0, &ox, &oy);
+  int lx = px0, ly = MENU_H + py0, hx = px0 + (content_w() < W ? content_w() : W),
+      hy = ly + (content_h() < view_h() ? content_h() : view_h());
+  x0 = x0 < lx ? lx : x0;
+  y0 = y0 < ly ? ly : y0;
+  x1 = x1 > hx ? hx : x1;
+  y1 = y1 > hy ? hy : y1;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++) {
+      unsigned d = fb[(unsigned long)y * W + x], o = 0;
+      for (int sh = 0; sh < 24; sh += 8)
+        o |= ((((d >> sh) & 255) * (255 - a) + ((rgb >> sh) & 255) * a) / 255) << sh;
+      fb[(unsigned long)y * W + x] = o;
+    }
+}
+
+static void tint_glyph(int i, unsigned rgb, unsigned a)
+{
+  int px0, py0, ox, oy;
+  page_origin(&px0, &py0, &ox, &oy);
+  if (gl[i].ch == '\n')
+    return;
+  tint((int)(px0 + gl[i].x0 * scale - ox), (int)(MENU_H + py0 + gl[i].y0 * scale - oy),
+       (int)(px0 + gl[i].x1 * scale - ox + 0.999f), (int)(MENU_H + py0 + gl[i].y1 * scale - oy + 0.999f), rgb, a);
+}
+
+static void draw_marks(void)
+{
+  ensure_text(page);
+  int lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
+  for (int i = 0; qlen && i < ngl; i++) {
+    int e = match_at(i);
+    if (e < 0)
+      continue;
+    for (int j = i; j < e; j++)
+      tint_glyph(j, 0xffd000, 110);
+    i = e - 1;
+  }
+  for (int i = lo; lo >= 0 && i <= hi && i < ngl; i++)
+    tint_glyph(i, 0x3070e0, 110);
+}
+
 static void draw_page(void)
 {
   unsigned *fb = win_fb();
@@ -250,6 +371,7 @@ static void draw_page(void)
     for (int x = 0; x < dw; x++, src += 4)
       dst[x] = (unsigned)src[0] << 16 | (unsigned)src[1] << 8 | src[2];
   }
+  draw_marks();
   if (ch > vh) {
     int th = vh * vh / ch;
     if (th < 12)
@@ -308,6 +430,69 @@ static void zoom_step(int dir)
   zoom_to(zoom_steps[i] / 75.0f);
 }
 
+static void reveal(int i)
+{
+  float cx = (gl[i].x0 + gl[i].x1) / 2 * scale, cy = (gl[i].y0 + gl[i].y1) / 2 * scale;
+  sx = (int)(cx - W / 2.0f);
+  sy = (int)(cy - view_h() / 2.0f);
+  clamp_scroll();
+}
+
+/* Select the next (dir 1) or previous (dir -1) match of the query, across pages, wrapping once around */
+static void find_step(int dir)
+{
+  note = 0;
+  if (!doc || !qlen)
+    return;
+  ensure_text(page);
+  int lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
+  int p = page, i = lo < 0 ? (dir > 0 ? 0 : ngl - 1) : (dir > 0 ? hi + 1 : lo - 1);
+  for (int tries = 0; tries <= npages; tries++) {
+    ensure_text(p);
+    for (; i >= 0 && i < ngl; i += dir) {
+      int e = match_at(i);
+      if (e < 0)
+        continue;
+      if (p != page)
+        show_page(p);
+      sel_a = i;
+      sel_b = e - 1;
+      reveal(i);
+      return;
+    }
+    p = (p + dir + npages) % npages;
+    ensure_text(p);
+    i = dir > 0 ? 0 : ngl - 1;
+  }
+  note = "not found";
+}
+
+static void copy_selection(void)
+{
+  int lo = sel_a < sel_b ? sel_a : sel_b, hi = sel_a < sel_b ? sel_b : sel_a;
+  if (lo < 0 || lo >= ngl) {
+    note = "nothing selected";
+    return;
+  }
+  char *buf = malloc((unsigned)(hi - lo + 1) * 4 + 1);
+  int n = 0;
+  for (int i = lo; buf && i <= hi && i < ngl; i++)
+    n += utf8_encode(gl[i].ch, buf + n);
+  if (buf) {
+    buf[n] = 0;
+    note = clip_put_text(buf, n) == 0 ? "copied" : "clipboard unavailable";
+  }
+  free(buf);
+}
+
+static void start_prompt(int kind)
+{
+  prompt_on = 1;
+  prompt_kind = kind;
+  prompt_len = 0;
+  prompt_buf[0] = 0;
+}
+
 static void open_dialog(void)
 {
   static const char *const exts[] = {"pdf", NULL};
@@ -334,8 +519,15 @@ static const char *const go_hints[] = {"Left", "Right", "Home", "End", "G"};
 static const unsigned char go_keys[] = {KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, 'g'};
 static struct menu gomenu = {"Go", go_items, 5, 0, go_hints, go_keys};
 
-static struct menu *const bar_menus[] = {&filemenu, &viewmenu, &gomenu};
-static struct menubar mbar = {bar_menus, 3, 2, 0};
+static const char *const edit_items[] = {"Find...", "Find Next", "Find Previous", "Copy"};
+static const char *const edit_hints[] = {"/", "N", "Shift+N", "Ctrl+C"};
+static const unsigned char edit_keys[] = {'/', 'n', 'N', KEY_INTR};
+static struct menu editmenu = {"Edit", edit_items, 4, 0, edit_hints, edit_keys};
+
+static struct menu *const bar_menus[] = {&filemenu, &editmenu, &viewmenu, &gomenu};
+static struct menubar mbar = {bar_menus, 4, 2, 0};
+
+static int menu_is_open(void) { return filemenu.open || editmenu.open || viewmenu.open || gomenu.open; }
 
 static void menu_action(struct menu *leaf, int item)
 {
@@ -366,30 +558,42 @@ static void menu_action(struct menu *leaf, int item)
       show_page(0);
     else if (item == 3)
       show_page(npages - 1);
-    else if (doc) {
-      prompt_on = 1;
-      prompt_len = 0;
-      prompt_buf[0] = 0;
-    }
+    else if (doc)
+      start_prompt(0);
+  } else if (leaf == &editmenu && doc) {
+    if (item == 0)
+      start_prompt(1);
+    else if (item == 3)
+      copy_selection();
+    else
+      find_step(item == 1 ? 1 : -1);
   }
 }
 
 static void on_key(unsigned char c)
 {
+  note = 0;
   if (prompt_on) {
     if (c == '\n') {
       int n = 0;
-      for (int i = 0; i < prompt_len; i++)
-        n = n * 10 + prompt_buf[i] - '0';
       prompt_on = 0;
-      if (prompt_len)
+      if (prompt_kind == 1 && prompt_len) {
+        strcpy(query, prompt_buf);
+        qlen = prompt_len;
+        sel_a = sel_b = -1;
+        find_step(1);
+      } else if (prompt_kind == 0 && prompt_len) {
+        for (int i = 0; i < prompt_len; i++)
+          n = n * 10 + prompt_buf[i] - '0';
         show_page(n - 1);
+      }
     } else if (c == 27)
       prompt_on = 0;
     else if (c == '\b') {
       if (prompt_len > 0)
         prompt_buf[--prompt_len] = 0;
-    } else if (c >= '0' && c <= '9' && prompt_len < (int)sizeof prompt_buf - 1) {
+    } else if (((prompt_kind == 0 && c >= '0' && c <= '9') || (prompt_kind == 1 && c >= ' ' && c < 127)) &&
+               prompt_len < (int)sizeof prompt_buf - 1) {
       prompt_buf[prompt_len++] = (char)c;
       prompt_buf[prompt_len] = 0;
     }
@@ -405,6 +609,8 @@ static void on_key(unsigned char c)
   switch (c) {
   case 27:
     menubar_close(&mbar);
+    sel_a = sel_b = -1;
+    qlen = 0;
     break;
   case KEY_UP:
     scroll_by(-48);
@@ -429,7 +635,8 @@ static void on_key(unsigned char c)
 
 static void on_click(int mx, int my)
 {
-  if (my < MENU_H || filemenu.open || viewmenu.open || gomenu.open) {
+  note = 0;
+  if (my < MENU_H || menu_is_open()) {
     struct menu *leaf;
     int item;
     if (menubar_click(&mbar, mx, my, &leaf, &item) && item >= 0)
@@ -438,12 +645,27 @@ static void on_click(int mx, int my)
   }
   drag_x = mx;
   drag_y = my;
+  selecting = 0;
+  if (!doc || my >= H - STATUS_H)
+    return;
+  int exact, i = glyph_at(mx, my, &exact);
+  sel_a = sel_b = -1;
+  if (exact) {
+    sel_a = sel_b = i;
+    selecting = 1;
+  }
 }
 
 static void on_drag(int mx, int my)
 {
-  if (!doc || filemenu.open || viewmenu.open || gomenu.open)
+  if (!doc || menu_is_open())
     return;
+  if (selecting) {
+    int exact, i = glyph_at(mx, my, &exact);
+    if (i >= 0)
+      sel_b = i;
+    return;
+  }
   sx -= mx - drag_x;
   sy -= my - drag_y;
   drag_x = mx;
@@ -456,8 +678,12 @@ static void render(void)
   draw_page();
   gfx_fill_rect(0, 0, W, MENU_H, COL_BAR);
   char line[160];
-  if (prompt_on)
+  if (prompt_on && prompt_kind == 1)
+    snprintf(line, sizeof line, "Find: %s_", prompt_buf);
+  else if (prompt_on)
     snprintf(line, sizeof line, "Go to page (1-%d): %s_", npages, prompt_buf);
+  else if (note)
+    snprintf(line, sizeof line, "%s", note);
   else if (doc)
     snprintf(line, sizeof line, "%s   page %d / %d   %d%%", basename_of(curpath), page + 1, npages, zoom_percent());
   else
