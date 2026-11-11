@@ -64,11 +64,11 @@ void fb_set_cursor_hooks(int (*set)(const uint32_t *argb, int w, int h, int hot_
 int fb_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale);
 void fb_cursor_move(int x, int y);
 
-/* Software brightness (fb_present dims pixels). fb_brightness_step re-renders the screen. IRQ-safe. */
-#define FB_BRIGHT_MAX 8
-#define FB_BRIGHT_MIN 2
+/* Display brightness 0..100 (0 = dimmest readable). Drives the panel backlight when backlight.c found one,
+ * else fb_present dims pixels and a change re-renders the screen. IRQ-safe. */
 void fb_brightness_step(int dir); /* +1 = brighter, -1 = dimmer (clamped) */
-int fb_brightness(void);          /* current level FB_BRIGHT_MIN..FB_BRIGHT_MAX */
+int fb_brightness_percent(void);
+void fb_set_brightness_percent(int percent); /* clamps */
 
 /* Pack 8-bit channels into the framebuffer's XRGB8888 pixel format. */
 static inline uint32_t fb_rgb(uint8_t r, uint8_t g, uint8_t b) { return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b; }

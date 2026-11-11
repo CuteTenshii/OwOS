@@ -1,6 +1,7 @@
 /* power.c: ACPI, QEMU-port and 8042/triple-fault power off, reset and S3 sleep. */
 
 #include "power.h"
+#include "backlight.h"
 #include "io.h"
 #include "irq.h"
 #include "paging.h"
@@ -500,4 +501,5 @@ void power_sleep(void)
   irq_resume(pic_mask1, pic_mask2); /* re-map PIC, restore masks */
   timer_init();                     /* re-program the PIT tick   */
   __asm__ volatile("sti");
+  backlight_resume();
 }

@@ -30,6 +30,7 @@
 
 #include "sysfs.h"
 #include "audio.h"
+#include "backlight.h"
 #include "battery.h"
 #include "blk.h"
 #include "bt.h"
@@ -65,6 +66,20 @@ static int parse_percent(const char *p)
   for (; *p >= '0' && *p <= '9'; p++)
     v = v < 1000 ? v * 10 + (*p - '0') : v;
   return v > 100 ? 100 : v;
+}
+
+/* Unsigned decimal, saturating at UINT32_MAX; -1 if it doesn't start with a digit. */
+static int parse_u32(const char *p, uint32_t *out)
+{
+  uint32_t v = 0;
+  if (*p < '0' || *p > '9')
+    return -1;
+  for (; *p >= '0' && *p <= '9'; p++) {
+    uint32_t d = (uint32_t)(*p - '0');
+    v = v > (UINT32_MAX - d) / 10 ? UINT32_MAX : v * 10 + d;
+  }
+  *out = v;
+  return 0;
 }
 
 /* text builder */
@@ -303,7 +318,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
     if (n == 2)
       return (eq(seg[1], "input") || eq(seg[1], "net") || eq(seg[1], "block") || eq(seg[1], "graphics") ||
               eq(seg[1], "dmi") || (eq(seg[1], "sound") && audio_volume_present()) ||
-              (eq(seg[1], "bluetooth") && bt_present()) || (eq(seg[1], "video") && uvc_present()))
+              (eq(seg[1], "backlight") && backlight_present()) || (eq(seg[1], "bluetooth") && bt_present()) ||
+              (eq(seg[1], "video") && uvc_present()))
                  ? S_DIR
                  : S_NONE;
     if (eq(seg[1], "input")) {
@@ -353,6 +369,19 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         if (eq(seg[3], "rate") || eq(seg[3], "brightness") ||
             eq(seg[3], "scale")) /* rate: compositor frame-pacing target (Hz) */
           return S_FILE_RW;
+      }
+      return S_NONE;
+    }
+    if (eq(seg[1], "backlight")) {
+      if (!backlight_present())
+        return S_NONE;
+      if (n == 3)
+        return eq(seg[2], "intel_backlight") ? S_DIR : S_NONE;
+      if (n == 4 && eq(seg[2], "intel_backlight")) {
+        if (eq(seg[3], "brightness"))
+          return S_FILE_RW;
+        if (eq(seg[3], "actual_brightness") || eq(seg[3], "max_brightness") || eq(seg[3], "type"))
+          return S_FILE_RO;
       }
       return S_NONE;
     }
@@ -589,8 +618,8 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
-      if (eq(seg[3], "brightness")) { /* 0..100 over FB_BRIGHT_MIN..FB_BRIGHT_MAX */
-        pu(b, (uint32_t)((fb_brightness() - FB_BRIGHT_MIN) * 100 / (FB_BRIGHT_MAX - FB_BRIGHT_MIN)));
+      if (eq(seg[3], "brightness")) {
+        pu(b, (uint32_t)fb_brightness_percent());
         pc(b, '\n');
         return;
       }
@@ -621,6 +650,20 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         }
         return;
       }
+    }
+    if (eq(seg[1], "backlight")) { /* raw PWM units, as Linux's intel_backlight */
+      if (eq(seg[3], "type")) {
+        ps(b, "raw\n");
+        return;
+      }
+      if (eq(seg[3], "brightness"))
+        pu(b, backlight_raw());
+      else if (eq(seg[3], "actual_brightness"))
+        pu(b, backlight_actual());
+      else
+        pu(b, backlight_max());
+      pc(b, '\n');
+      return;
     }
     if (eq(seg[1], "dmi")) {
       if (eq(seg[3], "product_name")) {
@@ -820,7 +863,15 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
     int v = parse_percent(arg);
     if (v < 0)
       return -1;
-    fb_brightness_step(FB_BRIGHT_MIN + (v * (FB_BRIGHT_MAX - FB_BRIGHT_MIN) + 50) / 100 - fb_brightness());
+    fb_set_brightness_percent(v);
+    return 0;
+  }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "backlight") && eq(seg[2], "intel_backlight") &&
+      eq(seg[3], "brightness")) {
+    uint32_t v;
+    if (!backlight_present() || parse_u32(arg, &v) < 0)
+      return -1;
+    backlight_set_raw(v);
     return 0;
   }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "mode")) {
@@ -891,7 +942,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   if (n == 1 && eq(seg[0], "class")) {
     /* input + graphics always; net/block only when present (so an empty dir
      * doesn't show). fb0 exists even in text mode, like /proc/display did. */
-    const char *kids[8];
+    const char *kids[9];
     int k = 0;
     kids[k++] = "input";
     if (nic_present())
@@ -900,6 +951,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (block_name(0, tmp))
       kids[k++] = "block";
     kids[k++] = "graphics";
+    if (backlight_present())
+      kids[k++] = "backlight";
     if (audio_volume_present())
       kids[k++] = "sound";
     if (bt_present())
@@ -961,6 +1014,14 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (idx != 0)
       return 0;
     cpy(name, "fb0", max);
+    if (is_dir)
+      *is_dir = 1;
+    return 1;
+  }
+  if (n == 2 && eq(seg[0], "class") && eq(seg[1], "backlight")) {
+    if (!backlight_present() || idx != 0)
+      return 0;
+    cpy(name, "intel_backlight", max);
     if (is_dir)
       *is_dir = 1;
     return 1;
@@ -1082,6 +1143,15 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
                                     "mode",  "modes",        "rate",    "brightness", "dpi",
                                     "scale", "scale_active", "hdmi",    "hdmi_audio", "connected"};
     hit = from_list(idx, name, max, k, 15);
+    if (hit && is_dir)
+      *is_dir = 0;
+    return hit;
+  }
+  if (n == 3 && eq(seg[0], "class") && eq(seg[1], "backlight") && eq(seg[2], "intel_backlight")) {
+    if (!backlight_present())
+      return 0;
+    static const char *const k[] = {"brightness", "actual_brightness", "max_brightness", "type"};
+    hit = from_list(idx, name, max, k, 4);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

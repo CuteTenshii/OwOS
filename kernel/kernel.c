@@ -4,6 +4,7 @@
 
 #include "ahci.h"
 #include "atapi.h"
+#include "backlight.h"
 #include "blk.h"
 #include "console.h"
 #include "crc32c.h"
@@ -437,6 +438,9 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     else
       con_write("fb: no framebuffer available; staying in text mode.\n");
   }
+
+  if (backlight_init())
+    con_printf("backlight: Intel PWM, period %u, level %u/100.\n", backlight_max(), (uint32_t)backlight_percent());
 
   net_init();
 

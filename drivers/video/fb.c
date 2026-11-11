@@ -3,6 +3,7 @@
  * DISPI adapter answers (the kernel keeps its VGA text console). */
 
 #include "fb.h"
+#include "backlight.h"
 #include "edid.h"
 #include "font_aa.h"
 #include "heap.h"
@@ -61,8 +62,14 @@ static const struct {
 #define FB_MAX_W 1920u
 #define FB_MAX_H 1080u
 
-/* Display brightness FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed), a per-channel scale on present. */
+/* Software brightness FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed), a per-channel scale on present, used only
+ * without a hardware backlight. */
+#define FB_BRIGHT_MAX 8
+#define FB_BRIGHT_MIN 2
 static int brightness = FB_BRIGHT_MAX;
+
+/* Percent per brightness key press on a hardware backlight. */
+#define FB_BACKLIGHT_STEP 10
 
 /* Compositor frame-pacing target in Hz (not a hardware mode); set via /sys/class/graphics/fb0/rate. */
 #define FB_HZ_MIN 20
@@ -493,12 +500,11 @@ void fb_present_rects(const struct fb_rect *r, int n)
     flush_hook();
 }
 
-/* Step brightness and re-render the whole screen (the WM only presents damage). IRQ-safe. */
-void fb_brightness_step(int dir)
+/* Set the software level and re-render the whole screen (the WM only presents damage). IRQ-safe. */
+static void set_soft_level(int nb)
 {
   if (!active || single)
     return;
-  int nb = brightness + dir;
   if (nb < FB_BRIGHT_MIN)
     nb = FB_BRIGHT_MIN;
   if (nb > FB_BRIGHT_MAX)
@@ -509,7 +515,32 @@ void fb_brightness_step(int dir)
   present_full();
 }
 
-int fb_brightness(void) { return brightness; }
+void fb_brightness_step(int dir)
+{
+  if (backlight_present())
+    backlight_set_percent(backlight_percent() + dir * FB_BACKLIGHT_STEP);
+  else
+    set_soft_level(brightness + dir);
+}
+
+int fb_brightness_percent(void)
+{
+  if (backlight_present())
+    return backlight_percent();
+  return (brightness - FB_BRIGHT_MIN) * 100 / (FB_BRIGHT_MAX - FB_BRIGHT_MIN);
+}
+
+void fb_set_brightness_percent(int percent)
+{
+  if (percent < 0)
+    percent = 0;
+  if (percent > 100)
+    percent = 100;
+  if (backlight_present())
+    backlight_set_percent(percent);
+  else
+    set_soft_level(FB_BRIGHT_MIN + (percent * (FB_BRIGHT_MAX - FB_BRIGHT_MIN) + 50) / 100);
+}
 
 int fb_active(void) { return active; }
 uint32_t fb_width(void) { return fb_w; }
