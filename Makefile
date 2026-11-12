@@ -88,6 +88,7 @@ install-hooks:
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf owos-arm.bin owos-arm.elf $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o user/aarch64/*.o tests/aarch64/*.o tests/aarch64/*.elf kernel/arch/aarch64/*.d tests/aarch64/*.d
+	rm -f kernel/arch/x86/*.o kernel/arch/x86/*.d
 	rm -f kernel/arch/arm/*.o kernel/arch/arm/*.d tests/arm/*.o tests/arm/*.d
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete

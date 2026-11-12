@@ -16,8 +16,6 @@
 #define MADT_IOAPIC 1
 #define MADT_LAPIC_OVERRIDE 5
 
-/* Low page the AP trampoline is copied to (SIPI vector); must match SMP_TRAMP in smp_ap.S. */
-#define SMP_TRAMP 0x8000
 #define AP_STACK 16384
 
 struct cpu_info {

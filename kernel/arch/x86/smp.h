@@ -2,6 +2,10 @@
 #ifndef OWOS_SMP_H
 #define OWOS_SMP_H
 
+/* Low page the AP trampoline (smp_ap_32.S / smp_ap_64.S) is copied to; also its SIPI vector. */
+#define SMP_TRAMP 0x8000
+
+#ifndef __ASSEMBLER__
 #include <stdint.h>
 
 #define SMP_MAX_CPUS 32
@@ -29,4 +33,5 @@ uint8_t smp_apic_id(int i);     /* i-th CPU's Local APIC ID            */
 uint32_t smp_lapic_base(void);  /* Local APIC MMIO base               */
 uint32_t smp_ioapic_base(void); /* first IO APIC MMIO base, 0 if none */
 
+#endif /* __ASSEMBLER__ */
 #endif /* OWOS_SMP_H */
