@@ -56,7 +56,8 @@ static void decode_name(struct iso_mount *m, char *dst, const uint8_t *id, int l
 }
 
 struct rec_iter {
-  uint32_t base_lba, size, pos;
+  uint32_t base_lba, size;
+  uint64_t pos; /* 64-bit so stepping past a size near 4 GiB cannot wrap back to 0 */
   uint32_t cur_sec;
   bool loaded;
 };
@@ -73,8 +74,8 @@ static void ri_init(struct rec_iter *it, uint32_t lba, uint32_t size)
 static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct dirrec *out)
 {
   while (it->pos < it->size) {
-    uint32_t sec = it->pos / ISO_SECTOR;
-    uint32_t off = it->pos % ISO_SECTOR;
+    uint32_t sec = (uint32_t)(it->pos / ISO_SECTOR);
+    uint32_t off = (uint32_t)(it->pos % ISO_SECTOR);
 
     if (!it->loaded || it->cur_sec != sec) {
       if (m->rd(it->base_lba + sec, m->dbuf) != 0)
@@ -85,11 +86,11 @@ static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct
 
     uint8_t reclen = m->dbuf[off];
     if (reclen == 0) {
-      it->pos = (sec + 1) * ISO_SECTOR;
+      it->pos = ((uint64_t)sec + 1) * ISO_SECTOR;
       continue;
     }
     if (off + reclen > ISO_SECTOR) {
-      it->pos = (sec + 1) * ISO_SECTOR;
+      it->pos = ((uint64_t)sec + 1) * ISO_SECTOR;
       continue;
     }
     if (reclen < 34) {
