@@ -12,6 +12,7 @@ enum { PEND_NONE = 0, PEND_CLAIMED, PEND_READY }; /* zero = no pending conn */
 
 struct port {
   bool used;
+  uint32_t gen; /* bumped per create, so a waiter notices its port was destroyed and the slot reused */
   char name[IPC_NAME_MAX];
   int pend;     /* PEND_*: guards the connection slot */
   int c2s, s2c; /* pending connection's pipe ids (READY) */
@@ -35,6 +36,7 @@ int ipc_port_create(const char *name)
   for (int i = 0; i < IPC_MAX_PORTS; i++) {
     if (!ports[i].used) {
       ports[i].used = true;
+      ports[i].gen++;
       ports[i].pend = PEND_NONE;
       int j = 0;
       for (; name[j] && j < IPC_NAME_MAX - 1; j++)
@@ -65,16 +67,17 @@ int ipc_connect(const char *name, int *rx, int *tx)
   struct port *p = find_port(name);
   if (!p)
     return -1;
+  uint32_t gen = p->gen;
 
   /* Claim the single connection slot, waiting if one is pending. */
   for (;;) {
     __asm__ volatile("cli");
-    if (p->used && p->pend == PEND_NONE) {
+    if (p->used && p->gen == gen && p->pend == PEND_NONE) {
       p->pend = PEND_CLAIMED;
       __asm__ volatile("sti");
       break;
     }
-    int gone = !p->used;
+    int gone = !p->used || p->gen != gen;
     __asm__ volatile("sti");
     if (gone)
       return -1;
