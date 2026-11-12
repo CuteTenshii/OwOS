@@ -1895,14 +1895,25 @@ static bool dir_under(struct fat_mount *m, uint32_t dir, uint32_t anc)
   return true;
 }
 
+/* Write back slots a failed replace already wiped, from the raw copies taken before. */
+static void slots_restore(struct fat_mount *m, const struct dirent *d, uint8_t (*saved)[32])
+{
+  for (int i = 0; i < d->loc_n; i++)
+    slot_write(m, &d->loc[i], saved[i]);
+}
+
 static int rename_impl(struct fat_mount *m, const char *from, const char *to)
 {
   const char *leaf;
   uint32_t plen, llen;
-  struct dirent *buf = kmalloc(3 * sizeof *buf);
+  struct rename_bufs {
+    struct dirent d[3];
+    uint8_t ex_slots[MAX_RECS][32]; /* the replaced target, to undo its wipe */
+  } *buf = kmalloc(sizeof *buf);
   if (!buf)
     return FAT_ENOMEM;
-  struct dirent *src = &buf[0], *dp = &buf[1], *ex = &buf[2];
+  struct dirent *src = &buf->d[0], *dp = &buf->d[1], *ex = &buf->d[2];
+  bool replaced = false;
   uint16_t key[MAX_LFN];
   uint32_t klen;
 
@@ -1934,10 +1945,18 @@ static int rename_impl(struct fat_mount *m, const char *from, const char *to)
         rc = FAT_EACCES;
         goto out;
       }
+      /* Keep the target restorable until the new entry is in: the add can still fail (full fixed root). */
+      for (int i = 0; i < ex->loc_n; i++) {
+        uint8_t b[SEC];
+        if (meta_read(m, ex->loc[i].sec, b) != 0) {
+          rc = FAT_EIO;
+          goto out;
+        }
+        memcpy(buf->ex_slots[i], b + ex->loc[i].off, 32);
+      }
       if ((rc = wipe_entry(m, ex)) != 0)
         goto out;
-      if (ex->cluster >= 2)
-        chain_free(m, ex->cluster);
+      replaced = true;
     } else if (ex->nlen == klen && memcmp(ex->name, key, klen * sizeof key[0]) == 0 && ex->loc_n == src->loc_n) {
       rc = 0;
       goto out;
@@ -1949,8 +1968,11 @@ static int rename_impl(struct fat_mount *m, const char *from, const char *to)
   struct dirent nd;
   memcpy(&nd, src, sizeof nd);
   nd.loc_n = 0;
-  if ((rc = dir_add(m, dp->cluster, key, klen, &nd, &src->loc[src->loc_n - 1])) != 0)
+  if ((rc = dir_add(m, dp->cluster, key, klen, &nd, &src->loc[src->loc_n - 1])) != 0) {
+    if (replaced)
+      slots_restore(m, ex, buf->ex_slots);
     goto out;
+  }
   if (src->is_dir && clus_ok(m, src->cluster)) {
     uint8_t b[SEC];
     uint32_t up = is_root(m, dp->cluster) ? 0 : dp->cluster;
@@ -1963,6 +1985,8 @@ static int rename_impl(struct fat_mount *m, const char *from, const char *to)
   }
   if (!rc)
     rc = wipe_entry(m, src);
+  if (!rc && replaced && ex->cluster >= 2)
+    chain_free(m, ex->cluster);
 out:
   kfree(buf);
   return rc;

@@ -1110,6 +1110,26 @@ static void dir_fat16_root_limit(void)
   EXPECT_FSCK();
 }
 
+/* Renaming onto an existing name in a full fixed root: if the new entry does not fit, the target must survive. */
+static void dir_rename_replace_full_root(void)
+{
+  expect(fmt_dev(16, 40960, 512, 0, NULL) == 0);
+  void *fs = mnt();
+  int rc = 0;
+  for (int i = 0; i < 600 && rc == 0; i++) {
+    char p[40];
+    snprintf(p, sizeof p, "/F%05d.TXT", i);
+    rc = put_seed(fs, p, 10, (uint32_t)i);
+  }
+  expect(rc == FAT_ENOSPC);
+  /* "F00007.TXT" took one slot; the mixed-case new name needs a long-name slot too, so it cannot fit. */
+  expect(fat_ops()->rename(fs, "/F00003.TXT", "/f00007.Txt") != 0);
+  expect(is_seed(fs, "/F00007.TXT", 10, 7) && is_seed(fs, "/F00003.TXT", 10, 3));
+  EXPECT_CLEAN(0);
+  fat_ops()->close(fs);
+  EXPECT_FSCK();
+}
+
 static void dir_fat12_root_limit(void)
 {
   expect(fmt_dev(12, 2880, 512, 0, NULL) == 0);
@@ -1185,6 +1205,7 @@ static void dir_subdir_growth(void)
 static void t_dir_growth(void)
 {
   test("FAT16 root directory is fixed at 512 entries", dir_fat16_root_limit);
+  test("rename onto a name in a full fixed root keeps the target", dir_rename_replace_full_root);
   test("FAT12 root directory limit", dir_fat12_root_limit);
   test("long names use several slots and fill the fixed root sooner", dir_long_names_fill_root);
 
