@@ -489,11 +489,9 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
   case CSS_JUST_END:
     start = leftover;
     break;
-  case CSS_JUST_BETWEEN:
+  case CSS_JUST_BETWEEN: /* a lone item sits at the start */
     if (nit > 1)
       between = leftover / (nit - 1);
-    else
-      start = leftover / 2;
     break;
   case CSS_JUST_AROUND:
     between = leftover / nit;
