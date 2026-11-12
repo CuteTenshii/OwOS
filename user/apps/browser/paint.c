@@ -422,9 +422,12 @@ static void draw_box_shadow(const struct lbox *b, const struct lgeom *ge, int sy
     fill_round_rect(bx - g, by - g, ge->w + 2 * g, ge->h + 2 * g, rr, rgb, alpha, ct, cb);
     return;
   }
-  for (int pass = 0; pass < 3; pass++) { /* outer (faint) -> inner (solid) */
-    int g = sp + bl * (2 - pass) / 2;
-    int a = alpha * (pass + 1) / 3;
+  /* The blur fades across about `bl` px centred on the shadow's edge: stack thin rings, outermost first, each
+   * adding its share of the opacity, so the falloff is smooth instead of stepped. */
+  int n = bl / 2 < 3 ? 3 : bl / 2 > 16 ? 16 : bl / 2;
+  int a = (alpha + n - 1) / n;
+  for (int pass = 0; pass < n; pass++) {
+    int g = sp + bl / 2 - bl * pass / n;
     int rr = r + g;
     if (rr < 0)
       rr = 0;
