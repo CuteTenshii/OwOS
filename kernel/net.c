@@ -1566,6 +1566,8 @@ static int usock_alloc(void)
       usocks[i].owner = sched_current_process_id();
       usocks[i].closed = usocks[i].listening = 0;
       usocks[i].conn = NULL;
+      usocks[i].rport = 0; /* a stale remote port from a previous UDP connect would filter out datagrams */
+      memset(usocks[i].peer, 0, sizeof usocks[i].peer);
       usocks[i].dg_head = usocks[i].dg_tail = 0;
       usocks[i].ttl = 64;
       return i;

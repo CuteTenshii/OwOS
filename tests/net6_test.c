@@ -1,6 +1,6 @@
 /* net6_test.c: host test for the IPv6 half of kernel/net.c (DAD, router advertisements, neighbor and MLD replies,
- * fragment reassembly, address parsing) with frames injected through net_rx_frame and transmissions captured at
- * nic_send. Run with `make test`. */
+ * fragment reassembly, address parsing), plus UDP socket slot reuse, with frames injected through net_rx_frame and
+ * transmissions captured at nic_send. Run with `make test`. */
 #define OWOS_SUITE_TEST
 #define OWOS_CONSOLE_H
 #define OWOS_ENTROPY_H
@@ -502,6 +502,21 @@ static void test_addresses_round_trip(void)
   }
 }
 
+static void test_udp_slot_reuse_clears_peer(void)
+{
+  static const uint8_t other[4] = {10, 0, 2, 99};
+  uint8_t src[16];
+  reset();
+  int h = net_sock_connect("10.0.2.2", 53, SK_UDP);
+  expect(h >= 0);
+  expect_eq(net_sock_close(h), 0);
+  int b = net_sock_bind(5000);
+  expect_eq(b, h); /* the same slot, which last held a connected peer */
+  addr_map_v4(src, other);
+  expect(usock_udp_deliver(src, 1234, 5000, (const uint8_t *)"hi", 2));
+  expect(b >= 0 && usocks[b].dg_head != usocks[b].dg_tail);
+}
+
 int main(void)
 {
   test("DAD probe, then preferred", test_dad_probe_then_preferred);
@@ -516,5 +531,6 @@ int main(void)
   test("overlapping fragments are dropped", test_fragment_overlap_dropped);
   test("fragment timeout and bad length", test_fragment_timeout_and_bad_length);
   test("address text round trips", test_addresses_round_trip);
+  test("a reused UDP slot forgets its old peer", test_udp_slot_reuse_clears_peer);
   return 0;
 }
