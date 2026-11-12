@@ -304,8 +304,10 @@ static void draw_switcher(void)
   int rows = (ph - 2 * AT_PAD) / AT_ROW_H;
   if (rows > at_count)
     rows = at_count;
-  for (int i = 0; i < rows; i++) {
-    int ry = y + AT_PAD + i * AT_ROW_H;
+  int first = at_sel >= rows ? at_sel - rows + 1 : 0; /* keep the selection on screen */
+  for (int r = 0; r < rows; r++) {
+    int i = first + r;
+    int ry = y + AT_PAD + r * AT_ROW_H;
     if (i == at_sel)
       gfx_fill_rect(x + 4, ry, pw - 8, AT_ROW_H, 0x2f6fb0);
     int s = slot_of(at_order[i]);
