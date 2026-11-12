@@ -331,7 +331,9 @@ static void arp_recv(const uint8_t *p, uint32_t len)
     if (nbr_pending_take(spa))
       nbr_cache_put(spa, a->sha);
   } else if (op == 1 && memcmp(a->tpa, my_ip, 4) == 0) {
-    nbr_cache_put(spa, a->sha); /* someone is asking for us: answer */
+    /* Answer, but cache the asker only if we were resolving it: a request must not plant or replace a mapping. */
+    if (nbr_pending_take(spa))
+      nbr_cache_put(spa, a->sha);
     uint8_t pkt[28];
     arp_build(pkt, 2, a->sha, a->spa);
     eth_send(a->sha, ETH_ARP, pkt, 28);

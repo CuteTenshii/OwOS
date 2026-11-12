@@ -1,6 +1,6 @@
 /* net6_test.c: host test for the IPv6 half of kernel/net.c (DAD, router advertisements, neighbor and MLD replies,
- * fragment reassembly, address parsing), plus UDP socket slot reuse, with frames injected through net_rx_frame and
- * transmissions captured at nic_send. Run with `make test`. */
+ * fragment reassembly, address parsing), plus ARP caching and UDP socket slot reuse, with frames injected through
+ * net_rx_frame and transmissions captured at nic_send. Run with `make test`. */
 #define OWOS_SUITE_TEST
 #define OWOS_CONSOLE_H
 #define OWOS_ENTROPY_H
@@ -117,6 +117,7 @@ static void reset(void)
   gua6_state = AS_NONE;
   gua6_expire = gw6_expire = dns6_expire = 0;
   have_gw6 = have_dns6 = false;
+  memset(my_ip, 0, sizeof my_ip);
   net_init();
 }
 
@@ -502,6 +503,48 @@ static void test_addresses_round_trip(void)
   }
 }
 
+static void rx_arp(uint16_t oper, const uint8_t sha[6], const uint8_t spa[4], const uint8_t tpa[4])
+{
+  uint8_t f[42] = {0};
+  memcpy(f, g_mac, 6);
+  memcpy(f + 6, sha, 6);
+  f[12] = 0x08;
+  f[13] = 0x06;
+  struct arp_hdr *a = (struct arp_hdr *)(f + 14);
+  a->htype = htons(1);
+  a->ptype = htons(ETH_IP);
+  a->hlen = 6;
+  a->plen = 4;
+  a->oper = htons(oper);
+  memcpy(a->sha, sha, 6);
+  memcpy(a->spa, spa, 4);
+  memcpy(a->tpa, tpa, 4);
+  net_rx_frame(f, sizeof f);
+}
+
+static void test_arp_request_cannot_poison(void)
+{
+  static const uint8_t me[4] = {10, 0, 2, 15}, gw[4] = {10, 0, 2, 2}, mask[4] = {255, 255, 255, 0};
+  static const uint8_t evil[6] = {0x02, 0xBA, 0xD0, 0x00, 0x00, 0x01};
+  uint8_t key[16], mac[6];
+  reset();
+  net_ifconfig(me, mask, gw, NULL);
+  addr_map_v4(key, gw);
+
+  rx_arp(1, PEER_MAC, gw, me); /* unsolicited: answered, not cached */
+  expect(!nbr_lookup(key, mac));
+  expect_eq(g_ntx, 1);
+  expect(g_tx[0][12] == 0x08 && g_tx[0][13] == 0x06 && g_tx[0][21] == 2);
+  expect(memcmp(g_tx[0], PEER_MAC, 6) == 0);
+
+  arp_request(gw); /* while we resolve the gateway, its own request completes the entry */
+  rx_arp(1, PEER_MAC, gw, me);
+  expect(nbr_lookup(key, mac) && memcmp(mac, PEER_MAC, 6) == 0);
+
+  rx_arp(1, evil, gw, me); /* a later request cannot repoint it */
+  expect(nbr_lookup(key, mac) && memcmp(mac, PEER_MAC, 6) == 0);
+}
+
 static void test_udp_slot_reuse_clears_peer(void)
 {
   static const uint8_t other[4] = {10, 0, 2, 99};
@@ -531,6 +574,7 @@ int main(void)
   test("overlapping fragments are dropped", test_fragment_overlap_dropped);
   test("fragment timeout and bad length", test_fragment_timeout_and_bad_length);
   test("address text round trips", test_addresses_round_trip);
+  test("ARP requests cannot poison the neighbor cache", test_arp_request_cannot_poison);
   test("a reused UDP slot forgets its old peer", test_udp_slot_reuse_clears_peer);
   return 0;
 }
