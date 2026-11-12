@@ -961,6 +961,18 @@ void sched_exit(int status)
     syscall_fs_process_exiting(sched_current_process_id());
   }
   fds_close_all(current);
+  if (current->as && current->as_owner) {
+    /* Worker threads must not outlive the leader: its reap frees the address space and the task they point at. */
+    task_t *th = main_task.next;
+    while (th != &main_task) {
+      if (th != current && th->as == current->as && !th->as_owner && th->state != TASK_ZOMBIE) {
+        th->sig_pending |= SIGBIT(SIGKILL);
+        if (th->state == TASK_WAITING)
+          th->state = TASK_RUNNABLE;
+      }
+      th = th->next;
+    }
+  }
   current->exit_status = status;
   current->state = TASK_ZOMBIE;
   if (current->self_reap) /* nobody waitpid's us: queue for schedule() to free */
@@ -1222,6 +1234,17 @@ int sched_sigreturn(struct registers *r)
   return 0;
 }
 
+/* Whether every worker thread of `leader` has exited and left its CPU, so reaping can free what they share. */
+static bool threads_settled(const task_t *leader)
+{
+  if (!leader->as || !leader->as_owner)
+    return true;
+  for (const task_t *s = main_task.next; s != &main_task; s = s->next)
+    if (s != leader && s->as == leader->as && !s->as_owner && (s->state != TASK_ZOMBIE || task_running(s)))
+      return false;
+  return true;
+}
+
 /* Find an exited child of `current` matching pid (-1 = any). */
 /* A child that has exited. Until its CPU has switched away (`settled`) it cannot be reaped yet, and nothing wakes a
  * parent that went to sleep waiting for it, so callers poll such a child instead of sleeping. */
@@ -1229,7 +1252,7 @@ static task_t *zombie_child_state(int pid, bool settled)
 {
   task_t *t = &main_task;
   do {
-    if (t->state == TASK_ZOMBIE && (!settled || !task_running(t)) && t->parent == current->id &&
+    if (t->state == TASK_ZOMBIE && (!settled || (!task_running(t) && threads_settled(t))) && t->parent == current->id &&
         (pid < 0 || (int)t->id == pid))
       return t;
     t = t->next;

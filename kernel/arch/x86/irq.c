@@ -80,6 +80,7 @@ void irq_handler(struct registers *r)
    * LAPIC, not the PIC. */
   if (r->int_no == LAPIC_TIMER_VEC) {
     smp_lapic_tick(r);
+    sched_signal_deliver(r); /* else a CPU-bound task pinned to an AP never sees SIGKILL */
     sched_kernel_leave();
     return;
   }
