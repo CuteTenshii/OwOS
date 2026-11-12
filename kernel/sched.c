@@ -60,7 +60,7 @@ typedef struct task {
   uint32_t parent;      /* pid of the task that created it */
   bool self_reap; /* detached kernel thread: no parent waitpid's it, so schedule() frees its zombie instead of leaking
                      it */
-  int wait_pid;   /* pid being waited on while WAITING */
+  int wait_pid;   /* pid a waitpid is blocked on, -1 for any child, 0 when not in waitpid */
   uint32_t futex_key; /* user address a futex waiter sleeps on (0 = none) */
   uint32_t wake_tick; /* if WAITING for a timed sleep: tick to wake at (0 = not a timed sleep, e.g. a waitpid waiter) */
   int exit_status;    /* set on exit, read by waitpid */
@@ -884,9 +884,12 @@ void sched_sleep_until(uint32_t wake)
                     nudge it to the next tick */
     wake = 1;
   uintptr_t flags = irq_save(); /* set the state + switch atomically vs the IRQ */
-  current->wake_tick = wake;
-  current->state = TASK_WAITING;
-  schedule(); /* entered IF=0; returns once woken + rescheduled */
+  /* A child exit or a blocked signal can wake us early: sleep on unless the deadline passed or a signal is due. */
+  do {
+    current->wake_tick = wake;
+    current->state = TASK_WAITING;
+    schedule(); /* entered IF=0; returns once woken + rescheduled */
+  } while ((int32_t)(timer_ticks() - wake) < 0 && !sched_intr_pending());
   current->wake_tick = 0;
   if (flags & 0x200) /* restore the caller's interrupt flag */
     __asm__ volatile("sti");
@@ -902,19 +905,25 @@ bool sched_futex_wait(uint32_t addr, uint32_t expected, uint32_t ms)
       wake = 1;
   }
   uintptr_t flags = irq_save();
-  sched_lock();
-  if (*(volatile uint32_t *)(uintptr_t)addr != expected) {
+  bool unwoken;
+  for (;;) {
+    sched_lock();
+    if (*(volatile uint32_t *)(uintptr_t)addr != expected) {
+      sched_unlock();
+      unwoken = false;
+      break;
+    }
+    current->futex_key = addr;
+    current->wake_tick = wake;
+    current->state = TASK_WAITING;
     sched_unlock();
-    irq_restore(flags);
-    return false;
+    schedule();
+    unwoken = current->futex_key != 0;
+    current->futex_key = 0;
+    /* Only a futex_wake, the deadline or a deliverable signal ends the wait; anything else re-checks and sleeps. */
+    if (!unwoken || (wake && (int32_t)(timer_ticks() - wake) >= 0) || sched_intr_pending())
+      break;
   }
-  current->futex_key = addr;
-  current->wake_tick = wake;
-  current->state = TASK_WAITING;
-  sched_unlock();
-  schedule();
-  bool unwoken = current->futex_key != 0;
-  current->futex_key = 0;
   current->wake_tick = 0;
   irq_restore(flags);
   return unwoken;
@@ -1006,7 +1015,8 @@ void sched_exit(int status)
     int chld_wake = chld && !(parent->sig_blocked & SIGBIT(SIGCHLD));
     if (chld)
       parent->sig_pending |= SIGBIT(SIGCHLD);
-    if (parent->state == TASK_WAITING && (parent->wait_pid < 0 || parent->wait_pid == (int)current->id || chld_wake))
+    bool waits_for_us = parent->wait_pid == -1 || parent->wait_pid == (int)current->id;
+    if (parent->state == TASK_WAITING && (waits_for_us || chld_wake))
       parent->state = TASK_RUNNABLE;
   }
 
@@ -1293,16 +1303,18 @@ int sched_waitpid(int pid)
       schedule();
       continue;
     }
-    current->wait_pid = pid;
+    current->wait_pid = pid < 0 ? -1 : pid;
     current->state = TASK_WAITING;
     /* A child on another CPU may have exited between the check above and this store, before it could see us
      * waiting. Look again now that it will: either it finds us WAITING and wakes us, or we find it a zombie. */
     __sync_synchronize();
     if (zombie_child_state(pid, false)) {
       current->state = TASK_RUNNABLE;
+      current->wait_pid = 0;
       continue;
     }
-    schedule();               /* yield; woken when a child exits */
+    schedule(); /* yield; woken when a child exits */
+    current->wait_pid = 0;
     if (sched_intr_pending()) /* a signal wants delivery: bail (EINTR) */
       return -1;
   }
