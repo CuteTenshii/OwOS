@@ -432,14 +432,14 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
 
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) { /* heap exhausted: fail rather than enqueue a task whose saved esp points into low memory */
-    address_space_put(as);
+    kfree(as);   /* the caller still owns and frees dir */
     kfree(t);
     return -1;
   }
   t->kstack = kstack;
   t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
   if (env_copy(&t->env, proc_env()) != 0) {
-    address_space_put(as);
+    kfree(as);
     kfree(kstack);
     kfree(t);
     return -1;
