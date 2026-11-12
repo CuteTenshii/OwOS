@@ -1260,6 +1260,14 @@ static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
 }
 
 /* Block ~2 s for a datagram; out_ip/out_port may be NULL. >0 bytes, 0 timeout, -4 intr. */
+/* Handle `h` if it is open and belongs to the calling process; handles are global, so this is the access check. */
+static struct usock *sock_get(int h)
+{
+  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].owner != sched_current_process_id())
+    return NULL;
+  return &usocks[h];
+}
+
 static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t out_ip[16], uint16_t *out_port)
 {
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
@@ -1411,9 +1419,9 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
 
 int net_sock_send(int h, const void *buf, uint32_t len)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+  struct usock *s = sock_get(h);
+  if (!s)
     return -1;
-  struct usock *s = &usocks[h];
   switch (s->proto) {
   case SK_TCP:
     return tcp_write(s->conn, buf, len);
@@ -1447,9 +1455,9 @@ int net_sock_send(int h, const void *buf, uint32_t len)
 /* Block for data. TCP: >0, 0 EOF, -1 error, -4 intr. UDP/ICMP: >0, 0 timeout, -4 intr. */
 int net_sock_recv(int h, void *buf, uint32_t max)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+  struct usock *s = sock_get(h);
+  if (!s)
     return -1;
-  struct usock *s = &usocks[h];
   if (s->proto == SK_UDP || s->proto == SK_ICMP)
     return sock_dgram_recv(s, buf, max);
   if (s->proto == SK_RAWETH)
@@ -1470,9 +1478,9 @@ int net_sock_recv(int h, void *buf, uint32_t max)
 /* Non-blocking recv. TCP: >0, 0 would-block, -1 error/EOF, -4 intr. Skips the blocking path's idle auto-close. */
 int net_sock_recv_nb(int h, void *buf, uint32_t max)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+  struct usock *s = sock_get(h);
+  if (!s)
     return -1;
-  struct usock *s = &usocks[h];
   if (s->proto == SK_UDP)
     return sock_dgram_recv_nb(s, buf, max);
   if (s->proto == SK_ICMP)
@@ -1498,9 +1506,9 @@ int net_sock_recv_nb(int h, void *buf, uint32_t max)
 
 int net_sock_close(int h)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+  struct usock *s = sock_get(h);
+  if (!s)
     return -1;
-  struct usock *s = &usocks[h];
   if (s->listening)
     tcp_unlisten(s->lport);
   else if (s->proto == SK_TCP && s->conn)
@@ -1514,11 +1522,10 @@ int net_sock_close(int h)
 /* Set the outgoing IP TTL for a UDP socket (the IP_MULTICAST_TTL analog). */
 int net_sock_set_ttl(int h, int ttl)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+  struct usock *s = sock_get(h);
+  if (!s || ttl < 1 || ttl > 255)
     return -1;
-  if (ttl < 1 || ttl > 255)
-    return -1;
-  usocks[h].ttl = (uint8_t)ttl;
+  s->ttl = (uint8_t)ttl;
   return 0;
 }
 
@@ -1561,9 +1568,10 @@ int net_sock_listen(int port)
 /* Block until a client connects or Ctrl+C. New handle, or -1 bad fd, -4 interrupted. */
 int net_sock_accept(int h)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || !usocks[h].listening)
+  struct usock *ls = sock_get(h);
+  if (!ls || !ls->listening)
     return -1;
-  uint16_t port = usocks[h].lport;
+  uint16_t port = ls->lport;
   tcp_conn_t *c = tcp_accept(port);
   if (!c)
     return -4;
@@ -1594,21 +1602,22 @@ int net_sock_bind(int port)
 /* Receive one datagram on a bound UDP socket; out pointers may be NULL. >0, 0 timeout, -1 bad fd, -4 intr. */
 int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[16], uint16_t *out_port)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
+  struct usock *s = sock_get(h);
+  if (!s || s->proto != SK_UDP)
     return -1;
-  return sock_dgram_recvfrom(&usocks[h], buf, max, out_ip, out_port);
+  return sock_dgram_recvfrom(s, buf, max, out_ip, out_port);
 }
 
 /* Send a datagram from a bound UDP socket to ip:port. Returns len or -1. */
 int net_sock_sendto(int h, const uint8_t ip[16], int port, const void *buf, uint32_t len)
 {
-  if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
+  struct usock *s = sock_get(h);
+  if (!s || s->proto != SK_UDP)
     return -1;
   if (!ip || (!buf && len) || port < 1 || port > 65535)
     return -1;
   if (len > udp_max_payload(ip)) /* one datagram won't hold more */
     return -1;
-  struct usock *s = &usocks[h];
   net_udp_send_ttl(ip, (uint16_t)port, s->lport, buf, len, s->ttl);
   return (int)len;
 }
