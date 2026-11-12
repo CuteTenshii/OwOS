@@ -235,7 +235,7 @@ void crash_record(const char *name, struct registers *r)
   c->esi = r->esi;
   c->edi = r->edi;
   c->ebp = r->ebp;
-  c->esp = r->esp;
+  c->esp = (uint32_t)r->useresp; /* r->esp is pusha's kernel-stack value, not the faulting user's */
 
   /* Backtrace via saved return addresses; every read is probed so a corrupt frame pointer can't fault. */
   c->ntrace = 0;
