@@ -6,6 +6,7 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "irqflags.h"
 #include "paging.h"
 #include "power.h"
 #include "sched.h"
@@ -200,16 +201,24 @@ static void lapic_enable_local(void)
   lapic_wr(LAPIC_SVR, lapic_rd(LAPIC_SVR) | 0x100 | LAPIC_SPURIOUS_VEC); /* enable + spurious vec */
 }
 
-/* Measure the LAPIC timer against the PIT once on the BSP (10 ms) to derive the per-tick reload. */
+/* Measure the LAPIC timer against the PIT once on the BSP (about 10 ms) to derive the per-tick reload. The PIT
+ * needs IRQs on to count, so time the real interval: a preemption inside udelay would otherwise inflate the result. */
 static uint32_t lapic_timer_calibrate(void)
 {
   lapic_wr(LAPIC_TIMER_DIV, 0x3); /* divide by 16 */
   lapic_wr(LAPIC_LVT_TIMER, LVT_MASKED);
+  uintptr_t fl = irq_save();
   lapic_wr(LAPIC_TIMER_INIT, 0xFFFFFFFF);
+  uint64_t t0 = timer_us64();
+  irq_restore(fl);
   udelay(10000);
+  fl = irq_save();
   uint32_t elapsed = 0xFFFFFFFFu - lapic_rd(LAPIC_TIMER_CUR);
-  lapic_wr(LAPIC_TIMER_INIT, 0);           /* stop */
-  return elapsed / 10 * (1000 / TIMER_HZ); /* per-10ms -> per (1/TIMER_HZ s) */
+  uint64_t t1 = timer_us64();
+  irq_restore(fl);
+  lapic_wr(LAPIC_TIMER_INIT, 0); /* stop */
+  uint64_t us = t1 > t0 ? t1 - t0 : 1;
+  return (uint32_t)((uint64_t)elapsed * (1000000u / TIMER_HZ) / us);
 }
 
 /* Start this core's LAPIC timer ticking periodically into LAPIC_TIMER_VEC. */
