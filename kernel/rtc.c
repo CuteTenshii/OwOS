@@ -79,7 +79,8 @@ unsigned rtc_epoch(void)
   if (m > 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0))
     days += 1;
   days += d - 1;
-  return (unsigned)(days * 86400L + (long)t.hour * 3600 + (long)t.min * 60 + t.sec);
+  /* Unsigned math: a signed 32-bit long overflows (undefined) in 2038, unsigned is exact until 2106. */
+  return (unsigned)days * 86400u + (unsigned)t.hour * 3600u + (unsigned)t.min * 60u + t.sec;
 }
 
 /* Write the wall clock back to CMOS, honouring whatever format the RTC is in
