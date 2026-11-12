@@ -6,6 +6,7 @@
 #include "irq.h"
 #include "irqflags.h"
 #include "sched.h"
+#include "spinlock.h"
 
 #define PIT_BASE_HZ 1193182 /* the PIT's fixed input frequency        */
 #define PIT_CH0_DATA 0x40
@@ -22,6 +23,9 @@
 
 #define PIT_DIVISOR (PIT_BASE_HZ / TIMER_HZ)
 #define US_PER_TICK (1000000u / TIMER_HZ)
+
+/* The latch and its two byte reads, and the IRR select-then-read, are port sequences two CPUs must not interleave. */
+static spinlock_t pit_lock;
 
 static volatile uint32_t ticks;
 static volatile uint32_t ticks_hi; /* ticks wraps (198 days at 250 Hz); this extends it to 64 bits */
@@ -64,7 +68,7 @@ uint32_t timer_ticks(void) { return ticks; }
  * Safe to call from interrupt context. */
 uint64_t timer_us64(void)
 {
-  uintptr_t fl = irq_save();
+  uintptr_t fl = spin_lock_irqsave(&pit_lock);
 
   outb(PIT_CMD, PIT_LATCH_CH0);
   uint32_t count = inb(PIT_CH0_DATA);
@@ -74,8 +78,9 @@ uint64_t timer_us64(void)
   uint8_t irr = inb(PIC1_CMD);
   uint64_t t = ((uint64_t)ticks_hi << 32) | ticks;
 
-  if (fl & 0x200)
-    __asm__ volatile("sti" ::: "memory");
+  spin_unlock_irqrestore(&pit_lock, fl);
+  if (count > PIT_DIVISOR) /* a misread count must not underflow frac into an hour's jump */
+    count = PIT_DIVISOR;
 
   if ((irr & 0x01) && count > PIT_DIVISOR / 2)
     t++; /* wrap already happened, tick pending */
