@@ -1,6 +1,7 @@
 #include "syscall_fs.h"
 #include "blk.h"
 #include "fs.h"
+#include "fsmount.h"
 #include "idt.h"
 #include "kstring.h"
 #include "perm.h"
@@ -34,7 +35,10 @@ void syscall_fs_stream_begin(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, abs, FS_W | FS_ACC_CREATE))
     return;
   r->eax = (uint32_t)fs_stream_begin(abs);
@@ -59,7 +63,10 @@ static void simple_path_op(struct registers *r, int op)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, abs, FS_ACC_ENTRY))
     return;
   if (op == 0)
@@ -84,7 +91,10 @@ void syscall_fs_rename(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(old_name, old_path, sizeof old_path);
+  if (join_cwd(old_name, old_path, sizeof old_path) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   join_cwd(new_name, new_path, sizeof new_path);
   if (access_denied(r, old_path, FS_ACC_ENTRY) || access_denied(r, new_path, FS_ACC_ENTRY))
     return;
@@ -125,7 +135,10 @@ void syscall_fs_writefile(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, abs, FS_W | FS_ACC_CREATE))
     return;
   const char *proc = procfs_subpath(abs);
@@ -167,16 +180,18 @@ void syscall_fs_readdir(struct registers *r)
     int is_dir;
     uint32_t size;
   } *out;
-  char path[SYS_PATH_MAX], name[64];
+  char raw[SYS_PATH_MAX], path[SYS_PATH_MAX], name[FS_ENUM_NAME_MAX];
   int is_dir = 0;
   uint32_t size = 0;
-  if (!user_out_range(r->edx, sizeof *out) || copyin_str(r->ebx, path, sizeof path) != 0) {
+  /* readdir paths have always been root-relative; normalize them like every other path. */
+  if (!user_out_range(r->edx, sizeof *out) || copyin_str(r->ebx, raw, sizeof raw) != 0 ||
+      path_join("/", raw, path, sizeof path) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
-  if (access_denied(r, path[0] ? path : "/", FS_R))
+  if (access_denied(r, path, FS_R))
     return;
-  int got = fs_enum_dir(path[0] ? path : "/", (int)r->ecx, name, &is_dir, &size, 0);
+  int got = fs_enum_dir(path, (int)r->ecx, name, &is_dir, &size, 0);
   if (got) {
     out = (struct rd_out *)r->edx;
     int i = 0;
@@ -276,7 +291,10 @@ void syscall_fs_stat(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, path, sizeof path);
+  if (join_cwd(name, path, sizeof path) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, path, 0))
     return;
   struct fs_stat_info st;
@@ -301,7 +319,10 @@ void syscall_fs_chmod(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, abs, 0))
     return;
   if (fs_stat_ex(abs, &st) != 0) {
@@ -324,7 +345,10 @@ void syscall_fs_chown(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   if (access_denied(r, abs, 0))
     return;
   if (fs_stat_ex(abs, &st) != 0) {
@@ -353,7 +377,10 @@ void syscall_fs_access(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   r->eax = (uint32_t)fs_access(abs, (int)(r->ecx & 7u));
 }
 

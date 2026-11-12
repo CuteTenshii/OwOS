@@ -61,8 +61,8 @@ void syscall_exec_replace(struct registers *r)
 
 void syscall_exec_spawn(struct registers *r)
 {
-  char path[SYS_PATH_MAX], arg[SYS_PATH_MAX];
-  if (copyin_str(r->ebx, path, sizeof path) != 0) {
+  char raw[SYS_PATH_MAX], path[SYS_PATH_MAX], arg[SYS_PATH_MAX];
+  if (copyin_str(r->ebx, raw, sizeof raw) != 0 || path_join("/", raw, path, sizeof path) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
@@ -177,8 +177,8 @@ void syscall_exec_spawn_cap(struct registers *r)
     }
   }
 
-  char path[SYS_PATH_MAX];
-  if (copyin_str(req.path, path, sizeof path) != 0) {
+  char raw[SYS_PATH_MAX], path[SYS_PATH_MAX];
+  if (copyin_str(req.path, raw, sizeof raw) != 0 || path_join("/", raw, path, sizeof path) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }

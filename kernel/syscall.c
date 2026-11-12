@@ -68,39 +68,61 @@
 /* Net transports are sockets: SYS_NET_CONNECT's `proto` selects TCP/TLS/UDP/raw-ICMP. */
 
 /* Make a user-supplied name an absolute owofs path; relative names join the caller's cwd. */
-void join_cwd(const char *name, char *out, int outsz)
+int path_join(const char *base, const char *name, char *out, int outsz)
 {
-  int n = 0;
-  if (name[0] != '/') {
-    const char *c = sched_cwd();
-    while (*c && n < outsz - 1)
-      out[n++] = *c++;
-    if ((n == 0 || out[n - 1] != '/') && n < outsz - 1)
-      out[n++] = '/';
+  if (outsz < 2)
+    return -1;
+  const char *parts[2] = {name[0] == '/' ? "" : base, name};
+  int n = 0; /* out[0..n) holds "/a/b"; empty means the root */
+  for (int k = 0; k < 2; k++) {
+    for (const char *p = parts[k]; *p;) {
+      while (*p == '/')
+        p++;
+      if (!*p)
+        break;
+      const char *e = p;
+      while (*e && *e != '/')
+        e++;
+      int len = (int)(e - p);
+      if (len == 2 && p[0] == '.' && p[1] == '.') {
+        while (n > 0 && out[n - 1] != '/')
+          n--;
+        if (n > 0)
+          n--;
+      } else if (len != 1 || p[0] != '.') {
+        if (n + 1 + len >= outsz) {
+          out[0] = '\0';
+          return -1;
+        }
+        out[n++] = '/';
+        for (int i = 0; i < len; i++)
+          out[n++] = p[i];
+      }
+      p = e;
+    }
   }
-  while (*name && n < outsz - 1)
-    out[n++] = *name++;
+  if (n == 0)
+    out[n++] = '/';
   out[n] = '\0';
+  return 0;
 }
+
+int join_cwd(const char *name, char *out, int outsz) { return path_join(sched_cwd(), name, out, outsz); }
 
 /* Read a file by `name` (cwd-relative), falling back to /bin/<name> like the shell's PATH lookup. */
 int read_with_path(const char *name, void *buf, uint32_t max)
 {
   char abs[SYS_PATH_MAX];
-  join_cwd(name, abs, sizeof abs);
+  if (join_cwd(name, abs, sizeof abs) != 0)
+    return -1;
   int rc = fs_access(abs, FS_R);
   if (rc == -PERM_EACCES)
     return rc;
   int n = rc == 0 ? fs_read(abs, buf, max) : -1;
   if (n < 0 && name[0] != '/') {
     char p[SYS_PATH_MAX];
-    int j = 0;
-    const char *pfx = "/bin/";
-    for (int i = 0; pfx[i]; i++)
-      p[j++] = pfx[i];
-    for (int i = 0; name[i] && j < (int)sizeof(p) - 1; i++)
-      p[j++] = name[i];
-    p[j] = '\0';
+    if (path_join("/bin", name, p, sizeof p) != 0)
+      return -1;
     rc = fs_access(p, FS_R);
     if (rc == -PERM_EACCES)
       return rc;
@@ -113,18 +135,12 @@ int read_with_path(const char *name, void *buf, uint32_t max)
 int resolve_path(const char *name, char *out, int outcap)
 {
   uint32_t sz;
-  join_cwd(name, out, (uint32_t)outcap);
+  if (join_cwd(name, out, outcap) != 0)
+    return -1;
   if (fs_stat(out, 0, &sz, 0) == 0)
     return 0;
-  if (name[0] == '/')
+  if (name[0] == '/' || path_join("/bin", name, out, outcap) != 0)
     return -1;
-  int j = 0;
-  const char *pfx = "/bin/";
-  for (int i = 0; pfx[i]; i++)
-    out[j++] = pfx[i];
-  for (int i = 0; name[i] && j < outcap - 1; i++)
-    out[j++] = name[i];
-  out[j] = '\0';
   return fs_stat(out, 0, &sz, 0) == 0 ? 0 : -1;
 }
 
