@@ -625,9 +625,9 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
     u->w = cw;
     u->h = ch;
     /* Clear the new logical buffer rather than copy the old image. */
-      uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
-      touch_full(u);
-      evq_push(u, WEV_RESIZE, cw, ch);
+    uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
+    touch_full(u);
+    evq_push(u, WEV_RESIZE, cw, ch);
     return;
   }
 
