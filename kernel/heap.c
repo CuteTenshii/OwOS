@@ -51,7 +51,7 @@ void heap_init(void)
 void *kmalloc(size_t size)
 {
   uintptr_t flags = spin_lock_irqsave(&heap_lock);
-  if (size == 0) {
+  if (size == 0 || size > (size_t)-1 - 7) { /* ALIGN_UP would wrap a huge size to 0 */
     spin_unlock_irqrestore(&heap_lock, flags);
     return 0;
   }
