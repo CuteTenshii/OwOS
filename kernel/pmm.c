@@ -166,7 +166,7 @@ phys_t pmm_alloc_contig(uint32_t bytes)
       uint32_t run = 0;
       while (run < need) {
         uint32_t cur = f + run;
-        if (!(cur & 31) && need - run >= 32 && bitmap[cur / 32] == ~0u) {
+        if (!(cur & 31) && need - run >= 32 && bitmap[cur / 32] == 0u) {
           run += 32;
           continue;
         }

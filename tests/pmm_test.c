@@ -127,6 +127,17 @@ static void check_contiguous(void)
   expect(pmm_alloc_contig(FRAME) != 0);
   pmm_free_frame(f[1]);
   expect(pmm_alloc_contig(2 * FRAME) != 0); /* frames 0,1,2 are now free */
+
+  /* A 32-frame-aligned word that is fully used must not count as 32 free frames. */
+  standard();
+  for (int i = 0; i < 1792; i++)
+    f[i] = pmm_alloc_frame();
+  for (int i = 88; i < 96; i++) /* 8 free frames ending at an aligned, fully used word */
+    pmm_free_frame(f[i]);
+  for (int i = 128; i < 1792; i++)
+    pmm_free_frame(f[i]);
+  phys_t big = pmm_alloc_contig(40 * FRAME);
+  expect_eq(big, 2 * MIB + 128 * FRAME);
 }
 
 static void check_cap_and_reinit(void)
