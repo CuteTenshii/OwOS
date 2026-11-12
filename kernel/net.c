@@ -1260,6 +1260,31 @@ static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
 }
 
 /* Block ~2 s for a datagram; out_ip/out_port may be NULL. >0 bytes, 0 timeout, -4 intr. */
+/* Is a UDP socket other than `except` already on local port `port`? Delivery goes to the first match. */
+static bool udp_port_busy(uint16_t port, int except)
+{
+  for (int i = 0; i < NET_SOCK_MAX; i++)
+    if (i != except && usocks[i].used && usocks[i].proto == SK_UDP && usocks[i].lport == port)
+      return true;
+  return false;
+}
+
+/* A random free port in the IANA ephemeral range, so an off-path attacker cannot guess where replies go. */
+static uint16_t udp_ephemeral(int h)
+{
+  for (int tries = 0; tries < 64; tries++) {
+    uint16_t r;
+    entropy_get(&r, sizeof r);
+    uint16_t port = (uint16_t)(0xC000u | (r & 0x3FFFu));
+    if (!udp_port_busy(port, h))
+      return port;
+  }
+  for (uint32_t port = 0xC000u; port <= 0xFFFFu; port++)
+    if (!udp_port_busy((uint16_t)port, h))
+      return (uint16_t)port;
+  return 0;
+}
+
 /* Handle `h` if it is open and belongs to the calling process; handles are global, so this is the access check. */
 static struct usock *sock_get(int h)
 {
@@ -1405,7 +1430,11 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
     break;
   case SK_UDP:
     s->rport = port;
-    s->lport = (uint16_t)(0xC000 + h);
+    s->lport = udp_ephemeral(h);
+    if (!s->lport) {
+      s->used = 0;
+      return -1;
+    }
     break;
   case SK_ICMP:
     s->lport = s->rport = 0;
@@ -1590,6 +1619,8 @@ int net_sock_accept(int h)
 int net_sock_bind(int port)
 {
   if (!nic_present() || port < 1 || port > 65535)
+    return -1;
+  if (udp_port_busy((uint16_t)port, -1)) /* a second binder would silently steal the first's datagrams */
     return -1;
   int h = usock_alloc();
   if (h < 0)
