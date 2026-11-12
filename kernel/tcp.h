@@ -1,10 +1,11 @@
 /* tcp.h — a minimal TCP client supporting several concurrent connections.
  *
  * Enough to open a handful of outbound connections at once, send a request on
- * each, and read the replies until the peers close — the happy path for
- * HTTP/1.0 GETs over QEMU's (near-lossless) SLIRP NAT. No retransmission
- * beyond resending the SYN, no out-of-order reassembly (in-order segments
- * only; the peer resends the rest), no congestion control.
+ * each, and read the replies until the peers close. Sending honours the peer's
+ * window: written data sits in a per-connection buffer until acknowledged and
+ * is retransmitted on timeout (RFC 6298 RTO with backoff, reset after a bounded
+ * number of retries), and a zero window is probed. No out-of-order reassembly
+ * (in-order segments only; the peer resends the rest), no congestion control.
  *
  * Each connection is a control block (TCB) drawn from a fixed table; the API
  * is handle-based. tcp_input() demultiplexes an inbound segment to the owning
@@ -31,7 +32,9 @@ void tcp_input(const uint8_t src[16], const uint8_t dst[16], const uint8_t *seg,
  * successful tcp_connect() until tcp_close(); the read/write/close calls take
  * the connection they operate on. */
 tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport); /* NULL = fail */
-int tcp_write(tcp_conn_t *c, const void *data, uint32_t len);      /* bytes, -1   */
+/* Queues data, blocking while the send buffer is full: bytes queued (short only if interrupted or reset partway),
+ * -1 on error or reset, TCP_EINTR if interrupted before any byte was queued. */
+int tcp_write(tcp_conn_t *c, const void *data, uint32_t len);
 int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
 /* bytes; sets
  * *closed=EOF */
@@ -39,6 +42,7 @@ int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
  * sets *closed at EOF. Lets one thread service many connections (no sleeping).
  */
 int tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
+/* Never blocks: queued data and the FIN are still delivered in the background, for at most ~30 s. */
 void tcp_close(tcp_conn_t *c);
 
 /* Server API, for headless TCP daemons (now user-space, via net_sock_*).
@@ -56,8 +60,9 @@ int tcp_listen(uint16_t port); /* 0 ok, -1 port already listening or no slot/buf
 void tcp_unlisten(uint16_t port);
 tcp_conn_t *tcp_accept(uint16_t port); /* NULL if interrupted by a signal */
 
-/* Periodic housekeeping from the network thread: reaps handshakes the peer abandoned, so a SYN flood
- * cannot hold every slot while no thread sits in tcp_accept. */
+/* Periodic housekeeping from the network thread, every tick: retransmission and zero-window probes, sending into
+ * newly opened windows, finishing closed connections, and reaping handshakes the peer abandoned (so a SYN flood
+ * cannot hold every slot while no thread sits in tcp_accept). Must not block on neighbour resolution. */
 void tcp_tick(void);
 
 #endif /* OWOS_TCP_H */

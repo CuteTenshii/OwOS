@@ -16,7 +16,8 @@ void net_init(void);       /* bring up the NIC and announce the IP config */
 void net_start(void);      /* start the deferred receive worker */
 void net_dhcp_spawn(void); /* launch /bin/dhcpcd detached (root) to lease a link */
 
-/* Socket handles (see kernel/syscall.c). connect takes an IPv4 or IPv6 literal; recv: >0 bytes, 0 EOF, -1 error. */
+/* Socket handles (see kernel/syscall.c). connect takes an IPv4 or IPv6 literal; recv: >0 bytes, 0 EOF, -1 error.
+ * TCP send blocks while the send buffer is full: bytes queued, -1 error, -4 interrupted before any were queued. */
 int net_sock_connect(const char *host, uint16_t port, int proto);
 int net_sock_send(int h, const void *buf, uint32_t len);
 int net_sock_recv(int h, void *buf, uint32_t max);

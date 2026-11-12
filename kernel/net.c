@@ -1454,8 +1454,10 @@ int net_sock_send(int h, const void *buf, uint32_t len)
   if (!s)
     return -1;
   switch (s->proto) {
-  case SK_TCP:
-    return tcp_write(s->conn, buf, len);
+  case SK_TCP: {
+    int r = tcp_write(s->conn, buf, len);
+    return r == TCP_EINTR ? -4 : r;
+  }
   case SK_UDP:
     if (len > udp_max_payload(s->peer)) /* one datagram won't hold more */
       return -1;
@@ -1715,7 +1717,9 @@ static void net_tick(void)
   for (int i = 0; i < FRAG_SLOTS; i++)
     if (frags[i].used && (int32_t)(timer_ticks() - frags[i].started) > FRAG_TIMEOUT)
       frags[i].used = false;
+  net_rx_depth++; /* retransmissions must not block resolving a neighbour this same thread receives for */
   tcp_tick();
+  net_rx_depth--;
 
   /* Router solicitations every 4 s until a router answers (max 5). */
   if (ll6_ok() && !have_gw6 && rs_sent < 5 && tick_passed(rs_next)) {
