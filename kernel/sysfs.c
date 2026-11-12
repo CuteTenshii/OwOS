@@ -1267,6 +1267,10 @@ int sysfs_size(const char *sub)
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "video") && eq(seg[2], "cam0") && eq(seg[3], "frame") &&
       uvc_present())
     return (int)uvc_frame_size();
+  /* The stream's size is how much has been captured, so a pread at the reader's position isn't clamped to EOF. */
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "capture_pcm") &&
+      hda_capture_present())
+    return (int)hda_capture_pos();
   n = sysfs_read(sub, scratch, (int)sizeof scratch);
   return n < 0 ? 0 : n;
 }
