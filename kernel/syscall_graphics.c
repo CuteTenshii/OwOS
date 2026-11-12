@@ -1,4 +1,5 @@
 #include "syscall_graphics.h"
+#include "console.h"
 #include "crash.h"
 #include "fb.h"
 #include "idt.h"
@@ -44,6 +45,7 @@ void syscall_graphics_fb_map(struct registers *r)
     return;
   }
   uwin_compositor_register(sched_current_id());
+  con_use_framebuffer(1); /* the back buffer is the compositor's now: the verbose boot console must stop drawing */
   r->eax = COMPOSITOR_FB_VADDR;
 }
 
