@@ -817,6 +817,9 @@ static const char *op_type(void *inst)
   return "NTFS";
 }
 
+/* The VFS sizes are 32-bit: report a larger file as 4 GiB - 1, not its size modulo 4 GiB. */
+static uint32_t clamp32(uint64_t v) { return v > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)v; }
+
 static int op_stat(void *inst, const char *path, int *is_dir, uint32_t *size)
 {
   struct ntfs_mount *m = inst;
@@ -827,7 +830,7 @@ static int op_stat(void *inst, const char *path, int *is_dir, uint32_t *size)
   if (is_dir)
     *is_dir = d;
   if (size)
-    *size = (uint32_t)sz;
+    *size = clamp32(sz);
   return 0;
 }
 
@@ -868,7 +871,7 @@ static int list_cb(void *vctx, const struct index_entry *e)
   if (!isd) {
     /* fetch the real $DATA size from the child record */
     if (read_mft_record(c->m, e->child, c->m->rec) == 0)
-      fsz = (uint32_t)data_size(c->m, c->m->rec);
+      fsz = clamp32(data_size(c->m, c->m->rec));
   }
 
   if (c->want_idx < 0) {
