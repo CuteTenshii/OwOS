@@ -53,10 +53,11 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
   return 0;
 }
 
-/* A user address range is valid only if it sits entirely in the user window. */
-static bool in_user_window(uint32_t addr, uint32_t len)
+/* A segment must stay below the stack and thread-stack region, whose pages load_elf and SYS_STACK_ALLOC map over
+ * whatever is there. */
+static bool in_image_window(uint32_t addr, uint32_t len)
 {
-  return addr >= USER_BASE && addr + len <= USER_REGION_END && addr + len >= addr;
+  return addr >= USER_BASE && addr + len <= USER_HEAP_MAX && addr + len >= addr;
 }
 
 int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out_entry, uint32_t *out_brk)
@@ -86,7 +87,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
     const Elf32_Phdr *ph = (const Elf32_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
     if (ph->p_type != PT_LOAD)
       continue;
-    if (!in_user_window(ph->p_vaddr, ph->p_memsz) || (uint64_t)ph->p_offset + ph->p_filesz > size ||
+    if (!in_image_window(ph->p_vaddr, ph->p_memsz) || (uint64_t)ph->p_offset + ph->p_filesz > size ||
         load_segment(dir, ph->p_vaddr, file + ph->p_offset, ph->p_filesz, ph->p_memsz) != 0) {
       paging_free_process_dir(dir);
       return -1;
