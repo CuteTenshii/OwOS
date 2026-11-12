@@ -300,6 +300,8 @@ static int dir_store(void) { return blk_write(sb.dir_start, dir, sb.dir_sectors)
 static int grow_dir(void)
 {
   uint32_t new_sectors = sb.dir_sectors ? sb.dir_sectors * 2 : 1;
+  if (new_sectors > FS_MAX_DIR_SECTORS) /* dir_load would refuse the disk at the next mount */
+    return -1;
   uint32_t new_start = alloc_run(new_sectors);
   if (new_start == 0)
     return -1;
@@ -397,15 +399,18 @@ static bool s_eq(const char *a, const char *b)
   return a[i] == b[i];
 }
 
+/* Slots a parent field can name: 16 bits, with FS_ROOT itself reserved for "in root". */
+static uint32_t usable_slots(void) { return dir_cap < FS_ROOT ? dir_cap : FS_ROOT; }
+
 /* First unused directory slot, growing the directory if full; -1 if it can't grow. */
 static int free_slot(void)
 {
-  for (uint32_t i = 0; i < dir_cap; i++)
+  for (uint32_t i = 0; i < usable_slots(); i++)
     if (!dir[i].name[0])
       return (int)i;
-  if (grow_dir() != 0)
+  if (dir_cap >= FS_ROOT || grow_dir() != 0)
     return -1;
-  for (uint32_t i = 0; i < dir_cap; i++)
+  for (uint32_t i = 0; i < usable_slots(); i++)
     if (!dir[i].name[0])
       return (int)i;
   return -1;
