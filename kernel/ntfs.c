@@ -279,6 +279,8 @@ static int resident_value(const uint8_t *a, uint32_t arec_room, const uint8_t **
   if (a[8] != 0)
     return -1;
   uint32_t alen = load_le32(a + 4);
+  if (alen < 0x18) /* the resident header itself must fit before its fields are read */
+    return -1;
   uint32_t vlength = load_le32(a + 0x10);
   uint16_t voff = load_le16(a + 0x14);
   if (voff + (uint64_t)vlength > alen)
@@ -652,6 +654,8 @@ static int load_mft_runlist(struct ntfs_mount *m, const uint8_t *mft_rec)
   if (!a || a[8] == 0) /* $MFT $DATA must be non-resident */
     return -1;
   uint32_t alen = load_le32(a + 4);
+  if (alen < 0x40) /* the non-resident header must fit before the runlist offset is read */
+    return -1;
   uint16_t mp_off = load_le16(a + 0x20);
   if (mp_off < 0x40 || mp_off >= alen)
     return -1;
