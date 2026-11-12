@@ -1671,6 +1671,30 @@ static void corrupt_entry_clusters(void)
   fat_ops()->close(fs);
 }
 
+/* A full directory cluster whose FAT entry points at itself has no end marker: entries must not repeat. */
+static void dir_full_cycle(void)
+{
+  expect(fmt_dev(32, 100000, 512, 1, NULL) == 0);
+  void *fs = mnt();
+  expect(fat_ops()->mkdir(fs, "/full") == 0);
+  for (int i = 0; i < 14; i++) { /* "." and ".." plus 14 short names fill one 512-byte cluster */
+    char p[16];
+    snprintf(p, sizeof p, "/full/F%02d", i);
+    expect(put(fs, p, "", 0) == 0);
+  }
+  fat_ops()->close(fs);
+  check_volume(g_img, 0, 0);
+  uint32_t d0 = ck_find("/full")->cluster;
+  poke_fat(d0, d0);
+  fs = mnt();
+  char name[FAT_ENUM_NAME_MAX];
+  int isd;
+  uint32_t sz;
+  expect(fat_ops()->enum_dir(fs, "/full", 13, name, &isd, &sz) == 1);
+  expect(fat_ops()->enum_dir(fs, "/full", 14, name, &isd, &sz) == 0);
+  fat_ops()->close(fs);
+}
+
 /* Rounding a size within one cluster of 4 GiB up to clusters must not wrap to zero and free the whole chain. */
 static void huge_size_truncate(void)
 {
@@ -1705,6 +1729,7 @@ static void t_corrupt(void)
   }
   test("entry pointing at cluster 0, 1 or beyond the volume", corrupt_entry_clusters);
   test("size near 4 GiB keeps its chain on truncate", huge_size_truncate);
+  test("full directory cluster linked to itself", dir_full_cycle);
   alarm(0);
 }
 

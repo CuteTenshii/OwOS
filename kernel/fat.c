@@ -706,6 +706,7 @@ static uint32_t count_free(struct fat_mount *m)
 struct diter {
   struct fat_mount *m;
   uint32_t clus, hops;
+  uint32_t mark, mark_at; /* Brent cycle check: the cluster seen at hop mark_at/2 */
   uint32_t sec_n, ent, limit;
   uint32_t cur_sec, cur_off, index;
   bool fixed, have, done, err;
@@ -717,6 +718,8 @@ static void diter_init(struct diter *it, struct fat_mount *m, uint32_t dir)
   memset(it, 0, sizeof *it);
   it->m = m;
   it->clus = dir;
+  it->mark = dir;
+  it->mark_at = 1;
   it->fixed = dir == 0 && m->kind != FAT32;
   it->limit = it->fixed ? m->root_secs : m->csec;
   if (!it->fixed && !clus_ok(m, dir)) {
@@ -735,10 +738,15 @@ static const uint8_t *diter_raw(struct diter *it)
       if (it->sec_n == it->limit) {
         uint32_t n;
         int r = it->fixed ? CH_END : chain_next(m, it->clus, &n);
-        if (r != CH_NEXT || ++it->hops > m->nclus) {
+        /* A cyclic chain, or one longer than any directory may be, would repeat entries without end. */
+        if (r != CH_NEXT || ++it->hops > m->nclus || it->hops >= DIR_MAX_ENTRIES * 32u / m->cbytes || n == it->mark) {
           it->done = true;
           it->err = r == CH_BAD || r == CH_NEXT;
           return NULL;
+        }
+        if (it->hops == it->mark_at) {
+          it->mark = n;
+          it->mark_at *= 2;
         }
         it->clus = n;
         it->sec_n = 0;
