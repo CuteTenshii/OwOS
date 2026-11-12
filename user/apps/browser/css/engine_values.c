@@ -1169,8 +1169,8 @@ void parse_bg_shorthand(const char *v, struct css_style *out)
 
   int a;
   int c = bg_value_color(v, &a);
-  if (c >= 0)
-    out->bg = c; /* the cascade keeps colour as 0xRRGGBB */
+  /* the cascade keeps colour as 0xRRGGBB; a shorthand without one (or a clear one) resets it to transparent */
+  out->bg = c >= 0 && a ? c : CSS_BG_CLEAR;
 
   char rest[160];
   int rl = 0; /* the value minus the image function */

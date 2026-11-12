@@ -45,6 +45,19 @@ static void check_logical_box(void)
   expect(s.margin[0] == 12 && s.margin[2] == 12 && s.margin[1] == -1 && s.padding[1] == 3 && s.padding[3] == -1);
 }
 
+/* A background shorthand without a colour, or a transparent one, clears a colour set earlier. */
+static void check_background_clear(void)
+{
+  struct css_style s = parse("background:#8a2fd6;background:0 0");
+  expect(s.bg == CSS_BG_CLEAR);
+  s = parse("background-color:#8a2fd6;background-color:transparent");
+  expect(s.bg == CSS_BG_CLEAR);
+  s = parse("background:0 0;background-color:#102030");
+  expect(s.bg == 0x102030);
+  s = parse("background:#8a2fd6 url(x.png) no-repeat");
+  expect(s.bg == 0x8a2fd6);
+}
+
 static void check_minified_areas(void)
 {
   struct css_style s = parse("grid-template:\".up.\"\"left.right\"\".down.\"/48px 48px 48px");
@@ -379,6 +392,7 @@ int main(void)
   test("grid-template areas, minified", check_minified_areas);
   test("grid fr weights keep their fraction", check_fractional_fr);
   test("logical margin and padding", check_logical_box);
+  test("background shorthand clears the colour", check_background_clear);
   test("grid-template-areas spans", check_area_span);
   test("grid-area", check_grid_area);
   test("grid line placement", check_grid_lines);

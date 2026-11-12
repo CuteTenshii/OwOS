@@ -145,6 +145,7 @@ struct css_bg_image {
 };
 
 #define CSS_SVG_DECL 160
+#define CSS_BG_CLEAR (-2) /* css_style.bg: set to transparent, overriding an earlier colour */
 #define CSS_W_BOLDER (-2) /* css_style.weight: one step heavier than the parent */
 #define CSS_W_LIGHTER (-3)
 struct css_style {

@@ -43,7 +43,7 @@ static void fold(struct css_style *out, const struct css_style *d)
 {
   if (d->color >= 0)
     out->color = d->color;
-  if (d->bg >= 0)
+  if (d->bg >= 0 || d->bg == CSS_BG_CLEAR)
     out->bg = d->bg;
   if (d->bold >= 0)
     out->bold = d->bold;
