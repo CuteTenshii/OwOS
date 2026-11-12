@@ -2092,7 +2092,8 @@ int fs_mount(const char *dev, const char *point)
   int slot = -1;
   for (int i = 0; i < MAX_MOUNTS; i++) {
     if (mtab[i].used) {
-      if (s_eq(mtab[i].point, point))
+      /* Two instances of one device would each cache and flush its allocation tables over the other's. */
+      if (s_eq(mtab[i].point, point) || s_eq(mtab[i].dev, dev))
         return -1;
     } else if (slot < 0) {
       slot = i;
