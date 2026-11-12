@@ -11,6 +11,7 @@
 #include "syscall_path.h"
 #include "sysfs.h"
 #include "uaccess.h"
+#include "users.h"
 #include "wallclock.h"
 #include <stdint.h>
 
@@ -279,10 +280,13 @@ void syscall_fs_volumes(struct registers *r)
   r->eax = 1;
 }
 
+/* Mounting exposes whole devices (FAT and NTFS carry no Unix modes) and unmounting pulls them from other users. */
+static bool may_mount(void) { return sched_uid() == 0 || users_sudo_valid(sched_uid()); }
+
 void syscall_fs_mount(struct registers *r)
 {
   char dev[16], point[48];
-  if (copyin_str(r->ebx, dev, sizeof dev) != 0 || copyin_str(r->ecx, point, sizeof point) != 0) {
+  if (!may_mount() || copyin_str(r->ebx, dev, sizeof dev) != 0 || copyin_str(r->ecx, point, sizeof point) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
@@ -293,7 +297,7 @@ void syscall_fs_mount(struct registers *r)
 void syscall_fs_umount(struct registers *r)
 {
   char point[48];
-  if (copyin_str(r->ebx, point, sizeof point) != 0) {
+  if (!may_mount() || copyin_str(r->ebx, point, sizeof point) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
