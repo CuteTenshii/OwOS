@@ -18,6 +18,7 @@
 #include "syscall.h"
 #include "syscall_nr.h"
 #include "timer.h"
+#include "uaccess.h"
 #include "uwin.h"
 #include <stdint.h>
 
@@ -1114,29 +1115,31 @@ static int sigframe_setup(task_t *t, struct registers *r, int sig)
   if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END || base > sp) /* underflow guard */
     return -1;
 
-  struct sigframe *f = (struct sigframe *)(uintptr_t)base;
-  uint32_t tramp = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
-  f->pretcode = tramp;
-  f->sig = (uint32_t)sig;
-  f->saved_blocked = t->sig_blocked;
-  f->uc.eip = (uint32_t)r->eip;
-  f->uc.eflags = (uint32_t)r->eflags;
-  f->uc.esp = (uint32_t)r->useresp;
-  f->uc.eax = (uint32_t)r->eax;
-  f->uc.ecx = (uint32_t)r->ecx;
-  f->uc.edx = (uint32_t)r->edx;
-  f->uc.ebx = (uint32_t)r->ebx;
-  f->uc.ebp = (uint32_t)r->ebp;
-  f->uc.esi = (uint32_t)r->esi;
-  f->uc.edi = (uint32_t)r->edi;
-  f->tramp[0] = 0xB8; /* mov $imm32, %eax */
-  f->tramp[1] = (uint8_t)(SYS_SIGRETURN);
-  f->tramp[2] = (uint8_t)(SYS_SIGRETURN >> 8);
-  f->tramp[3] = (uint8_t)(SYS_SIGRETURN >> 16);
-  f->tramp[4] = (uint8_t)(SYS_SIGRETURN >> 24);
-  f->tramp[5] = 0xCD; /* int $0x80 */
-  f->tramp[6] = 0x80;
-  f->tramp[7] = 0x90; /* nop pad */
+  struct sigframe f;
+  f.pretcode = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
+  f.sig = (uint32_t)sig;
+  f.saved_blocked = t->sig_blocked;
+  f.uc.eip = (uint32_t)r->eip;
+  f.uc.eflags = (uint32_t)r->eflags;
+  f.uc.esp = (uint32_t)r->useresp;
+  f.uc.eax = (uint32_t)r->eax;
+  f.uc.ecx = (uint32_t)r->ecx;
+  f.uc.edx = (uint32_t)r->edx;
+  f.uc.ebx = (uint32_t)r->ebx;
+  f.uc.ebp = (uint32_t)r->ebp;
+  f.uc.esi = (uint32_t)r->esi;
+  f.uc.edi = (uint32_t)r->edi;
+  f.tramp[0] = 0xB8; /* mov $imm32, %eax */
+  f.tramp[1] = (uint8_t)(SYS_SIGRETURN);
+  f.tramp[2] = (uint8_t)(SYS_SIGRETURN >> 8);
+  f.tramp[3] = (uint8_t)(SYS_SIGRETURN >> 16);
+  f.tramp[4] = (uint8_t)(SYS_SIGRETURN >> 24);
+  f.tramp[5] = 0xCD; /* int $0x80 */
+  f.tramp[6] = 0x80;
+  f.tramp[7] = 0x90; /* nop pad */
+  /* The user's esp may point anywhere: an unmapped or read-only stack must fail, not fault in ring 0. */
+  if (copyout(base, &f, sizeof f) != 0)
+    return -1;
 
   r->useresp = base;
   r->eip = t->sig_handler[sig];
@@ -1186,21 +1189,23 @@ int sched_sigreturn(struct registers *r)
   uint32_t base = (uint32_t)r->useresp - 4;
   if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END)
     return -1;
-  struct sigframe *f = (struct sigframe *)(uintptr_t)base;
+  struct sigframe f;
+  if (copyin(&f, base, sizeof f) != 0)
+    return -1;
 
   /* Strip SIGKILL/SIGSTOP so a crafted mask can't make the process unkillable. */
-  current->sig_blocked = f->saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
-  r->eip = f->uc.eip;
-  r->useresp = f->uc.esp;
+  current->sig_blocked = f.saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+  r->eip = f.uc.eip;
+  r->useresp = f.uc.esp;
   /* Sanitize user flags: keep arithmetic/DF/TF, force IF and bit1; never IOPL/NT. */
-  r->eflags = (f->uc.eflags & 0x00000DD5u) | 0x00000202u;
-  r->eax = f->uc.eax;
-  r->ecx = f->uc.ecx;
-  r->edx = f->uc.edx;
-  r->ebx = f->uc.ebx;
-  r->ebp = f->uc.ebp;
-  r->esi = f->uc.esi;
-  r->edi = f->uc.edi;
+  r->eflags = (f.uc.eflags & 0x00000DD5u) | 0x00000202u;
+  r->eax = f.uc.eax;
+  r->ecx = f.uc.ecx;
+  r->edx = f.uc.edx;
+  r->ebx = f.uc.ebx;
+  r->ebp = f.uc.ebp;
+  r->esi = f.uc.esi;
+  r->edi = f.uc.edi;
   return 0;
 }
 

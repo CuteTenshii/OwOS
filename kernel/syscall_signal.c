@@ -31,4 +31,8 @@ void syscall_signal_procmask(struct registers *r)
   r->eax = sched_sigprocmask((int)r->ebx, (uint32_t)r->ecx, (int)r->edx);
 }
 
-void syscall_signal_return(struct registers *r) { sched_sigreturn(r); }
+void syscall_signal_return(struct registers *r)
+{
+  if (sched_sigreturn(r) != 0)
+    sched_exit(128 + SIGSEGV); /* no readable frame: nothing to resume */
+}
