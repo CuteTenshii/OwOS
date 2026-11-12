@@ -38,6 +38,10 @@ uint32_t pmm_frame_refs(phys_t phys);
  * contiguous and don't fit in the small identity-mapped heap. Not freeable. */
 phys_t pmm_alloc_contig(uint32_t bytes);
 
+/* Keep pmm_alloc_contig out of physical [lo, hi). Contiguous runs are identity-mapped by the kernel, so on x86 they
+ * must not land where that mapping would sit inside every process's user window. */
+void pmm_set_contig_hole(phys_t lo, phys_t hi);
+
 /* Free a run returned by pmm_alloc_contig (frame by frame). */
 void pmm_free_contig(phys_t phys, uint32_t bytes);
 

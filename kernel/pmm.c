@@ -144,6 +144,14 @@ phys_t pmm_alloc_frame(void)
   return 0; /* out of physical memory */
 }
 
+static uint32_t hole_lo, hole_hi; /* frame range pmm_alloc_contig never returns */
+
+void pmm_set_contig_hole(phys_t lo, phys_t hi)
+{
+  hole_lo = (uint32_t)(lo / FRAME_SIZE);
+  hole_hi = (uint32_t)((hi + FRAME_SIZE - 1) / FRAME_SIZE);
+}
+
 phys_t pmm_alloc_contig(uint32_t bytes)
 {
   /* Reject an absurd size before the round-up overflows uint32 and yields a
@@ -163,6 +171,10 @@ phys_t pmm_alloc_contig(uint32_t bytes)
     uint32_t begin = pass == 0 ? start : low;
     uint32_t end = pass == 0 ? total_frames : start;
     for (uint32_t f = begin; f + need <= end;) {
+      if (f < hole_hi && f + need > hole_lo) {
+        f = hole_hi;
+        continue;
+      }
       uint32_t run = 0;
       while (run < need) {
         uint32_t cur = f + run;

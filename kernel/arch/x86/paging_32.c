@@ -44,6 +44,7 @@ void paging_init(void)
   page_directory[SCRATCH_VADDR >> 22] = (uint32_t)scratch_pt | PAGE_PRESENT | PAGE_RW;
 
   pool_next = pmm_pool_start(); /* page-table pool: [pool_start, low_end) */
+  pmm_set_contig_hole(USER_BASE, USER_REGION_END);
 
   __asm__ volatile("mov %0, %%cr3" : : "r"(page_directory));
 
@@ -130,7 +131,7 @@ void paging_free_process_dir(uint32_t *dir)
   user_stack_reset_owner(dir);
   /* Free the user window: each present PDE is a private table; free its frames, then the table. */
   for (uint32_t pdi = USER_PDI_LO; pdi < USER_PDI_HI; pdi++) {
-    if (!(dir[pdi] & PAGE_PRESENT))
+    if (!(dir[pdi] & PAGE_PRESENT) || !(dir[pdi] & PAGE_USER))
       continue;
     uint32_t *pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
     for (int i = 0; i < PT_ENTRIES; i++)
@@ -262,6 +263,10 @@ uint32_t *paging_fork_dir(uint32_t *parent)
   return child;
 }
 
+/* Kernel identity mappings must stay out of the per-process user window: there they would be inherited into every
+ * address space and freed or extended as if private. */
+static bool in_user_window(uint32_t start, uint32_t stop) { return start < USER_REGION_END && stop > USER_BASE; }
+
 int paging_identity_map(uint32_t phys, uint32_t len)
 {
   uint32_t *dir;
@@ -269,6 +274,8 @@ int paging_identity_map(uint32_t phys, uint32_t len)
 
   uint32_t start = phys & ~0xFFFu;
   uint32_t stop = (phys + len + 0xFFFu) & ~0xFFFu;
+  if (in_user_window(start, stop))
+    return -1;
   for (uint32_t a = start; a < stop && a >= start; a += 4096) {
     uint32_t pdi = a >> 22;
     uint32_t pti = (a >> 12) & 0x3FF;
@@ -292,6 +299,8 @@ int paging_kmap(uint32_t phys, uint32_t len)
 {
   uint32_t start = phys & ~0xFFFu;
   uint32_t stop = (phys + len + 0xFFFu) & ~0xFFFu;
+  if (in_user_window(start, stop))
+    return -1;
   for (uint32_t a = start; a < stop && a >= start; a += 4096) {
     uint32_t pdi = a >> 22, pti = (a >> 12) & 0x3FF;
     uint32_t *pt;

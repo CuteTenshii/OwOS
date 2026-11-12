@@ -83,6 +83,7 @@ void paging_init(void)
   master_pml4[0] = ((uint64_t)(uintptr_t)master_pdpt) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
 
   pool_next = pmm_pool_start(); /* page-table pool: [pool_start, low_end) */
+  pmm_set_contig_hole(USER_BASE, USER_REGION_END);
 
   /* Long mode is already on (boot.S); just install our tables. */
   __asm__ volatile("mov %0, %%cr3" : : "r"((uint64_t)(uintptr_t)master_pml4) : "memory");
@@ -190,7 +191,7 @@ void paging_free_process_dir(uint32_t *dir)
   uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[0] & PG_ADDR);
 
   /* User window [1,2GiB): free every present frame, then its page tables. */
-  if (pdpt[1] & PAGE_PRESENT) {
+  if ((pdpt[1] & PAGE_PRESENT) && (pdpt[1] & PAGE_USER)) {
     uint64_t *upd = (uint64_t *)(uintptr_t)(pdpt[1] & PG_ADDR);
     for (int d = 0; d < 512; d++) {
       if (!(upd[d] & PAGE_PRESENT) || (upd[d] & PAGE_PS))
@@ -341,11 +342,17 @@ uint32_t *paging_fork_dir(uint32_t *parent)
   return cdir;
 }
 
+/* Kernel identity mappings must stay out of the per-process user window: there they would be inherited into every
+ * address space and freed or extended as if private. */
+static bool in_user_window(uint32_t start, uint32_t stop) { return start < USER_REGION_END && stop > USER_BASE; }
+
 int paging_identity_map(uint32_t phys, uint32_t len)
 {
   uint64_t *pml4 = current_pml4();
   uint32_t start = phys & ~0xFFFu;
   uint32_t stop = (phys + len + 0xFFFu) & ~0xFFFu;
+  if (in_user_window(start, stop))
+    return -1;
   for (uint32_t a = start; a < stop && a >= start; a += 4096) {
     int large;
     uint64_t *pte = map_walk(pml4, a, PAGE_PRESENT | PAGE_RW, &large);
@@ -363,6 +370,8 @@ int paging_kmap(uint32_t phys, uint32_t len)
 {
   uint32_t start = phys & ~0xFFFu;
   uint32_t stop = (phys + len + 0xFFFu) & ~0xFFFu;
+  if (in_user_window(start, stop))
+    return -1;
   for (uint32_t a = start; a < stop && a >= start; a += 4096) {
     int large;
     uint64_t *pte = map_walk(master_pml4, a, PAGE_PRESENT | PAGE_RW, &large);
