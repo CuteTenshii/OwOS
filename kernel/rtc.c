@@ -5,6 +5,7 @@
 
 #include "rtc.h"
 #include "io.h"
+#include <stdbool.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -40,6 +41,10 @@ void rtc_now(struct rtc_time *t)
   uint8_t month = cmos_read(0x08);
   uint8_t year = cmos_read(0x09);
   uint8_t statusB = cmos_read(0x0B);
+  bool h12 = !(statusB & 0x02); /* bit 1 clear => 12-hour mode, PM in hour bit 7 */
+  bool pm = h12 && (hour & 0x80);
+  if (h12)
+    hour &= 0x7F;
 
   if (!(statusB & 0x04)) { /* bit 2 clear => values are BCD        */
     sec = bcd_to_bin(sec);
@@ -49,6 +54,8 @@ void rtc_now(struct rtc_time *t)
     month = bcd_to_bin(month);
     year = bcd_to_bin(year);
   }
+  if (h12)
+    hour = (uint8_t)(hour % 12 + (pm ? 12 : 0)); /* 12 AM is hour 0, 12 PM hour 12 */
 
   t->sec = sec;
   t->min = min;
