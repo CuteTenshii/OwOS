@@ -1383,6 +1383,8 @@ int fs_mkdir(const char *path)
   return (dir_store() == 0) ? 0 : -1;
 }
 
+static bool stream_targets(int slot);
+
 int fs_rmdir(const char *path)
 {
   if (!mounted)
@@ -1402,6 +1404,8 @@ int fs_rmdir(const char *path)
   for (uint32_t i = 0; i < dir_cap; i++)
     if (dir[i].name[0] && dir[i].parent == (uint16_t)s)
       return -3;
+  if (stream_targets(s)) /* the stream remembers the slot: a reused one would put its file in another directory */
+    return -3;
   slot_clear(s);
   return (dir_store() == 0) ? 0 : -1;
 }
@@ -1550,6 +1554,8 @@ static uint32_t strm_sectors;             /* full sectors flushed so far        
 static uint32_t strm_size;                /* bytes accepted so far                 */
 static uint8_t strm_buf[SECTOR_SIZE * 8]; /* the batch currently filling */
 static uint32_t strm_fill;                /* bytes pending in strm_buf             */
+
+static bool stream_targets(int slot) { return strm_active && strm_parent == slot; }
 
 int fs_stream_begin(const char *name)
 {
