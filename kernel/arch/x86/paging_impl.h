@@ -9,6 +9,7 @@
 #include "loader.h" /* USER_BASE / USER_REGION_END: the per-process window */
 #include "paging.h"
 #include "pmm.h"
+#include "smp.h"
 #include <stdint.h>
 
 /* IF-off bracket around scratch-slot use so a fork copy can't be preempted by another scratch user. */
@@ -41,5 +42,29 @@ static void scratch_acquire(void)
 }
 
 static void scratch_release(void) { __sync_lock_release(&scratch_lock); }
+
+/* Frames unmapped in a batch are freed only after every CPU has dropped its cached translations of them. */
+#define UNMAP_BATCH 64
+
+static void free_frames_flushed(const uint32_t *frames, int n)
+{
+  if (n == 0)
+    return;
+  smp_tlb_shootdown();
+  for (int i = 0; i < n; i++)
+    pmm_free_frame(frames[i]);
+}
+
+/* Page tables, likewise, go back to the pool only once no CPU can still walk them. */
+static void free_tables_flushed(uint32_t *dir, void *const *tables, int n)
+{
+  if (n == 0)
+    return;
+  if ((read_cr3() & ~(uintptr_t)0xFFF) == (uintptr_t)dir)
+    write_cr3(read_cr3());
+  smp_tlb_shootdown();
+  for (int i = 0; i < n; i++)
+    pfree(tables[i]);
+}
 
 #endif /* OWOS_PAGING_IMPL_H */

@@ -263,13 +263,20 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
   uint64_t *pml4 = (uint64_t *)(void *)dir;
   uint64_t start = vaddr & ~0x1FFFFFull; /* round to PD (2 MiB) */
   uint64_t stop = ((uint64_t)vaddr + bytes + 0x1FFFFFull) & ~0x1FFFFFull;
+  void *tables[UNMAP_BATCH];
+  int n = 0;
   for (uint64_t base = start; base < stop; base += 0x200000ull) {
     uint64_t *pde = get_pde(pml4, base);
     if (!pde || !(*pde & PAGE_PRESENT) || (*pde & PAGE_PS) || !(*pde & PAGE_USER))
-      continue;                                 /* absent, or a shared kernel table this call never allocated */
-    pfree((void *)(uintptr_t)(*pde & PG_ADDR)); /* the private page table */
+      continue; /* absent, or a shared kernel table this call never allocated */
+    tables[n++] = (void *)(uintptr_t)(*pde & PG_ADDR);
     *pde = 0;
+    if (n == UNMAP_BATCH) {
+      free_tables_flushed(dir, tables, n);
+      n = 0;
+    }
   }
+  free_tables_flushed(dir, tables, n);
 }
 
 bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
@@ -279,6 +286,11 @@ bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
   if (!(error & 2) || vaddr < USER_BASE || vaddr >= USER_REGION_END)
     return false;
   pte = get_pte(current_pml4(), vaddr);
+  /* Another CPU already made the page writable; this CPU faulted on its stale read-only translation. */
+  if (pte && (error & 1) && (*pte & PAGE_PRESENT) && (*pte & PAGE_USER) && (*pte & PAGE_RW)) {
+    invlpg(vaddr);
+    return true;
+  }
   if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || !(*pte & PAGE_COW))
     return false;
   old = (uint32_t)(*pte & PG_ADDR);
@@ -301,7 +313,7 @@ bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
   }
   *pte = (fresh & PG_ADDR) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   invlpg(vaddr);
-  pmm_free_frame(old);
+  free_frames_flushed(&old, 1); /* a sibling thread elsewhere may still read the shared frame */
   return true;
 }
 
@@ -339,6 +351,7 @@ uint32_t *paging_fork_dir(uint32_t *parent)
       }
     }
   }
+  smp_tlb_shootdown(); /* the parent's threads on other CPUs must stop writing the now-shared frames */
   return cdir;
 }
 
@@ -396,6 +409,7 @@ void paging_kunmap(uint32_t phys, uint32_t len)
       invlpg(a);
     }
   }
+  smp_tlb_shootdown(); /* the caller frees these frames next */
 }
 
 int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
@@ -426,14 +440,21 @@ int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
 void paging_user_shrink(uint32_t *dir, uint32_t new_top, uint32_t old_top)
 {
   uint64_t *pml4 = (uint64_t *)(void *)dir;
+  uint32_t frames[UNMAP_BATCH];
+  int n = 0;
   for (uint32_t a = new_top; a < old_top; a += 4096) {
     uint64_t *pte = get_pte(pml4, a);
     if (pte && (*pte & PAGE_PRESENT)) {
-      pmm_free_frame((uint32_t)(*pte & PG_ADDR));
+      frames[n++] = (uint32_t)(*pte & PG_ADDR);
       *pte = 0;
       invlpg(a);
+      if (n == UNMAP_BATCH) {
+        free_frames_flushed(frames, n);
+        n = 0;
+      }
     }
   }
+  free_frames_flushed(frames, n);
 }
 
 void *paging_scratch_map(int slot, uint32_t phys)

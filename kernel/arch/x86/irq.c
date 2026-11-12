@@ -75,6 +75,11 @@ void irq_unmask(uint8_t irq)
 /* Called from irq_common_stub for every hardware interrupt. */
 void irq_handler(struct registers *r)
 {
+  /* The shootdown initiator holds the kernel lock while it waits for us, so this must not take it. */
+  if (r->int_no == TLB_FLUSH_VEC) {
+    smp_tlb_ipi();
+    return;
+  }
   sched_kernel_enter();
   /* The Local APIC timer (AP scheduler tick) shares this dispatch but acks the
    * LAPIC, not the PIC. */

@@ -42,6 +42,14 @@ lapic_timer_isr:
 	push $0x40
 	jmp irq_common_stub
 
+/* TLB shootdown IPI (TLB_FLUSH_VEC); irq_handler services it before taking the kernel lock. */
+.global tlb_flush_isr
+.type tlb_flush_isr, @function
+tlb_flush_isr:
+	push $0
+	push $0xF0
+	jmp irq_common_stub
+
 /* LAPIC spurious vector 0xFF: the SDM says no EOI and no handler work, just return. */
 .global lapic_spurious_isr
 .type lapic_spurious_isr, @function

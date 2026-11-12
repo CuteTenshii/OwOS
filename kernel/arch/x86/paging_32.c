@@ -206,6 +206,11 @@ bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
     return false;
   pt = (uint32_t *)(pde & ~0xFFFu);
   pte = pt[(vaddr >> 12) & 0x3FF];
+  /* Another CPU already made the page writable; this CPU faulted on its stale read-only translation. */
+  if ((error & 1) && (pte & PAGE_PRESENT) && (pte & PAGE_USER) && (pte & PAGE_RW)) {
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+    return true;
+  }
   if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || !(pte & PAGE_COW))
     return false;
   old = pte & ~0xFFFu;
@@ -228,7 +233,7 @@ bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
   }
   pt[(vaddr >> 12) & 0x3FF] = fresh | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
-  pmm_free_frame(old);
+  free_frames_flushed(&old, 1); /* a sibling thread elsewhere may still read the shared frame */
   return true;
 }
 
@@ -260,6 +265,7 @@ uint32_t *paging_fork_dir(uint32_t *parent)
       }
     }
   }
+  smp_tlb_shootdown(); /* the parent's threads on other CPUs must stop writing the now-shared frames */
   return child;
 }
 
@@ -331,6 +337,7 @@ void paging_kunmap(uint32_t phys, uint32_t len)
     pt[pti] = 0;
     __asm__ volatile("invlpg (%0)" : : "r"(a) : "memory");
   }
+  smp_tlb_shootdown(); /* the caller frees these frames next */
 }
 
 /* Map npages of [phys..] at `vaddr` in `dir` as user pages with private PTs; 0, or -1 on exhaustion. */
@@ -360,13 +367,20 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
 {
   uint32_t start = vaddr & ~0x3FFFFFu; /* round to PDE (4 MiB) */
   uint32_t stop = (vaddr + bytes + 0x3FFFFFu) & ~0x3FFFFFu;
+  void *tables[UNMAP_BATCH];
+  int n = 0;
   for (uint32_t base = start; base < stop; base += 0x400000u) {
     uint32_t pdi = base >> 22;
     if (!(dir[pdi] & PAGE_PRESENT) || !(dir[pdi] & PAGE_USER))
-      continue;                          /* absent, or a shared kernel table this call never allocated */
-    pfree((void *)(dir[pdi] & ~0xFFFu)); /* the private page table */
+      continue; /* absent, or a shared kernel table this call never allocated */
+    tables[n++] = (void *)(dir[pdi] & ~0xFFFu);
     dir[pdi] = 0;
+    if (n == UNMAP_BATCH) {
+      free_tables_flushed(dir, tables, n);
+      n = 0;
+    }
   }
+  free_tables_flushed(dir, tables, n);
 }
 
 /* Heap grow: map zeroed user pages for [old_top, new_top); rolls back and returns -1 on exhaustion. */
@@ -398,17 +412,24 @@ int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
 /* Heap shrink: unmap and free user frames for [new_top, old_top); page tables stay. */
 void paging_user_shrink(uint32_t *dir, uint32_t new_top, uint32_t old_top)
 {
+  uint32_t frames[UNMAP_BATCH];
+  int n = 0;
   for (uint32_t a = new_top; a < old_top; a += 4096) {
     uint32_t pdi = a >> 22, pti = (a >> 12) & 0x3FF;
     if (!(dir[pdi] & PAGE_PRESENT))
       continue;
     uint32_t *pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
     if (pt[pti] & PAGE_PRESENT) {
-      pmm_free_frame(pt[pti] & ~0xFFFu);
+      frames[n++] = pt[pti] & ~0xFFFu;
       pt[pti] = 0;
       __asm__ volatile("invlpg (%0)" : : "r"(a) : "memory");
+      if (n == UNMAP_BATCH) {
+        free_frames_flushed(frames, n);
+        n = 0;
+      }
     }
   }
+  free_frames_flushed(frames, n);
 }
 
 void paging_mark_wc(uint32_t virt, uint32_t len)

@@ -176,8 +176,10 @@ static bool task_running(const task_t *task)
 
 static void sched_lock(void)
 {
-  while (__sync_lock_test_and_set(&scheduler_lock, 1))
+  while (__sync_lock_test_and_set(&scheduler_lock, 1)) {
+    smp_tlb_service();
     __asm__ volatile("pause");
+  }
 }
 
 static void sched_unlock(void) { __sync_lock_release(&scheduler_lock); }
@@ -189,8 +191,10 @@ void sched_kernel_enter(void)
     current->kernel_lock_depth++;
     return;
   }
-  while (__sync_lock_test_and_set(&kernel_lock, 1))
+  while (__sync_lock_test_and_set(&kernel_lock, 1)) {
+    smp_tlb_service(); /* the lock holder may be waiting on our flush */
     __asm__ volatile("pause");
+  }
   kernel_lock_cpu = cpu;
   current->kernel_lock_depth = 1;
 }
@@ -220,8 +224,10 @@ void sched_kernel_switch_in(void)
   uint8_t depth = current ? current->kernel_lock_reacquire : 0;
   if (!depth)
     return;
-  while (__sync_lock_test_and_set(&kernel_lock, 1))
+  while (__sync_lock_test_and_set(&kernel_lock, 1)) {
+    smp_tlb_service();
     __asm__ volatile("pause");
+  }
   kernel_lock_cpu = smp_this_cpu();
   current->kernel_lock_depth = depth;
   current->kernel_lock_reacquire = 0;

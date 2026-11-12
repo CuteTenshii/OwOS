@@ -123,6 +123,7 @@ uint32_t smp_ioapic_base(void) { return ioapic_base; }
 extern uint8_t ap_trampoline_start[], ap_trampoline_end[];
 extern void lapic_timer_isr(void);    /* irq_stubs.S, LAPIC_TIMER_VEC gate */
 extern void lapic_spurious_isr(void); /* irq_stubs.S, LAPIC_SPURIOUS_VEC gate */
+extern void tlb_flush_isr(void);      /* irq_stubs.S, TLB_FLUSH_VEC gate */
 #define LAPIC_SPURIOUS_VEC 0xFF
 #ifdef __x86_64__
 volatile uintptr_t ap_stack_top;
@@ -150,7 +151,9 @@ static volatile uint32_t online_mask = 1; /* bit i set when CPU i is running */
 #define LVT_MASKED 0x10000   /* LVT mask bit 16 */
 
 static volatile uint32_t *lapic;
-static uint32_t lapic_timer_count; /* periodic count for one tick */
+static uint32_t lapic_timer_count;    /* periodic count for one tick */
+static volatile uint32_t tlb_pending; /* bit i: CPU i still owes a requested TLB flush */
+#define TLB_SPIN_MAX 20000000u        /* a CPU stuck with IRQs off forever must not hang the initiator */
 static volatile uint32_t cpu_ticks[SMP_MAX_CPUS];
 
 static inline uint32_t lapic_rd(uint32_t reg) { return lapic[reg / 4]; }
@@ -247,6 +250,40 @@ void ap_main(uint32_t idx)
   sched_start_cpu((int)idx);
 }
 
+void smp_tlb_service(void)
+{
+  if (!tlb_pending)
+    return;
+  uint32_t bit = 1u << smp_this_cpu();
+  if (!(tlb_pending & bit))
+    return;
+  write_cr3(read_cr3()); /* the kernel maps nothing global, so this drops every cached translation */
+  __sync_fetch_and_and(&tlb_pending, ~bit);
+}
+
+void smp_tlb_ipi(void)
+{
+  smp_tlb_service();
+  lapic_wr(LAPIC_EOI, 0);
+}
+
+void smp_tlb_shootdown(void)
+{
+  if (!lapic)
+    return;
+  uint32_t others = online_mask & ~(1u << smp_this_cpu());
+  if (!others)
+    return;
+  __sync_fetch_and_or(&tlb_pending, others);
+  for (int i = 0; i < ncpu; i++)
+    if (others & (1u << i))
+      send_ipi(cpus[i].apic_id, 0x4000 | TLB_FLUSH_VEC); /* fixed delivery, assert */
+  for (uint32_t spin = 0; (tlb_pending & others) && spin < TLB_SPIN_MAX; spin++) {
+    smp_tlb_service(); /* a concurrent initiator may be waiting on us */
+    __asm__ volatile("pause");
+  }
+}
+
 /* Per-core timer tick (vector LAPIC_TIMER_VEC), dispatched from irq_handler. */
 void smp_lapic_tick(struct registers *r)
 {
@@ -269,6 +306,7 @@ void smp_start_aps(void)
   lapic_timer_count = lapic_timer_calibrate();
   idt_set_gate(LAPIC_TIMER_VEC, (uintptr_t)lapic_timer_isr, GDT_KERNEL_CODE, 0x8E);
   idt_set_gate(LAPIC_SPURIOUS_VEC, (uintptr_t)lapic_spurious_isr, GDT_KERNEL_CODE, 0x8E);
+  idt_set_gate(TLB_FLUSH_VEC, (uintptr_t)tlb_flush_isr, GDT_KERNEL_CODE, 0x8E);
 
   uint8_t bsp = (uint8_t)(lapic_rd(LAPIC_ID) >> 24);
 
