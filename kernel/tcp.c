@@ -446,9 +446,9 @@ int tcp_listen(uint16_t port)
   uint32_t f = irq_save();
   int slot = -1;
   for (int i = 0; i < TCP_MAX_LISTEN; i++) {
-    if (listeners[i].active && listeners[i].port == port) {
+    if (listeners[i].active && listeners[i].port == port) { /* in use: sharing would split accepts */
       irq_restore(f);
-      return 0;
+      return -1;
     }
     if (slot < 0 && !listeners[i].active)
       slot = i;

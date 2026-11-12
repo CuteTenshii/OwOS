@@ -52,7 +52,7 @@ void tcp_close(tcp_conn_t *c);
  *
  * Reuses the same TCB table as the client side — an accepted connection is
  * structurally identical to a connected one once it reaches ESTAB. */
-int tcp_listen(uint16_t port); /* 0 ok, -1 no slot/buffers */
+int tcp_listen(uint16_t port); /* 0 ok, -1 port already listening or no slot/buffers */
 void tcp_unlisten(uint16_t port);
 tcp_conn_t *tcp_accept(uint16_t port); /* NULL if interrupted by a signal */
 
