@@ -100,6 +100,9 @@ static uint32_t fb_res = FB_RESOURCE_A;
 static uint32_t fb_backing, fb_backing_bytes;
 static uint32_t host_w, host_h; /* last size the host reported */
 
+/* One command buffer serves every caller: the compositor, sysfs mode sets on any CPU and brightness keys in IRQ. */
+static spinlock_t ctrl_lock;
+
 static spinlock_t cursor_lock; /* the mouse IRQ moves the cursor */
 static uint8_t *cur_cmd;
 static uint32_t *cur_pix;
@@ -192,27 +195,33 @@ static void vgpu_present(int x, int y, int w, int h)
   if (w <= 0 || h <= 0)
     return;
   __asm__ volatile("sfence" ::: "memory"); /* drain write-combined framebuffer stores before the device reads them */
-  if (!cmd_transfer(fb_res, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, gpitch))
+  uintptr_t f = spin_lock_irqsave(&ctrl_lock);
+  if (!cmd_transfer(fb_res, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, gpitch)) {
+    spin_unlock_irqrestore(&ctrl_lock, f);
     return;
+  }
   if (flush_x1 <= flush_x0) {
     flush_x0 = (uint32_t)x;
     flush_y0 = (uint32_t)y;
     flush_x1 = (uint32_t)(x + w);
     flush_y1 = (uint32_t)(y + h);
-    return;
+  } else {
+    flush_x0 = flush_x0 < (uint32_t)x ? flush_x0 : (uint32_t)x;
+    flush_y0 = flush_y0 < (uint32_t)y ? flush_y0 : (uint32_t)y;
+    flush_x1 = flush_x1 > (uint32_t)(x + w) ? flush_x1 : (uint32_t)(x + w);
+    flush_y1 = flush_y1 > (uint32_t)(y + h) ? flush_y1 : (uint32_t)(y + h);
   }
-  flush_x0 = flush_x0 < (uint32_t)x ? flush_x0 : (uint32_t)x;
-  flush_y0 = flush_y0 < (uint32_t)y ? flush_y0 : (uint32_t)y;
-  flush_x1 = flush_x1 > (uint32_t)(x + w) ? flush_x1 : (uint32_t)(x + w);
-  flush_y1 = flush_y1 > (uint32_t)(y + h) ? flush_y1 : (uint32_t)(y + h);
+  spin_unlock_irqrestore(&ctrl_lock, f);
 }
 
 static void vgpu_flush(void)
 {
-  if (flush_x1 <= flush_x0)
-    return;
-  cmd_flush(flush_x0, flush_y0, flush_x1 - flush_x0, flush_y1 - flush_y0);
-  flush_x1 = flush_x0;
+  uintptr_t f = spin_lock_irqsave(&ctrl_lock);
+  if (flush_x1 > flush_x0) {
+    cmd_flush(flush_x0, flush_y0, flush_x1 - flush_x0, flush_y1 - flush_y0);
+    flush_x1 = flush_x0;
+  }
+  spin_unlock_irqrestore(&ctrl_lock, f);
 }
 
 /* Cursor queue commands carry no reply; the shared buffer is reused once the previous one completes. */
@@ -259,7 +268,10 @@ static int vgpu_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int ho
   for (int y = 0; y < h; y++)
     memcpy(cur_pix + y * CURSOR_DIM, argb + y * w, (uint32_t)w * 4);
   __asm__ volatile("mfence" ::: "memory");
-  if (!cmd_transfer(CURSOR_RESOURCE_ID, 0, 0, CURSOR_DIM, CURSOR_DIM, CURSOR_DIM * 4))
+  uintptr_t f = spin_lock_irqsave(&ctrl_lock);
+  bool ok = cmd_transfer(CURSOR_RESOURCE_ID, 0, 0, CURSOR_DIM, CURSOR_DIM, CURSOR_DIM * 4);
+  spin_unlock_irqrestore(&ctrl_lock, f);
+  if (!ok)
     return -1;
   cursor_scale = scale > 0 ? scale : 1;
   cursor_send(CMD_UPDATE_CURSOR, 0, 0, CURSOR_RESOURCE_ID, hot_x, hot_y);
@@ -347,10 +359,16 @@ static int vgpu_set_mode(uint32_t w, uint32_t h, uint32_t *pitch_bytes)
 {
   uint32_t res = fb_res == FB_RESOURCE_A ? FB_RESOURCE_B : FB_RESOURCE_A;
   uint32_t bytes = w * 4 * h;
-  if (bytes > fb_backing_bytes || !create_backed(res, FORMAT_B8G8R8X8, w, h, fb_backing, bytes))
+  if (bytes > fb_backing_bytes)
     return -1;
+  uintptr_t f = spin_lock_irqsave(&ctrl_lock);
+  if (!create_backed(res, FORMAT_B8G8R8X8, w, h, fb_backing, bytes)) {
+    spin_unlock_irqrestore(&ctrl_lock, f);
+    return -1;
+  }
   if (!cmd_set_scanout(res, w, h)) {
     cmd_unref(res);
+    spin_unlock_irqrestore(&ctrl_lock, f);
     return -1;
   }
   cmd_unref(fb_res);
@@ -360,6 +378,7 @@ static int vgpu_set_mode(uint32_t w, uint32_t h, uint32_t *pitch_bytes)
   gpitch = w * 4;
   flush_x1 = flush_x0;
   *pitch_bytes = gpitch;
+  spin_unlock_irqrestore(&ctrl_lock, f);
   return 0;
 }
 
@@ -383,7 +402,10 @@ static bool query_host_size(uint32_t *w, uint32_t *h)
 static int vgpu_poll_size(uint32_t *w, uint32_t *h)
 {
   uint32_t nw, nh;
-  if (!query_host_size(&nw, &nh))
+  uintptr_t f = spin_lock_irqsave(&ctrl_lock);
+  bool got = query_host_size(&nw, &nh);
+  spin_unlock_irqrestore(&ctrl_lock, f);
+  if (!got)
     return 0;
   bool changed = host_w && (nw != host_w || nh != host_h);
   host_w = nw;
