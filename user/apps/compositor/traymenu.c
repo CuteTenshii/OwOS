@@ -34,6 +34,8 @@ static void levels_truncate(int n)
 
 void tray_menu_close(void)
 {
+  if (!tray_menu_open && !ent)
+    return;
   levels_truncate(0);
   free(ent);
   ent = 0;
