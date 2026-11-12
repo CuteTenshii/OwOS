@@ -13,6 +13,7 @@
 #define NTFS_MAX_CLUSTER 65536u /* largest cluster we buffer (64 KiB cap) */
 #define NTFS_MAX_INDX 65536u    /* largest INDX block we buffer           */
 #define NTFS_MAX_NAME 255u      /* UTF-16 units in a name                 */
+#define NTFS_MAX_IXBMP 16384u   /* largest directory $BITMAP we buffer    */
 
 #define ATTR_END 0xFFFFFFFFu
 #define ATTR_VOLUME_NAME 0x60u
@@ -20,6 +21,7 @@
 #define ATTR_DATA 0x80u
 #define ATTR_INDEX_ROOT 0x90u
 #define ATTR_INDEX_ALLOC 0xA0u
+#define ATTR_BITMAP 0xB0u
 
 #define ATTR_FLAG_COMPRESSED 0x00FFu /* any compression-method bits */
 #define ATTR_FLAG_ENCRYPTED 0x4000u
@@ -51,6 +53,7 @@ struct ntfs_mount {
   uint8_t dir_rec[NTFS_MAX_REC];   /* the directory record being walked    */
   uint8_t clbuf[NTFS_MAX_CLUSTER]; /* one cluster, private to read_runlist  */
   uint8_t ixbuf[NTFS_MAX_INDX];    /* one INDX block of a directory index  */
+  uint8_t ixbmp[NTFS_MAX_IXBMP];   /* that index's $I30 $BITMAP            */
   char label[64];
 };
 
@@ -250,8 +253,21 @@ static int read_mft_record(struct ntfs_mount *m, uint64_t recno, uint8_t *buf)
   return read_mft_record_at(m, off, buf);
 }
 
-/* Find the first attribute of `type` in `rec`, or NULL. */
-static const uint8_t *find_attr(const uint8_t *rec, uint32_t rec_size, uint32_t type)
+/* Does attribute `a` (alen bytes) carry exactly the ASCII `name`? */
+static bool attr_name_is(const uint8_t *a, uint32_t alen, const char *name)
+{
+  uint32_t nlen = strlen(name);
+  uint16_t noff = load_le16(a + 0x0A);
+  if (a[9] != nlen || (uint32_t)noff + nlen * 2u > alen)
+    return false;
+  for (uint32_t i = 0; i < nlen; i++)
+    if (load_le16(a + noff + i * 2) != (uint8_t)name[i])
+      return false;
+  return true;
+}
+
+/* Find the first attribute of `type` in `rec` (named `name`, or any name if NULL), or NULL. */
+static const uint8_t *find_attr_named(const uint8_t *rec, uint32_t rec_size, uint32_t type, const char *name)
 {
   uint16_t aoff = load_le16(rec + 0x14);
   uint32_t used = load_le32(rec + 0x18);
@@ -272,11 +288,16 @@ static const uint8_t *find_attr(const uint8_t *rec, uint32_t rec_size, uint32_t 
     uint32_t alen = load_le32(a + 4);
     if (alen < 8 || off + alen > used)
       return NULL;
-    if (atype == type)
+    if (atype == type && (!name || (alen >= 0x10 && attr_name_is(a, alen, name))))
       return a;
     off += alen;
   }
   return NULL;
+}
+
+static const uint8_t *find_attr(const uint8_t *rec, uint32_t rec_size, uint32_t type)
+{
+  return find_attr_named(rec, rec_size, type, NULL);
 }
 
 /* Resident attribute value pointer and length. 0 / -1 (non-resident or malformed). */
@@ -483,8 +504,44 @@ static int walk_index_entries(const uint8_t *entries, const uint8_t *end, entry_
   return 0;
 }
 
-/* Run `cb` over every entry of directory `rec` ($INDEX_ROOT, then INDX blocks via ixbuf). 0/-1; *stopped if cb stopped.
+/* Load directory `rec`'s $I30 $BITMAP into ixbmp, zero-padded. Bytes loaded, or -1 if there is none or it is
+ * unreadable.
  */
+static int load_index_bitmap(struct ntfs_mount *m, const uint8_t *rec)
+{
+  const uint8_t *ba = find_attr_named(rec, m->mft_rec_size, ATTR_BITMAP, "$I30");
+  if (!ba)
+    return -1;
+  memset(m->ixbmp, 0, NTFS_MAX_IXBMP);
+  if (ba[8] == 0) {
+    const uint8_t *v;
+    uint32_t vlen;
+    if (resident_value(ba, m->mft_rec_size, &v, &vlen) != 0)
+      return -1;
+    if (vlen > NTFS_MAX_IXBMP)
+      vlen = NTFS_MAX_IXBMP;
+    memcpy(m->ixbmp, v, vlen);
+    return (int)vlen;
+  }
+  uint32_t alen = load_le32(ba + 4);
+  if (alen < 0x40)
+    return -1;
+  uint16_t mp_off = load_le16(ba + 0x20);
+  if (mp_off < 0x40 || mp_off >= alen)
+    return -1;
+  uint64_t real_sz = load_le64(ba + 0x30);
+  uint64_t init_sz = load_le64(ba + 0x38);
+  uint64_t want = init_sz < real_sz ? init_sz : real_sz;
+  if (want > NTFS_MAX_IXBMP)
+    want = NTFS_MAX_IXBMP;
+  int got = read_runlist(m, ba + mp_off, ba + alen, 0, m->ixbmp, (uint32_t)want);
+  if (got < 0 || (uint32_t)got < want)
+    return -1;
+  return real_sz > NTFS_MAX_IXBMP ? (int)NTFS_MAX_IXBMP : (int)real_sz;
+}
+
+/* Run `cb` over every entry of directory `rec` ($INDEX_ROOT, then in-use INDX blocks via ixbuf). 0/-1; *stopped if cb
+ * stopped. */
 static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb cb, void *ctx, int *stopped)
 {
   if (stopped)
@@ -531,11 +588,19 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
   if (blk < 512 || blk > NTFS_MAX_INDX || (blk & (blk - 1)))
     return 0;
 
+  /* Freed INDX blocks keep their magic and stale entries; only the bitmap tells them apart. */
+  int bmp_len = load_index_bitmap(m, rec);
+
   uint64_t pos = 0;
   int guard = 0;
   while (pos + blk <= alloc_sz) {
     if (++guard > 100000)
       return -1;
+    uint64_t vbn = pos / blk;
+    if (bmp_len >= 0 && (vbn >= (uint64_t)bmp_len * 8u || !(m->ixbmp[vbn >> 3] & (1u << (vbn & 7))))) {
+      pos += blk;
+      continue;
+    }
     int got = read_runlist(m, mp, mp_end, pos, m->ixbuf, blk);
     if (got <= 0)
       break;
