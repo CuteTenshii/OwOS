@@ -301,7 +301,11 @@ static int fault_signal(uint32_t vec)
 /* Called from isr_common_stub for every CPU exception. */
 void isr_handler(struct registers *r)
 {
-  int user_fault = (r->int_no == 0x80 || r->int_no < 32) && (r->cs & 3) == 3;
+  /* NMI and #MC are not caused by the interrupted instruction, so they never become a signal to the user task. */
+  if (r->int_no == 2)
+    return;
+  bool async = r->int_no == 18;
+  int user_fault = (r->int_no == 0x80 || (r->int_no < 32 && !async)) && (r->cs & 3) == 3;
   if (user_fault)
     sched_kernel_enter();
   if (r->int_no == 0x80) {
@@ -317,7 +321,7 @@ void isr_handler(struct registers *r)
   }
 
   /* Ring-3 fault: deliver the signal if handled, else record a crash and kill the process. */
-  if (r->int_no < 32 && (r->cs & 3) == 3) {
+  if (user_fault) {
     if (sched_fault_signal(r, fault_signal(r->int_no))) {
       sched_kernel_leave();
       return;
