@@ -239,6 +239,17 @@ static int g_sel_cur = -1; /* ::selection colour in effect at this depth of the 
  * element being entered is one (read before its children are walked), so it is blockified. */
 static bool g_flex_item, g_is_item;
 
+/* Tags whose UA stylesheet gives them vertical margins. */
+static bool has_ua_margin(const char *name)
+{
+  static const char *const tags[] = {"p",  "h1",  "h2",         "h3",     "h4",       "h5", "h6",   "ul", "ol",
+                                     "dl", "pre", "blockquote", "figure", "fieldset", "hr", "menu", 0};
+  for (int i = 0; tags[i]; i++)
+    if (streq(name, tags[i]))
+      return true;
+  return false;
+}
+
 static void walk_element(struct dom_node *el)
 {
   if (g_walk_depth >= WALK_DEPTH_MAX)
@@ -463,11 +474,13 @@ static void walk_element_inner(struct dom_node *el)
     if (cs.bg < 0)
       W_bg = 0xe8eaee; /* keycap tint */
   }
-  if (streq(name, "blockquote"))
+  /* The UA indent of quotes and lists stands for their default margin/padding; an author's value replaces it. */
+  if (streq(name, "blockquote") && cs.margin[3] == -1)
     W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
   if (streq(name, "ul") || streq(name, "ol")) {
     int ordered = name[0] == 'o';
-    W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
+    if (cs.padding[3] == -1)
+      W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
     W_listtype = ordered ? 'o' : 'u';
     W_listdef = list_type_from_attr(dom_get_attr(el, "type")); /* presentational default */
     W_listrev = (ordered && dom_get_attr(el, "reversed")) ? -1 : 1;
@@ -507,6 +520,10 @@ static void walk_element_inner(struct dom_node *el)
 
   int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_UNSET) ? is_block_tag(name) : 0;
   bool is_item = g_is_item;
+  /* Only elements with UA vertical margins get the blank line that stands in for them: not divs, list items,
+   * lists nested in a list, or inline elements made blocks as flex items. */
+  bool nested_list = (streq(name, "ul") || streq(name, "ol")) && sv_lt;
+  bool ua_gap = has_ua_margin(name) && !nested_list && !(is_item && !is_block_tag(name));
   if (is_item && cs.disp != CSS_DISP_CONTENTS)
     blk = 1; /* flex and grid items are block-level whatever their display (inline-flex buttons, spans) */
   /* a display:contents element's children are its parent's items */
@@ -522,30 +539,10 @@ static void walk_element_inner(struct dom_node *el)
     /* The blank line between blocks stands in for UA margins; an author margin replaces it. */
     if (cs.pos == CSS_POS_ABS)
       ; /* out of flow: no line break where it sat */
-    else if (cs.margin[0] != -1)
+    else if (cs.margin[0] != -1 || !ua_gap)
       line_end();
     else
       block_break();
-  }
-  if (streq(name, "li")) { /* list marker  */
-    unsigned char a = sty_byte();
-    /* Marker type precedence */
-    signed char ls = W_liststyle;
-    if (ls == CSS_LST_DEFAULT)
-      ls = list_type_from_attr(dom_get_attr(el, "type"));
-    if (ls == CSS_LST_DEFAULT)
-      ls = W_listdef;
-    if (ls == CSS_LST_DEFAULT)
-      ls = (W_listtype == 'o') ? CSS_LST_DECIMAL : CSS_LST_DISC;
-    int ordered = (ls >= CSS_LST_DECIMAL); /* numbered kinds advance a counter */
-    int num = 0;
-    if (ordered) {
-      num = attr_int(el, "value", W_olnum + W_listrev); /* `value` reseeds the sequence */
-      W_olnum = num;
-    }
-    char mark[24];
-    if (!css_marker_hidden(sheet_for(el), el) && li_marker(ls, num, mark, sizeof mark))
-      emit_lit(mark, a);
   }
   if (blk) {
     if (cs.bgi.kind == CSS_BGK_URL) { /* note the url() for the batched fetch, resolve its index */
@@ -576,6 +573,27 @@ static void walk_element_inner(struct dom_node *el)
       }
     layout_box_open(el, &cs, W_n); /* a block/flex box for the layout tree */
   }
+  /* the marker opens the item's own box, so it shares the first line with the item's text */
+  if (streq(name, "li")) { /* list marker  */
+    unsigned char a = sty_byte();
+    /* Marker type precedence */
+    signed char ls = W_liststyle;
+    if (ls == CSS_LST_DEFAULT)
+      ls = list_type_from_attr(dom_get_attr(el, "type"));
+    if (ls == CSS_LST_DEFAULT)
+      ls = W_listdef;
+    if (ls == CSS_LST_DEFAULT)
+      ls = (W_listtype == 'o') ? CSS_LST_DECIMAL : CSS_LST_DISC;
+    int ordered = (ls >= CSS_LST_DECIMAL); /* numbered kinds advance a counter */
+    int num = 0;
+    if (ordered) {
+      num = attr_int(el, "value", W_olnum + W_listrev); /* `value` reseeds the sequence */
+      W_olnum = num;
+    }
+    char mark[24];
+    if (!css_marker_hidden(sheet_for(el), el) && li_marker(ls, num, mark, sizeof mark))
+      emit_lit(mark, a);
+  }
   emit_pseudo(el, CSS_PSEUDO_BEFORE);
   walk(el);
   emit_pseudo(el, CSS_PSEUDO_AFTER);
@@ -583,7 +601,7 @@ static void walk_element_inner(struct dom_node *el)
     layout_box_close(W_n);
   if (blk && cs.pos == CSS_POS_ABS)
     ;
-  else if (blk && cs.margin[2] != -1)
+  else if (blk && (cs.margin[2] != -1 || !ua_gap))
     line_end();
   else if (blk)
     block_break();

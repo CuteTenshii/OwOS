@@ -144,7 +144,11 @@ static int block_line_h(void)
 /* A newline at `pos` that only ended the line inside the box just before it: no line of its own. */
 static int skip_box_terminator(int pos, int end)
 {
-  if (pos < end && B->pg->text[pos] == '\n' && img_at_pos(pos) < 0 && !(g_has_media && media_at_text_pos(pos)))
+  const char *t = B->pg->text;
+  /* the box's own content already ended its last line (a nested block did): this newline is a gap, keep it */
+  if (pos > 0 && t[pos - 1] == '\n' && img_at_pos(pos - 1) < 0 && !(g_has_media && media_at_text_pos(pos - 1)))
+    return pos;
+  if (pos < end && t[pos] == '\n' && img_at_pos(pos) < 0 && !(g_has_media && media_at_text_pos(pos)))
     return pos + 1;
   return pos;
 }
