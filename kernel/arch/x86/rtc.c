@@ -5,10 +5,18 @@
 
 #include "rtc.h"
 #include "io.h"
+#include "spinlock.h"
 #include <stdbool.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
+
+/* Each access is an index write then a data access; another CPU or a preemption must not slip in between. */
+static spinlock_t cmos_lock;
+
+struct cmos_raw {
+  uint8_t sec, min, hour, day, month, year, status_b;
+};
 
 static uint8_t cmos_read(uint8_t reg)
 {
@@ -28,19 +36,42 @@ static uint8_t bcd_to_bin(uint8_t v) { return (v & 0x0F) + ((v >> 4) * 10); }
 
 static uint8_t bin_to_bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
 
-void rtc_now(struct rtc_time *t)
+static void cmos_read_raw(struct cmos_raw *c)
 {
   /* Don't read mid-update; bounded so a quirky RTC can't hang us. */
   for (int i = 0; i < 1000000 && update_in_progress(); i++)
     ;
+  c->sec = cmos_read(0x00);
+  c->min = cmos_read(0x02);
+  c->hour = cmos_read(0x04);
+  c->day = cmos_read(0x07);
+  c->month = cmos_read(0x08);
+  c->year = cmos_read(0x09);
+  c->status_b = cmos_read(0x0B);
+}
 
-  uint8_t sec = cmos_read(0x00);
-  uint8_t min = cmos_read(0x02);
-  uint8_t hour = cmos_read(0x04);
-  uint8_t day = cmos_read(0x07);
-  uint8_t month = cmos_read(0x08);
-  uint8_t year = cmos_read(0x09);
-  uint8_t statusB = cmos_read(0x0B);
+static bool cmos_raw_eq(const struct cmos_raw *a, const struct cmos_raw *b)
+{
+  return a->sec == b->sec && a->min == b->min && a->hour == b->hour && a->day == b->day && a->month == b->month &&
+         a->year == b->year && a->status_b == b->status_b;
+}
+
+void rtc_now(struct rtc_time *t)
+{
+  /* An update can still start mid-read: read until two passes agree so a rollover can't tear the fields. */
+  struct cmos_raw a, b;
+  uintptr_t fl = spin_lock_irqsave(&cmos_lock);
+  cmos_read_raw(&a);
+  for (int i = 0; i < 8; i++) {
+    cmos_read_raw(&b);
+    if (cmos_raw_eq(&a, &b))
+      break;
+    a = b;
+  }
+  spin_unlock_irqrestore(&cmos_lock, fl);
+
+  uint8_t sec = a.sec, min = a.min, hour = a.hour, day = a.day, month = a.month, year = a.year;
+  uint8_t statusB = a.status_b;
   bool h12 = !(statusB & 0x02); /* bit 1 clear => 12-hour mode, PM in hour bit 7 */
   bool pm = h12 && (hour & 0x80);
   if (h12)
@@ -89,6 +120,7 @@ unsigned rtc_epoch(void)
  * chipset-specific and rtc_now hardcodes the 21st century anyway). */
 void rtc_set(const struct rtc_time *t)
 {
+  uintptr_t fl = spin_lock_irqsave(&cmos_lock);
   for (int i = 0; i < 1000000 && update_in_progress(); i++)
     ;
 
@@ -125,4 +157,5 @@ void rtc_set(const struct rtc_time *t)
   cmos_write(0x08, month);
   cmos_write(0x09, year);
   cmos_write(0x0B, statusB); /* resume updating         */
+  spin_unlock_irqrestore(&cmos_lock, fl);
 }
