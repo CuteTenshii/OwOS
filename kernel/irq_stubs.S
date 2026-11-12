@@ -69,6 +69,7 @@ irq_common_stub:
 	mov  %ds, %ax
 	push %rax
 
+	cld                            /* user DF=1 would run the kernel's rep movs/stos backwards */
 	mov  %rsp, %rdi                /* arg: pointer to struct registers        */
 	call irq_handler
 
@@ -105,6 +106,7 @@ irq_common_stub:
 	mov %ax, %es
 	mov %ax, %fs
 
+	cld
 	push %esp                      /* arg: pointer to struct registers        */
 	call irq_handler
 	add $4, %esp

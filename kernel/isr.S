@@ -96,6 +96,7 @@ isr_common_stub:                       /* on entry: top of stack = int_no       
 	mov  %ds, %ax
 	push %rax                      /* ds slot                                  */
 
+	cld                            /* user DF=1 would run the kernel's rep movs/stos backwards */
 	mov  %rsp, %rdi                /* arg: pointer to struct registers         */
 	call isr_handler
 
@@ -132,6 +133,7 @@ isr_common_stub:
 	mov %ax, %es
 	mov %ax, %fs                   /* %gs stays: it is the user's TLS segment */
 
+	cld
 	push %esp                      /* arg: pointer to struct registers        */
 	call isr_handler
 	add $4, %esp
