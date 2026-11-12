@@ -336,10 +336,7 @@ static int iso_enum_dir(struct iso_mount *m, const char *path, int idx, char *na
     if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
       continue;
     if (seen == idx) {
-      int i = 0;
-      for (; i < 255 && nm[i]; i++)
-        name[i] = nm[i];
-      name[i] = '\0';
+      fs_enum_name(name, nm, 255);
       if (is_dir)
         *is_dir = r.is_dir;
       if (size)

@@ -1788,7 +1788,7 @@ static int op_enum_dir(void *inst, const char *path, int idx, char *name, int *i
     uint32_t type;
     uint64_t sz;
     ent_attrs(m, d, &e, &type, &sz);
-    memcpy(name, e.name, (size_t)e.nlen + 1);
+    fs_enum_name(name, e.name, e.nlen);
     if (is_dir)
       *is_dir = type == S_DIR;
     if (size)

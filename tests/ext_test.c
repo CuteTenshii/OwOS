@@ -952,7 +952,19 @@ static void dirent_case(void)
     char l255[256];
     memset(l255, 'L', 255);
     l255[255] = '\0';
-    expect(has_name(m, "/d", l255));
+    char cut[FS_ENUM_NAME_MAX];
+    snprintf(cut, sizeof cut, "%s", l255);
+    expect(has_name(m, "/d", cut)); /* listed cut to the enum_dir buffer, still opened by its full name */
+    char guarded[FS_ENUM_NAME_MAX + 32];
+    memset(guarded, 0x5a, sizeof guarded);
+    int isd;
+    uint32_t sz;
+    for (int i = 0; ext_ops()->enum_dir(m, "/d", i, guarded, &isd, &sz); i++)
+      ;
+    bool intact = true;
+    for (size_t i = FS_ENUM_NAME_MAX; i < sizeof guarded; i++)
+      intact &= guarded[i] == 0x5a;
+    expect(intact);
     expect(!has_name(m, "/d", "deleted") && !has_name(m, "/d", "toobig") && !has_name(m, "/d", "reserved"));
     expect(same(m, "/d/\xff\xfex\x80.bin", "f", 1));
     char path[300];

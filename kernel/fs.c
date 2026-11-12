@@ -1740,10 +1740,7 @@ int fs_enum(int idx, char *name, uint32_t *size, uint32_t *mtime)
     return 0;
   if ((dir[idx].flags & FS_DIR_FLAG) || dir[idx].parent != FS_ROOT)
     return 0; /* SMB sees a flat share of root-level files */
-  int i = 0;
-  for (; i < FS_NAME_LEN && dir[idx].name[i]; i++)
-    name[i] = dir[idx].name[i];
-  name[i] = '\0';
+  fs_enum_name(name, dir[idx].name, FS_NAME_LEN);
   if (size)
     *size = dir[idx].size;
   if (mtime)
@@ -1990,10 +1987,7 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *si
     if (!dir[i].name[0] || dir[i].parent != parent || shadowed_by_mount(i))
       continue;
     if (count == idx) {
-      int j = 0;
-      for (; j < FS_NAME_LEN && dir[i].name[j]; j++)
-        name[j] = dir[i].name[j];
-      name[j] = '\0';
+      fs_enum_name(name, dir[i].name, FS_NAME_LEN);
       if (is_dir)
         *is_dir = (dir[i].flags & FS_DIR_FLAG) ? 1 : 0;
       if (size)

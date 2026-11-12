@@ -12,6 +12,25 @@
 
 #include <stdint.h>
 
+/* Size of the name buffer every enum_dir caller passes, terminator included. */
+#define FS_ENUM_NAME_MAX 64
+
+/* Copy at most len bytes of src (stopping at a NUL) into an enum_dir buffer, cut on a UTF-8 boundary to fit. */
+static inline void fs_enum_name(char *dst, const char *src, uint32_t len)
+{
+  uint32_t n = 0;
+  while (n < len && src[n])
+    n++;
+  if (n > FS_ENUM_NAME_MAX - 1) {
+    n = FS_ENUM_NAME_MAX - 1;
+    while (n && ((unsigned char)src[n] & 0xC0) == 0x80)
+      n--;
+  }
+  for (uint32_t i = 0; i < n; i++)
+    dst[i] = src[i];
+  dst[n] = '\0';
+}
+
 /* The backing block device, as seen by a mounted fs. LBA is in the device's own
  * sector size (512 for disks/USB/SD, 2048 for an ATAPI CD). */
 typedef int (*blk_read_fn)(uint32_t lba, void *buf);
@@ -35,6 +54,7 @@ struct fs_ops {
   int (*list)(void *inst, const char *path);
   int (*stat)(void *inst, const char *path, int *is_dir, uint32_t *size);
   int (*read_at)(void *inst, const char *path, uint32_t off, void *buf, uint32_t len);
+  /* name holds FS_ENUM_NAME_MAX bytes; longer names are cut (fs_enum_name). */
   int (*enum_dir)(void *inst, const char *path, int idx, char *name, int *is_dir, uint32_t *size);
 
   /* Write path -- NULL on a read-only driver. */

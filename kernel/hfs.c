@@ -461,10 +461,7 @@ static int visit_list(struct hfs_mount *m, const struct catrec *c, void *vp)
   if (L->seen == L->want_idx) {
     struct obj o;
     rec_to_obj(c, &o);
-    int i = 0;
-    for (; i < 255 && nm[i]; i++)
-      L->name[i] = nm[i];
-    L->name[i] = '\0';
+    fs_enum_name(L->name, nm, 255);
     if (L->is_dir)
       *L->is_dir = o.is_dir;
     if (L->size)

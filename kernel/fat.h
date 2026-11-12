@@ -46,7 +46,7 @@ enum fat_err {
 #define FAT_ATTR_ARCHIVE 0x20u
 
 /* Names enum_dir may write: callers pass 64 bytes, longer ones become the 8.3 alias. */
-#define FAT_ENUM_NAME_MAX 64
+#define FAT_ENUM_NAME_MAX FS_ENUM_NAME_MAX
 
 struct fat_stat {
   uint32_t size;

@@ -658,7 +658,9 @@ static void verify_dir(void *m, const struct ex *d)
       order_ok = false;
       break;
     }
-    const char *base = strrchr(c->path, '/') ? strrchr(c->path, '/') + 1 : c->path;
+    const char *path_base = strrchr(c->path, '/') ? strrchr(c->path, '/') + 1 : c->path;
+    char base[FS_ENUM_NAME_MAX];
+    snprintf(base, sizeof base, "%s", path_base); /* long names are listed cut to the enum_dir buffer */
     bool want_dir = c->kind == EX_DIR || c->kind == EX_DIRLINK;
     uint32_t want_size = want_dir ? 0 : c->kind == EX_FILE ? clamp32(c->len) : clamp32(c->len);
     if (strcmp(name, base) != 0 || (cdir != 0) != want_dir || csize != want_size) {

@@ -876,10 +876,7 @@ static int list_cb(void *vctx, const struct index_entry *e)
     return 0;
   }
   if (c->seen == c->want_idx) {
-    int j = 0;
-    for (; j < (int)NTFS_MAX_NAME && e->name[j]; j++)
-      c->name[j] = e->name[j];
-    c->name[j] = '\0';
+    fs_enum_name(c->name, e->name, sizeof e->name);
     if (c->is_dir_out)
       *c->is_dir_out = isd;
     if (c->size_out)

@@ -1426,7 +1426,7 @@ static int op_enum_dir(void *inst, const char *path, int idx, char *name, int *i
   bool d;
   uint32_t sz;
   bt_entry_info(m, &dir, path ? path : "", &e, &d, &sz);
-  memcpy(name, e.name, e.nlen + 1);
+  fs_enum_name(name, e.name, e.nlen);
   if (is_dir)
     *is_dir = d;
   if (size)

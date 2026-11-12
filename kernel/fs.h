@@ -129,7 +129,7 @@ int fs_chown(const char *path, uint32_t uid, uint32_t gid);
 int fs_access(const char *path, int want);
 
 /* Enumerate the children of directory `path` (NULL/""/"/" = root). For the
- * idx-th child (0-based, slot order) fill name (short component, >= 18 bytes),
+ * idx-th child (0-based, slot order) fill name (FS_ENUM_NAME_MAX bytes, longer names cut),
  * *is_dir, *size, *mtime and return 1; return 0 past the last child or if
  * `path` is not a directory. */
 int fs_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *size, uint32_t *mtime);
