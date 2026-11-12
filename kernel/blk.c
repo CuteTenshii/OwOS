@@ -370,7 +370,7 @@ int blk_write(uint32_t lba, const void *buf, uint32_t count)
       if (blk_write_sector_locked(lba, buf) != 0)
         goto fail;
   }
-  if (requested <= BLK_CACHE_LINES) {
+  if (rc == 0 && requested <= BLK_CACHE_LINES) { /* cache only what reached the disk */
     const uint8_t *p = start_buf;
     for (uint32_t i = 0; i < requested; i++, p += 512)
       cache_fill(start_lba + i, p);
