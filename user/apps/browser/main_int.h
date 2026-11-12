@@ -33,13 +33,15 @@ struct lmedia {
   int row, rows;
 };
 
-/* A position:fixed / top-layer box laid out out of flow: its lines live in layout_out.ovlt */
+/* A position:fixed / absolute / top-layer box laid out out of flow: its lines live in layout_out.ovlt */
 struct lovl {
   int box;       /* index into the box pool */
   int row0, row1; /* its line range in ovlt */
   int y0;        /* ovlt pixel top of the range */
   int h;         /* border-box height */
   bool modal;    /* a modal dialog: dims and blocks the page */
+  bool doc;      /* position:absolute: placed in the document, so it scrolls with the page */
+  int doc_top;   /* then its border-box top, document px */
 };
 
 #define OVL_MAX 32

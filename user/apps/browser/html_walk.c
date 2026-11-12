@@ -492,14 +492,16 @@ static void walk_element_inner(struct dom_node *el)
   int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_UNSET) ? is_block_tag(name) : 0;
   if (cs.disp == CSS_DISP_CONTENTS)
     cs.bg = -1; /* no box of its own, so no background */
-  if (cs.pos == CSS_POS_FIXED)
-    blk = 1; /* a fixed box is blockified so it gets a layout box */
+  if (cs.pos == CSS_POS_FIXED || cs.pos == CSS_POS_ABS)
+    blk = 1; /* fixed and absolute boxes are blockified so they get a layout box */
 
   if (blk) {
     sty_cur.clip = cs.overflow == 1; /* each block clips (or not) on its own; inline children share their block's */
     sty_cur.ellipsis = sty_cur.clip && cs.text_ovf == 1;
     /* The blank line between blocks stands in for UA margins; an author margin replaces it. */
-    if (cs.margin[0] != -1)
+    if (cs.pos == CSS_POS_ABS)
+      ; /* out of flow: no line break where it sat */
+    else if (cs.margin[0] != -1)
       line_end();
     else
       block_break();
@@ -547,7 +549,9 @@ static void walk_element_inner(struct dom_node *el)
   emit_pseudo(el, CSS_PSEUDO_AFTER);
   if (blk)
     layout_box_close(W_n);
-  if (blk && cs.margin[2] != -1)
+  if (blk && cs.pos == CSS_POS_ABS)
+    ;
+  else if (blk && cs.margin[2] != -1)
     line_end();
   else if (blk)
     block_break();

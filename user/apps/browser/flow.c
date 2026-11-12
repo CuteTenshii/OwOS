@@ -357,7 +357,43 @@ static int flex_clamp_main(const struct lbox *it, int v, int cont_w)
 }
 
 /* position:fixed boxes leave the flow and are laid out into the overlay table */
-static bool out_of_flow(const struct lbox *b) { return b->pos == CSS_POS_FIXED; }
+/* Fixed boxes leave the flow, and so do absolute ones, unless they sit inside another out-of-flow box (whose
+ * own layout then carries them). */
+static bool out_of_flow(const struct lbox *b)
+{
+  if (b->pos == CSS_POS_FIXED)
+    return true;
+  if (b->pos != CSS_POS_ABS)
+    return false;
+  int n;
+  const struct lbox *bx = layout_pool(&n);
+  for (int p = b->parent; p >= 0; p = bx[p].parent)
+    if (bx[p].pos == CSS_POS_FIXED || bx[p].pos == CSS_POS_ABS)
+      return false;
+  return true;
+}
+
+/* The padding box an absolute box's offsets are measured from: its nearest positioned (or transformed)
+ * ancestor's, else the page's. */
+static void abs_containing_block(const struct lbox *bx, int i, int paw, int *x, int *y, int *w, int *h)
+{
+  const struct lgeom *geo = g_bk->geo;
+  for (int p = bx[i].parent; p >= 0; p = bx[p].parent) {
+    const struct lbox *a = &bx[p];
+    bool transformed = a->ext && (a->ext->mat || a->ext->tr_x || a->ext->tr_y || a->ext->tr_xp || a->ext->tr_yp);
+    if (a->pos != CSS_POS_STATIC || transformed) {
+      *x = geo[p].x + a->border.l;
+      *y = geo[p].y + a->border.t;
+      *w = geo[p].w - a->border.l - a->border.r;
+      *h = geo[p].h - a->border.t - a->border.b;
+      return;
+    }
+  }
+  *x = 4;
+  *y = 0;
+  *w = paw;
+  *h = 0; /* the whole page; the caller measures it */
+}
 
 /* An item's cross-axis alignment: its align-self, else the container's align-items. */
 static signed char item_align(const struct lbox *cont, const struct lbox *it)
@@ -905,7 +941,10 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
         any_item = true;
       }
       flow_slice(pos, bx[j].t0, content_x, content_w); /* inline text before it */
-      if (!out_of_flow(&bx[j])) {
+      if (out_of_flow(&bx[j])) {
+        g_bk->geo[j].x = content_x; /* its static position, for an absolute box without offsets */
+        g_bk->geo[j].y = lt_doc_px(&g_bk->lt);
+      } else {
         if (col && any_item)
           add_blank_px(b->gap_row, bx[j].t0, content_x, content_w);
         any_item = true;
@@ -968,16 +1007,35 @@ static void layout_overlays(int paw)
     struct lbox *b = &bx[i];
     if (!out_of_flow(b))
       continue;
-    struct lovl rec = {i, o->lt.n, 0, lt_doc_px(&o->lt), 0, false};
+    struct lovl rec = {i, o->lt.n, 0, lt_doc_px(&o->lt), 0, false, false, 0};
+    bool abs = b->pos == CSS_POS_ABS;
+    int static_y = o->geo[i].y, cbx = 4, cby = 0, cbw = paw, cbh = 0;
+    if (abs) /* the ancestors' geometry is in the page table, swapped out above */
+      abs_containing_block(bx, i, paw, &cbx, &cby, &cbw, &cbh);
+    if (abs && cbh <= 0)
+      cbh = page_lt.n ? page_lt.y[page_lt.n - 1] + page_lt.h[page_lt.n - 1] : 0;
     int saved_w = b->spec_w, saved_t = b->off_t, saved_b = b->off_b;
     int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
     if (b->kind == LB_BLOCK && b->spec_w < 0 && b->pct_w < 0 && !(b->off_l >= 0 && b->off_r >= 0))
       b->spec_w = slice_maxcontent(b->t0, b->t1) + (b->border_box ? frame : 0); /* shrink to fit */
-    b->off_t = b->off_b = -1;                                                   /* placed vertically at paint time */
+    b->off_t = b->off_b = -1;                                                   /* placed vertically below */
+    int y0 = lt_doc_px(&o->lt);
     if (b->node && dom_get_attr(b->node, "fs-top"))
       flow_box(bx, i, 0, paw + 8); /* the fullscreen element covers the pane edge to edge */
+    else if (abs)
+      flow_box(bx, i, cbx, cbw);
     else
       flow_box(bx, i, 4, paw);
+    if (abs) { /* document position, scrolled with the page; flow_box put any translateY into geo.y */
+      int translate = o->geo[i].y - (y0 + max0(b->margin.t));
+      int top = saved_t >= 0   ? cby + saved_t + max0(b->margin.t)
+                : saved_b >= 0 ? cby + cbh - saved_b - max0(b->margin.b) - o->geo[i].h
+                               : static_y + max0(b->margin.t);
+      rec.doc = true;
+      rec.doc_top = top + translate;
+      o->geo[i].y -= translate; /* geo stays in the overlay table's rows; the translate lives in doc_top */
+      o->geo[i].cy -= translate;
+    }
     b->spec_w = saved_w;
     b->off_t = saved_t;
     b->off_b = saved_b;
@@ -1019,7 +1077,9 @@ static void layout_flow(int paw)
     flow_slice(pos, bx[j].t0, 4, paw);
     if (!out_of_flow(&bx[j]))
       flow_box(bx, j, 4, paw);
-    pos = bx[j].t1;
+    else
+      g_bk->geo[j].y = lt_doc_px(&g_bk->lt); /* static position */
+    pos = skip_box_terminator(bx[j].t1, B->pg->text_len);
     j = bx[j].end;
   }
   flow_slice(pos, B->pg->text_len, 4, paw);

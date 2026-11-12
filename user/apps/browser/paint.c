@@ -622,6 +622,10 @@ int overlay_place(const struct lovl *ov, int phh, int *h)
   int n;
   const struct lbox *b = &layout_pool(&n)[ov->box];
   int hh = ov->h, top = 0;
+  if (ov->doc) {
+    *h = hh;
+    return ov->doc_top - B->pg->scroll;
+  }
   if (b->off_t >= 0 && b->off_b >= 0 && b->spec_h < 0 && b->pct_h < 0) { /* top+bottom: stretch */
     if (phh - b->off_t - b->off_b > hh)
       hh = phh - b->off_t - b->off_b;
