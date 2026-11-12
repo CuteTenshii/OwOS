@@ -23,6 +23,28 @@ static void check_areas(void)
   expect(s.grid_cols[1].kind == CSS_TRK_PX && s.grid_cols[1].v == 48);
 }
 
+/* fr weights keep their fraction: 1fr 1.6fr is not two equal columns. */
+static void check_fractional_fr(void)
+{
+  struct css_style s = parse("grid-template-columns: 1fr 1.6fr 0.25fr 2fr");
+  expect(s.n_cols == 4);
+  expect(s.grid_cols[0].kind == CSS_TRK_FR && s.grid_cols[0].v == 100);
+  expect(s.grid_cols[1].kind == CSS_TRK_FR && s.grid_cols[1].v == 160);
+  expect(s.grid_cols[2].kind == CSS_TRK_FR && s.grid_cols[2].v == 25);
+  expect(s.grid_cols[3].kind == CSS_TRK_FR && s.grid_cols[3].v == 200);
+}
+
+/* Logical margins and paddings land on the physical sides of horizontal left-to-right text. */
+static void check_logical_box(void)
+{
+  struct css_style s = parse("margin-inline-start:auto;margin-inline-end:auto;padding-block-start:72px;"
+                             "padding-block-end:56px;padding-inline:4px 9px");
+  expect(s.margin[3] == -2 && s.margin[1] == -2 && s.margin[0] == -1 && s.margin[2] == -1);
+  expect(s.padding[0] == 72 && s.padding[2] == 56 && s.padding[3] == 4 && s.padding[1] == 9);
+  s = parse("margin-block:12px;padding-inline-end:3px");
+  expect(s.margin[0] == 12 && s.margin[2] == 12 && s.margin[1] == -1 && s.padding[1] == 3 && s.padding[3] == -1);
+}
+
 static void check_minified_areas(void)
 {
   struct css_style s = parse("grid-template:\".up.\"\"left.right\"\".down.\"/48px 48px 48px");
@@ -355,6 +377,8 @@ int main(void)
 {
   test("grid-template areas", check_areas);
   test("grid-template areas, minified", check_minified_areas);
+  test("grid fr weights keep their fraction", check_fractional_fr);
+  test("logical margin and padding", check_logical_box);
   test("grid-template-areas spans", check_area_span);
   test("grid-area", check_grid_area);
   test("grid line placement", check_grid_lines);

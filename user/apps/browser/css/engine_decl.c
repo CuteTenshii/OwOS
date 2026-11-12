@@ -331,6 +331,36 @@ static const char *const svg_props[] = {
     "letter-spacing",
 };
 
+/* margin/padding-inline and -block (with -start/-end) on their physical sides, for horizontal left-to-right
+ * text; true if the property was one of them. */
+static bool logical_box(const char *p, const char *pe, const char *val, struct css_style *out)
+{
+  bool m = span_is(p, pe, "margin-inline") || span_is(p, pe, "margin-block") || span_is(p, pe, "margin-inline-start") ||
+           span_is(p, pe, "margin-inline-end") || span_is(p, pe, "margin-block-start") ||
+           span_is(p, pe, "margin-block-end");
+  bool pd = !m && (span_is(p, pe, "padding-inline") || span_is(p, pe, "padding-block") ||
+                   span_is(p, pe, "padding-inline-start") || span_is(p, pe, "padding-inline-end") ||
+                   span_is(p, pe, "padding-block-start") || span_is(p, pe, "padding-block-end"));
+  if (!m && !pd)
+    return false;
+  short *box = m ? out->margin : out->padding;
+  const char *axis = p + (m ? 7 : 8); /* past "margin-" / "padding-" */
+  bool inl = axis[0] == 'i' || axis[0] == 'I';
+  int lo = inl ? 3 : 0, hi = inl ? 1 : 2;  /* start / end sides: left/right or top/bottom */
+  const char *side = axis + (inl ? 6 : 5); /* "" or "-start" / "-end" */
+  if (side >= pe) {                        /* the two-value shorthand: start [end] */
+    short two[4] = {-1, -1, -1, -1};
+    parse_box4(val, two, m);
+    box[lo] = two[0];
+    box[hi] = two[1];
+  } else if ((side[1] | 32) == 's') {
+    box[lo] = one_len(val, m);
+  } else {
+    box[hi] = one_len(val, m);
+  }
+  return true;
+}
+
 static void svg_decl_add(const char *p, const char *pe, const char *val, struct css_style *out)
 {
   int ol = (int)strlen(out->svg_decl), pl = (int)(pe - p), vl = (int)strlen(val);
@@ -492,7 +522,8 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->padding[2] = one_len(val, 0);
   else if (span_is(p, pe, "padding-left"))
     out->padding[3] = one_len(val, 0);
-  else if (span_is(p, pe, "border-width"))
+  else if (logical_box(p, pe, val, out)) {
+  } else if (span_is(p, pe, "border-width"))
     parse_box4(val, out->border_w, 0);
   else if (span_is(p, pe, "border-color")) {
     int c = parse_color(val);
