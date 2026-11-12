@@ -222,6 +222,8 @@ uint32_t *paging_new_process_dir(void)
 
 void paging_free_process_dir(uint32_t *dir)
 {
+  extern void user_stack_reset_owner(uint32_t *dir);
+  user_stack_reset_owner(dir); /* free its thread-stack slot table before the PML4 page is reused */
   uint64_t *pml4 = (uint64_t *)(void *)dir;
   uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[0] & PG_ADDR);
 
