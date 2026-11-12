@@ -584,10 +584,14 @@ static int fat_set(struct fat_mount *m, uint32_t c, uint32_t val)
       return -1;
   }
   if (m->free_known) {
-    if (old == 0 && val != 0)
-      m->free_count--;
-    else if (old != 0 && val == 0)
+    if (old == 0 && val != 0) {
+      if (m->free_count)
+        m->free_count--;
+      else
+        m->free_known = false; /* the FSInfo hint understated free space: recount when next needed */
+    } else if (old != 0 && val == 0) {
       m->free_count++;
+    }
   }
   m->fsi_dirty = true;
   return 0;
@@ -1411,7 +1415,7 @@ static int grow_check(struct fat_mount *m, uint32_t old_size, uint32_t new_size)
   uint32_t have = clusters_for(m, old_size), need = clusters_for(m, new_size);
   if (need <= have)
     return 0;
-  if (!m->free_known) {
+  if (!m->free_known || need - have > m->free_count) { /* FSInfo is only a hint: count before refusing */
     m->free_count = count_free(m);
     m->free_known = true;
   }

@@ -1671,6 +1671,23 @@ static void corrupt_entry_clusters(void)
   fat_ops()->close(fs);
 }
 
+/* An FSInfo free count of 0 on a clean volume is a lie the first allocation exposes; it must not wrap. */
+static void fsinfo_understated(void)
+{
+  expect(fmt_dev(32, 100000, 512, 1, NULL) == 0);
+  void *fs = mnt();
+  uint32_t real = free_clusters(fs);
+  fat_ops()->close(fs);
+  uint32_t fsi = g_img[48] | g_img[49] << 8;
+  uint8_t *f = g_img + (size_t)fsi * 512;
+  expect(f[0] == 'R' && f[1] == 'R');
+  f[488] = f[489] = f[490] = f[491] = 0;
+  fs = mnt();
+  expect(put(fs, "/a", "x", 1) == 0);
+  expect(free_clusters(fs) == real - 1);
+  fat_ops()->close(fs);
+}
+
 /* A directory entry with cluster 0 is read as an internal "do not follow" marker that must never reach the disk. */
 static void dir_cluster0_setattr(void)
 {
@@ -1753,6 +1770,7 @@ static void t_corrupt(void)
   test("size near 4 GiB keeps its chain on truncate", huge_size_truncate);
   test("full directory cluster linked to itself", dir_full_cycle);
   test("directory at cluster 0 keeps it through setattr", dir_cluster0_setattr);
+  test("understated FSInfo free count", fsinfo_understated);
   alarm(0);
 }
 
