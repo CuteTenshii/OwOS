@@ -1,4 +1,4 @@
-/* smp_ap.S — application-processor startup trampoline.
+/* smp_ap.S: application-processor startup trampoline.
  *
  * The bytes between ap_trampoline_start/end are copied to a low page (SMP_TRAMP)
  * and an AP is released there by SIPI in 16-bit real mode. It switches to 32-bit
@@ -7,7 +7,7 @@
  *
  * Two address kinds, and the distinction is load-bearing: references *inside* the
  * page must be SMP_TRAMP-relative (this code runs relocated, not at its link
- * address), while kernel symbols are reached by absolute address — hence ap_main
+ * address), while kernel symbols are reached by absolute address, hence ap_main
  * is called through a register, never a PC-relative `call`.
  */
 
@@ -19,7 +19,7 @@
  * staged by the BSP, ap_main is reached by absolute address), with an extra
  * PAE+LME+paging step and a 64-bit code segment in the trampoline GDT (0x18).
  * Inside-the-page references are SMP_TRAMP-relative; kernel symbols are absolute
- * (movabs the link address, then dereference — it is identity-mapped). */
+ * (movabs the link address, then dereference; it is identity-mapped). */
 .section .text
 .code16
 .globl ap_trampoline_start

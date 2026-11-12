@@ -33,7 +33,7 @@ require_tool = $(if $(shell command -v $(firstword $(1)) >/dev/null 2>&1 && echo
 need_tool = @command -v $(1) >/dev/null 2>&1 || { echo "error: $(1) not found" >&2; exit 1; }
 .PHONY: check all test format format-check tidy install-hooks run debug iso run-iso run-iso-uefi usb clean distclean
 
-FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
+FORMAT_FILES := $(shell find drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
 	! -path 'kernel/font*.h' ! -path kernel/fontstore.c ! -path 'user/lib/gfx/font*.h' \
 	! -path 'user/lib/mp3/minimp3.h' ! -path 'user/lib/tz/zones.h')
 CLANG_FORMAT ?= clang-format
@@ -47,7 +47,7 @@ TIDY_SRCS_arm    = $(filter kernel/arch/arm/%,$(TIDY_FILES))
 TIDY_TARGET_x86  = --target=$(if $(filter x86_64,$(ARCH)),x86_64,i386)-none-elf
 TIDY_TARGET_a64 := --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/aarch64 -Ikernel/arch/common
 TIDY_TARGET_arm := --target=armv7a-none-eabi -mcpu=cortex-a15 -marm -mfloat-abi=soft -Ikernel/arch/arm -Ikernel/arch/common
-TIDY_INC_x86     = $(addprefix -Idrivers/,$(DRVDIRS))
+TIDY_INC_x86     = -Ikernel/arch/x86 $(addprefix -Idrivers/,$(DRVDIRS))
 
 ifeq ($(ARCH),aarch64)
 include kernel/arch/aarch64/build.mk

@@ -1,4 +1,4 @@
-/* irq.h — hardware interrupt (IRQ) handling on top of the 8259 PIC.
+/* irq.h: hardware interrupt (IRQ) handling on top of the 8259 PIC.
  *
  * irq_init() remaps the PIC away from the CPU exception vectors, installs the
  * IRQ stubs into the IDT, and leaves every line masked. Drivers call

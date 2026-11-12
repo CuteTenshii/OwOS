@@ -1,4 +1,4 @@
-/* rtc.c — read date/time from the CMOS RTC (ports 0x70/0x71).
+/* rtc.c: read date/time from the CMOS RTC (ports 0x70/0x71).
  *
  * QEMU defaults to BCD values and 24-hour mode, taken from the host clock.
  */
@@ -65,7 +65,7 @@ void rtc_now(struct rtc_time *t)
   t->year = (uint16_t)(2000 + year);
 }
 
-/* Unix epoch seconds (UTC) from the CMOS clock — the basis for JS Date. Assumes
+/* Unix epoch seconds (UTC) from the CMOS clock, the basis for JS Date. Assumes
  * the RTC holds UTC (the ntp service sets it so). Civil-to-days is the standard
  * leap-aware form; fits unsigned 32-bit through 2106. */
 unsigned rtc_epoch(void)

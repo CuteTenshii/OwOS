@@ -1,4 +1,4 @@
-/* serial.c — minimal polled 16550 UART driver for COM1. */
+/* serial.c: minimal polled 16550 UART driver for COM1. */
 
 #include "serial.h"
 #include "io.h"
@@ -20,7 +20,7 @@
  * with no 16550 (most laptops; a VM with no serial port) floats the port to
  * 0xFF, so LSR reads "data ready" forever and serial_poll would spin handing
  * the shell phantom 0xFF bytes, never letting the main loop drain the keyboard
- * ring — keyboard appears dead while IRQ-driven mouse/LEDs still work. */
+ * ring, so the keyboard appears dead while IRQ-driven mouse/LEDs still work. */
 static int present;
 
 void serial_init(void)

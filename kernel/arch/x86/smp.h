@@ -1,4 +1,4 @@
-/* smp.h — CPU topology from the ACPI MADT and AP bring-up. */
+/* smp.h: CPU topology from the ACPI MADT and AP bring-up. */
 #ifndef OWOS_SMP_H
 #define OWOS_SMP_H
 

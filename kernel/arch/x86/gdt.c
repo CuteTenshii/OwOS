@@ -1,4 +1,4 @@
-/* gdt.c — build and install the Global Descriptor Table (32-bit flat, or the
+/* gdt.c: build and install the Global Descriptor Table (32-bit flat, or the
  * 64-bit long-mode layout). Segmentation does nothing useful in either mode;
  * the GDT exists for the ring0/ring3 code/data selectors and the per-CPU TSS
  * the CPU reads on a ring3->ring0 trap. */
@@ -153,7 +153,7 @@ void gdt_init(void)
   gdt_set_entry(&gdt[4], 0, 0xFFFFF, 0xF2, 0xC0); /* 0x20: user data (DPL3)*/
 
   /* One 32-bit-TSS descriptor (type 0x9) per possible CPU. gdt_init runs before
-   * smp_init, so the count isn't known yet — set all of them up; the unused
+   * smp_init, so the count isn't known yet: set all of them up; the unused
    * ones are simply never loaded. */
   for (int i = 0; i < SMP_MAX_CPUS; i++) {
     tss[i].ss0 = GDT_KERNEL_DATA;

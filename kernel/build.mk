@@ -28,9 +28,10 @@ $(ARCH_STAMP): FORCE
 		touch $@; \
 	fi
 
-# Every source in boot/, kernel/ (arch/ has its own builds) and drivers/<area>/ is linked.
-# fontstore.c is generated, so it is named here rather than left to the wildcard.
-KSRCS := $(filter-out kernel/fontstore.c,$(wildcard boot/*.S kernel/*.c kernel/*.S drivers/*/*.c drivers/*/*.S))
+# Every source in kernel/, kernel/arch/x86/ (the other arch/ dirs have their own builds) and drivers/<area>/ is
+# linked. fontstore.c is generated, so it is named here rather than left to the wildcard.
+KSRCS := $(filter-out kernel/fontstore.c,$(wildcard kernel/*.c kernel/*.S kernel/arch/x86/*.c kernel/arch/x86/*.S \
+           drivers/*/*.c drivers/*/*.S))
 OBJS  := $(addsuffix .o,$(basename $(KSRCS))) kernel/fontstore.o kernel/appsyms.o \
          $(APPS:%=kernel/%_blob.o) $(DESKTOP_APPS:%=kernel/%_desktop_blob.o) \
          $(foreach i,$(ICON_NAMES),kernel/icon_$(subst -,_,$(i))_blob.o)

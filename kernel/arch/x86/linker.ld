@@ -1,4 +1,4 @@
-/* linker.ld — physical memory layout for the OwOS kernel image.
+/* linker.ld: physical memory layout for the OwOS kernel image.
  *
  * The kernel is loaded at 1 MiB. Below that lies real-mode/BIOS junk and the
  * VGA buffer, so 1 MiB is the conventional first safe spot. The .multiboot

@@ -1,4 +1,4 @@
-/* switch.S — kernel-thread context switch and new-thread trampoline. */
+/* switch.S: kernel-thread context switch and new-thread trampoline. */
 
 .section .text
 
@@ -56,7 +56,7 @@ enter_user_task:
 
 /* A forked child's first schedule lands here: its kernel stack holds a full copy
  * of the parent's syscall trap frame (struct registers, with eax forced to 0).
- * This is the tail of isr_common_stub for 64-bit — restore the GPRs and iretq to
+ * This is the tail of isr_common_stub for 64-bit: restore the GPRs and iretq to
  * ring 3, so the child returns from fork() with 0. */
 .global fork_child_entry
 .type fork_child_entry, @function

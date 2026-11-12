@@ -1,4 +1,4 @@
-/* irq.c — remap the 8259 PIC and dispatch hardware interrupts. */
+/* irq.c: remap the 8259 PIC and dispatch hardware interrupts. */
 
 #include "irq.h"
 #include "gdt.h"
@@ -98,7 +98,7 @@ void irq_handler(struct registers *r)
   if (irq < 16 && handlers[irq])
     handlers[irq](r);
 
-  /* If we're headed back to a user context, deliver any signal now — this is
+  /* If we're headed back to a user context, deliver any signal now. This is
    * how a signal reaches a CPU-bound process that makes no syscalls (e.g.
    * SIGKILL a spinning task): the next timer tick preempts it and delivers
    * here. */

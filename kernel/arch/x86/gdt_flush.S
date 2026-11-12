@@ -1,8 +1,8 @@
-/* gdt_flush.S — load the GDT and make the CPU actually use it.
+/* gdt_flush.S: load the GDT and make the CPU actually use it.
  *
  * lgdt only points the CPU at the table; the segment registers still hold
  * the old selectors until reloaded. Data segments reload with a plain mov,
- * but CS can only change via a far jump (or far return) — that's what makes
+ * but CS can only change via a far jump (or far return), and that is what makes
  * the new code selector take effect.
  *
  * void gdt_flush(uint32_t gdt_ptr_addr);

@@ -1,4 +1,4 @@
-/* multiboot.h — the subset of the Multiboot v1 info structures we read.
+/* multiboot.h: the subset of the Multiboot v1 info structures we read.
  *
  * The bootloader fills this out and passes a pointer in EBX. We only care
  * about the memory map, which tells us which physical ranges are usable RAM.

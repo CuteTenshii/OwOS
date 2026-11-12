@@ -1,4 +1,4 @@
-/* cpu.c — CPUID queries. */
+/* cpu.c: CPUID queries. */
 
 #include "cpu.h"
 #include "timer.h"

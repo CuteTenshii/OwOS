@@ -1,11 +1,11 @@
-/* creg.h — control-register accessors, width-correct on i386 and x86_64.
+/* creg.h: control-register accessors, width-correct on i386 and x86_64.
  *
  * In long mode a `mov` to/from a control register is 64-bit only, so a 32-bit C
  * operand fails to assemble ("operand type mismatch"). uintptr_t is 32-bit on
  * i386 and 64-bit on x86_64, so these touch each register at its native width
  * on both. Pointer operands (e.g. a uint32_t* page directory) are already
- * register-width and need no helper — see paging.h's
- * paging_load/paging_current. */
+ * register-width and need no helper (see paging.h's
+ * paging_load/paging_current). */
 #ifndef OWOS_CREG_H
 #define OWOS_CREG_H
 

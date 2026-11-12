@@ -1,4 +1,4 @@
-/* boot.S — Multiboot entry point for OwOS.
+/* boot.S: Multiboot entry point for OwOS.
  *
  * QEMU's built-in loader reads the Multiboot header below and jumps to
  * _start in 32-bit protected mode with paging off. Our only jobs here are
@@ -19,7 +19,7 @@
 .long FLAGS
 .long CHECKSUM
 /* Address fields (offsets 12..31): only consulted when the AOUT_KLUDGE flag
- * (bit 16) is set, which it isn't — we're a plain ELF. But the VIDEO fields
+ * (bit 16) is set, which it isn't: we're a plain ELF. But the VIDEO fields
  * below sit at a fixed offset 32, so these five longs must physically exist as
  * zero padding to push the video request to the right place. */
 .long 0                            /* header_addr                              */

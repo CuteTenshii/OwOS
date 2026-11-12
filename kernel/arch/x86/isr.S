@@ -1,4 +1,4 @@
-/* isr.S — interrupt service routine stubs for the 32 CPU exceptions.
+/* isr.S: interrupt service routine stubs for the 32 CPU exceptions.
  *
  * Each vector gets a tiny stub. Some exceptions make the CPU push a 4-byte
  * error code, most do not; to give the C handler one uniform stack frame,
@@ -71,7 +71,7 @@ ISR_NOERR 128   /* int 0x80: system call (gate is DPL 3) */
 #ifdef __x86_64__
 /* 64-bit: no pusha; push each GPR. The CPU always pushes SS:RSP, so the frame is
  * uniform. Segment registers are flat/ignored in long mode, so we don't reload
- * them — we only record %ds for the struct. Push order builds struct registers
+ * them; we only record %ds for the struct. Push order builds struct registers
  * (idt.h) bottom-up: ds is lowest, then r15..r8, edi/esi/ebp/esp/ebx/edx/ecx/eax. */
 .type isr_common_stub, @function
 isr_common_stub:                       /* on entry: top of stack = int_no       */

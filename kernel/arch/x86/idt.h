@@ -1,4 +1,4 @@
-/* idt.h — Interrupt Descriptor Table setup.
+/* idt.h: Interrupt Descriptor Table setup.
  *
  * The IDT tells the CPU where to jump for each interrupt vector. We install
  * handlers for the 32 CPU exception vectors (0-31); the IRQ module adds gates
@@ -13,7 +13,7 @@
  * (low -> high). The common stubs pass a pointer to this frame.
  *
  * The 64-bit frame keeps the 32-bit field NAMES (eip, eax, esp, ...) so every
- * consumer compiles unchanged — they are just 64-bit-wide and hold the r*
+ * consumer compiles unchanged; they are just 64-bit-wide and hold the r*
  * values (eip=rip, eax=rax, ...). The added r8..r15 and the always-present
  * useresp/ss (long mode pushes SS:RSP on every interrupt, not only ring-3
  * traps) are the only structural differences. Field order MUST match the push

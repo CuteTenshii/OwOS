@@ -1,4 +1,4 @@
-/* multiboot2.h — the subset of the Multiboot2 boot-info format we read.
+/* multiboot2.h: the subset of the Multiboot2 boot-info format we read.
  *
  * GRUB hands a multiboot2 kernel a completely different structure from
  * multiboot1: a total_size header followed by a chain of 8-byte-aligned tags,
@@ -72,7 +72,7 @@ struct mb2_tag_framebuffer {
 } __attribute__((packed));
 
 /* type 14/15: a verbatim copy of the firmware's RSDP. On UEFI this is the ONLY
- * way to reach ACPI — the RSDP is not in the legacy BIOS memory area, so the
+ * way to reach ACPI: the RSDP is not in the legacy BIOS memory area, so the
  * power.c scan finds nothing without it. `rsdp` is the raw RSDP bytes (20 for
  * v1, 36 for v2); we only need the first 20 (signature..rsdt_addr). */
 struct mb2_tag_acpi {

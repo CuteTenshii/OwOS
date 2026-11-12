@@ -43,14 +43,14 @@ ifeq ($(ARCH),x86_64)
   # the top-2 GiB window -mcmodel=kernel assumes, so use 64-bit absolute addressing.
   # -mno-red-zone: interrupt handlers must not clobber the SysV red zone.
   ARCHFLAGS := -m64 -mcmodel=large -mno-red-zone
-  LINKER    := linker64.ld
+  LINKER    := kernel/arch/x86/linker64.ld
   KELF      := elf64-x86-64
   KBFD      := i386:x86-64
   QEMU      := qemu-system-x86_64
   KERNEL    := owos-x86_64.bin
 else
   ARCHFLAGS := -m32
-  LINKER    := linker.ld
+  LINKER    := kernel/arch/x86/linker.ld
   KELF      := elf32-i386
   KBFD      := i386
   QEMU      := qemu-system-i386
@@ -82,7 +82,7 @@ endef
 DRVDIRS := storage net audio usb input video acpi bus bt
 CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -O$(OPT_LEVEL) -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
-           -mno-sse -mno-mmx -Wall -Wextra -MMD -MP $(VERSION_DEF) -Icommon -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
+           -mno-sse -mno-mmx -Wall -Wextra -MMD -MP $(VERSION_DEF) -Icommon -Ikernel -Ikernel/arch/x86 $(addprefix -Idrivers/,$(DRVDIRS))
 LDFLAGS := $(ARCHFLAGS) -ffreestanding -nostdlib -no-pie -T $(LINKER)
 
 # The generic kernel compile rules (%.o) live in kernel/build.mk, not here: they must

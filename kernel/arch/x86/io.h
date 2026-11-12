@@ -1,4 +1,4 @@
-/* io.h — x86 port I/O primitives. */
+/* io.h: x86 port I/O primitives. */
 #ifndef OWOS_IO_H
 #define OWOS_IO_H
 
@@ -33,7 +33,7 @@ static inline uint32_t inl(uint16_t port)
 
 /* Block port I/O: transfer `count` 16-bit words to/from `port` in one string
  * instruction. QEMU services a whole `rep insw`/`outsw` as a single bulk
- * transfer, vs. one VM-exit per word for a 256× inw loop — the difference
+ * transfer, vs. one VM-exit per word for a 256× inw loop: the difference
  * between ~10 s and a blink when streaming a megabyte off PIO IDE. The flat
  * kernel data segment makes ES:EDI / DS:ESI address kernel buffers directly;
  * `cld` pins the forward direction the SysV ABI already guarantees. */
@@ -47,7 +47,7 @@ static inline void outsw(uint16_t port, const void *buf, uint32_t count)
   __asm__ volatile("cld; rep outsw" : "+S"(buf), "+c"(count) : "d"(port) : "memory");
 }
 
-/* Brief delay by bouncing a byte off an unused port — old PICs need a moment
+/* Brief delay by bouncing a byte off an unused port: old PICs need a moment
  * to settle between command writes. */
 static inline void io_wait(void) { __asm__ volatile("outb %0, $0x80" : : "a"((uint8_t)0)); }
 

@@ -1,4 +1,4 @@
-/* gdt.h — Global Descriptor Table setup.
+/* gdt.h: Global Descriptor Table setup.
  *
  * We replace the bootloader's GDT with our own flat layout: every segment
  * spans the full 4 GiB at base 0, so segmentation effectively does nothing

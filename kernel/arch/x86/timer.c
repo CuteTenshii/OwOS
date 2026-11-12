@@ -1,4 +1,4 @@
-/* timer.c — program the PIT and count IRQ0 ticks. */
+/* timer.c: program the PIT and count IRQ0 ticks. */
 
 #include "timer.h"
 #include "entropy.h"
@@ -14,9 +14,9 @@
 #define PIT_MODE2                                                                                                      \
   0x34                     /* ch0, lo/hi byte, rate generator, binary.                                                 \
                             * Mode 2 (not square-wave mode 3) so the                                                   \
-                            * counter counts down exactly once per tick                                                \
-                            * — unambiguous for sub-tick timing in                                                   \
-                            * timer_us(). */
+                            * counter counts down exactly once per tick,                                               \
+                            * which is unambiguous for sub-tick timing                                                 \
+                            * in timer_us(). */
 #define PIT_LATCH_CH0 0x00 /* counter-latch command for channel 0     */
 #define PIC1_CMD 0x20
 #define PIC_READ_IRR 0x0A /* OCW3: select the IRR for the next read  */

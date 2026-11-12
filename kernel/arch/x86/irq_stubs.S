@@ -1,4 +1,4 @@
-/* irq.S — stubs for the 16 hardware IRQs, remapped to vectors 32-47.
+/* irq.S: stubs for the 16 hardware IRQs, remapped to vectors 32-47.
  *
  * IRQs never push an error code, so every stub pushes a dummy zero (to match
  * struct registers) followed by its vector number, then falls into a common
@@ -44,7 +44,7 @@ lapic_timer_isr:
 
 .extern irq_handler
 #ifdef __x86_64__
-/* 64-bit IRQ landing pad — mirrors isr.S's 64-bit common stub but calls
+/* 64-bit IRQ landing pad: mirrors isr.S's 64-bit common stub but calls
  * irq_handler. See idt.h for the struct registers layout the push order builds. */
 .type irq_common_stub, @function
 irq_common_stub:
