@@ -482,8 +482,7 @@ bool render_incremental(unsigned seq_delta, int id)
   if (seq_delta != g_dmg.bumps || !g_painted.valid || g_painted.pg != B->pg || g_painted.bw != BW ||
       g_painted.bh != BH || g_painted.sig != render_sig())
     return false;
-  if (devtools_visible() || bm_panel_open || menu_any_open() || tabs[active_tab]->crashed ||
-      media_fullscreen() ||
+  if (devtools_visible() || bm_panel_open || menu_any_open() || tabs[active_tab]->crashed || media_fullscreen() ||
       B->pg->mode == MODE_IMAGE || is_loading() || !browser_surface_ready())
     return false;
   int py, phh, rows;
