@@ -84,7 +84,7 @@ stack_top:
  * (both header `arch` fields are 0 = i386). We build a temporary identity map
  * of the low 4 GiB with 2 MiB pages, enable PAE + long mode + paging, load a
  * GDT carrying a 64-bit code segment, and far-jump into 64-bit code, which sets
- * the stack and calls kernel_main(magic, mbi). The kernel's own paging.c later
+ * the stack and calls kernel_main(magic, mbi). The kernel's own paging_64.c later
  * installs the real address space; this map only needs to get us into C.
  *
  * Page tables: PML4 -> one PDPT -> four PDs (one per GiB), each PD full of 512

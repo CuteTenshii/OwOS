@@ -42,7 +42,7 @@ phys_t pmm_alloc_contig(uint32_t bytes);
 void pmm_free_contig(phys_t phys, uint32_t bytes);
 
 /* The RAM-scaled low-memory layout (computed in pmm_init from detected RAM).
- * pmm_low_end()    = end of the identity-mapped/reserved low region (paging.c).
+ * pmm_low_end()    = end of the identity-mapped/reserved low region (x86 paging_*.c).
  * pmm_pool_start() = start of the palloc page-table pool == kernel heap end. */
 uint32_t pmm_low_end(void);
 uint32_t pmm_pool_start(void);

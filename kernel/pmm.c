@@ -8,7 +8,7 @@
 #define BITMAP_DWORDS (MAX_FRAMES / 32)
 
 /* The low 16 MiB is identity-mapped and owned by the kernel + heap; the PMM
- * hands out only frames above it. Must match the identity map (paging.c) and
+ * hands out only frames above it. Must match the identity map (x86 paging_*.c) and
  * the heap window (heap.c). */
 #define RESERVED_BYTES (16u * 1024 * 1024)
 #define RESERVED_FRAMES (RESERVED_BYTES / FRAME_SIZE)
