@@ -1346,7 +1346,12 @@ static void layout_index(struct layout_out *o, const struct lbox *bx, int nb)
   if (tmp) {
     int *z = tmp, *top = tmp + nb, *bot = tmp + 2 * nb;
     for (int i = 0; i < nb; i++) {
-      z[i] = bx[i].z_index;
+      /* z-index takes on a positioned box or a flex/grid item, which then paints its subtree as one
+       * stacking context; everything else paints at its nearest such ancestor's level */
+      int p = bx[i].parent;
+      bool item = p >= 0 && (bx[p].kind == LB_FLEX || bx[p].kind == LB_GRID);
+      bool own = bx[i].z_index != CSS_Z_AUTO && (bx[i].pos > CSS_POS_STATIC || item);
+      z[i] = own ? bx[i].z_index : p >= 0 ? z[p] : CSS_Z_AUTO;
       box_extent(&bx[i], &o->geo[i], &top[i], &bot[i]);
     }
     ru_bands_build(&o->bands, z, top, bot, nb, CSS_Z_AUTO);
