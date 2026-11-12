@@ -327,37 +327,6 @@ static int slice_maxcontent(int t0, int t1)
   return best;
 }
 
-/* A flex item's flex-basis as a border-box main size. */
-static int flex_base_main(const struct lbox *it, int cont_w)
-{
-  int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
-  int spec = -1;
-  if (it->flex_basis >= 0 || it->pct_basis >= 0)
-    spec = resolve_len(it->flex_basis, it->pct_basis, cont_w);
-  else if (it->spec_w >= 0 || it->pct_w >= 0)
-    spec = resolve_len(it->spec_w, it->pct_w, cont_w);
-  if (spec >= 0)
-    return spec + (it->border_box ? 0 : frame);
-  return slice_maxcontent(it->t0, it->t1) + frame;
-}
-
-/* Clamp a border-box main size to min/max-width and a 1px floor. */
-static int flex_clamp_main(const struct lbox *it, int v, int cont_w)
-{
-  int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
-  int extra = it->border_box ? 0 : frame;
-  int maxw = resolve_len(it->max_w, it->pct_maxw, cont_w);
-  if (maxw >= 0 && v > maxw + extra)
-    v = maxw + extra;
-  int minw = resolve_len(it->min_w, it->pct_minw, cont_w);
-  if (minw >= 0 && v < minw + extra)
-    v = minw + extra;
-  if (v < frame + 1)
-    v = frame + 1;
-  return v;
-}
-
-/* position:fixed boxes leave the flow and are laid out into the overlay table */
 /* Fixed boxes leave the flow, and so do absolute ones, unless they sit inside another out-of-flow box (whose
  * own layout then carries them). */
 static bool out_of_flow(const struct lbox *b)
@@ -396,94 +365,314 @@ static void abs_containing_block(const struct lbox *bx, int i, int paw, int *x, 
   *h = 0; /* the whole page; the caller measures it */
 }
 
-/* An item's cross-axis alignment: its align-self, else the container's align-items. */
-static signed char item_align(const struct lbox *cont, const struct lbox *it)
-{
-  if (it->align_self >= 0 && it->align_self != CSS_ALIGN_AUTO)
-    return it->align_self;
-  return cont->align_items < 0 ? CSS_ALIGN_STRETCH : cont->align_items;
-}
+/* --- bands: a row flexbox or grid lays its items side by side over a run of BAND_PX page rows. Each item is
+ * flowed in full (nested boxes, flexboxes and grids too) into the band overlay, then moved to its row. --- */
 
-/* Number of direct child boxes of box `idx`, and (when items != NULL) their indices. */
-static int box_children(const struct lbox *bx, int idx, int *items)
+/* A flex or grid item: a child box, or (box -1) a run of the container's own inline content [t0,t1). */
+struct bitem {
+  int box, t0, t1;
+};
+
+static int g_ov_y0;        /* document y of band row g_ov_base */
+static int g_force_w = -1; /* the next flow_box gets this border-box width: an item's resolved size */
+
+/* Document y where the next line will go: the page table's end, or an item's pen inside a band. */
+static int flow_y(void) { return g_ov_active ? g_ov_y0 + g_ov_n * BAND_PX : lt_doc_px(&g_bk->lt); }
+
+static bool is_anchor(int i) { return img_at_pos(i) >= 0 || (g_has_media && media_at_text_pos(i)); }
+
+/* Anonymous items in [t0,t1): every image or media element alone, and each run of visible text between them. */
+static int anon_items(int t0, int t1, struct bitem *out)
 {
-  int n = 0;
-  for (int j = idx + 1; j < bx[idx].end;) {
-    if (bx[j].parent == idx && out_of_flow(&bx[j])) {
-      j = bx[j].end;
-    } else if (bx[j].parent == idx) {
-      if (items)
-        items[n] = j;
+  const char *t = B->pg->text;
+  int n = 0, s = t0;
+  for (int i = t0; i <= t1; i++) {
+    bool anchor = i < t1 && is_anchor(i);
+    if (i < t1 && !anchor)
+      continue;
+    int a = s, b = i;
+    while (a < b && (t[a] == '\n' || t[a] == ' '))
+      a++;
+    while (b > a && (t[b - 1] == '\n' || t[b - 1] == ' '))
+      b--;
+    if (b > a) {
+      if (out)
+        out[n] = (struct bitem){-1, a, b};
       n++;
-      j = bx[j].end;
-    } else
-      j++;
+    }
+    if (anchor) {
+      if (out)
+        out[n] = (struct bitem){-1, i, i + 1};
+      n++;
+    }
+    s = i + 1;
   }
   return n;
 }
 
-/* Lay out a row flex container's children side by side; false if out of memory. */
-static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w)
+/* The in-flow items of box `idx` in order (out may be NULL), and their count. */
+static int box_items(const struct lbox *bx, int idx, struct bitem *out)
 {
-  struct lbox *cont = &bx[idx];
-  struct lgeom *geo = g_bk->geo;
-  int nit = box_children(bx, idx, 0);
-  if (nit == 0)
-    return true;
-  int *mem = malloc((unsigned long)nit * 7 * sizeof *mem);
+  int n = 0, pos = bx[idx].t0;
+  for (int j = idx + 1; j < bx[idx].end;) {
+    if (bx[j].parent != idx) {
+      j++;
+      continue;
+    }
+    n += anon_items(pos, bx[j].t0, out ? out + n : 0);
+    if (!out_of_flow(&bx[j])) {
+      if (out)
+        out[n] = (struct bitem){j, bx[j].t0, bx[j].t1};
+      n++;
+    }
+    pos = skip_box_terminator(bx[j].t1, bx[idx].t1);
+    j = bx[j].end;
+  }
+  return n + anon_items(pos, bx[idx].t1, out ? out + n : 0);
+}
+
+/* Give the out-of-flow children of a band container their static position: the band's top-left. */
+static void band_static_pos(const struct lbox *bx, int idx, int x)
+{
+  for (int j = idx + 1; j < bx[idx].end; j = bx[j].parent == idx ? bx[j].end : j + 1)
+    if (bx[j].parent == idx && out_of_flow(&bx[j])) {
+      g_bk->geo[j].x = x;
+      g_bk->geo[j].y = flow_y();
+    }
+}
+
+/* Max-content width of inline content [t0,t1): its widest line, or widest image. */
+static int range_maxw(int t0, int t1)
+{
+  int w = slice_maxcontent(t0, t1);
+  for (int i = t0; i < t1; i++) {
+    int q = img_at_pos(i);
+    if (q < 0)
+      continue;
+    int dw = 0, dh = 0;
+    img_disp_size(&B->pg->imgs[q], 1 << 20, &dw, &dh);
+    if (dw > w)
+      w = dw;
+  }
+  return w;
+}
+
+static int box_maxw(const struct lbox *bx, int idx);
+
+/* An item's max-content width, its horizontal margins included. */
+static int item_maxw(const struct lbox *bx, const struct bitem *it)
+{
+  if (it->box < 0)
+    return range_maxw(it->t0, it->t1);
+  const struct lbox *b = &bx[it->box];
+  return box_maxw(bx, it->box) + max0(b->margin.l) + max0(b->margin.r);
+}
+
+/* A box's max-content border-box width: its set width, else what its content needs on one line per block. */
+static int box_maxw(const struct lbox *bx, int idx)
+{
+  const struct lbox *b = &bx[idx];
+  int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
+  if (b->spec_w >= 0)
+    return b->spec_w + (b->border_box ? 0 : frame);
+  int n = box_items(bx, idx, 0);
+  struct bitem *its = n ? malloc((unsigned long)n * sizeof *its) : 0;
+  int w = 0;
+  if (its) {
+    box_items(bx, idx, its);
+    bool row = b->kind == LB_FLEX && b->flex_dir == 0;
+    int ncols = b->kind == LB_GRID ? (b->n_cols > 0 ? b->n_cols : 1) : 0;
+    int colw[CSS_GRID_MAX] = {0};
+    for (int k = 0; k < n; k++) {
+      int iw = item_maxw(bx, &its[k]);
+      if (row)
+        w += iw + (k ? max0(b->gap_col) : 0);
+      else if (ncols) /* auto-placed in document order */
+        colw[k % ncols] = iw > colw[k % ncols] ? iw : colw[k % ncols];
+      else if (iw > w)
+        w = iw;
+    }
+    for (int c = 0; c < ncols && c < CSS_GRID_MAX; c++)
+      w += colw[c] + (c ? max0(b->gap_col) : 0);
+    free(its);
+  }
+  if (b->max_w >= 0 && w > b->max_w - (b->border_box ? frame : 0))
+    w = b->max_w - (b->border_box ? frame : 0);
+  if (b->min_w >= 0 && w < b->min_w - (b->border_box ? frame : 0))
+    w = b->min_w - (b->border_box ? frame : 0);
+  return (w > 0 ? w : 0) + frame;
+}
+
+/* An item's cross-axis alignment: its align-self, else the container's align-items. */
+static signed char item_align(const struct lbox *cont, const struct lbox *bx, const struct bitem *it)
+{
+  if (it->box >= 0 && bx[it->box].align_self >= 0 && bx[it->box].align_self != CSS_ALIGN_AUTO)
+    return bx[it->box].align_self;
+  return cont->align_items < 0 ? CSS_ALIGN_STRETCH : cont->align_items;
+}
+
+/* A flex item's flex-basis as a border-box main size (margins excluded). */
+static int flex_base_main(const struct lbox *bx, const struct bitem *it, int cont_w)
+{
+  if (it->box < 0)
+    return range_maxw(it->t0, it->t1);
+  const struct lbox *b = &bx[it->box];
+  int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
+  int spec = -1;
+  if (b->flex_basis >= 0 || b->pct_basis >= 0)
+    spec = resolve_len(b->flex_basis, b->pct_basis, cont_w);
+  else if (b->spec_w >= 0 || b->pct_w >= 0)
+    spec = resolve_len(b->spec_w, b->pct_w, cont_w);
+  if (spec >= 0)
+    return spec + (b->border_box ? 0 : frame);
+  return box_maxw(bx, it->box);
+}
+
+/* Clamp a border-box main size to min/max-width and a 1px floor. */
+static int flex_clamp_main(const struct lbox *bx, const struct bitem *it, int v, int cont_w)
+{
+  if (it->box < 0)
+    return v > 1 ? v : 1;
+  const struct lbox *b = &bx[it->box];
+  int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
+  int extra = b->border_box ? 0 : frame;
+  int maxw = resolve_len(b->max_w, b->pct_maxw, cont_w);
+  if (maxw >= 0 && v > maxw + extra)
+    v = maxw + extra;
+  int minw = resolve_len(b->min_w, b->pct_minw, cont_w);
+  if (minw >= 0 && v < minw + extra)
+    v = minw + extra;
+  if (v < frame + 1)
+    v = frame + 1;
+  return v;
+}
+
+static int item_grow(const struct lbox *bx, const struct bitem *it)
+{
+  return it->box >= 0 && bx[it->box].flex_grow > 0 ? bx[it->box].flex_grow : 0;
+}
+static int item_shrink(const struct lbox *bx, const struct bitem *it)
+{
+  return it->box >= 0 && bx[it->box].flex_shrink >= 0 ? bx[it->box].flex_shrink : 1;
+}
+static int item_margin_w(const struct lbox *bx, const struct bitem *it)
+{
+  return it->box >= 0 ? max0(bx[it->box].margin.l) + max0(bx[it->box].margin.r) : 0;
+}
+
+static void flow_box(struct lbox *bx, int idx, int x, int avail_w);
+
+/* A band being filled: its first row and document y, and the band (if any) it sits inside. */
+struct band {
+  int row, y;
+  bool nested;
+  int base0, n0, y00;
+};
+
+static void band_open(struct band *bd)
+{
+  bd->nested = g_ov_active;
+  bd->base0 = g_ov_base;
+  bd->n0 = g_ov_n;
+  bd->y00 = g_ov_y0;
+  bd->row = g_ov_active ? g_ov_base + g_ov_n : g_bk->lt.n;
+  bd->y = flow_y();
+}
+
+/* Flow one item into the band's top at x (its margin edge), `w` its border-box width; returns its height with
+ * margins. Its lines are g_bk->fs[*fs0, g_bk->n_fs). */
+static int band_flow_item(struct band *bd, struct lbox *bx, const struct bitem *it, int x, int w, int *fs0)
+{
+  g_ov_active = true;
+  g_ov_base = bd->row;
+  g_ov_n = 0;
+  g_ov_y0 = bd->y;
+  *fs0 = g_bk->n_fs;
+  if (it->box >= 0) {
+    g_force_w = w;
+    flow_box(bx, it->box, x, w + item_margin_w(bx, it));
+  } else {
+    flow_slice(it->t0, it->t1, x, w);
+  }
+  int h = g_ov_n * BAND_PX;
+  g_ov_active = bd->nested;
+  g_ov_base = bd->base0;
+  g_ov_n = bd->n0;
+  g_ov_y0 = bd->y00;
+  return h;
+}
+
+/* Move an item placed at the band top down by `dy` px: its lines, and the geometry of its boxes. */
+static void band_shift(const struct lbox *bx, const struct bitem *it, int fs0, int fs1, int dy)
+{
+  int rows = dy / BAND_PX;
+  if (rows <= 0)
+    return;
+  for (int s = fs0; s < fs1; s++)
+    g_bk->fs[s].row += rows;
+  if (it->box >= 0)
+    for (int i = it->box; i < bx[it->box].end; i++) {
+      g_bk->geo[i].y += rows * BAND_PX;
+      g_bk->geo[i].cy += rows * BAND_PX;
+    }
+}
+
+/* Stretch a box item to a line or cell `h` px tall (margins included), unless it has a height of its own. */
+static void band_stretch(const struct lbox *bx, const struct bitem *it, int h)
+{
+  if (it->box < 0)
+    return;
+  const struct lbox *b = &bx[it->box];
+  if (b->spec_h >= 0 || b->pct_h >= 0)
+    return;
+  struct lgeom *g = &g_bk->geo[it->box];
+  int bh = h - max0(b->margin.t) - max0(b->margin.b);
+  if (bh > g->h) {
+    g->ch += bh - g->h;
+    g->h = bh;
+  }
+}
+
+/* Close the band `h` px tall: reserve its page rows, or inside another band advance that item's pen. */
+static void band_close(struct band *bd, int h, int off, int x, int w)
+{
+  if (bd->nested)
+    g_ov_n += rows_for(h);
+  else
+    add_n_blanks(rows_for(h), off, x, w);
+}
+
+/* One flex line: items its[0..n) with base sizes `base`, laid out across content_w; `minh` is a cross size the
+ * line fills at least (a single-line container's own height), else 0. False if out of memory. */
+static bool flex_line(struct lbox *bx, const struct lbox *cont, const struct bitem *its, const int *base, int n,
+                      int content_x, int content_w, int minh)
+{
+  int *mem = malloc((unsigned long)n * 4 * sizeof *mem);
   if (!mem)
     return false;
-  int *items = mem, *base = mem + nit, *main_sz = mem + 2 * nit, *rows_of = mem + 3 * nit;
-  int *ov_start = mem + 4 * nit, *item_x = mem + 5 * nit, *toppad = mem + 6 * nit;
-  box_children(bx, idx, items);
-
-  int gap = cont->gap_col;
-  int total_gap = gap * (nit - 1);
-
-  long sumbase = 0, sumgrow = 0, sumshrinkw = 0;
-  for (int k = 0; k < nit; k++) {
-    base[k] = flex_base_main(&bx[items[k]], content_w);
+  int *main_sz = mem, *hs = mem + n, *fs0 = mem + 2 * n, *fs1 = mem + 3 * n;
+  int gap = max0(cont->gap_col);
+  long sumbase = 0, sumgrow = 0, sumshrinkw = 0, margins = 0;
+  for (int k = 0; k < n; k++) {
     main_sz[k] = base[k];
     sumbase += base[k];
-    int g = bx[items[k]].flex_grow;
-    if (g < 0)
-      g = 0;
-    int s = bx[items[k]].flex_shrink;
-    if (s < 0)
-      s = 1;
-    sumgrow += g;
-    sumshrinkw += (long)s * base[k];
+    sumgrow += item_grow(bx, &its[k]);
+    sumshrinkw += (long)item_shrink(bx, &its[k]) * base[k];
+    margins += item_margin_w(bx, &its[k]);
   }
-  long avail = content_w - total_gap;
-  long freepx = avail - sumbase;
-  if (freepx > 0 && sumgrow > 0) {
-    for (int k = 0; k < nit; k++) {
-      int g = bx[items[k]].flex_grow;
-      if (g < 0)
-        g = 0;
-      main_sz[k] = base[k] + (int)(freepx * g / sumgrow);
-    }
-  } else if (freepx < 0 && sumshrinkw > 0) {
-    long need = -freepx;
-    for (int k = 0; k < nit; k++) {
-      int s = bx[items[k]].flex_shrink;
-      if (s < 0)
-        s = 1;
-      main_sz[k] = base[k] - (int)(need * ((long)s * base[k]) / sumshrinkw);
-    }
+  long freepx = content_w - (long)gap * (n - 1) - margins - sumbase;
+  for (int k = 0; k < n; k++) {
+    if (freepx > 0 && sumgrow > 0)
+      main_sz[k] = base[k] + (int)(freepx * item_grow(bx, &its[k]) / sumgrow);
+    else if (freepx < 0 && sumshrinkw > 0)
+      main_sz[k] = base[k] - (int)(-freepx * ((long)item_shrink(bx, &its[k]) * base[k]) / sumshrinkw);
+    main_sz[k] = flex_clamp_main(bx, &its[k], main_sz[k], content_w);
   }
-  long used = 0;
-  for (int k = 0; k < nit; k++) {
-    main_sz[k] = flex_clamp_main(&bx[items[k]], main_sz[k], content_w);
+  long used = (long)gap * (n - 1) + margins;
+  for (int k = 0; k < n; k++)
     used += main_sz[k];
-  }
-
-  int leftover = (int)(content_w - total_gap - used);
-  if (leftover < 0)
-    leftover = 0;
-  int start = 0, between = 0;
-  signed char jc = cont->justify < 0 ? CSS_JUST_START : cont->justify;
-  switch (jc) {
+  int leftover = used < content_w ? (int)(content_w - used) : 0, start = 0, between = 0;
+  switch (cont->justify < 0 ? CSS_JUST_START : cont->justify) {
   case CSS_JUST_CENTER:
     start = leftover / 2;
     break;
@@ -491,102 +680,107 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
     start = leftover;
     break;
   case CSS_JUST_BETWEEN: /* a lone item sits at the start */
-    if (nit > 1)
-      between = leftover / (nit - 1);
+    if (n > 1)
+      between = leftover / (n - 1);
     break;
   case CSS_JUST_AROUND:
-    between = leftover / nit;
+    between = leftover / n;
     start = between / 2;
     break;
   case CSS_JUST_EVENLY:
-    between = leftover / (nit + 1);
+    between = leftover / (n + 1);
     start = between;
     break;
   default:
     break; /* flex-start */
   }
 
-  /* Phase 1: flow each item's text to learn its cross size; band is the tallest item. */
-  int band_top = g_bk->lt.n;
-  int band_top_y = lt_doc_px(&g_bk->lt); /* pixel top of the band (its rows are added below) */
-  int x = content_x + start, band_h = 0;
-  for (int k = 0; k < nit; k++) {
-    struct lbox *it = &bx[items[k]];
-    int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
-    int cw = main_sz[k] - fl - fr;
-    if (cw < 4)
-      cw = 4;
-    item_x[k] = x;
-    ov_start[k] = g_bk->n_fs;
-    g_ov_active = true;
-    g_ov_base = band_top;
-    g_ov_n = 0;
-    flow_slice(it->t0, it->t1, x + fl, cw);
-    g_ov_active = false;
-    int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
-    int content_px = g_ov_n * BAND_PX;
-    int minch = box_min_content_h(it, vframe, main_sz[k]);
-    if (minch > content_px)
-      content_px = minch;
-    int orows = rows_for(content_px + vframe);
-    if (orows < 1)
-      orows = 1;
-    rows_of[k] = orows;
-    toppad[k] = rows_for(it->border.t + it->padding.t);
-    if (orows > band_h)
-      band_h = orows;
-    x += main_sz[k] + gap + between;
+  struct band bd;
+  band_open(&bd);
+  int x = content_x + start, line_h = minh;
+  for (int k = 0; k < n; k++) {
+    hs[k] = band_flow_item(&bd, bx, &its[k], x, main_sz[k], &fs0[k]);
+    fs1[k] = g_bk->n_fs;
+    if (hs[k] > line_h)
+      line_h = hs[k];
+    x += main_sz[k] + item_margin_w(bx, &its[k]) + gap + between;
   }
-  int cvframe = cont->border.t + cont->border.b + cont->padding.t + cont->padding.b;
-  int cminch =
-      box_min_content_h(cont, cvframe, content_w + cont->border.l + cont->border.r + cont->padding.l + cont->padding.r);
-  if (cminch > 0 && rows_for(cminch) > band_h)
-    band_h = rows_for(cminch);
-  if (band_h < 1)
-    band_h = 1;
-
-  /* Phase 2: cross-axis place each item (align-items) and record geometry. */
-  for (int k = 0; k < nit; k++) {
-    struct lbox *it = &bx[items[k]];
-    signed char ai = item_align(cont, it);
-    int h_rows = (ai == CSS_ALIGN_STRETCH) ? band_h : rows_of[k];
-    int off_rows = 0;
-    if (ai == CSS_ALIGN_CENTER)
-      off_rows = (band_h - h_rows) / 2;
+  for (int k = 0; k < n; k++) {
+    signed char ai = item_align(cont, bx, &its[k]);
+    if (ai == CSS_ALIGN_STRETCH)
+      band_stretch(bx, &its[k], line_h);
+    else if (ai == CSS_ALIGN_CENTER)
+      band_shift(bx, &its[k], fs0[k], fs1[k], (line_h - hs[k]) / 2);
     else if (ai == CSS_ALIGN_END)
-      off_rows = band_h - h_rows;
-    int shift = off_rows + toppad[k];
-    if (shift) {
-      int end = (k + 1 < nit) ? ov_start[k + 1] : g_bk->n_fs;
-      for (int s = ov_start[k]; s < end; s++)
-        g_bk->fs[s].row += shift;
-    }
-    int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
-    int ft = it->border.t + it->padding.t;
-    int vframe = ft + it->border.b + it->padding.b;
-    struct lgeom *g = &geo[items[k]];
-    g->x = item_x[k];
-    g->w = main_sz[k];
-    g->y = band_top_y + off_rows * BAND_PX;
-    g->h = h_rows * BAND_PX;
-    g->cx = item_x[k] + fl;
-    g->cw = main_sz[k] - fl - fr;
-    if (g->cw < 4)
-      g->cw = 4;
-    g->cy = g->y + ft;
-    g->ch = g->h - vframe;
-    if (g->ch < 0)
-      g->ch = 0;
+      band_shift(bx, &its[k], fs0[k], fs1[k], line_h - hs[k]);
   }
-
-  add_n_blanks(band_h, cont->t0, content_x, content_w);
+  band_close(&bd, line_h, cont->t0, content_x, content_w);
   free(mem);
   return true;
 }
 
-/* An item's explicit cell: its grid-area name in the container, else its start lines (-1 auto) and spans. */
-static void grid_item_pos(const struct lbox *cont, const struct lbox *it, int *c0, int *r0, int *cs, int *rs)
+/* Lay out a row flex container's items side by side, wrapping into lines when it may; false if out of memory,
+ * so the caller flows it as a plain block. */
+static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w)
 {
+  struct lbox *cont = &bx[idx];
+  band_static_pos(bx, idx, content_x);
+  int nit = box_items(bx, idx, 0);
+  if (nit == 0)
+    return true;
+  struct bitem *its = malloc((unsigned long)nit * sizeof *its);
+  int *base = malloc((unsigned long)nit * sizeof *base);
+  if (!its || !base) {
+    free(its);
+    free(base);
+    return false;
+  }
+  box_items(bx, idx, its);
+  for (int k = 0; k < nit; k++)
+    base[k] = flex_base_main(bx, &its[k], content_w);
+
+  /* A single-line container's definite height is its line's cross size, so stretched items fill it. */
+  int minh = 0;
+  if (!cont->flex_wrap) {
+    int vframe = cont->border.t + cont->border.b + cont->padding.t + cont->padding.b;
+    int frame = cont->border.l + cont->border.r + cont->padding.l + cont->padding.r;
+    minh = box_min_content_h(cont, vframe, content_w + frame);
+    if (minh < 0)
+      minh = 0;
+  }
+  bool ok = true;
+  int gap = max0(cont->gap_col);
+  for (int k0 = 0; k0 < nit && ok;) {
+    int k1 = k0 + 1;
+    long used = flex_clamp_main(bx, &its[k0], base[k0], content_w) + item_margin_w(bx, &its[k0]);
+    while (cont->flex_wrap && k1 < nit) {
+      long next = gap + flex_clamp_main(bx, &its[k1], base[k1], content_w) + item_margin_w(bx, &its[k1]);
+      if (used + next > content_w)
+        break;
+      used += next;
+      k1++;
+    }
+    if (!cont->flex_wrap)
+      k1 = nit;
+    if (k0 > 0)
+      add_blank_px(max0(cont->gap_row), cont->t0, content_x, content_w);
+    ok = flex_line(bx, cont, its + k0, base + k0, k1 - k0, content_x, content_w, minh);
+    k0 = k1;
+  }
+  free(its);
+  free(base);
+  return ok;
+}
+
+/* An item's explicit cell: its grid-area name in the container, else its start lines (-1 auto) and spans. */
+static void grid_item_pos(const struct lbox *cont, const struct lbox *bx, const struct bitem *b, int *c0, int *r0,
+                          int *cs, int *rs)
+{
+  *c0 = *r0 = -1;
+  *cs = *rs = 1;
+  if (b->box < 0)
+    return; /* anonymous items auto-place */
+  const struct lbox *it = &bx[b->box];
   *c0 = it->col_start > 0 ? it->col_start - 1 : -1;
   *r0 = it->row_start > 0 ? it->row_start - 1 : -1;
   *cs = it->col_span > 0 ? it->col_span : 1;
@@ -604,61 +798,14 @@ static void grid_item_pos(const struct lbox *cont, const struct lbox *it, int *c
     }
 }
 
-/* --- grid: like flex-row, cells are drawn via the band overlay; no dense packing of row spans --- */
-/* False when memory runs out, so the caller flows the container as a plain block. */
-static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
+/* Column widths: fixed and percent tracks, auto tracks at their widest single-column item, fr tracks sharing
+ * what remains; scaled down if they overflow. */
+static void grid_columns(const struct lbox *cont, const struct lbox *bx, const struct bitem *its, int nit,
+                         const int *it_col, const int *it_cs, int ncols, int content_w, int *colw)
 {
-  struct lbox *cont = &bx[idx];
-  struct lgeom *geo = g_bk->geo;
-  int ncols = cont->n_cols > 0 ? cont->n_cols : 1;
-  if (cont->ext)
-    for (int i = 0; i < cont->ext->n_areas; i++)
-      if (cont->ext->areas[i].c1 > ncols)
-        ncols = cont->ext->areas[i].c1;
-  if (ncols > CSS_GRID_MAX)
-    ncols = CSS_GRID_MAX;
-
-  int nit = box_children(bx, idx, 0);
-  if (nit == 0)
-    return true;
-  int *mem = malloc((unsigned long)nit * 10 * sizeof *mem);
-  if (!mem)
-    return false;
-  int *items = mem, *it_col = mem + nit, *it_row = mem + 2 * nit, *it_cs = mem + 3 * nit, *it_rs = mem + 4 * nit;
-  int *rows_of = mem + 5 * nit, *ov_start = mem + 6 * nit, *toppad = mem + 7 * nit, *it_x = mem + 8 * nit,
-      *it_w = mem + 9 * nit;
-  box_children(bx, idx, items);
-
-  int gcol = cont->gap_col > 0 ? cont->gap_col : 0;
-  int grow_gap = cont->gap_row > 0 ? cont->gap_row : 0;
-
-  /* placement: named areas and start lines first claim their cells, the rest auto-flow by row */
-  for (int k = 0; k < nit; k++) {
-    grid_item_pos(cont, &bx[items[k]], &it_col[k], &it_row[k], &it_cs[k], &it_rs[k]);
-    int span = it_cs[k] < CSS_GRID_MAX ? it_cs[k] : 1;
-    if (it_col[k] >= 0 && it_col[k] + span > ncols)
-      ncols = it_col[k] + span;
-  }
-  if (ncols > CSS_GRID_MAX)
-    ncols = CSS_GRID_MAX;
-  int nrows = ru_grid_place(ncols, nit, it_col, it_row, it_cs, it_rs);
-  if (nrows < 0) {
-    free(mem);
-    return false;
-  }
-  if (nrows < 1)
-    nrows = 1;
-  int *rmem = malloc(((unsigned long)nrows * 2 + 1) * sizeof *rmem);
-  if (!rmem) {
-    free(mem);
-    return false;
-  }
-  int *rowh = rmem, *row_off = rmem + nrows;
-
-  /* column track sizing: fixed, auto (max-content), fr, then overflow scale-down */
-  int colw[CSS_GRID_MAX], is_fr[CSS_GRID_MAX], fr_w[CSS_GRID_MAX], is_auto[CSS_GRID_MAX];
-  int total_gap = gcol * (ncols - 1);
-  int avail = content_w - total_gap;
+  int is_fr[CSS_GRID_MAX], fr_w[CSS_GRID_MAX], is_auto[CSS_GRID_MAX];
+  int gcol = max0(cont->gap_col);
+  int avail = content_w - gcol * (ncols - 1);
   if (avail < ncols)
     avail = ncols;
   long fr_sum = 0, fixed = 0;
@@ -691,15 +838,12 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     if (!is_auto[c])
       continue;
     int best = 0;
-    for (int k = 0; k < nit; k++) {
-      if (it_cs[k] != 1 || it_col[k] != c)
-        continue;
-      struct lbox *it = &bx[items[k]];
-      int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
-      int mc = slice_maxcontent(it->t0, it->t1) + frame;
-      if (mc > best)
-        best = mc;
-    }
+    for (int k = 0; k < nit; k++)
+      if (it_cs[k] == 1 && it_col[k] == c) {
+        int mc = item_maxw(bx, &its[k]);
+        if (mc > best)
+          best = mc;
+      }
     colw[c] = best;
     fixed += best;
   }
@@ -728,134 +872,125 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   for (int c = 0; c < ncols; c++)
     if (colw[c] < 1)
       colw[c] = 1;
+}
 
-  int track_x[CSS_GRID_MAX + 1];
+/* Lay out a grid container: place items in cells, size columns, flow each item into the band at its column,
+ * size rows from the items, then move each item down to its row. False if out of memory, so the caller flows
+ * the container as a plain block. */
+static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
+{
+  struct lbox *cont = &bx[idx];
+  band_static_pos(bx, idx, content_x);
+  int ncols = cont->n_cols > 0 ? cont->n_cols : 1;
+  if (cont->ext)
+    for (int i = 0; i < cont->ext->n_areas; i++)
+      if (cont->ext->areas[i].c1 > ncols)
+        ncols = cont->ext->areas[i].c1;
+  if (ncols > CSS_GRID_MAX)
+    ncols = CSS_GRID_MAX;
+
+  int nit = box_items(bx, idx, 0);
+  if (nit == 0)
+    return true;
+  struct bitem *its = malloc((unsigned long)nit * sizeof *its);
+  int *mem = malloc((unsigned long)nit * 9 * sizeof *mem);
+  if (!its || !mem) {
+    free(its);
+    free(mem);
+    return false;
+  }
+  box_items(bx, idx, its);
+  int *it_col = mem, *it_row = mem + nit, *it_cs = mem + 2 * nit, *it_rs = mem + 3 * nit, *hs = mem + 4 * nit,
+      *fs0 = mem + 5 * nit, *fs1 = mem + 6 * nit, *it_x = mem + 7 * nit, *it_w = mem + 8 * nit;
+  int gcol = max0(cont->gap_col), grow_gap = max0(cont->gap_row);
+
+  /* placement: named areas and start lines first claim their cells, the rest auto-flow by row */
+  for (int k = 0; k < nit; k++) {
+    grid_item_pos(cont, bx, &its[k], &it_col[k], &it_row[k], &it_cs[k], &it_rs[k]);
+    int span = it_cs[k] < CSS_GRID_MAX ? it_cs[k] : 1;
+    if (it_col[k] >= 0 && it_col[k] + span > ncols)
+      ncols = it_col[k] + span;
+  }
+  if (ncols > CSS_GRID_MAX)
+    ncols = CSS_GRID_MAX;
+  int nrows = ru_grid_place(ncols, nit, it_col, it_row, it_cs, it_rs);
+  int *rmem = nrows >= 0 ? malloc(((unsigned long)(nrows > 0 ? nrows : 1) * 2 + 1) * sizeof *rmem) : 0;
+  if (!rmem) {
+    free(its);
+    free(mem);
+    return false;
+  }
+  if (nrows < 1)
+    nrows = 1;
+  int *rowh = rmem, *row_off = rmem + nrows;
+
+  int colw[CSS_GRID_MAX], track_x[CSS_GRID_MAX + 1];
+  grid_columns(cont, bx, its, nit, it_col, it_cs, ncols, content_w, colw);
   track_x[0] = content_x;
   for (int c = 0; c < ncols; c++)
     track_x[c + 1] = track_x[c] + colw[c] + gcol;
 
-  /* flow each item into the overlay, measuring rows, column x and border-box width */
-  int band_top = g_bk->lt.n;
-  int band_top_y = lt_doc_px(&g_bk->lt);
+  /* flow every item at the band top in its column, measuring its height */
+  struct band bd;
+  band_open(&bd);
   for (int k = 0; k < nit; k++) {
-    struct lbox *it = &bx[items[k]];
-    int cs = it_cs[k];
     int iw = 0;
-    for (int c = it_col[k]; c < it_col[k] + cs && c < ncols; c++)
+    for (int c = it_col[k]; c < it_col[k] + it_cs[k] && c < ncols; c++)
       iw += colw[c];
-    iw += gcol * (cs - 1);
-    it_x[k] = track_x[it_col[k]];
-    it_w[k] = iw;
-    int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
-    int cw = iw - fl - fr;
-    if (cw < 4)
-      cw = 4;
-    ov_start[k] = g_bk->n_fs;
-    g_ov_active = true;
-    g_ov_base = band_top;
-    g_ov_n = 0;
-    flow_slice(it->t0, it->t1, it_x[k] + fl, cw);
-    g_ov_active = false;
-    int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
-    int content_px = g_ov_n * BAND_PX;
-    int minch = box_min_content_h(it, vframe, iw);
-    if (minch > content_px)
-      content_px = minch;
-    int orows = rows_for(content_px + vframe);
-    if (orows < 1)
-      orows = 1;
-    rows_of[k] = orows;
-    toppad[k] = rows_for(it->border.t + it->padding.t);
+    iw += gcol * (it_cs[k] - 1);
+    it_x[k] = track_x[it_col[k] < ncols ? it_col[k] : ncols - 1];
+    it_w[k] = iw - item_margin_w(bx, &its[k]);
+    if (it_w[k] < 4)
+      it_w[k] = 4;
+    hs[k] = band_flow_item(&bd, bx, &its[k], it_x[k], it_w[k], &fs0[k]);
+    fs1[k] = g_bk->n_fs;
   }
 
-  /* row-track heights: px floor, single-row items raise it, spanning items extend the last row */
+  /* row heights: px tracks are a floor, single-row items raise them, spanning items extend their last row */
   for (int r = 0; r < nrows; r++) {
     rowh[r] = 0;
-    if (cont->n_rows > 0 && r < cont->n_rows && cont->rows_t[r].kind == CSS_TRK_PX) {
-      int rr = rows_for(cont->rows_t[r].v);
-      if (rr > rowh[r])
-        rowh[r] = rr;
-    }
+    if (r < cont->n_rows && cont->rows_t[r].kind == CSS_TRK_PX && cont->rows_t[r].v > 0)
+      rowh[r] = cont->rows_t[r].v;
   }
   for (int k = 0; k < nit; k++)
-    if (it_rs[k] == 1 && it_row[k] < nrows && rows_of[k] > rowh[it_row[k]])
-      rowh[it_row[k]] = rows_of[k];
-  for (int r = 0; r < nrows; r++)
-    if (rowh[r] < 1)
-      rowh[r] = 1;
-
-  int gap_rows = rows_for(grow_gap);
+    if (it_rs[k] == 1 && it_row[k] < nrows && hs[k] > rowh[it_row[k]])
+      rowh[it_row[k]] = hs[k];
   row_off[0] = 0;
   for (int r = 0; r < nrows; r++)
-    row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? gap_rows : 0);
-  for (int k = 0; k < nit; k++) { /* extend last spanned row for tall row-span items */
+    row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? grow_gap : 0);
+  for (int k = 0; k < nit; k++) {
     if (it_rs[k] <= 1)
       continue;
-    int r0 = it_row[k], r1 = r0 + it_rs[k];
-    if (r1 > nrows)
-      r1 = nrows;
-    int have = row_off[r1] - row_off[r0] - (r1 < nrows ? gap_rows : 0);
-    if (rows_of[k] > have && r1 - 1 >= 0 && r1 - 1 < nrows) {
-      rowh[r1 - 1] += rows_of[k] - have;
+    int r0 = it_row[k], r1 = r0 + it_rs[k] < nrows ? r0 + it_rs[k] : nrows;
+    int have = row_off[r1] - row_off[r0] - (r1 < nrows ? grow_gap : 0);
+    if (hs[k] > have && r1 >= 1) {
+      rowh[r1 - 1] += hs[k] - have;
       for (int r = r1 - 1; r < nrows; r++)
-        row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? gap_rows : 0);
+        row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? grow_gap : 0);
     }
   }
   int band_h = row_off[nrows];
-  int cvframe = cont->border.t + cont->border.b + cont->padding.t + cont->padding.b;
-  int cminch =
-      box_min_content_h(cont, cvframe, content_w + cont->border.l + cont->border.r + cont->padding.l + cont->padding.r);
-  if (cminch > 0 && rows_for(cminch) > band_h)
-    band_h = rows_for(cminch);
-  if (band_h < 1)
-    band_h = 1;
+  int vframe = cont->border.t + cont->border.b + cont->padding.t + cont->padding.b;
+  int frame = cont->border.l + cont->border.r + cont->padding.l + cont->padding.r;
+  int cminch = box_min_content_h(cont, vframe, content_w + frame);
+  if (cminch > band_h)
+    band_h = cminch;
 
-  /* place: shift each cell's text to its row (align-items) and record geometry */
+  /* move each item down to its row, aligned in its cell */
   for (int k = 0; k < nit; k++) {
-    struct lbox *it = &bx[items[k]];
-    signed char ai = item_align(cont, it);
-    int r0 = it_row[k], r1 = r0 + it_rs[k];
-    if (r1 > nrows)
-      r1 = nrows;
-    int cell_rows = row_off[r1] - row_off[r0] - (r1 < nrows ? gap_rows : 0);
-    if (cell_rows < 1)
-      cell_rows = 1;
-    int h_rows = (ai == CSS_ALIGN_STRETCH) ? cell_rows : rows_of[k];
-    if (h_rows > cell_rows)
-      h_rows = cell_rows;
-    int off_rows = 0;
-    if (ai == CSS_ALIGN_CENTER)
-      off_rows = (cell_rows - h_rows) / 2;
-    else if (ai == CSS_ALIGN_END)
-      off_rows = cell_rows - h_rows;
-    int base_row = row_off[r0] + off_rows;
-    int shift = base_row + toppad[k];
-    if (shift) {
-      int end = (k + 1 < nit) ? ov_start[k + 1] : g_bk->n_fs;
-      for (int s = ov_start[k]; s < end; s++)
-        g_bk->fs[s].row += shift;
-    }
-    int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
-    int ft = it->border.t + it->padding.t;
-    int vframe = ft + it->border.b + it->padding.b;
-    struct lgeom *g = &geo[items[k]];
-    g->x = it_x[k];
-    g->w = it_w[k];
-    g->y = band_top_y + base_row * BAND_PX;
-    g->h = h_rows * BAND_PX;
-    g->cx = it_x[k] + fl;
-    g->cw = it_w[k] - fl - fr;
-    if (g->cw < 4)
-      g->cw = 4;
-    g->cy = g->y + ft;
-    g->ch = g->h - vframe;
-    if (g->ch < 0)
-      g->ch = 0;
+    int r0 = it_row[k] < nrows ? it_row[k] : nrows - 1;
+    int r1 = r0 + it_rs[k] < nrows ? r0 + it_rs[k] : nrows;
+    int cell = row_off[r1] - row_off[r0] - (r1 < nrows ? grow_gap : 0);
+    signed char ai = item_align(cont, bx, &its[k]);
+    int off = ai == CSS_ALIGN_CENTER ? (cell - hs[k]) / 2 : ai == CSS_ALIGN_END ? cell - hs[k] : 0;
+    if (ai == CSS_ALIGN_STRETCH)
+      band_stretch(bx, &its[k], cell);
+    band_shift(bx, &its[k], fs0[k], fs1[k], row_off[r0] + (off > 0 ? off : 0));
   }
-
-  add_n_blanks(band_h, cont->t0, content_x, content_w);
+  band_close(&bd, band_h, cont->t0, content_x, content_w);
   free(rmem);
   free(mem);
+  free(its);
   return true;
 }
 
@@ -865,7 +1000,9 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   struct lbox *b = &bx[idx];
   int ml = max0(b->margin.l), mr = max0(b->margin.r);
   int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
-  int box_w = box_width(b, avail_w, frame, ml, mr);
+  int force = g_force_w; /* a flex or grid item's resolved size */
+  g_force_w = -1;
+  int box_w = force >= 0 ? force : box_width(b, avail_w, frame, ml, mr);
 
   /* Horizontal placement: auto margins absorb the slack. */
   int slack = avail_w - box_w - ml - mr;
@@ -908,9 +1045,9 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
     content_w = 8;
 
   add_blank_px(max0(b->margin.t), b->t0, box_x, box_w);
-  int box_top_y = lt_doc_px(&g_bk->lt);
+  int box_top_y = flow_y();
   add_blank_px(b->border.t + b->padding.t, b->t0, content_x, content_w);
-  int content_top_y = lt_doc_px(&g_bk->lt);
+  int content_top_y = flow_y();
 
   struct lgeom *g = &g_bk->geo[idx];
   g->x = box_x;
@@ -942,12 +1079,24 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
       flow_slice(pos, bx[j].t0, content_x, content_w); /* inline text before it */
       if (out_of_flow(&bx[j])) {
         g_bk->geo[j].x = content_x; /* its static position, for an absolute box without offsets */
-        g_bk->geo[j].y = lt_doc_px(&g_bk->lt);
+        g_bk->geo[j].y = flow_y();
       } else {
         if (col && any_item)
           add_blank_px(b->gap_row, bx[j].t0, content_x, content_w);
         any_item = true;
-        flow_box(bx, j, content_x, content_w);
+        struct bitem it = {j, bx[j].t0, bx[j].t1};
+        signed char ai = col ? item_align(b, bx, &it) : CSS_ALIGN_STRETCH;
+        if (ai != CSS_ALIGN_STRETCH && bx[j].spec_w < 0 && bx[j].pct_w < 0) {
+          /* not stretched across the column: as wide as its content, placed by align-items */
+          int mw = item_margin_w(bx, &it), w = box_maxw(bx, j);
+          if (w > content_w - mw)
+            w = content_w - mw;
+          int off = ai == CSS_ALIGN_CENTER ? (content_w - mw - w) / 2 : ai == CSS_ALIGN_END ? content_w - mw - w : 0;
+          g_force_w = w > 1 ? w : 1;
+          flow_box(bx, j, content_x + off, g_force_w + mw);
+        } else {
+          flow_box(bx, j, content_x, content_w);
+        }
       }
       pos = skip_box_terminator(bx[j].t1, b->t1);
       j = bx[j].end; /* skip its descendants */
@@ -961,14 +1110,14 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   int vframe = b->border.t + b->border.b + b->padding.t + b->padding.b;
   int min_ch = box_min_content_h(b, vframe, box_w);
   if (min_ch > 0) {
-    int have = lt_doc_px(&g_bk->lt) - content_top_y;
+    int have = flow_y() - content_top_y;
     if (min_ch > have)
       add_blank_px(min_ch - have, b->t1, content_x, content_w);
   }
 
-  int content_bot_y = lt_doc_px(&g_bk->lt);
+  int content_bot_y = flow_y();
   add_blank_px(b->padding.b + b->border.b, b->t1, content_x, content_w);
-  int box_bot_y = lt_doc_px(&g_bk->lt);
+  int box_bot_y = flow_y();
   add_blank_px(max0(b->margin.b), b->t1, box_x, box_w);
 
   if (b->ext && !b->ext->mat)
@@ -1079,7 +1228,7 @@ static void layout_flow(int paw)
     if (!out_of_flow(&bx[j]))
       flow_box(bx, j, 4, paw);
     else
-      g_bk->geo[j].y = lt_doc_px(&g_bk->lt); /* static position */
+      g_bk->geo[j].y = flow_y(); /* static position */
     pos = skip_box_terminator(bx[j].t1, B->pg->text_len);
     j = bx[j].end;
   }

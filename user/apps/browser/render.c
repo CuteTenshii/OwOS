@@ -89,7 +89,7 @@ static void paint_overlays(int py, int pw, int ct, int cb)
       if (f->row < ov->row0 || f->row >= ov->row1 || f->off + f->len > B->pg->text_len)
         continue;
       int sy = shift + t->y[f->row];
-      if (sy + t->h[f->row] + o->over <= ct || sy >= cb)
+      if (sy + f->h + o->over <= ct || sy >= cb)
         continue;
       draw_slice_core(f->x, sy, f->off, f->len, f->w, ct, cb, f->h, f->maxpx);
     }
@@ -130,7 +130,7 @@ static void paint_page_core(int py, int pw, int ct, int cb, unsigned bg, bool fi
     if (f->row < 0 || f->row >= t->n || f->off + f->len > B->pg->text_len || !gate_text(f->off))
       continue;
     int sy = py + t->y[f->row] - sc;
-    if (sy + t->h[f->row] + over <= ct || sy >= cb)
+    if (sy + f->h + over <= ct || sy >= cb)
       continue;
     draw_slice_core(f->x, sy, f->off, f->len, f->w, ct, cb, f->h, f->maxpx);
   }

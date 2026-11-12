@@ -235,23 +235,18 @@ static __attribute__((noinline)) bool region_props(struct dom_node *el, signed c
 
 static int g_sel_cur = -1; /* ::selection colour in effect at this depth of the walk */
 
-/* g_flex_item: the elements entered next are direct children of a flex or grid container (ITEM_BOX for a
- * column flexbox, whose items get full box layout; ITEM_BAND for a row flexbox or grid, whose items are flowed
- * as flat text); g_is_item: the same for the element being entered, read before its children are walked.
- * g_flat: inside a band item, where nested boxes don't lay out, so nothing below is blockified. */
-enum { ITEM_NONE, ITEM_BOX, ITEM_BAND };
-static unsigned char g_flex_item, g_is_item;
-static bool g_flat;
+/* g_flex_item: the elements entered next are direct children of a flex or grid container; g_is_item: the
+ * element being entered is one (read before its children are walked), so it is blockified. */
+static bool g_flex_item, g_is_item;
 
 static void walk_element(struct dom_node *el)
 {
   if (g_walk_depth >= WALK_DEPTH_MAX)
     return;
   g_walk_depth++;
-  unsigned char outer_item = g_flex_item;
-  bool outer_flat = g_flat;
+  bool outer_item = g_flex_item;
   g_is_item = g_flex_item;
-  g_flex_item = ITEM_NONE;
+  g_flex_item = false;
   int si = span_begin(el);
   signed char props[3];
   int start = W_n, sel, outer_sel = g_sel_cur;
@@ -262,7 +257,6 @@ static void walk_element(struct dom_node *el)
     sel = -1; /* unchanged from the enclosing element: its region already covers this one */
   walk_element_inner(el);
   g_flex_item = outer_item;
-  g_flat = outer_flat;
   g_sel_cur = outer_sel;
   if ((tagged || sel >= 0) && W_n > start && browser_ensure_regs(B->pg->nregs + 1)) {
     B->pg->regs[B->pg->nregs] = (struct pregion){start, W_n, props[0], props[1], props[2], sel};
@@ -509,19 +503,11 @@ static void walk_element_inner(struct dom_node *el)
     W_liststyle = cs.list_style;
 
   int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_UNSET) ? is_block_tag(name) : 0;
-  unsigned char is_item = g_is_item;
+  bool is_item = g_is_item;
   if (is_item && cs.disp != CSS_DISP_CONTENTS)
     blk = 1; /* flex and grid items are block-level whatever their display (inline-flex buttons, spans) */
-  if (is_item == ITEM_BAND && cs.disp != CSS_DISP_CONTENTS)
-    g_flat = true;
-  if (cs.disp == CSS_DISP_CONTENTS) /* its children are its parent's items */
-    g_flex_item = is_item;
-  else if (blk && !g_flat && cs.flex == 1)
-    g_flex_item = cs.flex_dir == 1 ? ITEM_BOX : ITEM_BAND;
-  else if (blk && !g_flat && cs.grid == 1)
-    g_flex_item = ITEM_BAND;
-  else
-    g_flex_item = ITEM_NONE;
+  /* a display:contents element's children are its parent's items */
+  g_flex_item = cs.disp == CSS_DISP_CONTENTS ? is_item : blk && (cs.flex == 1 || cs.grid == 1);
   if (cs.disp == CSS_DISP_CONTENTS)
     cs.bg = -1; /* no box of its own, so no background */
   if (cs.pos == CSS_POS_FIXED || cs.pos == CSS_POS_ABS)
