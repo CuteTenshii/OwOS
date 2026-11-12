@@ -22,14 +22,20 @@ static void cpy(char *d, const char *s, int max)
 }
 
 /* Parse a non-negative decimal prefix of `s` into *out; return the char after
- * the digits. */
+ * the digits, or NULL when there are none or the value overflows. */
 static const char *parse_u32(const char *s, uint32_t *out)
 {
   uint32_t v = 0;
+  const char *start = s;
   while (*s >= '0' && *s <= '9') {
-    v = v * 10 + (uint32_t)(*s - '0');
+    uint32_t d = (uint32_t)(*s - '0');
+    if (v > (UINT32_MAX - d) / 10)
+      return NULL;
+    v = v * 10 + d;
     s++;
   }
+  if (s == start)
+    return NULL;
   *out = v;
   return s;
 }
@@ -75,38 +81,44 @@ static const char *next_line(const char *p)
   return p;
 }
 
+#define PASSWD_MAX (1u << 20)
+
 /* One parsed passwd record. */
 struct pwent {
   char name[USER_NAME_MAX];
   char pwhash[80];
   uint32_t uid, gid;
   char home[USER_HOME_MAX];
+  bool valid; /* every field through gid was present and well formed */
 };
 
 /* Parse the passwd line at `line` into *e. Returns the start of the next line.
  */
 static const char *parse_line(const char *line, struct pwent *e)
 {
-  const char *p = line;
+  /* A short or damaged line must not default to uid 0 with no password: anything malformed is no account at all. */
+  const char *p = line, *q;
   e->pwhash[0] = e->home[0] = '\0';
   e->uid = e->gid = 0;
+  e->valid = false;
   take_field(&p, e->name, sizeof e->name);
-  if (*p == ':') {
-    p++;
-    take_field(&p, e->pwhash, sizeof e->pwhash);
-  }
-  if (*p == ':') {
-    p++;
-    p = parse_u32(p, &e->uid);
-  }
-  if (*p == ':') {
-    p++;
-    p = parse_u32(p, &e->gid);
-  }
+  if (!e->name[0] || *p != ':')
+    return next_line(p);
+  p++;
+  take_field(&p, e->pwhash, sizeof e->pwhash);
+  if (*p != ':')
+    return next_line(p);
+  if (!(q = parse_u32(p + 1, &e->uid)) || *q != ':')
+    return next_line(q ? q : p);
+  p = q;
+  if (!(q = parse_u32(p + 1, &e->gid)))
+    return next_line(p);
+  p = q;
   if (*p == ':') {
     p++;
     take_field(&p, e->home, sizeof e->home);
   }
+  e->valid = *p == '\0' || *p == '\n' || *p == '\r';
   return next_line(p);
 }
 
@@ -114,23 +126,32 @@ static const char *parse_line(const char *line, struct pwent *e)
  * or a uid (`want_uid`). Returns 1 and fills *out on a hit, 0 if absent. */
 static int passwd_lookup(const char *want_name, uint32_t want_uid, struct pwent *out)
 {
-  static char buf[4096];
-  int n = fs_read("/etc/passwd", buf, sizeof buf - 1);
-  if (n < 0)
+  /* Read the whole file: a fixed buffer would cut the last record mid-field. */
+  int size = fs_size("/etc/passwd");
+  if (size < 0 || (uint32_t)size > PASSWD_MAX)
     return 0;
+  char *buf = kmalloc((uint32_t)size + 1);
+  if (!buf)
+    return 0;
+  int n = fs_read("/etc/passwd", buf, (uint32_t)size);
+  if (n < 0) {
+    kfree(buf);
+    return 0;
+  }
   buf[n] = '\0';
-  for (const char *line = buf; *line;) {
+  int found = 0;
+  for (const char *line = buf; *line && !found;) {
     struct pwent e;
     line = parse_line(line, &e);
-    if (!e.name[0])
+    if (!e.valid)
       continue;
-    int hit = want_name ? streq(e.name, want_name) : (e.uid == want_uid);
-    if (hit) {
+    if (want_name ? streq(e.name, want_name) : (e.uid == want_uid)) {
       *out = e;
-      return 1;
+      found = 1;
     }
   }
-  return 0;
+  kfree(buf);
+  return found;
 }
 
 void users_init(void)
@@ -219,6 +240,8 @@ static bool in_group(const char *group, const char *name, uint32_t gid)
       continue;
     uint32_t ggid;
     p = parse_u32(p + 1, &ggid);
+    if (!p)
+      return false; /* a damaged group line grants nothing */
     if (ggid == gid)
       return true;
     if (*p != ':')
