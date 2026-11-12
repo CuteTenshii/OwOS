@@ -1,3 +1,4 @@
+#include "features/omnibox/omnibox.h"
 #include "main_int.h"
 #include "mutex.h"
 
@@ -282,12 +283,10 @@ void blur_content_control(void)
 
 void submit(void)
 {
-  if (B->addr_tf.len == 0)
+  char target[URL_MAX];
+  if (omnibox_target(B->addr, target, sizeof target) == 0)
     return;
-  int i = 0;
-  for (; B->addr[i] && i < URL_MAX - 1; i++)
-    B->req_url[i] = B->addr[i];
-  B->req_url[i] = '\0';
+  memcpy(B->req_url, target, sizeof target);
   B->req_method[0] = '\0';
   B->req_body_len = 0; /* GET */
   if (B->loading)
