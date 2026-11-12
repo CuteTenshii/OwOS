@@ -61,7 +61,11 @@ enter_user_task:
 .global fork_child_entry
 .type fork_child_entry, @function
 fork_child_entry:
-	add  $8, %rsp                  /* drop ds                                 */
+	/* DS is per CPU, not per task: a task resumed on a CPU that ran the kernel would iretq to ring 3 with
+	 * DPL-0 DS, which the CPU nulls, and compatibility mode then faults on every DS access. */
+	pop  %rax                      /* ds saved at entry                        */
+	mov  %ax, %ds
+	mov  %ax, %es
 	pop  %r15
 	pop  %r14
 	pop  %r13
