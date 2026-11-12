@@ -772,6 +772,10 @@ static void reap_task(task_t *t)
 /* Free exited detached kernel threads (parent main_task never waits); called from schedule() with IRQs off. */
 static void reap_detached(void)
 {
+  /* Freeing a task closes its files and tears down its address space; other CPUs only walk the task list and use
+   * that state under the kernel lock, so an idle AP must leave the work to a CPU holding it. */
+  if (kernel_lock_cpu != smp_this_cpu())
+    return;
   while (detached_zombies > 0) {
     task_t *z = 0, *t = main_task.next;
     while (t != &main_task) {
