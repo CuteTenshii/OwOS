@@ -73,7 +73,7 @@ Note QEMU's built-in `-kernel` multiboot loader only loads 32-bit ELF, so
 required to run it.
 
 On Linux there is **no cross-compiler**: the kernel is built with the host
-`gcc -m32 -ffreestanding -nostdlib` and linked at 1 MiB by `linker.ld` (on macOS the
+`gcc -m32 -ffreestanding -nostdlib` and linked at 1 MiB by `kernel/arch/x86/linker.ld` (on macOS the
 `i686-elf-` cross-toolchain above plays that role). QEMU's `-kernel` is itself a
 Multiboot loader, so nothing else is needed there. The ISO exists only for the
 targets that genuinely need a bootloader on the media - VMware, VirtualBox, bare
@@ -96,7 +96,7 @@ persist in `disk.img` across reboots.
 
 ### Boot & firmware
 
-`boot/boot.S` carries **two** Multiboot headers: Multiboot1 (for QEMU `-kernel`,
+`kernel/arch/x86/boot.S` carries **two** Multiboot headers: Multiboot1 (for QEMU `-kernel`,
 which hands us the info struct directly) and Multiboot2 (for GRUB on both BIOS
 and UEFI, whose mb1 handoff page-faults under UEFI). On the mb2 path the kernel
 walks the tag chain and synthesizes an mb1-shaped info struct, so the PMM and
@@ -301,23 +301,31 @@ work. Bundled programs: `edit`, `editor`, `curl`, `browser`, `imgview`,
 ## Per-file layout
 
 ```
-boot/boot.S        Multiboot1+2 headers, entry point, stack setup
+kernel/arch/x86/ - the x86 CPU layer, shared by i386 and x86_64; files that
+          differ by word size come as _32/_64 pairs, picked by ARCH:
+
+kernel/arch/x86/boot.S              Multiboot1+2 headers, entry point, stack setup
+kernel/arch/x86/linker.ld, 64.ld    load the kernel at 1 MiB, multiboot header first
+kernel/arch/x86/gdt.c gdt_flush_*.S GDT + lgdt/segment reload
+kernel/arch/x86/idt.c isr*.S        CPU exception IDT + dispatcher (panic screen + COM1)
+kernel/arch/x86/irq.c irq_*.S       PIC remap + hardware IRQ dispatch
+kernel/arch/x86/switch_*.S          context switch and new-thread entry
+kernel/arch/x86/smp.c smp_ap_*.S    MADT topology and application-processor bring-up
+kernel/arch/x86/paging_*.c          identity map, frame pool, per-process address spaces
+kernel/arch/x86/timer.c             PIT (250 Hz), tick counter + sleep (IRQ0)
+kernel/arch/x86/serial.c            polled COM1 UART (console mirror / logging)
+kernel/arch/x86/rtc.c               CMOS real-time clock
+kernel/arch/x86/cpu.c               CPUID vendor/brand
 
 kernel/kernel.c    kernel_main - brings subsystems up in dependency order
-kernel/gdt.c .S    flat 32-bit GDT + lgdt/segment reload
-kernel/idt.c isr.S CPU exception IDT + dispatcher (panic screen + COM1)
-kernel/irq.c .S    PIC remap + hardware IRQ dispatch
-kernel/timer.c     PIT (250 Hz), tick counter + sleep (IRQ0)
-kernel/serial.c    polled COM1 UART (console mirror / logging)
 kernel/console.c   text + framebuffer console funnel (was vga.c)
 kernel/shell.c     COM1/text recovery console (the desktop shell is user/term.c)
 kernel/crash.c     crash reporter (fault -> crash window)
 
 kernel/pmm.c       physical frame allocator (bitmap over the mmap)
-kernel/paging.c    identity map, frame pool, per-process address spaces
 kernel/heap.c      kmalloc/kfree (first-fit free list)
 kernel/kstring.c   freestanding memory primitives
-kernel/sched.c .S  scheduler: kernel threads + user processes, fork, reaping
+kernel/sched.c     scheduler: kernel threads + user processes, fork, reaping
 kernel/syscall.c   int 0x80 dispatch (write..net..win)
 kernel/loader.c    ELF32 loader: load segments into a fresh address space
 kernel/pipe.c      kernel pipe ring buffers
@@ -347,8 +355,6 @@ kernel/smb.c       read-only SMB2 file server (smbd)
 kernel/gzip.c      gzip/DEFLATE codec + CRC32 (png screenshot; user space: user/lib/zlib/deflate.c)
 kernel/smbios.c    SMBIOS/DMI host name for neofetch
 kernel/firmware.c  BIOS vs UEFI detection
-kernel/cpu.c       CPUID vendor/brand
-kernel/rtc.c       CMOS real-time clock
 kernel/neofetch.c  system-info splash
 
 drivers/ - device drivers, grouped by type (each subdir is on the -I path,
@@ -394,7 +400,6 @@ user/clock.c       clock app
 user/about.c       about box
 user/crashme.c     fault demo (exercises the crash reporter)
 
-linker.ld          loads the kernel at 1 MiB, multiboot header first
 Makefile           build + run + iso + usb
 CLAUDE.md          cross-cutting notes (what spans files or isn't obvious)
 ```

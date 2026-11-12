@@ -5,15 +5,18 @@
 OwOS is a freestanding operating system written in C, with GAS assembly for
 boot and low-level CPU code.
 
-- `boot/` contains Multiboot startup code and early boot support.
 - `kernel/` contains kernel subsystems, including memory, processes, filesystems,
   networking, graphics, and system calls.
+- `kernel/arch/x86/` holds the x86 CPU layer shared by i386 and x86_64: Multiboot boot code, linker scripts,
+  GDT/IDT and entry stubs, context switch, SMP bring-up, paging, and the PIT, CMOS RTC and COM port. Files that
+  differ by word size come as `_32`/`_64` pairs, and `kernel/build.mk` picks the half matching `ARCH`.
+  `kernel/arch/aarch64/` and `kernel/arch/arm/` are separate bring-up kernels with their own builds.
 - `drivers/` contains hardware drivers grouped by device area.
 - `user/lib/` contains user-space libraries, and `user/apps/<name>/` contains one directory per program,
   embedded into the kernel image.
 - `tests/` contains the host unit-test suites and their harness (`tests.mk`, `run-tests.sh`, the `owos.h`
   host shim); `scripts/` holds dev tools such as the scripted QEMU test harness.
-- `fonts/`, `hostinc/`, `tools/`, linker scripts, and `*.img` files provide assets.
+- `fonts/`, `hostinc/`, `tools/`, and `*.img` files provide assets.
 
 ## Build, Run, and Test Commands
 
