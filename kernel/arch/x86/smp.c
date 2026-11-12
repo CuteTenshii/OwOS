@@ -120,7 +120,9 @@ uint32_t smp_ioapic_base(void) { return ioapic_base; }
 
 /* Trampoline blob + the slots the BSP stages for each AP before its SIPI. */
 extern uint8_t ap_trampoline_start[], ap_trampoline_end[];
-extern void lapic_timer_isr(void); /* irq_stubs.S, LAPIC_TIMER_VEC gate */
+extern void lapic_timer_isr(void);    /* irq_stubs.S, LAPIC_TIMER_VEC gate */
+extern void lapic_spurious_isr(void); /* irq_stubs.S, LAPIC_SPURIOUS_VEC gate */
+#define LAPIC_SPURIOUS_VEC 0xFF
 #ifdef __x86_64__
 volatile uintptr_t ap_stack_top;
 volatile uintptr_t ap_arg;
@@ -194,8 +196,8 @@ static void send_ipi(uint8_t apic_id, uint32_t icr_low)
 /* Each core soft-enables (and hardware-enables) its own Local APIC. */
 static void lapic_enable_local(void)
 {
-  wrmsr(0x1B, rdmsr(0x1B) | (1 << 11));                    /* IA32_APIC_BASE */
-  lapic_wr(LAPIC_SVR, lapic_rd(LAPIC_SVR) | 0x100 | 0xFF); /* enable + spurious vec */
+  wrmsr(0x1B, rdmsr(0x1B) | (1 << 11));                                  /* IA32_APIC_BASE */
+  lapic_wr(LAPIC_SVR, lapic_rd(LAPIC_SVR) | 0x100 | LAPIC_SPURIOUS_VEC); /* enable + spurious vec */
 }
 
 /* Measure the LAPIC timer against the PIT once on the BSP (10 ms) to derive the per-tick reload. */
@@ -257,6 +259,7 @@ void smp_start_aps(void)
   lapic_enable_local(); /* BSP's own Local APIC */
   lapic_timer_count = lapic_timer_calibrate();
   idt_set_gate(LAPIC_TIMER_VEC, (uintptr_t)lapic_timer_isr, GDT_KERNEL_CODE, 0x8E);
+  idt_set_gate(LAPIC_SPURIOUS_VEC, (uintptr_t)lapic_spurious_isr, GDT_KERNEL_CODE, 0x8E);
 
   uint8_t bsp = (uint8_t)(lapic_rd(LAPIC_ID) >> 24);
 

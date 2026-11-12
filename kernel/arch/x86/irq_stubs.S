@@ -41,3 +41,13 @@ lapic_timer_isr:
 	push $0
 	push $0x40
 	jmp irq_common_stub
+
+/* LAPIC spurious vector 0xFF: the SDM says no EOI and no handler work, just return. */
+.global lapic_spurious_isr
+.type lapic_spurious_isr, @function
+lapic_spurious_isr:
+#ifdef __x86_64__
+	iretq
+#else
+	iret
+#endif
