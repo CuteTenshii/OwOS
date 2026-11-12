@@ -451,7 +451,7 @@ static bool nbr_resolve(const uint8_t ip[16], uint8_t out[6])
   for (int tries = 0; tries < 4; tries++) {
     nbr_request(ip);
     uint32_t deadline = timer_ticks() + TIMER_HZ / 4;
-    while (timer_ticks() < deadline) {
+    while (!tick_passed(deadline)) {
       __asm__ volatile("" ::: "memory");
       if (nbr_lookup(ip, out))
         return true;
@@ -1317,7 +1317,7 @@ static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t
     }
     if (sched_intr_pending())
       return -4;
-    if (timer_ticks() > deadline)
+    if (tick_passed(deadline))
       return 0;
     __asm__ volatile("sti\n\thlt");
   }
@@ -1357,7 +1357,7 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
       return 0;
     if (sched_intr_pending())
       return -4;
-    if (timer_ticks() > deadline)
+    if (tick_passed(deadline))
       return 0;
     __asm__ volatile("sti\n\thlt");
   }

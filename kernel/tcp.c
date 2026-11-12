@@ -79,6 +79,8 @@ static uint16_t lport_seq;
 /* Snapshot EFLAGS and cli; restore keeps IF clear if it was already clear (IRQ-safe). */
 #include "irqflags.h"
 
+static bool tick_passed(uint32_t t) { return (int32_t)(timer_ticks() - t) >= 0; }
+
 /* Claim a free slot as `newstate`; need_rxbuf (IRQ path) only takes slots with a buffer. NULL if none. */
 static struct tcp_conn *tcb_alloc(int newstate, int need_rxbuf)
 {
@@ -323,7 +325,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport)
   for (int tries = 0; tries < 6; tries++) {
     tcp_send_ctl(c, TCP_SYN, isn);
     uint32_t deadline = timer_ticks() + TIMER_HZ / 2;
-    while (timer_ticks() < deadline) {
+    while (!tick_passed(deadline)) {
       __asm__ volatile("" ::: "memory");
       if (c->state == ST_ESTAB)
         return c;
@@ -412,7 +414,7 @@ int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
       return 0;
     if (sched_intr_pending())
       return TCP_EINTR;
-    if (timer_ticks() > deadline) {
+    if (tick_passed(deadline)) {
       *closed = 1;
       return 0;
     }
