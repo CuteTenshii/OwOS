@@ -7,11 +7,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Device ids per controller family: xHCI slot ids are 8 bits, then 128 addresses for each of up to 8 UHCI
+/* Device ids per controller family: xHCI slot ids are 8 bits, then 128 addresses for each of up to 8 UHCI and 4 EHCI
  * controllers. */
 #define USBH_ADDRS 128
 #define USBH_UHCI_FIRST_ID 256
 #define USBH_UHCI_MAX_HCS 8
+#define USBH_EHCI_FIRST_ID (USBH_UHCI_FIRST_ID + USBH_UHCI_MAX_HCS * USBH_ADDRS)
+#define USBH_EHCI_MAX_HCS 4
 
 struct usbh_hc_ops;
 

@@ -1,6 +1,6 @@
-/* usbhost.h: USB host core services for class drivers (HID, hub), on whichever controller (xHCI, UHCI) a device hangs
- * off. Everything here runs on the usb poll thread (or the boot thread before it exists); class callbacks must not
- * block. */
+/* usbhost.h: USB host core services for class drivers (HID, hub), on whichever controller (xHCI, EHCI, UHCI) a device
+ * hangs off. Everything here runs on the usb poll thread (or the boot thread before it exists); class callbacks must
+ * not block. */
 #ifndef OWOS_USBHOST_H
 #define OWOS_USBHOST_H
 
@@ -68,8 +68,8 @@ struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_
 /* An interrupt OUT endpoint; send with usbh_pipe_send (below). */
 struct usbh_pipe *usbh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval);
 
-/* Bulk endpoints on a configured slot (xHCI only: NULL on UHCI). IN: cb runs per completed transfer (at most mps bytes,
- * a short one ends a packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
+/* Bulk endpoints on a configured slot (NULL on UHCI). IN: cb runs per completed transfer (at most mps bytes, a short
+ * one ends a packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
 struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx);
 struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps);
 int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len);

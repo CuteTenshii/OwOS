@@ -1,13 +1,15 @@
 /* usb.c - the `lsusb` command.
  *
  * Like lspci, this finds USB host controllers on the PCI bus (class 0x0C,
- * subclass 0x03) and names them by prog_if. Under each xHCI or UHCI controller
- * it lists the devices that controller's driver enumerated, with the hubs they
- * hang off; an empty UHCI root port gets a "no device" line.
+ * subclass 0x03) and names them by prog_if. Under each xHCI, EHCI or UHCI
+ * controller it lists the devices that controller's driver enumerated, with
+ * the hubs they hang off; an EHCI or UHCI root port without one gets a line
+ * saying it is empty or handed to the companion controller.
  */
 
 #include "usb.h"
 #include "console.h"
+#include "ehci.h"
 #include "kstring.h"
 #include "pci.h"
 #include "uhci.h"
@@ -142,6 +144,24 @@ static void xhci_list(int detail_port)
     con_write("xhci: no usable device on any port\n");
 }
 
+static void ehci_list(uint8_t bus, uint8_t slot, uint8_t func, int detail_port)
+{
+  int first, last, nports;
+  uint32_t companion;
+  if (!ehci_controller(bus, slot, func, &first, &last, &nports, &companion)) {
+    con_write("    (not driven)\n");
+    return;
+  }
+  for (int p = 1; p <= nports; p++) {
+    if (list_port("ehci", first, last, p, detail_port))
+      continue;
+    if (companion & (1u << p))
+      con_printf("    port %d: full/low-speed device on the companion controller\n", p);
+    else
+      con_printf("    port %d: no device\n", p);
+  }
+}
+
 static void uhci_list(uint8_t bus, uint8_t slot, uint8_t func, int detail_port)
 {
   int first, last, nports;
@@ -179,7 +199,9 @@ void usb_list(int detail_port)
         con_printf("%02x:%02x.%01x  %04x:%04x  %s\n", bus, slot, f, id & 0xFFFF, (id >> 16) & 0xFFFF,
                    controller_type(prog_if));
 
-        if (prog_if == USB_PROGIF_UHCI)
+        if (prog_if == USB_PROGIF_EHCI)
+          ehci_list((uint8_t)bus, (uint8_t)slot, (uint8_t)f, detail_port);
+        else if (prog_if == USB_PROGIF_UHCI)
           uhci_list((uint8_t)bus, (uint8_t)slot, (uint8_t)f, detail_port);
         else if (prog_if == USB_PROGIF_XHCI)
           if (xhci_present())

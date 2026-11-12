@@ -658,7 +658,7 @@ static void load_usb(struct page *pg)
       const char *s = line;
       while (*s == ' ')
         s++;
-      if (begins(s, "xhci:") || begins(s, "uhci:"))
+      if (begins(s, "xhci:") || begins(s, "ehci:") || begins(s, "uhci:"))
         s += 5;
       while (*s == ' ')
         s++;

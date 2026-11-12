@@ -3,6 +3,7 @@
  * drivers only ever run in one context. */
 
 #include "console.h"
+#include "ehci.h"
 #include "heap.h"
 #include "kstring.h"
 #include "sched.h"
@@ -217,6 +218,7 @@ static void poll_thread(void)
 void usb_boot(void)
 {
   xhci_boot();
+  ehci_boot();
   uhci_boot();
   /* xHCI's loop also runs its bulk data paths and calls usbh_service itself. */
   if (xhci_present())

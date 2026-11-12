@@ -147,6 +147,11 @@ static void usb(void)
   expect_string(u.ids, "0e0f:0003");
   expect_string(u.rest, "1.5 Mbps [hid mouse] \"VMware Virtual USB Mouse\"");
 
+  expect(dh_parse_usb("ehci: port 3: 8087:0024 class 09 480 Mbps [hub 6 ports]", &u));
+  expect_eq(u.depth, 0);
+  expect_string(u.port, "3");
+  expect_string(dh_usb_class(u.cls), "Hub");
+
   expect(!dh_parse_usb("xhci: no usable device on any port", &u));
   expect(!dh_parse_usb("ohci: port 1: 0627:0001 class 00", &u));
   expect(!dh_parse_usb("    port 1: no device", &u));
