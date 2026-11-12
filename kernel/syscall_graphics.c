@@ -75,7 +75,8 @@ void syscall_graphics_fb_cursor(struct registers *r)
     r->eax = (uint32_t)fb_cursor_set(NULL, 0, 0, 0, 0, 1);
     return;
   }
-  if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM || copyin(pix, r->ebx, (uint32_t)(w * h) * 4) != 0) {
+  if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM || hx >= w || hy >= h ||
+      copyin(pix, r->ebx, (uint32_t)(w * h) * 4) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
