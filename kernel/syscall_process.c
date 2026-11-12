@@ -6,6 +6,7 @@
 #include "sched.h"
 #include "timer.h"
 #include "uaccess.h"
+#include "users.h"
 #include <stdint.h>
 
 #define WNOHANG 1
@@ -87,6 +88,10 @@ void syscall_process_power(struct registers *r)
 {
   if (r->ebx == 3) {
     r->eax = power_can_sleep();
+    return;
+  }
+  if (sched_uid() != 0 && !users_sudo_valid(sched_uid())) {
+    r->eax = (uint32_t)-1;
     return;
   }
   if (r->ebx == 2) {
