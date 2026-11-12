@@ -2828,6 +2828,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   if (d->bcd_usb >= 0x0201)
     read_bos(d);
 
+  usbh_read_product(d, desc[15]);
   usbh_read_config(d);
   d->active = 1;
 

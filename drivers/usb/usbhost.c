@@ -138,6 +138,25 @@ int usbh_max_slot(void)
   return max;
 }
 
+void usbh_read_product(struct usbdev *d, uint8_t index)
+{
+  uint8_t buf[2 + 2 * (sizeof d->product - 1)];
+  const int cap = (int)sizeof buf;
+  uint16_t value = (uint16_t)(0x0300 | index);
+  d->product[0] = 0;
+  if (!index || usbh_control_in(d->slot, 0x80, 0x06, value, 0x0409, buf, 2) != 2)
+    return;
+  int len = buf[0] < cap ? buf[0] : cap;
+  if (len < 4 || buf[1] != 0x03 || usbh_control_in(d->slot, 0x80, 0x06, value, 0x0409, buf, len) != len)
+    return;
+  int n = 0;
+  for (int i = 2; i + 1 < len; i += 2)
+    d->product[n++] = (buf[i + 1] == 0 && buf[i] >= 32 && buf[i] < 127 && buf[i] != '"') ? (char)buf[i] : '?';
+  while (n > 0 && d->product[n - 1] == ' ')
+    n--;
+  d->product[n] = 0;
+}
+
 void usbh_read_config(struct usbdev *d)
 {
   uint8_t hdr[9];

@@ -425,6 +425,8 @@ static void print_device(int slot, const char *path, int depth, int detail_port)
   btusb_print(slot);
   uvc_print(slot);
   hid_print(slot, false);
+  if (d->product[0])
+    con_printf(" \"%s\"", d->product);
   con_putc('\n');
   if (detail_port == d->root_port) {
     if (d->cfg_len)

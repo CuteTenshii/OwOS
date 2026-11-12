@@ -22,6 +22,7 @@ struct usbdev {
   int speed;
   uint16_t vid, pid;
   uint8_t cls;
+  char product[40]; /* iProduct string, printable ASCII; empty if the device has none */
   uint8_t *cfg;
   int cfg_len;
   /* Topology: root port, hub parent (slot 0 = root port), port on that hub, hub tier, xHCI route string, and the

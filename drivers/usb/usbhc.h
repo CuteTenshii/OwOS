@@ -41,6 +41,7 @@ struct usbh_hc_ops {
 void usbh_register(const struct usbh_hc_ops *ops, int first, int count);
 
 /* Enumeration steps shared by every controller, run once the device answers at its address. */
+void usbh_read_product(struct usbdev *d, uint8_t index);
 void usbh_read_config(struct usbdev *d); /* cache the first configuration and select it */
 void usbh_bind_classes(struct usbdev *d);
 void usbh_unbind_classes(int id);
