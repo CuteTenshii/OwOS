@@ -560,6 +560,8 @@ static void into_dir(char *path, const char *src)
     if (*p == '/' && p[1])
       base = p + 1;
   int n = (int)strlen(path);
+  if (n >= PATH_MAX - 2) /* no room for "/" and a name: leave it naming the directory, which then fails */
+    return;
   if (n == 0 || path[n - 1] != '/')
     path[n++] = '/';
   for (int i = 0; base[i] && n < PATH_MAX - 1; i++)
