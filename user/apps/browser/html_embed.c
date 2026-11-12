@@ -207,7 +207,9 @@ static void img_box_style(struct inl_img *im, const struct css_style *cs)
   im->bw = (short)(cs->border_w[0] > 0 ? (cs->border_w[0] > 64 ? 64 : cs->border_w[0]) : 0);
   im->bcol = cs->border_color >= 0 ? (unsigned)cs->border_color : sty_cur.fg;
   im->radius = (short)(cs->radius > 0 ? (cs->radius > 9999 ? 9999 : cs->radius) : 0);
-  if (cs->box_sizing == 1) { /* the CSS size includes the border; the picture gets what is inside */
+  if (!im->radius && cs->pct_w == 100 && (cs->pct_h == 100 || cs->height < 0))
+    im->radius = (short)layout_clip_radius(); /* filling a rounded box that clips its content */
+  if (cs->box_sizing == 1) {                  /* the CSS size includes the border; the picture gets what is inside */
     if (im->cw)
       im->cw = im->cw > 2 * im->bw ? im->cw - 2 * im->bw : 1;
     if (im->ch)

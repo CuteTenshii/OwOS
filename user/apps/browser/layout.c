@@ -245,6 +245,14 @@ bool layout_cover_image(const char *url, int img_idx, short pos_x, short pos_y)
   return false;
 }
 
+int layout_clip_radius(void)
+{
+  if (g_cur < 0 || g_pool[g_cur].overflow != 1 || g_pool[g_cur].radius <= 0)
+    return 0;
+  int r = g_pool[g_cur].radius - g_pool[g_cur].border.t; /* the padding edge's radius */
+  return r > 0 ? r : 0;
+}
+
 void layout_box_close(int t1)
 {
   if (g_cur < 0)
