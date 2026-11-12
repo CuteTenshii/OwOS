@@ -588,7 +588,7 @@ static void usock_raw_deliver(const uint8_t *frame, uint32_t len);
 
 static void icmp_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
 {
-  if (len < 8)
+  if (len < 8 || inet_csum(p, len) != 0) /* the checksum covers the whole ICMP message */
     return;
   const struct icmp_hdr *ic = (const struct icmp_hdr *)p;
   if (ic->type == 0) {
