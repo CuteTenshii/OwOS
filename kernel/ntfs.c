@@ -21,6 +21,9 @@
 #define ATTR_INDEX_ROOT 0x90u
 #define ATTR_INDEX_ALLOC 0xA0u
 
+#define ATTR_FLAG_COMPRESSED 0x00FFu /* any compression-method bits */
+#define ATTR_FLAG_ENCRYPTED 0x4000u
+
 #define MFT_REC_VOLUME 3u
 #define MFT_REC_ROOT 5u
 #define MFT_FIRST_USER 16u /* records below this are system metafiles */
@@ -309,7 +312,8 @@ static int utf16_to_ascii(const uint8_t *src, uint32_t units, char *dst, uint32_
   return (int)n;
 }
 
-/* Locate the unnamed $DATA of `rec`: resident ptr/len, or non-resident mapping pairs [*mp,*mp_end). 0 / -1. */
+/* Locate the unnamed $DATA of `rec`: resident ptr/len, or non-resident mapping pairs [*mp,*mp_end). Compressed or
+ * encrypted data is refused. 0 / -1. */
 static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, const uint8_t **res_ptr,
                      uint32_t *res_len, const uint8_t **mp, const uint8_t **mp_end, uint64_t *size)
 {
@@ -332,6 +336,8 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, co
     if (alen < 8 || off + alen > used)
       return -1;
     if (alen >= 0x10 && atype == ATTR_DATA && a[9] == 0) {
+      if (load_le16(a + 0x0C) & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_ENCRYPTED))
+        return -1;
       if (a[8] == 0) {
         if (alen < 0x18)
           return -1;
