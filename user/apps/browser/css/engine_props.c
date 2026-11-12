@@ -526,6 +526,34 @@ void parse_line_height(const char *v, struct css_style *o)
 }
 
 /* font-size: keyword scale, else length/percent; em approximated as rem; *o untouched on failure. */
+/* A bare `<number>em` font-size as a percentage of the parent's (0.55em -> 55); -1 for anything else. */
+static int font_em_pct(const char *v)
+{
+  while (*v == ' ' || *v == '\t')
+    v++;
+  long n = 0, frac = 0, scale = 1;
+  bool any = false;
+  while (*v >= '0' && *v <= '9' && n < 100000) {
+    n = n * 10 + (*v++ - '0');
+    any = true;
+  }
+  if (*v == '.')
+    for (v++; *v >= '0' && *v <= '9'; v++, any = true)
+      if (scale < 10000) {
+        frac = frac * 10 + (*v - '0');
+        scale *= 10;
+      }
+  if (!any || (v[0] | 32) != 'e' || (v[1] | 32) != 'm')
+    return -1;
+  v += 2;
+  while (*v == ' ' || *v == '\t')
+    v++;
+  if (*v && *v != '!' && *v != ';')
+    return -1;
+  long pct = n * 100 + frac * 100 / scale;
+  return pct > 32767 ? 32767 : (int)pct;
+}
+
 void parse_font_size(const char *v, struct css_style *o)
 {
   if (has_ci(v, "xx-small"))
@@ -546,6 +574,8 @@ void parse_font_size(const char *v, struct css_style *o)
     o->font_px = 18;
   else if (has_ci(v, "medium"))
     o->font_px = 16;
+  else if (font_em_pct(v) >= 0) /* em is the parent's font-size, so it scales like a percentage */
+    o->font_pct = (short)font_em_pct(v);
   else {
     int q;
     int px = parse_len2(v, &q);

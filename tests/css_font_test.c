@@ -45,6 +45,85 @@ static void chk_body(void)
   expect(ok);
 }
 
+static short weight_of(const char *decls)
+{
+  struct css_style s;
+  css_style_reset(&s);
+  css_apply_inline(decls, &s);
+  return s.weight;
+}
+
+static void weight_numbers(void)
+{
+  expect(weight_of("color: red") == -1);
+  expect(weight_of("font-weight: 800") == 800);
+  expect(weight_of("font-weight: 600") == 600);
+  expect(weight_of("font-weight: bold") == 700);
+  expect(weight_of("font-weight: normal") == 400);
+  expect(weight_of("font-weight: bolder") == CSS_W_BOLDER);
+  expect(weight_of("font-weight: lighter") == CSS_W_LIGHTER);
+  expect(weight_of("font: 800 2rem/1 sans-serif") == 800);
+  expect(weight_of("font: 1rem sans-serif") == 400);
+  expect(weight_of("font: bold 1rem sans-serif") == 700);
+}
+
+/* The shape fonts.bunny.net and Google Fonts serve: one face per subset, each limited by unicode-range. */
+static const char bunny[] = "@font-face{font-family:'Nunito Sans';font-style:normal;font-weight:600;"
+                            "src:url(https://cdn.example/latin-ext-600.woff2) format('woff2'),"
+                            "url(https://cdn.example/latin-ext-600.woff) format('woff');"
+                            "unicode-range:U+0100-02BA,U+02BD-02C5,U+1E00-1E9F}"
+                            "@font-face{font-family:'Nunito Sans';font-style:italic;font-weight:600;"
+                            "src:url(https://cdn.example/latin-600i.woff2) format('woff2');"
+                            "unicode-range:U+0000-00FF,U+2000-206F,U+4??}"
+                            "@font-face{font-family:Var;font-weight:100 900;src:url(/v.ttf)}";
+
+static void fontface_descriptors(void)
+{
+  css_sheet *sh = css_new();
+  css_add(sh, bunny, (int)strlen(bunny), "https://fonts.example/css");
+  expect(css_fontface_count(sh) == 3);
+  struct css_fontface f;
+  expect(css_fontface_get(sh, 0, &f));
+  expect_string(f.family, "nunito sans");
+  expect_string(f.url, "https://cdn.example/latin-ext-600.woff2");
+  expect_string(f.base, "https://fonts.example/css");
+  expect(f.wmin == 600 && f.wmax == 600 && !f.italic && f.nranges == 3);
+  expect(!css_fontface_covers(&f, 'A'));
+  expect(css_fontface_covers(&f, 0x0152));
+  expect(css_fontface_covers(&f, 0x1E9F));
+  expect(!css_fontface_covers(&f, 0x1EA0));
+
+  expect(css_fontface_get(sh, 1, &f));
+  expect(f.italic && f.nranges == 3);
+  expect(css_fontface_covers(&f, 'A') && css_fontface_covers(&f, 0xE9) && css_fontface_covers(&f, 0x2019));
+  expect(css_fontface_covers(&f, 0x400) && css_fontface_covers(&f, 0x4FF) && !css_fontface_covers(&f, 0x500));
+
+  expect(css_fontface_get(sh, 2, &f));
+  expect_string(f.family, "var"); /* names fold to lowercase, as in font-family stacks */
+  expect(f.wmin == 100 && f.wmax == 900 && f.nranges == 0);
+  expect(css_fontface_covers(&f, 0x1F33A));
+  expect(!css_fontface_get(sh, 3, &f));
+  css_free(sh);
+}
+
+/* src skips formats font_load can't read and takes extensionless URLs (Google Fonts serves those). */
+static void fontface_src_choice(void)
+{
+  static const char src[] = "@font-face{font-family:A;src:url(a.eot);src:url(a.eot?#iefix) format('embedded-opentype'),"
+                            "url(https://fonts.gstatic.example/s/a/v1/abc) format(\"woff2\")}"
+                            "@font-face{font-family:B;src:url(b.svg#b) format('svg'),url(b-noext)}"
+                            "@font-face{font-family:C;src:local('C'),url(c.eot)}";
+  css_sheet *sh = css_new();
+  css_add(sh, src, (int)strlen(src), 0);
+  struct css_fontface f;
+  expect(css_fontface_count(sh) == 2);
+  expect(css_fontface_get(sh, 0, &f));
+  expect_string(f.url, "https://fonts.gstatic.example/s/a/v1/abc");
+  expect(css_fontface_get(sh, 1, &f));
+  expect_string(f.url, "b-noext");
+  css_free(sh);
+}
+
 static void chk(const char *decls, int want_px, int want_pct, int want_bold, int want_italic, int want_scaps,
                 short want_lhpct, const char *want_fam)
 {
@@ -88,6 +167,10 @@ int main(void)
   /* Longhand font-size keyword + percent forms still work. */
   chk("font-size: x-large", 24, -1, -1, -1, -1, -1, NULL);
   chk("font-size: 120%", -1, 120, -1, -1, -1, -1, NULL);
+  /* em scales the parent's size like a percentage; rem stays absolute. */
+  chk("font-size: .55em", -1, 55, -1, -1, -1, -1, NULL);
+  chk("font-size: 2em", -1, 200, -1, -1, -1, -1, NULL);
+  chk("font-size: 2rem", 32, -1, -1, -1, -1, -1, NULL);
 
   test("weight_numbers", weight_numbers);
   test("fontface_descriptors", fontface_descriptors);
