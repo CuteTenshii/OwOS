@@ -614,7 +614,8 @@ static int chain_next(struct fat_mount *m, uint32_t c, uint32_t *next)
 static int chain_seek(struct fat_mount *m, uint32_t first, uint32_t idx, uint32_t *c, uint32_t *at)
 {
   uint32_t cur = first, i = 0;
-  if (m->hint_first == first && m->hint_clus && m->hint_idx <= idx) {
+  /* Writes reset hint_first to 0 but keep hint_clus, so a cluster-0 file must not match the stale hint. */
+  if (first && m->hint_first == first && m->hint_clus && m->hint_idx <= idx) {
     cur = m->hint_clus;
     i = m->hint_idx;
   }

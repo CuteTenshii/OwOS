@@ -1634,7 +1634,7 @@ static void corrupt_entry_clusters(void)
   expect(fmt_dev(32, 100000, 512, 1, NULL) == 0);
   void *fs = mnt();
   expect(put_seed(fs, "/c.bin", 1024, 1) == 0 && put_seed(fs, "/d.bin", 1024, 2) == 0 &&
-         put_seed(fs, "/e.bin", 1024, 3) == 0);
+         put_seed(fs, "/e.bin", 1024, 3) == 0 && put_seed(fs, "/f.bin", 1024, 4) == 0);
   fat_ops()->close(fs);
   check_volume(g_img, 0, 0);
   const struct ck_ent *e = ck_find("/c.bin");
@@ -1661,6 +1661,9 @@ static void corrupt_entry_clusters(void)
   (void)e;
   fs = mnt();
   uint8_t tb[1024];
+  /* A read leaves a chain hint and a write op zeroes only its key: the cluster-0 file must not inherit it. */
+  expect(fat_ops()->read_at(fs, "/f.bin", 0, tb, 512) == 512); /* one cluster: hint index 0 */
+  expect(fat_setattr(fs, "/f.bin", FAT_ATTR_ARCHIVE, 0) == 0);
   expect(fat_ops()->read_at(fs, "/c.bin", 0, tb, 1024) <= 0);
   expect(fat_ops()->read_at(fs, "/d.bin", 0, tb, 1024) <= 0);
   expect(fat_ops()->read_at(fs, "/e.bin", 0, tb, 1024) <= 0);
