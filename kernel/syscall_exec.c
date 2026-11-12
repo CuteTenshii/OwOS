@@ -97,10 +97,12 @@ void syscall_exec_spawn(struct registers *r)
     }
     argc = 2;
   }
-  int pid = exec_program(image, (uint32_t)n, argc, argv);
+  int pid = exec_program_held(image, (uint32_t)n, argc, argv);
   kfree(image);
-  if (pid >= 0)
+  if (pid >= 0) {
     sched_set_cwd(pid, sched_cwd());
+    sched_release(pid);
+  }
   r->eax = (uint32_t)pid;
 }
 void syscall_exec_spawn_cap(struct registers *r)
@@ -258,7 +260,7 @@ void syscall_exec_spawn_cap(struct registers *r)
   }
   uint8_t *buf = kmalloc((uint32_t)fsz);
   int sz = buf ? fs_read(path, buf, (uint32_t)fsz) : -1;
-  int pid = sz < 0 ? -1 : exec_program(buf, (uint32_t)sz, argc, argv);
+  int pid = sz < 0 ? -1 : exec_program_held(buf, (uint32_t)sz, argc, argv);
   kfree(buf);
   if (pid < 0) {
     if (id >= 0) {
@@ -294,8 +296,7 @@ void syscall_exec_spawn_cap(struct registers *r)
     fds[rfd].pipe = (uint8_t)id;      /* our read end   */
     sched_set_pipe_fd(pid, 1, 1, id); /* child fd 1 (stdout) -> write end */
   }
-  /* Creds + cwd, atomic with the fd wiring (the int-0x80 gate runs IF=0, so no timer tick runs the child before it
-   * is fully set up). */
+  /* The child is held off every CPU until sched_release below, so it never runs half set up. */
   if (set_uid || set_gid)
     sched_set_creds(pid, set_uid ? (uint32_t)req.uid : sched_uid(), set_gid ? (uint32_t)req.gid : sched_gid());
   sched_set_cwd(pid, req.cwd ? cwdbuf : sched_cwd()); /* explicit cwd, else inherit */
@@ -306,6 +307,7 @@ void syscall_exec_spawn_cap(struct registers *r)
     kfree(block);
   }
   if (want_rfd && copyout(req.rfd, &rfd, sizeof rfd) != 0) {
+    sched_release(pid);
     r->eax = (uint32_t)-1;
     return;
   }
@@ -333,6 +335,7 @@ void syscall_exec_spawn_cap(struct registers *r)
       copyout(req.wfd, &nofd, sizeof nofd);
     }
   }
+  sched_release(pid);
   r->eax = (uint32_t)pid;
 #undef MAXARGS
 #undef MAXARG

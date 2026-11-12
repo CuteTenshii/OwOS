@@ -14,8 +14,10 @@ void sched_init_cpu(int cpu);
 void sched_start_cpu(int cpu);
 void sched_create_thread(const char *name, void (*entry)(void));
 
-/* Spawn a user process from a built address space; `brk` is the initial program break. */
-int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk);
+/* Spawn a user process from a built address space; `brk` is the initial program break. A `held` process is not
+ * scheduled until sched_release(pid), so its spawner can finish setting it up on an SMP machine. */
+int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk, bool held);
+void sched_release(int pid);
 
 /* User heap: sched_sbrk returns the previous break or (uint32_t)-1; sched_set_brk resets it on exec. */
 uint32_t sched_sbrk(int inc);

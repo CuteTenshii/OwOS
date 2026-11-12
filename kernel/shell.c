@@ -352,7 +352,8 @@ static int tokenize(char *s, char **argv, int max)
   return argc;
 }
 
-/* Read argv[0] off disk and spawn it; pid or -1. Looked up in the cwd (or absolute), then /bin. */
+/* Read argv[0] off disk and spawn it held (see sched_release); pid or -1. Looked up in the cwd (or absolute), then
+ * /bin. */
 static int spawn(int argc, char **argv)
 {
   if (argc == 0)
@@ -381,7 +382,7 @@ static int spawn(int argc, char **argv)
   if (!buf)
     return -1;
   int n = fs_read(path, buf, (uint32_t)sz);
-  int pid = (n < 0) ? -1 : exec_program(buf, (uint32_t)n, argc, argv);
+  int pid = (n < 0) ? -1 : exec_program_held(buf, (uint32_t)n, argc, argv);
   if (pid >= 0)
     sched_set_cwd(pid, cwd); /* child resolves relative paths from here */
   kfree(buf);
@@ -414,15 +415,17 @@ static void run_pipeline(char *cmd, char *bar)
     con_write("out of pipes\n");
     return;
   }
-  /* Set both up before either can be scheduled. */
-  __asm__ volatile("cli");
+  /* Both start held, so neither runs before the pipe is wired. */
   int p1 = spawn(ac1, av1);
   int p2 = spawn(ac2, av2);
-  if (p1 >= 0)
+  if (p1 >= 0) {
     sched_set_pipe_fd(p1, 1, 1, id); /* a's stdout -> pipe write */
-  if (p2 >= 0)
+    sched_release(p1);
+  }
+  if (p2 >= 0) {
     sched_set_pipe_fd(p2, 0, 0, id); /* b's stdin -> pipe read */
-  __asm__ volatile("sti");
+    sched_release(p2);
+  }
 
   if (p1 < 0 || p2 < 0) {
     con_write("pipeline: bad program\n");
@@ -1220,6 +1223,7 @@ static void run(char *cmd)
   int ac = tokenize(cmd, av, 8);
   int pid = (ac > 0) ? spawn(ac, av) : -1;
   if (pid >= 0) {
+    sched_release(pid);
     wait_reap(pid);
   } else if (ac > 0) {
     con_printf("unknown command: %s\ntype 'help'\n", av[0]);

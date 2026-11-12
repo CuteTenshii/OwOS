@@ -76,4 +76,7 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[]);
  * arguments. Returns its pid, or -1 on failure. */
 int exec_program(const void *image, uint32_t size, int argc, char *const argv[]);
 
+/* As exec_program, but the process stays off the CPUs until sched_release(pid). */
+int exec_program_held(const void *image, uint32_t size, int argc, char *const argv[]);
+
 #endif /* OWOS_LOADER_H */

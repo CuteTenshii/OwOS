@@ -36,7 +36,8 @@
            0x0000000D. */
 #define TASK_CWD_MAX 128 /* must match the shell's PATH_MAX */
 
-enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE };
+/* TASK_EMBRYO: created but held off the CPUs until its spawner finishes wiring creds, fds, cwd and env. */
+enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE, TASK_EMBRYO };
 
 typedef struct address_space {
   uint32_t *dir;
@@ -395,7 +396,7 @@ void sched_set_env_block(int pid, const char *block, uint32_t len)
   env_from_block(&t->env, block, len);
 }
 
-int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk)
+int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk, bool held)
 {
   task_t *t = alloc_task();
   address_space_t *as;
@@ -422,7 +423,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   t->as_owner = true;
   t->process = t;
   t->parent = current->id;
-  t->state = TASK_RUNNABLE;
+  t->state = held ? TASK_EMBRYO : TASK_RUNNABLE;
   sig_init(t);
   fds_init_console(t);
   cwd_set(t->cwd, current->cwd); /* inherit the spawner's cwd by default */
@@ -818,6 +819,15 @@ void sched_set_fd(int pid, int fd, const struct fd *f)
     return;
   t->fds[fd] = *f;
   fd_ref(f);
+}
+
+void sched_release(int pid)
+{
+  task_t *t = find_task((uint32_t)pid);
+  if (!t || t->state != TASK_EMBRYO)
+    return;
+  __sync_synchronize(); /* the child's setup must be visible before another CPU can pick it */
+  t->state = TASK_RUNNABLE;
 }
 
 /* Set a not-yet-running process's working directory. */

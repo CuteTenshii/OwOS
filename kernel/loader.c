@@ -169,7 +169,7 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
   return sp;
 }
 
-int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
+static int spawn_image(const void *image, uint32_t size, int argc, char *const argv[], bool held)
 {
   uint32_t *dir;
   uint32_t entry, brk;
@@ -178,10 +178,20 @@ int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
 
   uint32_t user_esp = setup_args(dir, argc, argv);
   const char *nm = (argc > 0 && argv[0]) ? argv[0] : "user";
-  int pid = sched_create_process(nm, entry, dir, user_esp, brk);
+  int pid = sched_create_process(nm, entry, dir, user_esp, brk, held);
   if (pid < 0)
     paging_free_process_dir(dir);
   return pid;
+}
+
+int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
+{
+  return spawn_image(image, size, argc, argv, false);
+}
+
+int exec_program_held(const void *image, uint32_t size, int argc, char *const argv[])
+{
+  return spawn_image(image, size, argc, argv, true);
 }
 
 /* Guarded thread stacks (SYS_STACK_ALLOC/FREE): per-CR3 slot bitmap; free keeps the frames. */
