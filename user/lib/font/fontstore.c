@@ -6,8 +6,9 @@
 #define CONF "/etc/fonts.conf"
 #define NAME_MAX_U 64
 
-static const char *const key[] = {"sans=", "mono="};
-static const char *const builtin[] = {"LiberationSans-Regular.ttf", "LiberationMono-Regular.ttf"};
+static const char *const key[FONT_ROLES] = {"sans=", "mono=", "emoji="};
+static const char *const builtin[FONT_ROLES] = {"LiberationSans-Regular.ttf", "LiberationMono-Regular.ttf",
+                                                "NotoColorEmoji.ttf"};
 
 /* Web-font containers; present only in programs that link user/lib/font/woff.c */
 extern int woff_is_woff(const unsigned char *, int) __attribute__((weak));
@@ -99,7 +100,7 @@ int fontstore_list(int i, char *name)
 {
   struct dirent_u de;
   for (int idx = 0, seen = 0; readdir(DIR, idx, &de) == 0; idx++) {
-    if (de.is_dir || !is_font_name(de.name))
+    if (de.is_dir || !is_font_name(de.name) || !strcmp(de.name, builtin[FONT_EMOJI]))
       continue;
     if (seen++ == i) {
       strcpy(name, de.name);
@@ -153,16 +154,18 @@ void fontstore_path(int role, char *path, int n)
 
 int fontstore_choose(int role, const char *name)
 {
-  char cur[2][NAME_MAX_U], out[2 * (NAME_MAX_U + 8)];
-  if (!is_font_name(name))
+  char cur[NAME_MAX_U], out[FONT_ROLES * (NAME_MAX_U + 8)];
+  if (role < 0 || role >= FONT_ROLES || !is_font_name(name))
     return -1;
-  for (int r = 0; r < 2; r++)
+  int o = 0;
+  for (int r = 0; r < FONT_ROLES; r++) {
     if (r == role)
-      strcpy(cur[r], name);
+      strcpy(cur, name);
     else
-      fontstore_current(r, cur[r]);
-  snprintf(out, sizeof out, "%s%s\n%s%s\n", key[0], cur[0], key[1], cur[1]);
-  return writefile(CONF, out, (int)strlen(out));
+      fontstore_current(r, cur);
+    o += snprintf(out + o, sizeof out - (unsigned)o, "%s%s\n", key[r], cur);
+  }
+  return writefile(CONF, out, o);
 }
 
 static int ieq(const char *a, const char *b)

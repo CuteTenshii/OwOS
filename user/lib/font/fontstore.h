@@ -2,7 +2,9 @@
 #ifndef OWOS_FONTSTORE_H
 #define OWOS_FONTSTORE_H
 
-enum { FONT_SANS, FONT_MONO };
+/* FONT_EMOJI is the fallback for codepoints the text fonts lack; fontstore_list leaves it out, as it is no text face.
+ */
+enum { FONT_SANS, FONT_MONO, FONT_EMOJI, FONT_ROLES };
 
 /* Validate the .ttf/.otf/.woff/.woff2 file at `src` and copy it into /etc/fonts (web fonts are
  * unpacked to .ttf/.otf; .woff/.woff2 need woff.o linked). `name` (>= 64 bytes) gets the installed
