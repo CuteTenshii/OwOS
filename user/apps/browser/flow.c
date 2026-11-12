@@ -1109,6 +1109,14 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   /* Pad short content up to the box's minimum content height. */
   int vframe = b->border.t + b->border.b + b->padding.t + b->padding.b;
   int min_ch = box_min_content_h(b, vframe, box_w);
+  if (b->spec_h < 0 && b->pct_h >= 0 && b->parent >= 0 && bx[b->parent].spec_h >= 0) {
+    /* a percent height resolves against a parent whose height is set */
+    const struct lbox *pa = &bx[b->parent];
+    int pch = pa->spec_h - (pa->border_box ? pa->border.t + pa->border.b + pa->padding.t + pa->padding.b : 0);
+    int h = pch * b->pct_h / 100 - (b->border_box ? vframe : 0);
+    if (h > min_ch)
+      min_ch = h;
+  }
   if (min_ch > 0) {
     int have = flow_y() - content_top_y;
     if (min_ch > have)
