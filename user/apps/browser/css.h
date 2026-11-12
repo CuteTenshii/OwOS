@@ -22,7 +22,7 @@ enum css_track_kind { CSS_TRK_AUTO = 0, CSS_TRK_PX, CSS_TRK_PCT, CSS_TRK_FR };
 struct css_track {
   signed char kind;
   short v;
-}; /* v = px | percent | fr weight */
+}; /* v = px | percent | fr weight in hundredths (1.5fr = 150) */
 #define CSS_AREA_MAX 16 /* named grid areas per container */
 #define CSS_AREA_NAME 12
 struct css_area {

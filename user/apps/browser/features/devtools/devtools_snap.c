@@ -349,7 +349,11 @@ static void sty_tracks(struct textblk *t, const char *label, const struct css_tr
       uapp(b, &k, sizeof b, (unsigned)tr[i].v);
       sapp(b, &k, sizeof b, "%");
     } else if (tr[i].kind == CSS_TRK_FR) {
-      uapp(b, &k, sizeof b, (unsigned)tr[i].v);
+      uapp(b, &k, sizeof b, (unsigned)tr[i].v / 100);
+      if (tr[i].v % 100) {
+        sapp(b, &k, sizeof b, tr[i].v % 100 < 10 ? ".0" : ".");
+        uapp(b, &k, sizeof b, (unsigned)(tr[i].v % 100 % 10 ? tr[i].v % 100 : tr[i].v % 100 / 10));
+      }
       sapp(b, &k, sizeof b, "fr");
     } else
       sapp(b, &k, sizeof b, "auto");

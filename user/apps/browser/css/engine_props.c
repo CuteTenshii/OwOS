@@ -224,6 +224,11 @@ static void parse_track_token(const char *a, const char *b, struct css_track *t)
     const char *s = buf;
     while (*s >= '0' && *s <= '9' && fr < 30000)
       fr = fr * 10 + (*s++ - '0');
+    fr *= 100;
+    if (*s == '.')
+      for (s++; *s >= '0' && *s <= '9'; s++)
+        if (scale > 1)
+          fr += (*s - '0') * (scale /= 10);
     t->kind = CSS_TRK_FR;
     t->v = (short)(fr > 0 && fr <= 32767 ? fr : fr > 0 ? 32767 : 100);
     return;

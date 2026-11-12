@@ -666,7 +666,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   for (int c = 0; c < ncols; c++) {
     struct css_track t = c < cont->n_cols   ? cont->cols_t[c]
                          : cont->n_cols > 0 ? (struct css_track){CSS_TRK_AUTO, 0}
-                                            : (struct css_track){CSS_TRK_FR, 1};
+                                            : (struct css_track){CSS_TRK_FR, 100};
     is_fr[c] = is_auto[c] = 0;
     fr_w[c] = 0;
     colw[c] = 0;
