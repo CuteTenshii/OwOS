@@ -323,14 +323,20 @@ static int grow_dir(void)
     return -1;
   }
 
+  /* Point the on-disk superblock at the new extent before switching to it in memory. */
   uint32_t old_start = sb.dir_start, old_sectors = sb.dir_sectors;
-  kfree(dir);
-  dir = nd;
   sb.dir_start = new_start;
   sb.dir_sectors = new_sectors;
-  dir_cap = entries_for(new_sectors);
-  if (blk_write_sector(SUPER_LBA, &sb) != 0)
+  if (blk_write_sector(SUPER_LBA, &sb) != 0) {
+    sb.dir_start = old_start;
+    sb.dir_sectors = old_sectors;
+    kfree(nd);
+    run_mark(new_start, new_sectors, 0);
     return -1;
+  }
+  kfree(dir);
+  dir = nd;
+  dir_cap = entries_for(new_sectors);
   free_extent(old_start, old_sectors * SECTOR_SIZE);
   return 0;
 }
