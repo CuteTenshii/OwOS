@@ -11,6 +11,7 @@
 
 #define NTFS_MAX_REC 4096u      /* largest MFT record we handle           */
 #define NTFS_MAX_CLUSTER 65536u /* largest cluster we buffer (64 KiB cap) */
+#define NTFS_MAX_INDX 65536u    /* largest INDX block we buffer           */
 #define NTFS_MAX_NAME 255u      /* UTF-16 units in a name                 */
 
 #define ATTR_END 0xFFFFFFFFu
@@ -44,7 +45,8 @@ struct ntfs_mount {
 
   uint8_t rec[NTFS_MAX_REC];       /* one MFT record being inspected       */
   uint8_t dir_rec[NTFS_MAX_REC];   /* the directory record being walked    */
-  uint8_t clbuf[NTFS_MAX_CLUSTER]; /* one cluster (or INDX block)          */
+  uint8_t clbuf[NTFS_MAX_CLUSTER]; /* one cluster, private to read_runlist  */
+  uint8_t ixbuf[NTFS_MAX_INDX];    /* one INDX block of a directory index  */
   char label[64];
 };
 
@@ -462,7 +464,7 @@ static int walk_index_entries(const uint8_t *entries, const uint8_t *end, entry_
   return 0;
 }
 
-/* Run `cb` over every entry of directory `rec` ($INDEX_ROOT, then INDX blocks via clbuf). 0/-1; *stopped if cb stopped.
+/* Run `cb` over every entry of directory `rec` ($INDEX_ROOT, then INDX blocks via ixbuf). 0/-1; *stopped if cb stopped.
  */
 static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb cb, void *ctx, int *stopped)
 {
@@ -481,6 +483,7 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
   /* INDEX_ROOT: 0x10 header, then an INDEX_HEADER; entries_off is relative to it (irval+0x10). */
   if (irlen < 0x20)
     return -1;
+  uint32_t blk = load_le32(irval + 0x08); /* INDX block size; usually 4 KiB whatever the cluster size */
   uint32_t ih_off = 0x10;
   uint32_t entries_off = load_le32(irval + ih_off + 0x00);
   uint32_t total_used = load_le32(irval + ih_off + 0x04);
@@ -506,38 +509,34 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
     return 0;
   const uint8_t *mp = ia + mp_off, *mp_end = ia + alen;
 
-  /* Read INDX blocks one at a time into clbuf (capped at NTFS_MAX_CLUSTER). */
-  uint32_t blk = m->bytes_per_cluster;
-  if (blk < 512)
-    blk = 512;
-  if (blk > NTFS_MAX_CLUSTER)
-    blk = NTFS_MAX_CLUSTER;
+  if (blk < 512 || blk > NTFS_MAX_INDX || (blk & (blk - 1)))
+    return 0;
 
   uint64_t pos = 0;
   int guard = 0;
   while (pos + blk <= alloc_sz) {
     if (++guard > 100000)
       return -1;
-    int got = read_runlist(m, mp, mp_end, pos, m->clbuf, blk);
+    int got = read_runlist(m, mp, mp_end, pos, m->ixbuf, blk);
     if (got <= 0)
       break;
     pos += blk;
 
-    if (m->clbuf[0] != 'I' || m->clbuf[1] != 'N' || m->clbuf[2] != 'D' || m->clbuf[3] != 'X')
+    if (m->ixbuf[0] != 'I' || m->ixbuf[1] != 'N' || m->ixbuf[2] != 'D' || m->ixbuf[3] != 'X')
       continue;
-    uint16_t usa_off = load_le16(m->clbuf + 0x04);
-    uint16_t usa_cnt = load_le16(m->clbuf + 0x06);
-    if (apply_fixup(m->clbuf, blk, usa_off, usa_cnt) != 0)
+    uint16_t usa_off = load_le16(m->ixbuf + 0x04);
+    uint16_t usa_cnt = load_le16(m->ixbuf + 0x06);
+    if (apply_fixup(m->ixbuf, blk, usa_off, usa_cnt) != 0)
       continue;
     /* INDX: 0x18 header then an INDEX_HEADER at 0x18. */
     uint32_t ih = 0x18;
     if (ih + 8u > blk)
       continue;
-    uint32_t entries_off2 = load_le32(m->clbuf + ih + 0x00);
-    uint32_t used2 = load_le32(m->clbuf + ih + 0x04);
-    const uint8_t *s = m->clbuf + ih + entries_off2;
-    const uint8_t *e = m->clbuf + ih + used2;
-    if (s < m->clbuf || e > m->clbuf + blk || s > e)
+    uint32_t entries_off2 = load_le32(m->ixbuf + ih + 0x00);
+    uint32_t used2 = load_le32(m->ixbuf + ih + 0x04);
+    const uint8_t *s = m->ixbuf + ih + entries_off2;
+    const uint8_t *e = m->ixbuf + ih + used2;
+    if (s < m->ixbuf || e > m->ixbuf + blk || s > e)
       continue;
     if (walk_index_entries(s, e, cb, ctx, stopped) != 0)
       continue;
