@@ -61,6 +61,7 @@ struct tcp_conn {
   volatile uint32_t adv_wnd; /* last window advertised */
 
   volatile bool accepted; /* handed out by tcp_accept */
+  bool passive;           /* opened by a peer's SYN on a listener, not by tcp_connect */
   uint32_t opened;        /* timer_ticks() at SYN_RCVD */
 };
 
@@ -179,6 +180,7 @@ static void tcp_accept_syn(const uint8_t src[16], const struct tcp_hdr *t)
   c->finned = false;
   c->reset = false;
   c->accepted = false;
+  c->passive = true;
   c->opened = timer_ticks();
   tcp_send_ctl(c, TCP_SYN | TCP_ACK, isn);
 }
@@ -314,6 +316,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport)
   c->finned = false;
   c->reset = false;
   c->accepted = false;
+  c->passive = false;
   c->state = ST_SYN_SENT;
 
   for (int tries = 0; tries < 6; tries++) {
@@ -486,8 +489,8 @@ tcp_conn_t *tcp_accept(uint16_t port)
   for (;;) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
       struct tcp_conn *c = &conns[i];
-      if (c->state != ST_ESTAB || c->lport != port || c->accepted)
-        continue;
+      if (c->state != ST_ESTAB || c->lport != port || c->accepted || !c->passive)
+        continue; /* an outgoing connection can share the port number but is never a listener's */
       uint32_t f = irq_save();
       if (c->state == ST_ESTAB && !c->accepted) {
         c->accepted = true;
