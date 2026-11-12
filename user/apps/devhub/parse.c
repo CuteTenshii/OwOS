@@ -298,7 +298,7 @@ bool dh_parse_bt(const char *line, struct dh_bt *d)
 
 bool dh_parse_usb(const char *line, struct dh_usb *u)
 {
-  if (!starts(line, "xhci: "))
+  if (!starts(line, "xhci: ") && !starts(line, "uhci: "))
     return false;
   const char *s = line + 6;
   int sp = 0;

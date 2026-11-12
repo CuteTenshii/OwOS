@@ -57,7 +57,8 @@ struct dh_bt {
 };
 bool dh_parse_bt(const char *line, struct dh_bt *d);
 
-/* A /proc/usb xHCI device line: "xhci: <2 spaces per hub level>port 1.2: 046d:c077 class 00 12 Mbps [msc] ...". */
+/* A /proc/usb device line, "xhci: " or "uhci: " then <2 spaces per hub level>, e.g.
+ * "xhci:   port 1.2: 046d:c077 class 00 12 Mbps [msc] ...". */
 struct dh_usb {
   int depth;     /* hub nesting, 0 for a device on a root port */
   char port[16]; /* "1", "1.2" */

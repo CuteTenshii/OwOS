@@ -7,6 +7,7 @@
 #include "kstring.h"
 #include "sched.h"
 #include "timer.h"
+#include "uhci.h"
 #include "usb.h"
 #include "usbhc.h"
 #include "xhci.h"
@@ -216,6 +217,7 @@ static void poll_thread(void)
 void usb_boot(void)
 {
   xhci_boot();
+  uhci_boot();
   /* xHCI's loop also runs its bulk data paths and calls usbh_service itself. */
   if (xhci_present())
     sched_create_thread("usbpoll", xhci_poll_loop);

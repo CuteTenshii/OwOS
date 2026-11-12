@@ -1,5 +1,6 @@
-/* usbhost.h: xHCI host core services for USB class drivers (HID, hub). Everything here runs on the usb poll thread (or
- * the boot thread before it exists); class callbacks must not block. */
+/* usbhost.h: USB host core services for class drivers (HID, hub), on whichever controller (xHCI, UHCI) a device hangs
+ * off. Everything here runs on the usb poll thread (or the boot thread before it exists); class callbacks must not
+ * block. */
 #ifndef OWOS_USBHOST_H
 #define OWOS_USBHOST_H
 
@@ -67,17 +68,17 @@ struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_
 /* An interrupt OUT endpoint; send with usbh_pipe_send (below). */
 struct usbh_pipe *usbh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval);
 
-/* Bulk endpoints on a configured slot. IN: cb runs per completed transfer (at most mps bytes, a short one ends a
- * packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
+/* Bulk endpoints on a configured slot (xHCI only: NULL on UHCI). IN: cb runs per completed transfer (at most mps bytes,
+ * a short one ends a packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
 struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx);
 struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps);
 int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len);
 
-/* An isochronous IN endpoint kept armed, one TD per service interval of `payload` bytes (0 means
- * mps * (burst + 1) * (mult + 1)). At most USBH_ISOC_MAX_PAYLOAD, or 48 KiB on a controller without Large ESIT Payload
- * support. A SuperSpeedPlus isochronous companion's dwBytesPerInterval goes in payload, with
- * mult 0. cb runs per completed interval with the received bytes (they are only valid during the call), or with
- * err != 0 (xHCI completion code, len 0) when the controller missed it. binterval is the descriptor's bInterval. */
+/* An isochronous IN endpoint (xHCI only: NULL on UHCI) kept armed, one TD per service interval of `payload` bytes (0
+ * means mps * (burst + 1) * (mult + 1)). At most USBH_ISOC_MAX_PAYLOAD, or 48 KiB on a controller without Large ESIT
+ * Payload support. A SuperSpeedPlus isochronous companion's dwBytesPerInterval goes in payload, with mult 0. cb runs
+ * per completed interval with the received bytes (they are only valid during the call), or with err != 0 (xHCI
+ * completion code, len 0) when the controller missed it. binterval is the descriptor's bInterval. */
 typedef void (*usbh_isoc_cb)(void *ctx, const uint8_t *data, int len, int err);
 #define USBH_ISOC_MAX_PAYLOAD (256u * 1024u)
 struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
