@@ -23,6 +23,7 @@
 #include "console.h"
 #include "cpu.h"
 #include "fs.h"
+#include "heap.h"
 #include "kstring.h"
 #include "log.h"
 #include "nvme.h"
@@ -278,11 +279,14 @@ int procfs_list(int idx, char *name, int max)
  * stat/ls report a real size and the files behave like ordinary ones. */
 int procfs_size(const char *sub)
 {
-  static char scratch[8192];
   const char *leaf = sub[0] == '/' ? sub + 1 : sub;
   if (streq(leaf, "hostclip") || streq(leaf, "login") || streq(leaf, "sudo"))
     return 0; /* control nodes: a read would consume host state */
-  int n = procfs_read(sub, scratch, (int)sizeof scratch);
+  char *scratch = kmalloc(PSEUDO_FILE_MAX);
+  if (!scratch)
+    return 0;
+  int n = procfs_read(sub, scratch, PSEUDO_FILE_MAX);
+  kfree(scratch);
   return n < 0 ? 0 : n;
 }
 

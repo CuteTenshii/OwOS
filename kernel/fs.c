@@ -654,17 +654,21 @@ static int gen_read_at(gen_read_fn gen, const char *sub, uint32_t off, void *buf
 {
   if (off == 0)
     return gen(sub, (char *)buf, (int)len);
-  static char scratch[8192];
-  int total = gen(sub, scratch, (int)sizeof scratch);
-  if (total < 0)
+  /* Per call, not static: a generator may enable interrupts, and another reader could then overwrite the slice. */
+  char *scratch = kmalloc(PSEUDO_FILE_MAX);
+  if (!scratch)
     return -1;
-  if (off >= (uint32_t)total)
-    return 0;
-  uint32_t avail = (uint32_t)total - off;
-  uint32_t want = avail < len ? avail : len;
-  for (uint32_t i = 0; i < want; i++)
-    ((uint8_t *)buf)[i] = (uint8_t)scratch[off + i];
-  return (int)want;
+  int total = gen(sub, scratch, PSEUDO_FILE_MAX);
+  int want = 0;
+  if (total < 0)
+    want = -1;
+  else if (off < (uint32_t)total) {
+    uint32_t avail = (uint32_t)total - off;
+    want = (int)(avail < len ? avail : len);
+    memcpy(buf, scratch + off, (uint32_t)want);
+  }
+  kfree(scratch);
+  return want;
 }
 
 /* /proc: flat, one generated file per fact (see procfs.c). */
