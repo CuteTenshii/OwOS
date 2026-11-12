@@ -1510,10 +1510,8 @@ int net_sock_recv_nb(int h, void *buf, uint32_t max)
   struct usock *s = sock_get(h);
   if (!s)
     return -1;
-  if (s->proto == SK_UDP)
+  if (s->proto == SK_UDP || s->proto == SK_ICMP)
     return sock_dgram_recv_nb(s, buf, max);
-  if (s->proto == SK_ICMP)
-    return sock_dgram_recv(s, buf, max);
   if (s->proto == SK_RAWETH)
     return sock_raw_recv(s, buf, max, 0);
   if (s->closed)
