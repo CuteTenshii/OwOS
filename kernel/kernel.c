@@ -47,6 +47,7 @@
 #include "syscall.h"
 #include "timer.h"
 #include "ufs.h"
+#include "usb.h"
 #include "users.h"
 #include "uwin.h"
 #include "virtiogpu.h"
@@ -54,7 +55,6 @@
 #include "vmsvga.h"
 #include "vmtools.h"
 #include "wallclock.h"
-#include "xhci.h"
 
 /* Boot-stage breadcrumb printed by the panic screen (idt.c). */
 const char *g_boot_stage = "early";
@@ -233,8 +233,8 @@ static void boot_bringup(void)
   /* PID 1 runs as root so the daemons it spawns inherit uid 0. */
   spawn_bin_detached("/bin/init", "init");
 
-  bootmark("xhci");
-  xhci_boot();
+  bootmark("usb");
+  usb_boot();
 
   bootmark("vmtools");
   vmtools_init(); /* no-op off VMware */

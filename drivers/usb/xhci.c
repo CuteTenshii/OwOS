@@ -32,6 +32,7 @@
 #include "sched.h"
 #include "timer.h"
 #include "usb3.h"
+#include "usbhc.h"
 #include "usbhost.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -193,8 +194,9 @@ struct isoc {
   usbh_isoc_cb cb;
 };
 
-struct usbh_pipe {
-  struct usbh_pipe *next;
+struct xpipe {
+  struct usbh_pipe base;
+  struct xpipe *next;
   int slot, dci;
   uint8_t ep_addr;
   uint16_t mps;
@@ -207,10 +209,12 @@ struct usbh_pipe {
   struct isoc *iso;
 };
 
+static const struct usbh_hc_ops xhci_ops;
+
 struct xdev {
   struct usbdev pub;
   struct ring ep0;
-  struct usbh_pipe *pipes;
+  struct xpipe *pipes;
 };
 static struct xdev *devs[XHCI_MAX_SLOTS];
 static int *root_slot;
@@ -328,7 +332,7 @@ static struct trb *event_next(void)
 }
 
 static bool pipe_event(struct trb *e);
-static void isoc_event(struct usbh_pipe *p, struct trb *e);
+static void isoc_event(struct xpipe *p, struct trb *e);
 
 /* Events no synchronous waiter owns: port changes (flagged for the poll thread) and interrupt-pipe completions. */
 static bool event_consumed(struct trb *e)
@@ -723,8 +727,8 @@ static int control_finish(int slot, uint32_t *status)
 }
 
 /* Control-IN over EP0: SETUP -> DATA IN -> STATUS OUT; len must fit in one page; returns len or -1. */
-int usbh_control_in(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex, uint8_t *out,
-                    int len)
+static int xh_control_in(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex, uint8_t *out,
+                         int len)
 {
   uint8_t *buf = palloc();
   if (!buf) /* palloc pool exhausted: fail gracefully */
@@ -749,7 +753,7 @@ int usbh_control_in(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValu
 }
 
 /* Control transfer with no data stage (SET_CONFIGURATION etc.): SETUP -> STATUS IN. */
-int usbh_control_nodata(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex)
+static int xh_control_nodata(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex)
 {
   struct ring *ep0 = ep0_of(slot_id);
   uint32_t setup_lo = bmReqType | ((uint32_t)bReq << 8) | ((uint32_t)wValue << 16);
@@ -760,8 +764,8 @@ int usbh_control_nodata(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t w
 }
 
 /* Control transfer with an OUT data stage (e.g. RNDIS SEND_ENCAPSULATED_COMMAND): SETUP -> DATA OUT -> STATUS IN. */
-int usbh_control_out(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex,
-                     const uint8_t *data, int len)
+static int xh_control_out(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wValue, uint16_t wIndex,
+                          const uint8_t *data, int len)
 {
   uint8_t *buf = palloc();
   if (!buf) /* palloc pool exhausted: fail gracefully */
@@ -805,9 +809,9 @@ static void put_le32(uint8_t *p, uint32_t v)
 /* Send one RNDIS control message and read the reply, both over EP0. */
 static int rndis_cmd(int slot, int iface, const uint8_t *msg, int mlen, uint8_t *resp, int rlen)
 {
-  if (usbh_control_out(slot, 0x21, 0x00, 0, iface, msg, mlen) != 0)
+  if (xh_control_out(slot, 0x21, 0x00, 0, iface, msg, mlen) != 0)
     return -1;
-  return usbh_control_in(slot, 0xA1, 0x01, 0, iface, resp, rlen);
+  return xh_control_in(slot, 0xA1, 0x01, 0, iface, resp, rlen);
 }
 
 /* INITIALIZE the RNDIS device and query its MAC into d->mac. Returns 0 on
@@ -1160,7 +1164,7 @@ static void recover_in_stall(void)
 
   ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_RESET_EP) | ((uint32_t)net_in_dci << 16) | ((uint32_t)net_slot << 24));
   cmd_submit();
-  usbh_control_nodata(net_slot, 0x02, 0x01, 0, net_in_ep);
+  xh_control_nodata(net_slot, 0x02, 0x01, 0, net_in_ep);
   uint32_t deq = (uint32_t)(uintptr_t)&net_in_ring.base[net_in_ring.enq] | net_in_ring.cycle;
   ring_push(&cmd_ring, deq, 0, 0, TRB_TYPE(TRB_SET_TRDQ) | ((uint32_t)net_in_dci << 16) | ((uint32_t)net_slot << 24));
   cmd_submit();
@@ -1247,7 +1251,7 @@ static void data_loop(void)
      * back cleanly). Draining it is what unblocks an Android gadget. */
     if (resp_avail) {
       uint8_t r[64];
-      usbh_control_in(net_slot, 0xA1, 0x01, 0, net_ctrl_iface, r, sizeof r);
+      xh_control_in(net_slot, 0xA1, 0x01, 0, net_ctrl_iface, r, sizeof r);
     }
     timer_sleep(1);
   }
@@ -1439,7 +1443,7 @@ static void msc_clear_stall(int dci, uint8_t ep_addr, struct ring *ring)
   ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_RESET_EP) | ((uint32_t)dci << 16) | ((uint32_t)msc_slot << 24));
   cmd_submit();
 
-  usbh_control_nodata(msc_slot, 0x02, 0x01, 0, ep_addr);
+  xh_control_nodata(msc_slot, 0x02, 0x01, 0, ep_addr);
 
   uint32_t deq = (uint32_t)(uintptr_t)&ring->base[ring->enq] | ring->cycle;
   ring_push(&cmd_ring, deq, 0, 0, TRB_TYPE(TRB_SET_TRDQ) | ((uint32_t)dci << 16) | ((uint32_t)msc_slot << 24));
@@ -2274,7 +2278,7 @@ static int config_endpoint(int slot, int dci, const uint32_t ep[5])
 }
 
 /* Queue Normal TRBs until the pipe has PIPE_BUFS outstanding, then ring its doorbell. */
-static void pipe_post(struct usbh_pipe *p)
+static void pipe_post(struct xpipe *p)
 {
   while (p->queued < PIPE_BUFS) {
     ring_push(&p->ring, (uint32_t)(uintptr_t)(p->buf + p->tail * p->mps), 0, p->mps,
@@ -2285,11 +2289,11 @@ static void pipe_post(struct usbh_pipe *p)
   db[p->slot] = p->dci;
 }
 
-static struct usbh_pipe *pipe_find(int slot, int dci)
+static struct xpipe *pipe_find(int slot, int dci)
 {
   if (slot <= 0 || slot >= XHCI_MAX_SLOTS || !devs[slot])
     return NULL;
-  for (struct usbh_pipe *p = devs[slot]->pipes; p; p = p->next)
+  for (struct xpipe *p = devs[slot]->pipes; p; p = p->next)
     if (p->dci == dci)
       return p;
   return NULL;
@@ -2299,7 +2303,7 @@ static uint8_t *isoc_buf(const struct isoc *s, int i) { return s->buf + (uint32_
 
 /* Build the TRBs of the TD for slot i into td; returns their count. TD Size is the packets still to come after each
  * TRB (xHCI 1.0+), capped at its 5-bit field. */
-static int isoc_td(const struct usbh_pipe *p, int i, uint32_t first_control, struct trb *td, uint32_t *end)
+static int isoc_td(const struct xpipe *p, int i, uint32_t first_control, struct trb *td, uint32_t *end)
 {
   const struct isoc *s = p->iso;
   uint32_t addr = (uint32_t)(uintptr_t)isoc_buf(s, i), done = 0;
@@ -2323,7 +2327,7 @@ static int isoc_td(const struct usbh_pipe *p, int i, uint32_t first_control, str
 
 /* Queue TDs until the pipe's depth are outstanding and ring the doorbell. Every TD asks to start as soon as possible,
  * so a ring that ran dry resumes at the next interval instead of waiting for a stale frame number. */
-static void isoc_post(struct usbh_pipe *p)
+static void isoc_post(struct xpipe *p)
 {
   struct isoc *s = p->iso;
   uint32_t packets = (s->payload + p->mps - 1) / p->mps, tbc = 0, tlbpc = packets - 1;
@@ -2353,7 +2357,7 @@ static void isoc_post(struct usbh_pipe *p)
 }
 
 /* A completed interval: retire it (and any the controller skipped before it), hand the data on, queue a replacement. */
-static void isoc_event(struct usbh_pipe *p, struct trb *e)
+static void isoc_event(struct xpipe *p, struct trb *e)
 {
   struct isoc *s = p->iso;
   if (p->dead)
@@ -2386,7 +2390,7 @@ static void isoc_event(struct usbh_pipe *p, struct trb *e)
  * (we may be inside another command's wait); a halt is flagged for pipes_recover on the poll thread. */
 static bool pipe_event(struct trb *e)
 {
-  struct usbh_pipe *p = pipe_find((e->control >> 24) & 0xFF, (e->control >> 16) & 0x1F);
+  struct xpipe *p = pipe_find((e->control >> 24) & 0xFF, (e->control >> 16) & 0x1F);
   if (p && p->iso) {
     isoc_event(p, e);
     return true;
@@ -2424,11 +2428,11 @@ static void pipes_recover(void)
   for (int s = 1; s <= max_slot_id; s++) {
     if (!devs[s])
       continue;
-    for (struct usbh_pipe *p = devs[s]->pipes; p; p = p->next) {
+    for (struct xpipe *p = devs[s]->pipes; p; p = p->next) {
       if (!p->halted)
         continue;
       ep_reset(s, p->dci, &p->ring);
-      usbh_control_nodata(s, 0x02, 0x01, 0, p->ep_addr);
+      xh_control_nodata(s, 0x02, 0x01, 0, p->ep_addr);
       p->queued = p->head = p->tail = 0;
       p->halted = false;
       if (++p->errors > 8) {
@@ -2446,14 +2450,14 @@ static void pipes_recover(void)
 #define EP_TYPE_BULK_IN 6
 #define EP_TYPE_INTR_IN 7
 
-static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int ep_type, uint8_t interval,
-                                   usbh_pipe_cb cb, void *ctx)
+static struct xpipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int ep_type, uint8_t interval, usbh_pipe_cb cb,
+                               void *ctx)
 {
   struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
   bool out = !(ep_addr & 0x80);
   if (!x || mps == 0 || mps > 1024 || out != (ep_type == EP_TYPE_BULK_OUT || ep_type == EP_TYPE_INTR_OUT))
     return NULL;
-  struct usbh_pipe *p = kmalloc(sizeof *p);
+  struct xpipe *p = kmalloc(sizeof *p);
   if (!p)
     return NULL;
   memset(p, 0, sizeof *p);
@@ -2467,6 +2471,7 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
     kfree(p);
     return NULL;
   }
+  p->base.ops = &xhci_ops;
   p->slot = slot;
   p->dci = ep_dci(ep_addr);
   p->ep_addr = ep_addr;
@@ -2498,27 +2503,30 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
   return p;
 }
 
-struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx)
+static struct usbh_pipe *pub_pipe(struct xpipe *p) { return p ? &p->base : NULL; }
+
+static struct usbh_pipe *xh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb,
+                                      void *ctx)
 {
-  return open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_IN, interval, cb, ctx);
+  return pub_pipe(open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_IN, interval, cb, ctx));
 }
 
-struct usbh_pipe *usbh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval)
+static struct usbh_pipe *xh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval)
 {
-  return open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_OUT, interval, NULL, NULL);
+  return pub_pipe(open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_OUT, interval, NULL, NULL));
 }
 
-struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx)
+static struct usbh_pipe *xh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx)
 {
-  return open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_IN, 0, cb, ctx);
+  return pub_pipe(open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_IN, 0, cb, ctx));
 }
 
-struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps)
+static struct usbh_pipe *xh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps)
 {
-  return open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_OUT, 0, NULL, NULL);
+  return pub_pipe(open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_OUT, 0, NULL, NULL));
 }
 
-static void pipe_free(struct usbh_pipe *p)
+static void pipe_free(struct xpipe *p)
 {
   if (p->iso) {
     if (p->iso->buf)
@@ -2532,8 +2540,8 @@ static void pipe_free(struct usbh_pipe *p)
   kfree(p);
 }
 
-struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
-                                    uint32_t payload, uint8_t binterval, usbh_isoc_cb cb, void *ctx)
+static struct usbh_pipe *xh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uint8_t burst, uint8_t mult,
+                                         uint32_t payload, uint8_t binterval, usbh_isoc_cb cb, void *ctx)
 {
   struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
   if (!payload)
@@ -2542,7 +2550,7 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   uint32_t max_payload = large_esit ? USBH_ISOC_MAX_PAYLOAD : 3u * 16u * 1024u;
   if (!x || !(ep_addr & 0x80) || mps == 0 || mps > 1024 || payload > max_payload || burst > 15 || mult > 2 || !cb)
     return NULL;
-  struct usbh_pipe *p = kmalloc(sizeof *p);
+  struct xpipe *p = kmalloc(sizeof *p);
   if (!p)
     return NULL;
   memset(p, 0, sizeof *p);
@@ -2576,6 +2584,7 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
     pipe_free(p);
     return NULL;
   }
+  p->base.ops = &xhci_ops;
   p->slot = slot;
   p->dci = ep_dci(ep_addr);
   p->ep_addr = ep_addr;
@@ -2599,11 +2608,12 @@ struct usbh_pipe *usbh_open_isoc_in(int slot, uint8_t ep_addr, uint16_t mps, uin
   p->next = x->pipes;
   x->pipes = p;
   isoc_post(p);
-  return p;
+  return &p->base;
 }
 
-void usbh_close_pipe(struct usbh_pipe *p)
+static void xh_close_pipe(struct usbh_pipe *bp)
 {
+  struct xpipe *p = (struct xpipe *)bp;
   struct xdev *x = p ? devs[p->slot] : NULL;
   if (!x)
     return;
@@ -2625,7 +2635,7 @@ void usbh_close_pipe(struct usbh_pipe *p)
   }
   if (input)
     pfree(input);
-  for (struct usbh_pipe **pp = &x->pipes; *pp; pp = &(*pp)->next)
+  for (struct xpipe **pp = &x->pipes; *pp; pp = &(*pp)->next)
     if (*pp == p) {
       *pp = p->next;
       break;
@@ -2638,13 +2648,14 @@ static void isoc_service(void)
 {
   for (int s = 1; s <= max_slot_id; s++)
     if (devs[s])
-      for (struct usbh_pipe *p = devs[s]->pipes; p; p = p->next)
+      for (struct xpipe *p = devs[s]->pipes; p; p = p->next)
         if (p->iso && !p->dead)
           isoc_post(p);
 }
 
-int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len)
+static int xh_pipe_send(struct usbh_pipe *bp, const uint8_t *data, int len)
 {
+  struct xpipe *p = (struct xpipe *)bp;
   if (!p || !p->out || p->dead || len <= 0 || len > 4096)
     return -1;
   memcpy(p->buf, data, (uint32_t)len);
@@ -2652,12 +2663,12 @@ int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len)
   int got = bulk_xfer(p->slot, &p->ring, p->dci, p->buf, len, &cc);
   if (got < 0 && cc == CC_STALL) {
     ep_reset(p->slot, p->dci, &p->ring);
-    usbh_control_nodata(p->slot, 0x02, 0x01, 0, p->ep_addr);
+    xh_control_nodata(p->slot, 0x02, 0x01, 0, p->ep_addr);
   }
   return got < 0 ? -1 : 0;
 }
 
-int usbh_config_hub(int slot, int nports, int think_time)
+static int xh_config_hub(int slot, int nports, int think_time)
 {
   struct xdev *x = devs[slot];
   if (!x || !x->pub.cfg)
@@ -2681,8 +2692,11 @@ int usbh_config_hub(int slot, int nports, int think_time)
   return cc == CC_SUCCESS ? 0 : -1;
 }
 
-struct usbdev *usbh_dev(int slot) { return slot > 0 && slot < XHCI_MAX_SLOTS && devs[slot] ? &devs[slot]->pub : NULL; }
-int usbh_max_slot(void) { return max_slot_id; }
+static struct usbdev *xh_dev(int slot)
+{
+  return slot > 0 && slot < XHCI_MAX_SLOTS && devs[slot] ? &devs[slot]->pub : NULL;
+}
+static int xh_max_slot(void) { return max_slot_id; }
 bool usbh_is_net_slot(int slot) { return net_up && slot == net_slot; }
 
 /* Drop a device: children first, class drivers, then the slot and every page it held. */
@@ -2691,17 +2705,13 @@ static void remove_device(int slot)
   struct xdev *x = devs[slot];
   if (!x)
     return;
-  for (struct usbh_pipe *p = x->pipes; p; p = p->next)
+  for (struct xpipe *p = x->pipes; p; p = p->next)
     p->dead = true;
   for (int s = 1; s <= max_slot_id; s++)
     if (devs[s] && devs[s]->pub.parent_slot == slot)
       remove_device(s);
   con_printf("usb: slot %d detached\n", slot);
-  hub_unbind(slot);
-  hid_unbind(slot);
-  xbox_unbind(slot);
-  btusb_unbind(slot);
-  uvc_unbind(slot);
+  usbh_unbind_classes(slot);
   if (x->pub.is_msc && slot == msc_slot)
     msc_ready = 0;
   if (x->pub.is_mtp && slot == mtp_slot)
@@ -2712,7 +2722,7 @@ static void remove_device(int slot)
 
   devs[slot] = NULL;
   while (x->pipes) {
-    struct usbh_pipe *p = x->pipes;
+    struct xpipe *p = x->pipes;
     x->pipes = p->next;
     pipe_free(p);
   }
@@ -2729,7 +2739,7 @@ static void remove_device(int slot)
 static void read_bos(struct usbdev *d)
 {
   uint8_t hdr[5];
-  if (usbh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, hdr, 5) != 5)
+  if (xh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, hdr, 5) != 5)
     return;
   int total = hdr[2] | (hdr[3] << 8);
   if (total < 5)
@@ -2739,7 +2749,7 @@ static void read_bos(struct usbdev *d)
   uint8_t *bos = kmalloc((uint32_t)total);
   if (!bos)
     return;
-  if (usbh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, bos, total) == total)
+  if (xh_control_in(d->slot, 0x80, 0x06, 0x0F00, 0, bos, total) == total)
     usb3_bos_parse(bos, total, &d->bos);
   kfree(bos);
 }
@@ -2797,7 +2807,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
 
   uint8_t desc[18];
   /* Two-step read: 8 bytes first to learn bMaxPacketSize0, fix EP0 via Evaluate Context if it differs. */
-  if (usbh_control_in(slot_id, 0x80, 0x06, 0x0100, 0, desc, 8) != 8)
+  if (xh_control_in(slot_id, 0x80, 0x06, 0x0100, 0, desc, 8) != 8)
     goto fail;
   if (speed < 4) {
     uint32_t guessed = (speed == 3) ? 64 : 8;
@@ -2805,7 +2815,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
     if (real != guessed)
       eval_context_mps(slot_id, real);
   }
-  if (usbh_control_in(slot_id, 0x80, 0x06, 0x0100, 0, desc, 18) != 18)
+  if (xh_control_in(slot_id, 0x80, 0x06, 0x0100, 0, desc, 18) != 18)
     goto fail;
 
   d->bcd_usb = desc[2] | (desc[3] << 8);
@@ -2818,20 +2828,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   if (d->bcd_usb >= 0x0201)
     read_bos(d);
 
-  /* Read the config descriptor (9-byte header for wTotalLength, then all), cache it, select it. */
-  uint8_t hdr[9];
-  if (usbh_control_in(slot_id, 0x80, 0x06, 0x0200, 0, hdr, 9) == 9) {
-    int total = hdr[2] | (hdr[3] << 8);
-    if (total > 4096)
-      total = 4096;
-    if (total >= 9) {
-      d->cfg = kmalloc(total);
-      if (d->cfg && usbh_control_in(slot_id, 0x80, 0x06, 0x0200, 0, d->cfg, total) == total) {
-        d->cfg_len = total;
-        usbh_control_nodata(slot_id, 0x00, 0x09, d->cfg[5], 0);
-      }
-    }
-  }
+  usbh_read_config(d);
   d->active = 1;
 
   /* Classify the device and bring up its driver; MTP first (its bulk pair looks like USB-Ethernet). */
@@ -2856,13 +2853,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
       d->bound |= USBH_BOUND_MSC;
   }
   con_printf("usb: slot %d %04x:%04x attached\n", slot_id, d->vid, d->pid);
-  if (d->cfg_len) {
-    hub_bind(d);
-    hid_bind(d);
-    xbox_bind(d);
-    btusb_bind(d);
-    uvc_bind(d);
-  }
+  usbh_bind_classes(d);
   return slot_id;
 
 fail:
@@ -2870,13 +2861,13 @@ fail:
   return 0;
 }
 
-int usbh_attach_child(int parent_slot, int port, int speed, uint32_t kbps)
+static int xh_attach_child(int parent_slot, int port, int speed, uint32_t kbps)
 {
   struct xdev *parent = devs[parent_slot];
   return parent ? enumerate_device(parent_slot, port, parent->pub.root_port, speed, kbps) : 0;
 }
 
-void usbh_detach_child(int parent_slot, int port)
+static void xh_detach_child(int parent_slot, int port)
 {
   for (int s = 1; s <= max_slot_id; s++)
     if (devs[s] && devs[s]->pub.parent_slot == parent_slot && devs[s]->pub.parent_port == port)
@@ -3009,17 +3000,15 @@ static void event_drain(void)
       defer_event(e);
 }
 
-/* Non-blocking upkeep shared by the poll loop and data_loop: halted pipes, HID repeat and LEDs, hub status changes
- * and root-port rescans (on a Port Status Change event, and about once a second regardless). */
+/* Non-blocking upkeep shared by the poll loop and data_loop: halted pipes, isochronous refills, the other controllers
+ * and class ticks (usbh_service), and root-port rescans (on a Port Status Change event, and about once a second
+ * regardless). */
 static void usb_service(void)
 {
   static uint32_t last_scan;
   pipes_recover();
-  hid_tick();
-  hub_service();
-  btusb_tick();
   isoc_service();
-  uvc_tick();
+  usbh_service();
   uint32_t now = timer_ticks();
   if (port_event || now - last_scan >= TIMER_HZ) {
     port_event = false;
@@ -3034,7 +3023,7 @@ static void usb_service(void)
  * within a poll interval - fast enough that the phone's tethering switch
  * engages instead of timing out and snapping back off. `lsusb` only reads the
  * cache. */
-static void usb_poll_thread(void)
+void xhci_poll_loop(void)
 {
   for (;;) {
     if (net_up)
@@ -3056,14 +3045,29 @@ static void usb_poll_thread(void)
   }
 }
 
-/* Boot-time: bring the host up, configure attached devices once, then hand all
- * further scanning to a background thread so OwOS stays a live, responsive USB
- * host - a tethered phone sees a stable computer that reconfigures it promptly.
- */
+static const struct usbh_hc_ops xhci_ops = {
+    .dev = xh_dev,
+    .max_id = xh_max_slot,
+    .control_in = xh_control_in,
+    .control_out = xh_control_out,
+    .control_nodata = xh_control_nodata,
+    .open_intr = xh_open_intr,
+    .open_intr_out = xh_open_intr_out,
+    .open_bulk_in = xh_open_bulk_in,
+    .open_bulk_out = xh_open_bulk_out,
+    .open_isoc_in = xh_open_isoc_in,
+    .pipe_send = xh_pipe_send,
+    .close_pipe = xh_close_pipe,
+    .config_hub = xh_config_hub,
+    .attach_child = xh_attach_child,
+    .detach_child = xh_detach_child,
+    .poll = NULL,
+};
+
 void xhci_boot(void)
 {
   if (setup_controller() != 0)
     return;
+  usbh_register(&xhci_ops, 1, XHCI_MAX_SLOTS - 1);
   scan_ports(); /* configure whatever's already attached       */
-  sched_create_thread("usbpoll", usb_poll_thread);
 }

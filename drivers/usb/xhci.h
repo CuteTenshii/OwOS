@@ -13,10 +13,16 @@
 #include <stdint.h>
 
 /* Bring the xHCI controller up at boot and configure attached devices, so OwOS
- * is a persistent USB host (a tethered phone keeps offering tethering). Call
- * after interrupts are enabled - it uses timer_sleep. No-op if no controller.
+ * is a persistent USB host (a tethered phone keeps offering tethering). Called
+ * by usb_boot after interrupts are enabled - it uses timer_sleep. No-op if no
+ * controller.
  */
 void xhci_boot(void);
+
+/* The USB poll thread's body when an xHCI controller is up: it also drives the
+ * xHCI bulk data paths and calls usbh_service for everything else. Never
+ * returns. */
+void xhci_poll_loop(void);
 
 /* USB Mass Storage (Bulk-Only Transport / SCSI) block device. A connected USB
  * flash drive / SD reader is exposed as a 512-byte-sector block device the FAT
