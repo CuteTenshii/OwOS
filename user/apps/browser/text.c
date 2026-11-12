@@ -657,12 +657,13 @@ void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh)
     *dh = 0;
     return;
   }
-  if (w > paw) {
-    h = (int)((long)h * paw / (w ? w : 1));
-    w = paw;
+  int frame = 2 * (im->bw > 0 ? im->bw : 0);
+  if (w + frame > paw && paw > frame) {
+    h = (int)((long)h * (paw - frame) / (w ? w : 1));
+    w = paw - frame;
   } /* fit width */
-  *dw = w < 1 ? 1 : w;
-  *dh = h < 1 ? 1 : h;
+  *dw = (w < 1 ? 1 : w) + frame; /* the border box */
+  *dh = (h < 1 ? 1 : h) + frame;
 }
 
 /* Inline image anchored at text offset `pos` (lowest index), or -1. */

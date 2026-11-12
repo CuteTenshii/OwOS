@@ -447,6 +447,58 @@ static bool draw_transformed(struct inl_img *im, int x, int y, int fw, int fh, i
   return true;
 }
 
+/* Coverage (0..255) of pixel (x,y) by a w*h box with corners rounded to radius r */
+static unsigned rrect_cov(int x, int y, int w, int h, int r)
+{
+  if (x < 0 || y < 0 || x >= w || y >= h)
+    return 0;
+  if (r > w / 2)
+    r = w / 2;
+  if (r > h / 2)
+    r = h / 2;
+  if (r <= 0)
+    return 255;
+  int cx = 16 * x + 8, cy = 16 * y + 8, dx = 0, dy = 0; /* pixel centre, 1/16 px */
+  if (cx < 16 * r)
+    dx = 16 * r - cx;
+  else if (cx > 16 * (w - r))
+    dx = cx - 16 * (w - r);
+  if (cy < 16 * r)
+    dy = 16 * r - cy;
+  else if (cy > 16 * (h - r))
+    dy = cy - 16 * (h - r);
+  if (!dx || !dy)
+    return 255;
+  int over = (int)ru_isqrt((unsigned)(dx * dx + dy * dy)) - 16 * r + 8; /* 1/16 px past the arc */
+  return over <= 0 ? 255 : over >= 16 ? 0 : (unsigned)(255 - over * 16);
+}
+
+static unsigned mix_rgb(unsigned a, unsigned b, unsigned t) /* a..b by t/255 */
+{
+  unsigned it = 255 - t;
+  return ((((a >> 16) & 0xff) * it + ((b >> 16) & 0xff) * t) / 255) << 16 |
+         ((((a >> 8) & 0xff) * it + ((b >> 8) & 0xff) * t) / 255) << 8 | (((a & 0xff) * it + (b & 0xff) * t) / 255);
+}
+
+/* Round the corners of the image just drawn over `bg` (the pixels saved before it) and ring it with its border:
+ * the border box is bw x by, w*h, its rows [r0,r1) on screen. */
+static void frame_image(const struct inl_img *im, const unsigned *bg, int bx, int by, int w, int h, int r0, int r1)
+{
+  unsigned *fb = browser_surface();
+  int b = im->bw, r = im->radius;
+  for (int y = r0; y < r1; y++)
+    for (int x = 0; x < w; x++) {
+      int sx = bx + x;
+      if (sx < 0 || sx >= BW)
+        continue;
+      unsigned *p = fb + (long)(by + y) * BW + sx;
+      unsigned under = bg[(long)(y - r0) * w + x];
+      unsigned co = rrect_cov(x, y, w, h, r), ci = b ? rrect_cov(x - b, y - b, w - 2 * b, h - 2 * b, r - b) : co;
+      unsigned ring = b ? mix_rgb(under, im->bcol, co) : under;
+      *p = mix_rgb(ring, *p, ci);
+    }
+}
+
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 {
   if (im->hidden)
@@ -459,32 +511,63 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   int rw = recorded ? t->w[row] : (paw < 1 ? 1 : paw);
   int dw = 0, dh = 0;
   img_disp_size(im, rw, &dw, &dh);
+  int bw = im->bw > 0 ? im->bw : 0, bdw = dw, bdh = dh; /* border box; the picture sits bw inside it */
+  dw -= 2 * bw;
+  dh -= 2 * bw;
   if (dw < 1)
     dw = 1;
   if (dh < 1)
     dh = 1;
   if (!recorded)
     return;
-  int y0 = py + t->y[row] - B->pg->scroll;
+  int y0 = py + t->y[row] - B->pg->scroll + bw;
+  x0 += bw;
+  /* Rounded or bordered: keep what lies under the border box, so the corners can show it again. */
+  unsigned *under = 0;
+  int fr0 = 0, fr1 = 0, fbx = x0 - bw, fby = y0 - bw;
+  if ((im->radius > 0 || bw > 0) && !im->xf.on) {
+    fr0 = fby < ct ? ct - fby : 0;
+    fr1 = fby + bdh > cb ? cb - fby : bdh;
+    if (fby + fr0 < 0)
+      fr0 = -fby;
+    if (fby + fr1 > BH)
+      fr1 = BH - fby;
+    if (fr1 > fr0 && (under = malloc((unsigned long)bdw * (unsigned)(fr1 - fr0) * 4)))
+      for (int y = fr0; y < fr1; y++)
+        for (int x = 0; x < bdw; x++) {
+          int sx = fbx + x;
+          under[(long)(y - fr0) * bdw + x] = sx >= 0 && sx < BW ? browser_surface()[(long)(fby + y) * BW + sx] : 0;
+        }
+  }
   int ry0 = y0 < ct ? ct - y0 : 0, ry1 = y0 + dh > cb ? cb - y0 : dh;
-  if (ry1 <= ry0)
+  if (ry1 <= ry0) {
+    if (under)
+      frame_image(im, under, fbx, fby, bdw, bdh, fr0, fr1);
+    free(under);
     return;
+  }
   int fw = dw, fh = dh, ox = 0, oy = 0;
   if (im->fit && im->iw && im->ih)
     ru_fit_rect(im->fit, im->iw, im->ih, dw, dh, &fw, &fh, &ox, &oy);
   /* columns of the fitted image that land inside the box and the window */
   int lo_i = -ox > -(x0 + ox) ? -ox : -(x0 + ox), hi_i = dw - ox < BW - (x0 + ox) ? dw - ox : BW - (x0 + ox);
   unsigned lo = (unsigned)(lo_i < 0 ? 0 : lo_i), hi = (unsigned)(hi_i > fw ? fw : hi_i);
-  if (hi_i <= lo_i || hi <= lo)
+  if (hi_i <= lo_i || hi <= lo) {
+    if (under)
+      frame_image(im, under, fbx, fby, bdw, bdh, fr0, fr1);
+    free(under);
     return;
+  }
   unsigned *fb = browser_surface();
   if (ry0 < oy)
     ry0 = oy;
   if (ry1 > oy + fh)
     ry1 = oy + fh;
 
-  if (im->xf.on && draw_transformed(im, x0 + ox, y0 + oy, fw, fh, ct, cb))
+  if (im->xf.on && draw_transformed(im, x0 + ox, y0 + oy, fw, fh, ct, cb)) {
+    free(under);
     return;
+  }
   bool filt = im->fbright != 1000 || im->fgray || im->finvert;
   int vw = (int)(hi - lo), vh = ry1 - ry0;
   unsigned *base = fb + (long)(y0 + ry0) * BW + x0 + ox + lo;
@@ -507,6 +590,9 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
       }
     free(save);
   }
+  if (under)
+    frame_image(im, under, fbx, fby, bdw, bdh, fr0, fr1);
+  free(under);
 }
 
 /* A placeholder box for an image that couldn't be fetched/decoded. */

@@ -132,6 +132,9 @@ struct inl_img {
   } xf;
   short fbright;              /* filter brightness permille, 1000 = none */
   signed char fgray, finvert; /* filter grayscale / invert percent */
+  short radius;               /* border-radius px (9999 = pill), 0 = square */
+  short bw;                   /* uniform border width px around the image */
+  unsigned bcol;              /* its colour, 0xRRGGBB */
 };
 
 /* 32 random hex digits, the shape Chrome gives target and frame ids */
