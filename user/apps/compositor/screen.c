@@ -109,6 +109,9 @@ int bind_mode(void)
     }
     for (int y = 0; y < hw_h; y++)
       memset(hw + (long)y * hw_pitch, 0, (unsigned)hw_w * 4);
+    /* Scaled presents never reach the strip past screen_w*ui_scale when hw size isn't a multiple of the scale. */
+    struct fbrect all = {0, 0, hw_w, hw_h};
+    fb_present_rects(&all, 1);
   }
   gfx_init(back, fb_pitch, screen_h); /* surface stride = pitch */
   input_set_bounds(screen_w - 1, screen_h - 1);
