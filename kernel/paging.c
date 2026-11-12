@@ -150,6 +150,9 @@ static uint64_t *map_walk(uint64_t *pml4, uint64_t va, uint64_t iflags, int *lar
         *large = 1;
         return 0;
       }
+      /* A supervisor page table here is a shared kernel one (MMIO): user PTEs must not land in it. */
+      if (l == 2 && (iflags & PAGE_USER) && !(t[i] & PAGE_USER))
+        return 0;
       t[i] |= (iflags & PAGE_USER); /* widen a shared branch to user */
     }
     t = (uint64_t *)(uintptr_t)(t[i] & PG_ADDR);
@@ -297,8 +300,8 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
   uint64_t stop = ((uint64_t)vaddr + bytes + 0x1FFFFFull) & ~0x1FFFFFull;
   for (uint64_t base = start; base < stop; base += 0x200000ull) {
     uint64_t *pde = get_pde(pml4, base);
-    if (!pde || !(*pde & PAGE_PRESENT) || (*pde & PAGE_PS))
-      continue;
+    if (!pde || !(*pde & PAGE_PRESENT) || (*pde & PAGE_PS) || !(*pde & PAGE_USER))
+      continue;                                 /* absent, or a shared kernel table this call never allocated */
     pfree((void *)(uintptr_t)(*pde & PG_ADDR)); /* the private page table */
     *pde = 0;
   }
@@ -844,6 +847,8 @@ int paging_map_user_at(uint32_t *dir, uint32_t vaddr, uint32_t phys, int npages)
     uint32_t pdi = a >> 22, pti = (a >> 12) & 0x3FF;
     uint32_t *pt;
     if (dir[pdi] & PAGE_PRESENT) {
+      if (!(dir[pdi] & PAGE_USER)) /* shared kernel table (MMIO): never put user PTEs in it */
+        return -1;
       pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
     } else {
       pt = palloc();
@@ -863,8 +868,8 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
   uint32_t stop = (vaddr + bytes + 0x3FFFFFu) & ~0x3FFFFFu;
   for (uint32_t base = start; base < stop; base += 0x400000u) {
     uint32_t pdi = base >> 22;
-    if (!(dir[pdi] & PAGE_PRESENT))
-      continue;
+    if (!(dir[pdi] & PAGE_PRESENT) || !(dir[pdi] & PAGE_USER))
+      continue;                          /* absent, or a shared kernel table this call never allocated */
     pfree((void *)(dir[pdi] & ~0xFFFu)); /* the private page table */
     dir[pdi] = 0;
   }
