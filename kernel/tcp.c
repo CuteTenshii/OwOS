@@ -229,7 +229,8 @@ void tcp_input(const uint8_t src[16], const uint8_t dst[16], const uint8_t *seg,
     int ok = (c->state == ST_SYN_SENT) ? ((flags & TCP_ACK) && ack == c->snd_nxt) : seq_in_rcv_window(c, seq);
     if (ok) {
       c->reset = true;
-      c->state = ST_DONE;
+      /* No socket holds an unaccepted connection, so nothing would ever close it: free the slot now. */
+      c->state = c->passive && !c->accepted ? ST_CLOSED : ST_DONE;
     }
     return;
   }
@@ -467,6 +468,12 @@ void tcp_unlisten(uint16_t port)
   for (int i = 0; i < TCP_MAX_LISTEN; i++)
     if (listeners[i].active && listeners[i].port == port)
       listeners[i].active = false;
+  /* Connections still waiting to be accepted have no other owner. */
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    struct tcp_conn *c = &conns[i];
+    if (c->state != ST_CLOSED && c->passive && !c->accepted && c->lport == port)
+      tcp_close(c);
+  }
 }
 
 /* Reap half-open (SYN_RCVD) connections whose peer never sent the final ACK. */
@@ -484,15 +491,19 @@ static void tcp_reap_halfopen(void)
   }
 }
 
+void tcp_tick(void) { tcp_reap_halfopen(); }
+
 tcp_conn_t *tcp_accept(uint16_t port)
 {
   for (;;) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
       struct tcp_conn *c = &conns[i];
-      if (c->state != ST_ESTAB || c->lport != port || c->accepted || !c->passive)
+      /* A connection the peer already half-closed is still handed out: its data and EOF remain readable. */
+      bool open = c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT;
+      if (!open || c->lport != port || c->accepted || !c->passive)
         continue; /* an outgoing connection can share the port number but is never a listener's */
       uint32_t f = irq_save();
-      if (c->state == ST_ESTAB && !c->accepted) {
+      if ((c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT) && !c->accepted) {
         c->accepted = true;
         irq_restore(f);
         return c;

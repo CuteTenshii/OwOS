@@ -1682,6 +1682,7 @@ static void net_tick(void)
   for (int i = 0; i < FRAG_SLOTS; i++)
     if (frags[i].used && (int32_t)(timer_ticks() - frags[i].started) > FRAG_TIMEOUT)
       frags[i].used = false;
+  tcp_tick();
 
   /* Router solicitations every 4 s until a router answers (max 5). */
   if (ll6_ok() && !have_gw6 && rs_sent < 5 && tick_passed(rs_next)) {

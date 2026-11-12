@@ -56,4 +56,8 @@ int tcp_listen(uint16_t port); /* 0 ok, -1 no slot/buffers */
 void tcp_unlisten(uint16_t port);
 tcp_conn_t *tcp_accept(uint16_t port); /* NULL if interrupted by a signal */
 
+/* Periodic housekeeping from the network thread: reaps handshakes the peer abandoned, so a SYN flood
+ * cannot hold every slot while no thread sits in tcp_accept. */
+void tcp_tick(void);
+
 #endif /* OWOS_TCP_H */
