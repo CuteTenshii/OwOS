@@ -229,7 +229,7 @@ void tray_menu_draw(void)
         gfx_fill_rect(p->x + 1, iy, p->w - 2, TBM_ITEM_H, SEL_BG);
       unsigned fg = dim ? DIM_FG : 0xc8d0dc;
       draw_check(p->x + 6, iy + (TBM_ITEM_H - 10) / 2, fl, fg);
-      gfx_ui_text_clip(p->x + MENU_PAD, iy + (TBM_ITEM_H - UIFONT_H) / 2, ent[e].label, fg, p->x + p->w - 16);
+      gfx_ui_text_clip(p->x + MENU_PAD, iy + (TBM_ITEM_H - UIFONT_H) / 2, ent[e].label, fg, p->w - MENU_PAD - 16);
       if (has_children(e))
         draw_arrow(p->x + p->w - 12, iy + (TBM_ITEM_H - 9) / 2, fg);
     }
