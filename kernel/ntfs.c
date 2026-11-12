@@ -23,6 +23,7 @@
 
 #define MFT_REC_VOLUME 3u
 #define MFT_REC_ROOT 5u
+#define MFT_FIRST_USER 16u /* records below this are system metafiles */
 
 #define FNAME_DIR_FLAG 0x10000000u /* $FILE_NAME file-flags directory bit */
 #define INDEX_ENTRY_NODE 0x01u     /* index-entry flag: has a sub-node    */
@@ -843,7 +844,7 @@ static int op_read_at(void *inst, const char *path, uint32_t off, void *buf, uin
   return read_data(m, m->dir_rec, off, buf, len);
 }
 
-/* enum_dir and list share one walk (index or print mode); skips "." and $-prefixed metafiles. */
+/* enum_dir and list share one walk (index or print mode); skips ".", DOS 8.3 aliases and system metafiles. */
 struct list_ctx {
   int want_idx; /* >=0 = the index to return; -1 = print mode    */
   int seen;
@@ -857,12 +858,14 @@ struct list_ctx {
 static int list_cb(void *vctx, const struct index_entry *e)
 {
   struct list_ctx *c = vctx;
-  /* skip "." and $-prefixed metafiles */
   if (e->name[0] == '\0')
     return 0;
   if (e->name[0] == '.' && e->name[1] == '\0')
     return 0;
-  if (e->name[0] == '$')
+  /* a namespace-2 entry is the short alias of a long name already listed */
+  if (e->nspace == 2)
+    return 0;
+  if (e->name[0] == '$' && e->child < MFT_FIRST_USER)
     return 0;
 
   uint32_t fsz = 0;
