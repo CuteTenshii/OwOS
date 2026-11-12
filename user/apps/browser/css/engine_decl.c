@@ -705,7 +705,14 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->bottom = parse_len(val);
   else if (span_is(p, pe, "left"))
     out->left = parse_len(val);
-  else if (span_is(p, pe, "overflow") || span_is(p, pe, "overflow-x")) { /* the horizontal axis decides */
+  else if (span_is(p, pe, "inset")) { /* top right bottom left, as margin's 1-4 values */
+    short v[4] = {-1, -1, -1, -1};
+    parse_box4(val, v, 0);
+    out->top = v[0];
+    out->right = v[1];
+    out->bottom = v[2];
+    out->left = v[3];
+  } else if (span_is(p, pe, "overflow") || span_is(p, pe, "overflow-x")) { /* the horizontal axis decides */
     const char *f = val;
     out->overflow = (starts_ci(f, "hidden") || starts_ci(f, "clip"))                              ? 1
                     : (starts_ci(f, "auto") || starts_ci(f, "scroll") || starts_ci(f, "overlay")) ? 2

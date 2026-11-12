@@ -763,6 +763,8 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
                    : has_ci(val, "none")     ? CSS_OF_NONE
                    : has_ci(val, "fill")     ? CSS_OF_FILL
                                              : out->obj_fit;
+  } else if (span_is(p, pe, "object-position")) {
+    parse_bg_position(val, &out->obj_pos_x, &out->obj_pos_y);
   } else if (span_is(p, pe, "pointer-events")) {
     out->pointer_events = has_ci(val, "none") ? 0 : 1;
   } else if (span_is(p, pe, "user-select") || span_is(p, pe, "-webkit-user-select") ||

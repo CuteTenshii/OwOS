@@ -211,6 +211,10 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->text_ovf = d->text_ovf;
   if (d->obj_fit >= 0)
     out->obj_fit = d->obj_fit;
+  if (d->obj_pos_x >= 0)
+    out->obj_pos_x = d->obj_pos_x;
+  if (d->obj_pos_y >= 0)
+    out->obj_pos_y = d->obj_pos_y;
   if (d->pointer_events >= 0)
     out->pointer_events = d->pointer_events;
   if (d->user_select >= 0)

@@ -322,6 +322,15 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   if (!csp_url_ok(CSP_IMG, imgabs, "image", imgurl, sizeof imgurl))
     return;
 
+  /* An absolutely positioned image filling its container is that container's backdrop: paint it as one. */
+  bool fills =
+      (cs->pct_w == 100 && cs->pct_h == 100) || (cs->top == 0 && cs->right == 0 && cs->bottom == 0 && cs->left == 0);
+  if (cs->pos == CSS_POS_ABS && fills && g_frame_depth == 0 &&
+      layout_cover_image(srcbuf, bg_image_index(srcbuf, g_base_url), cs->obj_pos_x, cs->obj_pos_y)) {
+    bg_note_url(srcbuf);
+    return;
+  }
+
   if (W_run_nl < 1 && W_n > 0)
     W_n = text_put(W_n, '\n', 0);
 

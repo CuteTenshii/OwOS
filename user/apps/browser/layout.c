@@ -226,6 +226,25 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   g_cur = i;
 }
 
+bool layout_cover_image(const char *url, int img_idx, short pos_x, short pos_y)
+{
+  for (int p = g_cur; p >= 0; p = g_pool[p].parent) {
+    struct css_bg_image *b = &g_pool[p].bgi;
+    if (g_pool[p].pos <= CSS_POS_STATIC)
+      continue;
+    css_bgi_reset(b);
+    b->kind = CSS_BGK_URL;
+    b->repeat = CSS_BGR_NO_REPEAT;
+    b->size_kind = CSS_BGS_COVER;
+    b->pos_x = pos_x >= 0 ? pos_x : 50;
+    b->pos_y = pos_y >= 0 ? pos_y : 50;
+    b->img_idx = (short)img_idx;
+    strlcpy(b->url, url, (int)sizeof b->url);
+    return true;
+  }
+  return false;
+}
+
 void layout_box_close(int t1)
 {
   if (g_cur < 0)

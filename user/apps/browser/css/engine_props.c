@@ -43,6 +43,7 @@ void css_style_reset(struct css_style *s)
   s->align_self = -1;
   s->aspect = -1;
   s->visibility = s->text_ovf = -1;
+  s->obj_pos_x = s->obj_pos_y = -1;
   s->obj_fit = s->pointer_events = s->user_select = s->cursor = s->tab_size = s->bg_clip = -1;
   s->sb_w = -1;
   s->sb_thumb = s->sb_track = -1;

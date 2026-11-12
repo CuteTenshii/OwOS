@@ -98,6 +98,9 @@ void layout_free(void);                  /* drop the tree (page teardown) */
 /* HTML-walk hooks */
 void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0);
 void layout_box_close(int t1);
+/* Paint `url` as the cover background of the nearest positioned open box (what an absolutely positioned
+ * image filling it shows); false if there is none. */
+bool layout_cover_image(const char *url, int img_idx, short pos_x, short pos_y);
 
 struct lbox *layout_pool(int *n); /* the box array (pre-order) + count */
 

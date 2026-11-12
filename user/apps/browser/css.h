@@ -206,6 +206,7 @@ struct css_style {
   signed char visibility;     /* 1 visible, 0 hidden/collapse, -1 unset (inherited) */
   signed char text_ovf;       /* text-overflow: 1 ellipsis, 0 clip, -1 unset */
   signed char obj_fit;        /* enum css_objfit, -1 unset */
+  short obj_pos_x, obj_pos_y; /* object-position, percent 0..100; -1 unset */
   signed char pointer_events; /* 1 auto, 0 none, -1 unset (inherited) */
   short letter_sp;            /* letter-spacing px, CSS_LS_UNSET unset (inherited) */
   signed char va_kind;        /* vertical-align: enum css_valign, -1 unset */

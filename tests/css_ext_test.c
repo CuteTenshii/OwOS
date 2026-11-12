@@ -67,6 +67,16 @@ static void check_font_relative_widths(void)
   expect(s.font_rel_w[1] == 0 && s.max_w == 200);
 }
 
+/* inset sets all four offsets; object-position keeps percentages. */
+static void check_inset_object_position(void)
+{
+  struct css_style s = parse("inset:0;object-position:30% 60%");
+  expect(s.top == 0 && s.right == 0 && s.bottom == 0 && s.left == 0);
+  expect(s.obj_pos_x == 30 && s.obj_pos_y == 60);
+  s = parse("inset:4px 8px");
+  expect(s.top == 4 && s.right == 8 && s.bottom == 4 && s.left == 8);
+}
+
 static void check_minified_areas(void)
 {
   struct css_style s = parse("grid-template:\".up.\"\"left.right\"\".down.\"/48px 48px 48px");
@@ -403,6 +413,7 @@ int main(void)
   test("logical margin and padding", check_logical_box);
   test("background shorthand clears the colour", check_background_clear);
   test("em and ch widths stay font-relative", check_font_relative_widths);
+  test("inset and object-position", check_inset_object_position);
   test("grid-template-areas spans", check_area_span);
   test("grid-area", check_grid_area);
   test("grid line placement", check_grid_lines);
