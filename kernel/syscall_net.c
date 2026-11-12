@@ -1,5 +1,6 @@
 #include "syscall_net.h"
 #include "entropy.h"
+#include "heap.h"
 #include "idt.h"
 #include "net.h"
 #include "rtc.h"
@@ -24,6 +25,10 @@ void syscall_net_connect(struct registers *r)
   r->eax = (uint32_t)net_sock_connect(host, (uint16_t)r->ecx, (int)r->edx);
 }
 
+/* Socket calls can block (ARP, TCP window), and a sibling thread may unmap the user buffer meanwhile, so data moves
+ * through a kernel buffer. A chunk is above every datagram limit, so an oversized datagram still fails whole. */
+#define NET_CHUNK 65536u
+
 void syscall_net_send(struct registers *r)
 {
   uint32_t a[6];
@@ -36,16 +41,36 @@ void syscall_net_send(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  if (ip_ptr) {
-    uint8_t ip[16];
-    if (copyin(ip, ip_ptr, sizeof ip) != 0) {
-      r->eax = (uint32_t)-1;
-      return;
-    }
-    r->eax = (uint32_t)net_sock_sendto((int)fd, ip, (int)port, (const void *)(uintptr_t)buf, len);
-  } else {
-    r->eax = (uint32_t)net_sock_send((int)fd, (const void *)(uintptr_t)buf, len);
+  uint8_t ip[16];
+  if (ip_ptr && copyin(ip, ip_ptr, sizeof ip) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
   }
+  uint32_t cap = len < NET_CHUNK ? len : NET_CHUNK;
+  uint8_t *kbuf = kmalloc(cap);
+  if (!kbuf) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  uint32_t done = 0;
+  int err = 0; /* first failure, reported only when nothing was sent (-4 = interrupted) */
+  while (done < len) {
+    uint32_t n = len - done < cap ? len - done : cap;
+    if (copyin(kbuf, buf + done, n) != 0) {
+      err = -1;
+      break;
+    }
+    int w = ip_ptr ? net_sock_sendto((int)fd, ip, (int)port, kbuf, n) : net_sock_send((int)fd, kbuf, n);
+    if (w < 0) {
+      err = w;
+      break;
+    }
+    done += (uint32_t)w;
+    if ((uint32_t)w < n)
+      break;
+  }
+  kfree(kbuf);
+  r->eax = done || !err ? done : (uint32_t)err;
 }
 
 void syscall_net_recv(struct registers *r)
@@ -62,11 +87,18 @@ void syscall_net_recv(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
+  if (max > NET_CHUNK)
+    max = NET_CHUNK;
+  uint8_t *kbuf = kmalloc(max);
+  if (!kbuf) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   int n;
   if (ip_ptr || port_ptr) {
     uint8_t ip[16];
     uint16_t port = 0;
-    n = net_sock_recvfrom((int)fd, (void *)(uintptr_t)buf, max, ip_ptr ? ip : 0, &port);
+    n = net_sock_recvfrom((int)fd, kbuf, max, ip_ptr ? ip : 0, &port);
     if (n > 0) {
       if (ip_ptr && copyout(ip_ptr, ip, sizeof ip) != 0)
         n = -1;
@@ -77,10 +109,13 @@ void syscall_net_recv(struct registers *r)
       }
     }
   } else if (flags & MSG_DONTWAIT) {
-    n = net_sock_recv_nb((int)fd, (void *)(uintptr_t)buf, max);
+    n = net_sock_recv_nb((int)fd, kbuf, max);
   } else {
-    n = net_sock_recv((int)fd, (void *)(uintptr_t)buf, max);
+    n = net_sock_recv((int)fd, kbuf, max);
   }
+  if (n > 0 && copyout(buf, kbuf, (uint32_t)n) != 0)
+    n = -1;
+  kfree(kbuf);
   r->eax = (uint32_t)n;
 }
 

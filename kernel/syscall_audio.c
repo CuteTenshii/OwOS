@@ -1,9 +1,12 @@
 #include "syscall_audio.h"
 #include "audio.h"
+#include "heap.h"
 #include "idt.h"
 #include "sched.h"
 #include "uaccess.h"
 #include <stdint.h>
+
+#define AUDIO_CHUNK 4096u
 
 static const struct audio_card *audio_backend;
 static uint32_t audio_owner;
@@ -41,8 +44,32 @@ void syscall_audio_write(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
+  /* stream_write waits for DMA room with interrupts on, so a sibling thread can unmap `buf`: stage it in chunks. */
+  uint8_t *kbuf = kmalloc(AUDIO_CHUNK);
+  if (!kbuf) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
   __asm__ volatile("sti");
-  r->eax = (uint32_t)audio_backend->stream_write((const void *)(uintptr_t)buf, len);
+  uint32_t done = 0;
+  int err = 0;
+  while (done < len && audio_backend && audio_owner == sched_current_id()) {
+    uint32_t n = len - done < AUDIO_CHUNK ? len - done : AUDIO_CHUNK;
+    if (copyin(kbuf, buf + done, n) != 0) {
+      err = 1;
+      break;
+    }
+    int w = audio_backend->stream_write(kbuf, n);
+    if (w < 0) {
+      err = 1;
+      break;
+    }
+    done += (uint32_t)w;
+    if ((uint32_t)w < n)
+      break;
+  }
+  kfree(kbuf);
+  r->eax = done || !err ? done : (uint32_t)-1;
 }
 
 void syscall_audio_close(struct registers *r)

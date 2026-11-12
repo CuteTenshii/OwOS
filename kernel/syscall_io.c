@@ -10,6 +10,42 @@
 #include "uaccess.h"
 #include <stdint.h>
 
+/* Blocking pipe ends yield, and a sibling thread may unmap the user buffer meanwhile: stage the bytes in the kernel
+ * and touch user memory only through copyin/copyout. */
+#define IO_CHUNK 512
+
+/* Write `len` user bytes at `ubuf` to pipe `id`, CRLF-translating when `tty`. Bytes written, or -1. */
+static int pipe_write_user(int id, uint32_t ubuf, uint32_t len, bool tty)
+{
+  char kbuf[IO_CHUNK];
+  uint32_t done = 0;
+  while (done < len) {
+    uint32_t n = len - done < IO_CHUNK ? len - done : IO_CHUNK;
+    if (copyin(kbuf, ubuf + done, n) != 0)
+      return done ? (int)done : -1;
+    if (tty) {
+      uint32_t from = 0;
+      for (uint32_t i = 0; i <= n; i++) {
+        if (i < n && kbuf[i] != '\n')
+          continue;
+        pipe_write(id, kbuf + from, (int)(i - from));
+        if (i < n)
+          pipe_write(id, "\r\n", 2);
+        from = i + 1;
+      }
+      done += n;
+      continue;
+    }
+    int w = pipe_write(id, kbuf, (int)n);
+    if (w < 0)
+      return done ? (int)done : -1;
+    done += (uint32_t)w;
+    if ((uint32_t)w < n)
+      break;
+  }
+  return (int)done;
+}
+
 void syscall_io_write(struct registers *r)
 {
   int fd = (int)r->ebx;
@@ -25,21 +61,13 @@ void syscall_io_write(struct registers *r)
       con_putc(buf[i]);
     r->eax = len;
   } else if (f->type == FD_PIPE_WR) {
-    r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
+    r->eax = (uint32_t)pipe_write_user(f->pipe, r->ecx, len, false);
   } else if (f->type == FD_TTY) {
     /* output processing of a terminal: newline becomes carriage return + newline */
-    uint32_t from = 0;
-    for (uint32_t i = 0; i <= len; i++) {
-      if (i < len && buf[i] != '\n')
-        continue;
-      pipe_write(f->tx, buf + from, (int)(i - from));
-      if (i < len)
-        pipe_write(f->tx, "\r\n", 2);
-      from = i + 1;
-    }
-    r->eax = len;
+    int w = pipe_write_user(f->tx, r->ecx, len, true);
+    r->eax = w < 0 ? (uint32_t)-1 : len;
   } else if (fd_is_channel(f)) {
-    r->eax = (uint32_t)pipe_write(f->tx, buf, (int)len);
+    r->eax = (uint32_t)pipe_write_user(f->tx, r->ecx, len, false);
   } else {
     r->eax = (uint32_t)-1;
   }
@@ -53,8 +81,10 @@ void syscall_io_read(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  char *buf = (char *)r->ecx;
   struct fd *f = &sched_fds()[fd];
+  char kbuf[IO_CHUNK];
+  if (len > IO_CHUNK)
+    len = IO_CHUNK; /* a pipe never holds more, and short reads are allowed */
   if (f->type == FD_CONSOLE) {
     char c;
     int got = 0;
@@ -70,12 +100,15 @@ void syscall_io_read(struct registers *r)
       return;
     }
     uint32_t n = 0;
-    buf[n++] = c;
+    kbuf[n++] = c;
     while (n < len && keyboard_poll_text(&c, 0))
-      buf[n++] = c;
-    r->eax = n;
+      kbuf[n++] = c;
+    r->eax = copyout(r->ecx, kbuf, n) == 0 ? n : (uint32_t)-1;
   } else if (f->type == FD_PIPE_RD || fd_is_channel(f)) {
-    r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
+    int n = pipe_read(f->pipe, kbuf, (int)len);
+    if (n > 0 && copyout(r->ecx, kbuf, (uint32_t)n) != 0)
+      n = -1;
+    r->eax = (uint32_t)n;
   } else {
     r->eax = (uint32_t)-1;
   }
