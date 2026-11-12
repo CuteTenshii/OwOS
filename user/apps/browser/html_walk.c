@@ -347,7 +347,10 @@ static void walk_element_inner(struct dom_node *el)
     emit_select(el);
     return;
   }
-  if (streq(name, "button")) {
+  /* An unstyled button reads as [ label ]; one the author gave a box of its own is laid out like any element. */
+  if (streq(name, "button") && (cs.bg >= 0 || cs.border_w[0] >= 0 || cs.padding[0] >= 0 || g_is_item))
+    g_has_controls = true;
+  else if (streq(name, "button")) {
     struct sty sv = sty_cur;
     sty_cur.bold = 1;
     g_has_controls = true;
