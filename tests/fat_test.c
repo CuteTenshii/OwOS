@@ -1671,6 +1671,28 @@ static void corrupt_entry_clusters(void)
   fat_ops()->close(fs);
 }
 
+/* Rounding a size within one cluster of 4 GiB up to clusters must not wrap to zero and free the whole chain. */
+static void huge_size_truncate(void)
+{
+  expect(fmt_dev(32, 100000, 512, 1, NULL) == 0);
+  void *fs = mnt();
+  expect(put_seed(fs, "/g.bin", 512, 7) == 0);
+  fat_ops()->close(fs);
+  check_volume(g_img, 0, 0);
+  uint8_t *dir = g_img + (size_t)(g_ck.root0 + (g_ck.rootc - 2) * g_ck.spc) * 512;
+  for (int i = 0; i < 16; i++)
+    if (memcmp(dir + i * 32, "G       BIN", 11) == 0) {
+      dir[i * 32 + 28] = 0xF8;
+      dir[i * 32 + 29] = dir[i * 32 + 30] = dir[i * 32 + 31] = 0xFF;
+    }
+  fs = mnt();
+  fat_truncate(fs, "/g.bin", 0xFFFFFFF0u);
+  uint8_t tb[512], want[512];
+  fill(want, sizeof want, 7);
+  expect(fat_ops()->read_at(fs, "/g.bin", 0, tb, sizeof tb) == (int)sizeof tb && memcmp(tb, want, sizeof tb) == 0);
+  fat_ops()->close(fs);
+}
+
 static void t_corrupt(void)
 {
   alarm(60);
@@ -1682,6 +1704,7 @@ static void t_corrupt(void)
     test(title, corrupt_chains);
   }
   test("entry pointing at cluster 0, 1 or beyond the volume", corrupt_entry_clusters);
+  test("size near 4 GiB keeps its chain on truncate", huge_size_truncate);
   alarm(0);
 }
 

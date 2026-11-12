@@ -1367,10 +1367,16 @@ static int chain_write(struct fat_mount *m, struct dirent *d, uint32_t off, cons
   return 0;
 }
 
+/* Clusters that hold `bytes`; (bytes + cbytes - 1) would wrap for sizes within a cluster of 4 GiB. */
+static uint32_t clusters_for(const struct fat_mount *m, uint32_t bytes)
+{
+  return bytes / m->cbytes + (bytes % m->cbytes != 0);
+}
+
 /* Drop clusters beyond what newsize needs. */
 static int chain_shrink(struct fat_mount *m, struct dirent *d, uint32_t newsize)
 {
-  uint32_t keep = (newsize + m->cbytes - 1) / m->cbytes;
+  uint32_t keep = clusters_for(m, newsize);
   if (d->cluster < 2)
     return 0;
   if (keep == 0) {
@@ -1393,7 +1399,7 @@ static int chain_shrink(struct fat_mount *m, struct dirent *d, uint32_t newsize)
 /* Fail with ENOSPC up front if growing old_size to new_size needs more clusters than free. */
 static int grow_check(struct fat_mount *m, uint32_t old_size, uint32_t new_size)
 {
-  uint32_t have = (old_size + m->cbytes - 1) / m->cbytes, need = (new_size + m->cbytes - 1) / m->cbytes;
+  uint32_t have = clusters_for(m, old_size), need = clusters_for(m, new_size);
   if (need <= have)
     return 0;
   if (!m->free_known) {
