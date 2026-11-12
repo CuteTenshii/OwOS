@@ -777,8 +777,20 @@ static void run_variant(void)
   bb_free(&b);
 }
 
+/* A stored deflate block carries LEN and its complement NLEN; a mismatch is the only sign of corruption. */
+static void zlib_stored_nlen(void)
+{
+  static const uint8_t text[] = "stored block payload";
+  uint8_t z[64], out[64];
+  int n = zlib_store(text, sizeof text, z, sizeof z);
+  expect(n > 0 && zlib_inflate(z, (uint32_t)n, out, sizeof out) == (int)sizeof text);
+  z[5] ^= 0x01; /* NLEN low byte, after the 2-byte header, block type and LEN */
+  expect(zlib_inflate(z, (uint32_t)n, out, sizeof out) < 0);
+}
+
 static void t_variants(void)
 {
+  test("zlib stored block rejects a bad NLEN", zlib_stored_nlen);
   vc = (struct cfg){.nodesize = 4096, .sectorsize = 4096};
   test("btrfs: 4K nodes, natural packing", run_variant);
 

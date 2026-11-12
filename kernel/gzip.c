@@ -163,6 +163,9 @@ static int inflate_stored(struct inbits *s, uint8_t *dst, uint32_t dcap, uint32_
   if (s->pos + 4 > s->len)
     return -1;
   uint32_t len = s->src[s->pos] | ((uint32_t)s->src[s->pos + 1] << 8);
+  uint32_t nlen = s->src[s->pos + 2] | ((uint32_t)s->src[s->pos + 3] << 8);
+  if ((len ^ nlen) != 0xFFFFu) /* NLEN is LEN's complement: the stored block's only integrity check */
+    return -1;
   s->pos += 4;
   if (s->pos + len > s->len || *outp + len > dcap)
     return -1;
