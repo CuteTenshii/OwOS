@@ -1208,8 +1208,6 @@ static void entry_set_owner(int slot, uint32_t base_mode)
 
 int fs_create(const char *name, const void *data, uint32_t size)
 {
-  if (!mounted)
-    return -1;
   const char *sub;
   struct mnt *mv = mount_for(name, &sub);
   if (mv) {
@@ -1217,6 +1215,8 @@ int fs_create(const char *name, const void *data, uint32_t size)
       return -1;
     return mv->ops->create(mv->inst, sub, data, size) == 0 ? 0 : -1;
   }
+  if (!mounted)
+    return -1;
 
   int parent;
   char leaf[FS_NAME_LEN];
@@ -1293,8 +1293,6 @@ static void slot_clear(int i)
 
 int fs_delete(const char *name)
 {
-  if (!mounted)
-    return -1;
   const char *sub;
   struct mnt *mv = mount_for(name, &sub);
   if (mv) {
@@ -1302,6 +1300,8 @@ int fs_delete(const char *name)
       return -1;
     return mv->ops->del(mv->inst, sub) == 0 ? 0 : -1;
   }
+  if (!mounted)
+    return -1;
   int i = find_path(name);
   if (i < 0 || i == FS_SLOT_ROOT)
     return -1;
@@ -1314,12 +1314,12 @@ int fs_delete(const char *name)
 
 int fs_rename(const char *old, const char *neu)
 {
-  if (!mounted)
-    return -1;
   const char *osub, *nsub;
   struct mnt *om = mount_for(old, &osub), *nm = mount_for(neu, &nsub);
   if (om || nm) /* a rename can't cross mounts */
     return (om == nm && om->ops->rename && om->ops->rename(om->inst, osub, nsub) == 0) ? 0 : -1;
+  if (!mounted)
+    return -1;
 
   int src = find_path(old);
   if (src < 0 || src == FS_SLOT_ROOT)
@@ -1355,8 +1355,6 @@ int fs_rename(const char *old, const char *neu)
 
 int fs_mkdir(const char *path)
 {
-  if (!mounted)
-    return -1;
   const char *sub;
   struct mnt *mv = mount_for(path, &sub);
   if (mv) {
@@ -1364,6 +1362,8 @@ int fs_mkdir(const char *path)
       return -1;
     return mv->ops->mkdir(mv->inst, sub) == 0 ? 0 : -1;
   }
+  if (!mounted)
+    return -1;
   int parent;
   char leaf[FS_NAME_LEN];
   if (resolve_path(path, &parent, leaf) != 0 || leaf[0] == '\0')
@@ -1387,8 +1387,6 @@ static bool stream_targets(int slot);
 
 int fs_rmdir(const char *path)
 {
-  if (!mounted)
-    return -1;
   const char *sub;
   struct mnt *mv = mount_for(path, &sub);
   if (mv) {
@@ -1396,6 +1394,8 @@ int fs_rmdir(const char *path)
       return -1;
     return mv->ops->rmdir(mv->inst, sub) == 0 ? 0 : -1;
   }
+  if (!mounted)
+    return -1;
   int s = find_path(path);
   if (s < 0 || s == FS_SLOT_ROOT)
     return -1;
@@ -1496,14 +1496,14 @@ int fs_prealloc(const char *name, uint32_t size)
 
 int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t len)
 {
-  if (!mounted)
-    return -1;
   const char *sub;
   struct mnt *mv = mount_for(name, &sub);
   if (mv) {
     int r = mv->ops->write_at ? mv->ops->write_at(mv->inst, sub, offset, data, len) : -1;
     return r < 0 ? -1 : r;
   }
+  if (!mounted)
+    return -1;
   int i = find_file(name);
   if (i >= 0) {
     if (offset > dir[i].size || len > dir[i].size - offset)
