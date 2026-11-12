@@ -479,6 +479,8 @@ int body_cp_adv(struct bctx *c, unsigned cp, int px, int set)
   return adv;
 }
 
+int font_zero_adv(int px, int set) { return body_cp_adv(&g_wk, '0', px, set); }
+
 /* Alpha-blend one cached glyph (coverage in colour fg, or its own ARGB colours) clipped to [ct,cb) */
 static void blit_glyph(int x, int y, const struct ru_gent *g, unsigned fg, int ct, int cb, int italic)
 {

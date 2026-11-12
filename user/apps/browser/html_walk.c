@@ -560,7 +560,18 @@ static void walk_element_inner(struct dom_node *el)
     if (cs.border_color < 0)
       cs.border_color = (int)sty_cur.fg;    /* a border without a colour is currentColor */
     cs.visibility = sty_cur.hidden ? 0 : 1; /* the inherited value, not just this rule's */
-    layout_box_open(el, &cs, W_n);          /* a block/flex box for the layout tree */
+    for (int k = 0; k < 3; k++)             /* em and ch widths, now the element's font is known */
+      if (cs.font_rel_w[k]) {
+        int r = cs.font_rel_w[k], base = r > 0 ? (W_fontpx ? W_fontpx : HTML_BASE_FONT) : walk_ch_px();
+        int px = (r > 0 ? r : -r) * base / 100;
+        if (k == 0)
+          cs.width = px;
+        else if (k == 1)
+          cs.max_w = px;
+        else
+          cs.min_w = px;
+      }
+    layout_box_open(el, &cs, W_n); /* a block/flex box for the layout tree */
   }
   emit_pseudo(el, CSS_PSEUDO_BEFORE);
   walk(el);

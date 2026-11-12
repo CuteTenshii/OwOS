@@ -58,6 +58,15 @@ static void check_background_clear(void)
   expect(s.bg == 0x8a2fd6);
 }
 
+/* em and ch widths wait for the element's font; px and rem resolve at once. */
+static void check_font_relative_widths(void)
+{
+  struct css_style s = parse("max-width:34ch;width:2.5em;min-width:3rem");
+  expect(s.font_rel_w[1] == -3400 && s.font_rel_w[0] == 250 && s.font_rel_w[2] == 0 && s.min_w == 48);
+  s = parse("max-width:34ch;max-width:200px");
+  expect(s.font_rel_w[1] == 0 && s.max_w == 200);
+}
+
 static void check_minified_areas(void)
 {
   struct css_style s = parse("grid-template:\".up.\"\"left.right\"\".down.\"/48px 48px 48px");
@@ -393,6 +402,7 @@ int main(void)
   test("grid fr weights keep their fraction", check_fractional_fr);
   test("logical margin and padding", check_logical_box);
   test("background shorthand clears the colour", check_background_clear);
+  test("em and ch widths stay font-relative", check_font_relative_widths);
   test("grid-template-areas spans", check_area_span);
   test("grid-area", check_grid_area);
   test("grid line placement", check_grid_lines);

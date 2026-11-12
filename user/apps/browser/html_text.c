@@ -135,6 +135,8 @@ static unsigned char cur_fset(void)
   return (unsigned char)g_fset_memo.set;
 }
 
+int walk_ch_px(void) { return font_zero_adv(W_fontpx ? W_fontpx : HTML_BASE_FONT, cur_fset()); }
+
 int text_put(int n, char c, unsigned char a)
 {
   if (!browser_ensure_text(n + 1))

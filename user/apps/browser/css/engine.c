@@ -58,9 +58,11 @@ static void fold(struct css_style *out, const struct css_style *d)
   if (d->width >= 0) {
     out->width = d->width;
     out->pct_w = -1;
+    out->font_rel_w[0] = d->font_rel_w[0];
   } else if (d->pct_w >= 0) {
     out->pct_w = d->pct_w;
     out->width = -1;
+    out->font_rel_w[0] = 0;
   }
   if (d->height >= 0) {
     out->height = d->height;
@@ -72,9 +74,11 @@ static void fold(struct css_style *out, const struct css_style *d)
   if (d->max_w >= 0) {
     out->max_w = d->max_w;
     out->pct_maxw = -1;
+    out->font_rel_w[1] = d->font_rel_w[1];
   } else if (d->pct_maxw >= 0) {
     out->pct_maxw = d->pct_maxw;
     out->max_w = -1;
+    out->font_rel_w[1] = 0;
   }
   if (d->max_h >= 0) {
     out->max_h = d->max_h;
@@ -86,9 +90,11 @@ static void fold(struct css_style *out, const struct css_style *d)
   if (d->min_w >= 0) {
     out->min_w = d->min_w;
     out->pct_minw = -1;
+    out->font_rel_w[2] = d->font_rel_w[2];
   } else if (d->pct_minw >= 0) {
     out->pct_minw = d->pct_minw;
     out->min_w = -1;
+    out->font_rel_w[2] = 0;
   }
   if (d->min_h >= 0) {
     out->min_h = d->min_h;

@@ -159,6 +159,8 @@ struct css_style {
   signed char center; /* text-align: 1 = center, 0 = left/other, -1 unset */
   int width, height;
   int max_w, max_h;                       /* max-width/height: px or -1 */
+  short font_rel_w[3];                    /* width, max-width, min-width as hundredths of em (>0) or ch (<0),
+                                             resolved against the element's font; 0 = the px value stands */
   int min_w, min_h;                       /* min-width/height: px or -1 */
   short pct_w, pct_h;                     /* width/height as a percent, else -1 */
   short pct_maxw, pct_maxh;               /* max-width/height as a percent, else -1 */

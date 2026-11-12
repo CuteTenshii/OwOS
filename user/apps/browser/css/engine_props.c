@@ -6,6 +6,7 @@ void css_style_reset(struct css_style *s)
   s->color = s->bg = -1;
   s->bold = s->under = s->strike = -1;
   s->weight = -1;
+  s->font_rel_w[0] = s->font_rel_w[1] = s->font_rel_w[2] = 0;
   s->disp = CSS_DISP_UNSET;
   s->center = -1;
   s->width = s->height = -1;

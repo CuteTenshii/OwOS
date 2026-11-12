@@ -34,6 +34,8 @@ unsigned char fam_intern(const char *stack);
 void fonts_walk_reset(void);
 /* Start the page's font sets over (after its faces change). */
 void fonts_page_reset(void);
+/* Width of "0" in the walk's current font: the CSS ch unit. */
+int walk_ch_px(void);
 
 struct css_src {
   const char *text;

@@ -333,6 +333,38 @@ static const char *const svg_props[] = {
 
 /* margin/padding-inline and -block (with -start/-end) on their physical sides, for horizontal left-to-right
  * text; true if the property was one of them. */
+/* A bare `<number>em` or `<number>ch` length as hundredths of em (positive) or ch (negative), which only the
+ * element's font can turn into px; 0 for anything else. */
+static short font_rel_len(const char *v)
+{
+  while (*v == ' ' || *v == '\t')
+    v++;
+  long n = 0, frac = 0, scale = 1;
+  bool any = false;
+  while (*v >= '0' && *v <= '9' && n < 10000) {
+    n = n * 10 + (*v++ - '0');
+    any = true;
+  }
+  if (*v == '.')
+    for (v++; *v >= '0' && *v <= '9'; v++, any = true)
+      if (scale < 100) {
+        frac = frac * 10 + (*v - '0');
+        scale *= 10;
+      }
+  bool em = (v[0] | 32) == 'e' && (v[1] | 32) == 'm', ch = (v[0] | 32) == 'c' && (v[1] | 32) == 'h';
+  if (!any || (!em && !ch))
+    return 0;
+  v += 2;
+  while (*v == ' ' || *v == '\t')
+    v++;
+  if (*v && *v != '!' && *v != ';')
+    return 0;
+  long h = n * 100 + frac * 100 / scale;
+  if (h > 32767)
+    h = 32767;
+  return (short)(em ? h : -h);
+}
+
 static bool logical_box(const char *p, const char *pe, const char *val, struct css_style *out)
 {
   bool m = span_is(p, pe, "margin-inline") || span_is(p, pe, "margin-block") || span_is(p, pe, "margin-inline-start") ||
@@ -489,18 +521,21 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   } else if (span_is(p, pe, "width")) {
     out->width = parse_len2(val, &pct);
     out->pct_w = (short)pct;
+    out->font_rel_w[0] = font_rel_len(val);
   } else if (span_is(p, pe, "height")) {
     out->height = parse_len2(val, &pct);
     out->pct_h = (short)pct;
   } else if (span_is(p, pe, "max-width")) {
     out->max_w = parse_len2(val, &pct);
     out->pct_maxw = (short)pct;
+    out->font_rel_w[1] = font_rel_len(val);
   } else if (span_is(p, pe, "max-height")) {
     out->max_h = parse_len2(val, &pct);
     out->pct_maxh = (short)pct;
   } else if (span_is(p, pe, "min-width")) {
     out->min_w = parse_len2(val, &pct);
     out->pct_minw = (short)pct;
+    out->font_rel_w[2] = font_rel_len(val);
   } else if (span_is(p, pe, "min-height")) {
     out->min_h = parse_len2(val, &pct);
     out->pct_minh = (short)pct;

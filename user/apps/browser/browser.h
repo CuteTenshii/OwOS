@@ -358,7 +358,8 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
 int browser_ensure_raw(int need);
 int browser_grow_cap(int cap, int init, int need);
 int browser_ensure_text(int need);
-void fonts_preload_emoji(void); /* load the emoji fallback font now (text.c) */
+void fonts_preload_emoji(void);     /* load the emoji fallback font now (text.c) */
+int font_zero_adv(int px, int set); /* advance of "0" in font set `set` at `px`, the CSS ch (text.c) */
 int browser_ensure_links(int need);
 int browser_ensure_regs(int need);
 int browser_ensure_imgs(int need);
