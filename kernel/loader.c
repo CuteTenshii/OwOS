@@ -17,28 +17,35 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
   uint32_t first = vaddr & ~0xFFFu;
   uint32_t last = (vaddr + memsz + 0xFFFu) & ~0xFFFu;
   for (uint32_t page = first; page < last; page += 4096) {
-    uint32_t phys = pmm_alloc_frame();
-    if (!phys)
+    /* A page another segment already mapped is shared: write only this segment's bytes into it. */
+    uint32_t phys = paging_user_phys(dir, page);
+    bool fresh = phys == 0;
+    if (fresh && !(phys = pmm_alloc_frame()))
       return -1;
     uint32_t fl = irq_save();
     uint8_t *kv = paging_scratch_map(0, phys);
-    /* Page = [0,lo) padding, [lo,hi) file data, [hi,4096) .bss tail. */
-    uint32_t seg_end = vaddr + filesz;
+    /* This segment covers [lo,top) of the page: file data in [lo,hi), .bss after it. */
+    uint32_t seg_end = vaddr + filesz, mem_end = vaddr + memsz;
     uint32_t lo = (vaddr > page) ? (vaddr - page) : 0;
     uint32_t hi = (seg_end > page) ? (seg_end - page) : 0;
+    uint32_t top = (mem_end > page) ? (mem_end - page) : 0;
     if (hi > 4096)
       hi = 4096;
+    if (top > 4096)
+      top = 4096;
     if (hi < lo)
       hi = lo;
-    if (lo)
-      memset(kv, 0, lo);
+    if (top < hi)
+      top = hi;
+    if (fresh)
+      memset(kv, 0, 4096);
     if (hi > lo)
       memcpy(kv + lo, src + page + lo - vaddr, hi - lo);
-    if (hi < 4096)
-      memset(kv + hi, 0, 4096 - hi);
+    if (top > hi)
+      memset(kv + hi, 0, top - hi);
     paging_scratch_unmap(0);
     irq_restore(fl);
-    if (paging_map_user_at(dir, page, phys, 1) < 0) {
+    if (fresh && paging_map_user_at(dir, page, phys, 1) < 0) {
       pmm_free_frame(phys);
       return -1;
     }
