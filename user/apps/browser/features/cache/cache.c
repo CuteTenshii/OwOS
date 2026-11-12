@@ -12,6 +12,8 @@
 #define CACHE_MAX_BYTES (16 * 1024 * 1024)
 #define CACHE_MAX_ONE (4 * 1024 * 1024)
 #define CACHE_MAGIC "OWCACHE2"
+/* CACHE_DIR, '/', then a file name: one of ours or anything readdir finds in the directory. */
+#define CACHE_PATH_MAX (sizeof CACHE_DIR + sizeof(((struct dirent_u *)0)->name))
 #define PEND_UNLINK_MAX 128 /* deferred deletes between flushes       */
 #define FM_MAX 3072         /* front-matter (magic+url+meta+ctype) cap */
 
@@ -457,7 +459,7 @@ int cache_revalidated(const char *url, const char *req_hdrs, long now, const cha
 /* Write front matter (magic, url, numbers, ctype), variant key, header block, then body. Worker thread only. */
 static int write_entry(const struct cache_entry *e)
 {
-  char path[128];
+  char path[CACHE_PATH_MAX];
   disk_path(e->disk, path, sizeof path);
 
   char fm[FM_MAX];
@@ -512,7 +514,7 @@ void cache_flush(void)
         e->dirty = false;
     }
   for (int i = 0; i < g_nunlink; i++) {
-    char path[128];
+    char path[CACHE_PATH_MAX];
     disk_path(g_unlink[i], path, sizeof path);
     unlink(path);
   }
@@ -579,7 +581,7 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *
 /* Load one cache file into a linked entry, or NULL (caller then deletes the file). Startup only. */
 static struct cache_entry *load_file(const char *name)
 {
-  char path[128];
+  char path[CACHE_PATH_MAX];
   disk_path(name, path, sizeof path);
 
   char fm[FM_MAX];
@@ -677,7 +679,7 @@ void cache_load(void)
     memcpy(bad[nbad++], de.name, sizeof de.name);
   }
   for (int i = 0; i < nbad; i++) {
-    char path[128];
+    char path[CACHE_PATH_MAX];
     disk_path(bad[i], path, sizeof path);
     unlink(path);
   }
