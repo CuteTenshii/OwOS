@@ -108,10 +108,12 @@ static const char *parse_line(const char *line, struct pwent *e)
   take_field(&p, e->pwhash, sizeof e->pwhash);
   if (*p != ':')
     return next_line(p);
-  if (!(q = parse_u32(p + 1, &e->uid)) || *q != ':')
+  q = parse_u32(p + 1, &e->uid);
+  if (!q || *q != ':')
     return next_line(q ? q : p);
   p = q;
-  if (!(q = parse_u32(p + 1, &e->gid)))
+  q = parse_u32(p + 1, &e->gid);
+  if (!q)
     return next_line(p);
   p = q;
   if (*p == ':') {
