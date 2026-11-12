@@ -177,11 +177,36 @@ static void run_mark(uint32_t start, uint32_t nsec, int used)
   }
 }
 
-/* Free a file's extent, guarding the superblock sector and the start==0 sentinel of an empty file. */
+/* Whether the directory table or a live file other than the extent starting at `skip` has data in cluster `c`. */
+static bool cluster_in_use(uint32_t c, uint32_t skip)
+{
+  uint32_t lo = c * clus_sectors, hi = lo + clus_sectors;
+  if (sb.dir_start != skip && sb.dir_start < hi && sb.dir_start + sb.dir_sectors > lo)
+    return true;
+  for (uint32_t i = 0; i < dir_cap; i++) {
+    if (!dir[i].name[0] || (dir[i].flags & FS_DIR_FLAG) || dir[i].start < (uint32_t)RESERVED_SECTORS ||
+        dir[i].start == skip)
+      continue;
+    uint32_t s = dir[i].start, e = s + size_to_sectors(dir[i].size);
+    if (s < hi && e > lo)
+      return true;
+  }
+  return false;
+}
+
+/* Free a file's extent, guarding the superblock sector and the start==0 sentinel of an empty file. Extents written
+ * under a smaller cluster size can share their edge clusters with a neighbour, so those stay used if one does. */
 static void free_extent(uint32_t start, uint32_t size)
 {
-  if (start >= (uint32_t)RESERVED_SECTORS)
-    run_mark(start, size_to_sectors(size), 0);
+  if (start < (uint32_t)RESERVED_SECTORS)
+    return;
+  uint32_t nsec = size_to_sectors(size);
+  run_mark(start, nsec, 0);
+  uint32_t c0 = start / clus_sectors, c1 = (start + nsec - 1) / clus_sectors;
+  if (c0 < clus_count && cluster_in_use(c0, start))
+    clus_set(c0);
+  if (c1 != c0 && c1 < clus_count && cluster_in_use(c1, start))
+    clus_set(c1);
 }
 
 /* Directory entries that fit in the given sectors. */
