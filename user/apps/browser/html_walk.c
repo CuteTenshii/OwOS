@@ -498,7 +498,11 @@ static void walk_element_inner(struct dom_node *el)
   if (blk) {
     sty_cur.clip = cs.overflow == 1; /* each block clips (or not) on its own; inline children share their block's */
     sty_cur.ellipsis = sty_cur.clip && cs.text_ovf == 1;
-    block_break();
+    /* The blank line between blocks stands in for UA margins; an author margin replaces it. */
+    if (cs.margin[0] != -1)
+      line_end();
+    else
+      block_break();
   }
   if (streq(name, "li")) { /* list marker  */
     unsigned char a = sty_byte();
@@ -543,7 +547,9 @@ static void walk_element_inner(struct dom_node *el)
   emit_pseudo(el, CSS_PSEUDO_AFTER);
   if (blk)
     layout_box_close(W_n);
-  if (blk)
+  if (blk && cs.margin[2] != -1)
+    line_end();
+  else if (blk)
     block_break();
 
   if (linked)

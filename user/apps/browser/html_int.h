@@ -117,6 +117,7 @@ int utf8_emit(int n, unsigned cp, unsigned char a);
 bool cp_drop(unsigned cp);
 void emit_text(const char *s);
 void block_break(void);
+void line_end(void); /* end the line; no blank line for paragraph spacing */
 void capture_title(struct dom_node *el);
 void title_walk_begin(void);
 void title_walk_publish(void);

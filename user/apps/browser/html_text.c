@@ -340,6 +340,16 @@ void emit_text(const char *s)
 }
 
 /* End the current line */
+/* End the current line without adding a blank one (a block edge whose margin the author set). */
+void line_end(void)
+{
+  W_pend_sp = false;
+  if (W_run_nl < 1 && W_n > 0) {
+    W_n = text_put(W_n, '\n', 0);
+    W_run_nl++;
+  }
+}
+
 void block_break(void)
 {
   W_pend_sp = false;

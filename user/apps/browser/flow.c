@@ -141,6 +141,25 @@ static int block_line_h(void)
   return lh < LINE_H ? LINE_H : lh;
 }
 
+/* A newline at `pos` that only ended the line inside the box just before it: no line of its own. */
+static int skip_box_terminator(int pos, int end)
+{
+  if (pos < end && B->pg->text[pos] == '\n' && img_at_pos(pos) < 0 && !(g_has_media && media_at_text_pos(pos)))
+    return pos + 1;
+  return pos;
+}
+
+/* True if [t0,t1) holds anything a flex item would be made of: a visible glyph or a replaced element. */
+static bool slice_has_item(int t0, int t1)
+{
+  for (int i = t0; i < t1; i++) {
+    char ch = B->pg->text[i];
+    if ((ch != '\n' && ch != ' ') || img_at_pos(i) >= 0 || (g_has_media && media_at_text_pos(i)))
+      return true;
+  }
+  return false;
+}
+
 /* Wrap glyph slice [t0,t1) at origin `base_x` / width `w` px into display lines. */
 static void flow_slice(int t0, int t1, int base_x, int w)
 {
@@ -871,18 +890,32 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   else if (b->kind == LB_FLEX && b->flex_dir == 0)
     banded = flow_flex_row(bx, idx, content_x, content_w);
   if (!banded) {
+    /* A column flexbox stacks its items like blocks, with row-gap between consecutive ones. */
+    bool col = b->kind == LB_FLEX && b->flex_dir == 1;
+    bool any_item = false;
     int pos = b->t0;
     for (int j = idx + 1; j < b->end;) {
       if (bx[j].parent != idx) {
         j++;
         continue;
       } /* not a direct child */
+      if (col && slice_has_item(pos, bx[j].t0)) {
+        if (any_item)
+          add_blank_px(b->gap_row, pos, content_x, content_w);
+        any_item = true;
+      }
       flow_slice(pos, bx[j].t0, content_x, content_w); /* inline text before it */
-      if (!out_of_flow(&bx[j]))
+      if (!out_of_flow(&bx[j])) {
+        if (col && any_item)
+          add_blank_px(b->gap_row, bx[j].t0, content_x, content_w);
+        any_item = true;
         flow_box(bx, j, content_x, content_w);
-      pos = bx[j].t1;
+      }
+      pos = skip_box_terminator(bx[j].t1, b->t1);
       j = bx[j].end; /* skip its descendants */
     }
+    if (col && any_item && slice_has_item(pos, b->t1))
+      add_blank_px(b->gap_row, pos, content_x, content_w);
     flow_slice(pos, b->t1, content_x, content_w);
   }
 
