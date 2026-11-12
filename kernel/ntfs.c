@@ -90,6 +90,8 @@ static int apply_fixup(uint8_t *buf, uint32_t total, uint16_t usa_off, uint16_t 
     uint32_t pos = i * 512u - 2u; /* last 2 bytes of stride i-1 */
     if (pos + 2u > total)
       return -1;
+    if (buf[pos] != usa[0] || buf[pos + 1] != usa[1]) /* torn or corrupt sector */
+      return -1;
     buf[pos] = usa[i * 2];
     buf[pos + 1] = usa[i * 2 + 1];
   }
