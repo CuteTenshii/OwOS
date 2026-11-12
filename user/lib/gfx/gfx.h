@@ -58,6 +58,8 @@ void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int c
 int gfx_ui_width_px(const char *s, int px);
 int gfx_ui_cw_cp_px(unsigned cp, int px);
 int gfx_ui_ascent_px(int px);
+struct font;
+struct font *gfx_ui_font(void); /* the UI sans face itself (owned by gfx), or NULL if it failed to load */
 
 /* --------------------------------------------------------------- GUI widgets
  */

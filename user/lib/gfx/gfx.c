@@ -441,6 +441,8 @@ int gfx_ui_cw_cp_px(unsigned cp, int px)
   return cache_glyph(v.font, v.px, v.cache, v.n, cp)->adv;
 }
 int gfx_ui_cw_cp(unsigned cp) { return gfx_ui_cw_cp_px(cp, SANS_PX); }
+
+struct font *gfx_ui_font(void) { return face_ready(&g_sans, FONT_SANS, SANS_PX) ? g_sans.font : 0; }
 int gfx_ui_cw(unsigned char c) { return gfx_ui_cw_cp(c); }
 
 int gfx_ui_width_px(const char *s, int px)
