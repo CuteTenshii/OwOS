@@ -32,6 +32,14 @@ static uint32_t timer_us(void) { return g_ticks * 4000u; }
 static void timer_sleep(uint32_t ms) { (void)ms; }
 static void con_write(const char *s) { (void)s; }
 static void entropy_stir(uint32_t v) { (void)v; }
+static void entropy_get(void *out, uint32_t n) /* deterministic stand-in for the kernel CSPRNG */
+{
+  static uint32_t x = 0x9E3779B9u;
+  for (uint32_t i = 0; i < n; i++) {
+    x = x * 1103515245u + 12345u;
+    ((uint8_t *)out)[i] = (uint8_t)(x >> 24);
+  }
+}
 static int fs_size(const char *p) { return (void)p, -1; }
 static int fs_read(const char *p, void *b, uint32_t n) { return (void)p, (void)b, (void)n, -1; }
 static void *kmalloc(uint32_t n) { return malloc(n); }
@@ -76,6 +84,7 @@ static void tcp_close(tcp_conn_t *c) { (void)c; }
 static int tcp_listen(uint16_t p) { return (void)p, 0; }
 static void tcp_unlisten(uint16_t p) { (void)p; }
 static tcp_conn_t *tcp_accept(uint16_t p) { return (void)p, NULL; }
+static void tcp_tick(void) {}
 static int g_tcp_segments;
 static void tcp_input(const uint8_t *src, const uint8_t *dst, const uint8_t *seg, uint32_t len)
 {
