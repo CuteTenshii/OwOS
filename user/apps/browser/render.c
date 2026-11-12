@@ -285,7 +285,7 @@ static unsigned render_sig(void)
                         ((unsigned)media_active() << 15) | ((unsigned)active_tab << 16));
   h = layout_mix(h, (unsigned)n_tabs);
   h = layout_mix(h, pg->page_bg);
-  h = layout_mix(h, (unsigned)(unsigned long)pg->body_font);
+  h = layout_mix(h, pg->font_gen);
   h = layout_mix(h, (unsigned)pg->n_bgimgs);
   for (int q = 0; q < pg->n_imgs; q++) {
     const struct inl_img *im = &pg->imgs[q];

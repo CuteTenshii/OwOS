@@ -997,10 +997,13 @@ static void layout_flow(int paw)
 unsigned layout_sig(int paw)
 {
   const struct page *pg = B->pg;
-  unsigned h = layout_mix((unsigned)paw, (unsigned)(unsigned long)pg->body_font);
+  unsigned h = layout_mix((unsigned)paw, pg->font_gen);
   h = layout_mix(h, (unsigned)pg->mode);
   if (pg->text)
     h = layout_mix(h, ru_text_sig(pg->text, pg->fsz, pg->lh, pg->bp, pg->attr, pg->text_len, ST_NOWRAP));
+  if (pg->ff) /* the font each glyph is measured in */
+    for (int i = 0; i < pg->text_len; i++)
+      h = h * 31u + pg->ff[i];
   if (pg->has_ls)
     for (int i = 0; i < pg->text_len; i++)
       h = layout_mix(h, (unsigned)(unsigned char)pg->ls[i]);

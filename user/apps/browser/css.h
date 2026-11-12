@@ -145,10 +145,13 @@ struct css_bg_image {
 };
 
 #define CSS_SVG_DECL 160
+#define CSS_W_BOLDER (-2) /* css_style.weight: one step heavier than the parent */
+#define CSS_W_LIGHTER (-3)
 struct css_style {
   int color;
   int bg;
   signed char bold;
+  short weight; /* font-weight 1..1000, CSS_W_BOLDER/LIGHTER, -1 unset */
   signed char under;
   signed char strike;
   signed char disp;
@@ -289,10 +292,20 @@ void css_set_state(const struct dom_node *hover, const struct dom_node *active, 
 unsigned css_state_generation(void);
 bool css_state_in_use(void);
 
-/* @font-face faces: family + first raw TTF/OTF url (woff/woff2 are skipped, not decodable). */
+/* An @font-face face: family, the first src url in a format font_load reads (TTF/OTF/WOFF/WOFF2), the declaring
+ * sheet's URL (or 0) that a relative url resolves against, and the descriptors that select it. */
+struct css_fontface {
+  const char *family, *url, *base;
+  short wmin, wmax; /* font-weight range, 100..900 */
+  bool italic;
+  const unsigned *ranges; /* nranges [lo,hi] unicode-range pairs; 0 = every codepoint */
+  int nranges;
+};
 int css_fontface_count(const css_sheet *sheet);
-/* `base` (may be 0) receives the declaring sheet's URL. */
-void css_fontface_at(const css_sheet *sheet, int i, const char **family, const char **url, const char **base);
+/* Face `i` in declaration order; false past the end. */
+bool css_fontface_get(const css_sheet *sheet, int i, struct css_fontface *out);
+/* True if the face's unicode-range covers `cp`. */
+bool css_fontface_covers(const struct css_fontface *f, unsigned cp);
 
 /* A parsed selector list for querySelector/matches; css_sel_parse returns NULL if nothing parses. */
 struct sel_list;

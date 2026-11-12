@@ -109,9 +109,11 @@ struct bctx {
   int bindent; /* indent level 0..7                   */
   bool bhr;    /* this line is a horizontal rule      */
   int blh;     /* CSS line-height px at the line start, 0 = auto */
-  struct ru_gtab at;
-  struct ru_gtab gt;
-  struct font *gf; /* the face the caches currently hold */
+  struct ru_gtab at;             /* advances, keyed by codepoint and px | font set << 9 */
+  struct ru_gtab gt;             /* glyph bitmaps, keyed by codepoint and px | face << 9 */
+  struct ru_gtab pk;             /* face picks, keyed by codepoint and font set */
+  const struct page *pg;         /* the page the caches were filled for */
+  unsigned gen;                  /* and its font_gen then */
   bool worker;
   bool held; /* the caller already holds browser_buf_lock */
 };
@@ -168,12 +170,16 @@ extern struct bctx g_ui;
 extern struct bctx g_wk;
 void set_block(struct bctx *c, int off);
 int glyph_px(int off);
-int body_cp_adv(struct bctx *c, unsigned cp, int px);
+int body_cp_adv(struct bctx *c, unsigned cp, int px, int set);
+int glyph_set(int off);
 /* Advance of the glyph at text offset `off`: its font size plus its letter-spacing. */
-static inline int glyph_adv(struct bctx *c, unsigned cp, int off) { return body_cp_adv(c, cp, glyph_px(off)) + B->pg->ls[off]; }
-int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px, int baseline,
-                  int italic);
-int run_ascent(int px);
+static inline int glyph_adv(struct bctx *c, unsigned cp, int off)
+{
+  return body_cp_adv(c, cp, glyph_px(off), glyph_set(off)) + B->pg->ls[off];
+}
+int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px, int set,
+                  int baseline, int italic, int bold);
+int run_ascent(int px, int set);
 int line_height(int maxpx, int lhmax);
 extern bool g_ov_active;
 extern int g_ov_base;

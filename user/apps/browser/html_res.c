@@ -184,155 +184,158 @@ void scan_meta_csp(struct dom_node *node)
   }
 }
 
-/* Generic font-family keywords that resolve to the default proportional UI font (we have no */
-static bool fam_generic_default(const char *n)
-{
-  return streq(n, "sans-serif") || streq(n, "serif") || streq(n, "system-ui") || streq(n, "ui-sans-serif") ||
-         streq(n, "ui-serif") || streq(n, "ui-rounded") || streq(n, "cursive") || streq(n, "fantasy") ||
-         streq(n, "-apple-system") || streq(n, "blinkmacsystemfont");
-}
-static bool fam_monospace(const char *n) { return streq(n, "monospace") || streq(n, "ui-monospace"); }
+/* Codepoints the document's text uses: a BMP bitmap, plus whether any lie above it. */
+struct cp_cover {
+  unsigned bmp[0x10000 / 32];
+  bool astral;
+};
 
-/* Load a TTF from a local file into `slot` (so it's freed with the other faces) */
-static struct font *load_face_file(const char *path, struct loaded_face *slot)
+static void cover_text(const struct dom_node *root, struct cp_cover *c)
 {
-  struct statinfo st;
-  if (stat(path, &st) < 0 || st.is_dir || st.size == 0)
-    return false;
-  unsigned char *buf = malloc(st.size);
-  if (!buf)
-    return false;
-  if (readfile_at(path, 0, buf, st.size) != (int)st.size) {
-    free(buf);
-    return false;
+  const struct dom_node *n = root;
+  while (n) {
+    bool skip =
+        n->type == DOM_ELEMENT && (streq(n->tag, "script") || streq(n->tag, "style") || streq(n->tag, "template"));
+    if (n->type == DOM_TEXT && n->text) {
+      const char *p = n->text, *end = p + strlen(p);
+      unsigned cp;
+      while (p < end) {
+        p += utf8_decode(p, end, &cp);
+        if (cp < 0x10000)
+          c->bmp[cp >> 5] |= 1u << (cp & 31);
+        else
+          c->astral = true;
+      }
+    }
+    if (n->first_child && !skip) {
+      n = n->first_child;
+      continue;
+    }
+    while (n && n != root && !n->next)
+      n = n->parent;
+    if (!n || n == root)
+      break;
+    n = n->next;
   }
-  struct font *f = font_load(buf, (int)st.size);
-  if (!f) {
-    free(buf);
-    return false;
-  }
-  slot->data = buf;
-  slot->font = f;
-  slot->family[0] = '\0';
-  return f;
 }
 
-/* Load the sheet's @font-face faces */
-/* Is `family` one of the comma-separated names in the font-family `stack`? Uses the same naive */
-static bool family_in_stack(const char *stack, const char *family)
+/* True if the text uses any codepoint in [lo,hi]. */
+static bool cover_any(const struct cp_cover *c, unsigned lo, unsigned hi)
 {
-  const char *p = stack;
-  while (*p) {
-    char name[CSS_FAM_MAX];
-    int n = 0;
-    while (*p && *p != ',' && n < (int)sizeof name - 1)
-      name[n++] = *p++;
-    name[n] = '\0';
-    while (*p && *p != ',')
-      p++;
-    if (*p == ',')
-      p++;
-    if (name[0] && streq(name, family))
+  if (hi > 0xffff) {
+    if (c->astral)
       return true;
+    hi = 0xffff;
+  }
+  for (unsigned cp = lo; cp <= hi && cp <= 0xffff;) {
+    unsigned w = c->bmp[cp >> 5];
+    if (!(cp & 31) && cp + 31 <= hi) {
+      if (w)
+        return true;
+      cp += 32;
+      continue;
+    }
+    if (w & (1u << (cp & 31)))
+      return true;
+    cp++;
   }
   return false;
 }
 
-/* Ensure B->pg->faces holds `need` entries (grows on demand) */
-static bool faces_room(int need)
+/* Text the UI font can't draw, which the emoji font then may. */
+static bool cover_needs_fallback(const struct cp_cover *c)
 {
-  if (need <= B->pg->faces_cap)
+  if (c->astral)
     return true;
-  int nc = B->pg->faces_cap ? B->pg->faces_cap : 4;
-  while (nc < need)
-    nc *= 2;
-  struct loaded_face *n = realloc(B->pg->faces, (unsigned)nc * sizeof *n);
-  if (!n)
-    return false;
-  B->pg->faces = n;
-  B->pg->faces_cap = nc;
-  return true;
+  struct font *ui = gfx_ui_font();
+  for (unsigned i = 0x2000 / 32; i < 0x10000 / 32; i++)
+    for (unsigned w = c->bmp[i]; w; w &= w - 1) {
+      unsigned cp = i * 32 + (unsigned)__builtin_ctz(w);
+      if (!ui || font_glyph_index(ui, (int)cp) <= 0)
+        return true;
+    }
+  return false;
 }
 
+static unsigned g_font_gen; /* source of page font generations; never reused */
+
+/* Load the @font-face faces the page's text can use: those whose unicode-range covers some of it. Each
+ * element then picks among them (and the installed fonts) by its own font-family, weight and style. */
 void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
 {
-  /* The page renders with a single body font, so the ONLY @font-face faces that can ever be used */
-  struct css_style cs;
-  struct dom_node *body_el = find_tag(root, "body");
-  const char *stack = "";
-  if (body_el) {
-    compute_style(body_el, &cs);
-    stack = cs.fam;
-  }
+  struct cp_cover *cov = calloc(1, sizeof *cov);
+  if (cov && root)
+    cover_text(root, cov);
+  if (cov && cover_needs_fallback(cov))
+    fonts_preload_emoji();
 
   int nfaces = css_fontface_count(g_sheet);
-  char **urls = nfaces ? malloc((unsigned)nfaces * sizeof *urls) : 0;
-  char (*fams)[CSS_FAM_MAX] = nfaces ? malloc((unsigned)nfaces * sizeof *fams) : 0;
+  char **urls = nfaces ? calloc((unsigned)nfaces, sizeof *urls) : 0;
+  struct loaded_face *nf = nfaces ? calloc((unsigned)nfaces, sizeof *nf) : 0;
   int nu = 0;
-  if (nfaces && (!urls || !fams)) {
-    free(urls);
-    free(fams);
-    urls = 0;
-    fams = 0;
+  if (nfaces && (!urls || !nf))
     nfaces = 0;
-  }
 
   for (int i = 0; i < nfaces; i++) {
-    const char *family = 0, *url = 0, *base = 0;
-    css_fontface_at(g_sheet, i, &family, &url, &base);
-    if (!family || !family[0] || !url || !url[0])
+    struct css_fontface ff;
+    if (!css_fontface_get(g_sheet, i, &ff) || !ff.family[0] || !ff.url[0])
       continue;
-    if (!family_in_stack(stack, family))
-      continue; /* body can't use it */
+    bool used = !ff.nranges || !cov;
+    for (int r = 0; r < ff.nranges && !used; r++)
+      used = cover_any(cov, ff.ranges[2 * r], ff.ranges[2 * r + 1]);
+    if (!used)
+      continue; /* a subset for script the page doesn't contain */
 
-    /* A relative src resolves against the sheet that declared it (so an external sheet's */
+    /* A relative src resolves against the sheet that declared it */
     char abs[URL_MAX], use[URL_MAX];
-    resolve_url(base && base[0] ? base : page_url, url, abs, sizeof abs);
+    resolve_url(ff.base && ff.base[0] ? ff.base : page_url, ff.url, abs, sizeof abs);
     if (!csp_url_ok(CSP_FONT, abs, "font", use, sizeof use))
       continue; /* font-src */
     int L = strlen(use);
     char *u = malloc((unsigned)L + 1);
-    if (!u)
+    unsigned *rg = ff.nranges ? malloc((unsigned)ff.nranges * 2 * sizeof *rg) : 0;
+    if (!u || (ff.nranges && !rg)) {
+      free(u);
+      free(rg);
       continue;
-    for (int k = 0; k <= L; k++)
-      u[k] = use[k];
-
+    }
+    memcpy(u, use, (unsigned)L + 1);
+    if (rg)
+      memcpy(rg, ff.ranges, (unsigned)ff.nranges * 2 * sizeof *rg);
+    struct loaded_face *lf = &nf[nu];
     int j = 0;
-    for (; family[j] && j < CSS_FAM_MAX - 1; j++)
-      fams[nu][j] = family[j];
-    fams[nu][j] = '\0';
+    for (; ff.family[j] && j < (int)sizeof lf->family - 1; j++)
+      lf->family[j] = ff.family[j];
+    lf->family[j] = '\0';
+    lf->wmin = ff.wmin;
+    lf->wmax = ff.wmax;
+    lf->italic = ff.italic;
+    lf->ranges = rg;
+    lf->nranges = ff.nranges;
     urls[nu++] = u;
   }
+  free(cov);
 
   /* Batch-fetch the font files (multiplexed over h2 same-origin), then parse */
-  struct loaded_face *nf = malloc((unsigned)(nu + 1) * sizeof *nf);
   int nn = 0;
-  if (nf && nu > 0) {
+  if (nu > 0) {
     unsigned char **bodies = calloc((unsigned)nu, sizeof *bodies);
     int *lens = calloc((unsigned)nu, sizeof *lens);
-    if (bodies && lens) {
-      if (fetch)
-        fetch(urls, nu, bodies, lens);
-      for (int i = 0; i < nu; i++) {
-        unsigned char *body = bodies[i];
-        if (!body || lens[i] <= 0) {
-          free(body);
-          continue;
-        }
-        /* font_load transparently decodes WOFF/WOFF2 containers to SFNT. */
-        struct font *f = font_load(body, lens[i]);
-        if (!f) {
-          free(body);
-          continue;
-        } /* unsupported (e.g. pure CFF) */
-        int j = 0;
-        for (; fams[i][j] && j < (int)sizeof nf[nn].family - 1; j++)
-          nf[nn].family[j] = fams[i][j];
-        nf[nn].family[j] = '\0';
-        nf[nn].font = f;
-        nf[nn].data = body;
-        nn++;
+    if (bodies && lens && fetch)
+      fetch(urls, nu, bodies, lens);
+    for (int i = 0; i < nu; i++) {
+      unsigned char *body = bodies ? bodies[i] : 0;
+      /* font_load transparently decodes WOFF/WOFF2 containers to SFNT. */
+      struct font *f = body && lens[i] > 0 ? font_load(body, lens[i]) : 0;
+      if (!f) {
+        free(body);
+        free(nf[i].ranges);
+        continue;
       }
+      nf[nn] = nf[i];
+      nf[nn].font = f;
+      nf[nn].data = body;
+      nn++;
     }
     free(bodies);
     free(lens);
@@ -340,52 +343,6 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
   for (int i = 0; i < nu; i++)
     free(urls[i]);
   free(urls);
-  free(fams);
-
-  /* Walk the <body> font-family stack and pick the first available family. */
-  struct font *chosen = 0;
-  if (body_el && nf) {
-    const char *p = stack;
-    while (*p) {
-      char name[CSS_FAM_MAX];
-      int n = 0;
-      while (*p && *p != ',' && n < (int)sizeof name - 1)
-        name[n++] = *p++;
-      name[n] = '\0';
-      while (*p && *p != ',')
-        p++;
-      if (*p == ',')
-        p++;
-      if (!name[0])
-        continue;
-
-      int hit = 0; /* a loaded @font-face? */
-      for (int i = 0; i < nn; i++)
-        if (streq(nf[i].family, name)) {
-          chosen = nf[i].font;
-          hit = 1;
-          break;
-        }
-      if (hit)
-        break;
-      if (fam_generic_default(name)) {
-        chosen = 0;
-        break;
-      } /* default UI sans */
-      char fpath[96];
-      if (fam_monospace(name))
-        fontstore_path(FONT_MONO, fpath, sizeof fpath);
-      if (fam_monospace(name) || fontstore_find(name, fpath, sizeof fpath)) {
-        struct font *m = load_face_file(fpath, &nf[nn]);
-        if (m) {
-          chosen = m;
-          nn++;
-          break;
-        }
-      }
-      /* a named family we don't have -> fall through to the next entry */
-    }
-  }
 
   /* Publish: drop the previous page's faces, install the new set. */
   browser_buf_lock();
@@ -393,27 +350,17 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
     if (B->pg->faces[i].font)
       font_free(B->pg->faces[i].font);
     free(B->pg->faces[i].data);
+    free(B->pg->faces[i].ranges);
   }
-  if (nn > 0 && faces_room(nn)) {
-    for (int i = 0; i < nn; i++)
-      B->pg->faces[i] = nf[i];
-    B->pg->n_faces = nn;
-    B->pg->body_font = chosen;
-  } else {
-    B->pg->n_faces = 0;
-    B->pg->body_font = 0; /* faces_room OOM: free below, fall back */
-  }
+  free(B->pg->faces);
+  B->pg->faces = nn ? nf : 0;
+  B->pg->n_faces = nn;
+  B->pg->faces_cap = nn;
+  B->pg->font_gen = ++g_font_gen;
   browser_buf_unlock();
-
-  if (nf) {
-    if (B->pg->n_faces == 0) /* publish failed: don't leak parsed faces */
-      for (int i = 0; i < nn; i++) {
-        if (nf[i].font)
-          font_free(nf[i].font);
-        free(nf[i].data);
-      }
+  if (!nn)
     free(nf);
-  }
+  fonts_page_reset();
 }
 
 /* ---------------------------------------------------- url() backgrounds ---- * Each url() */

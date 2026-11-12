@@ -2,7 +2,22 @@
 
 /* --------------------------------------------------------------- drawing */
 
-/* Draw one wrapped display line in the body font */
+/* A line's baseline: the tallest ascent at the line's font size among the fonts its runs use. */
+static int line_ascent(int off, int len, int maxpx)
+{
+  int best = run_ascent(maxpx, glyph_set(off)), seen = glyph_set(off);
+  for (int p = off; p < off + len; p += utf8_seqlen((unsigned char)B->pg->text[p])) {
+    int set = glyph_set(p);
+    if (set == seen)
+      continue;
+    seen = set;
+    int a = run_ascent(maxpx, set);
+    if (a > best)
+      best = a;
+  }
+  return best;
+}
+
 /* Draw one wrapped text run [off,off+len) at (x,y), clipped vertically to [ct,cb) */
 int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h, int maxpx)
 {
@@ -15,9 +30,9 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     return x + m;
   }
 
-  int col_right = x + paw;       /* the column's right edge, before indent and alignment */
-  x += g_ui.bindent * INDENT_PX; /* blockquote / list indent  */
-  int base = run_ascent(maxpx);  /* baseline shared by the line's runs */
+  int col_right = x + paw;                 /* the column's right edge, before indent and alignment */
+  x += g_ui.bindent * INDENT_PX;           /* blockquote / list indent  */
+  int base = line_ascent(off, len, maxpx); /* baseline shared by the line's runs */
   if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
     int lw = 0, p = off, end = off + len;
     unsigned cp;
@@ -46,7 +61,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     }
     if (!fits) {
       bool dots = (B->pg->attr[off] & ST_ELLIPSIS) != 0;
-      int avail = room - (dots ? 3 * body_cp_adv(&g_ui, '.', glyph_px(off)) : 0), w = 0;
+      int avail = room - (dots ? 3 * body_cp_adv(&g_ui, '.', glyph_px(off), glyph_set(off)) : 0), w = 0;
       for (int p = 0; p < len;) {
         unsigned cp;
         int nb = utf8_decode(&B->pg->text[off + p], &B->pg->text[off + len], &cp);
@@ -84,13 +99,14 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     unsigned char a = B->pg->attr[off + i];
     unsigned fg = B->pg->fg[off + i];
     unsigned bgc = B->pg->bg[off + i];
-    int rpx = glyph_px(off + i);
+    int rpx = glyph_px(off + i), rset = glyph_set(off + i);
     int rls = B->pg->ls[off + i], rva = B->pg->va[off + i];
     char run[260];
     int rl = 0, rw = 0;
-    /* Accumulate codepoints sharing one (attr,fg,bg,size,spacing,shift) so any change starts a new run */
+    /* Accumulate codepoints sharing one (attr,fg,bg,size,font,spacing,shift) so any change starts a new run */
     while (i < len && B->pg->attr[off + i] == a && B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc &&
-           glyph_px(off + i) == rpx && B->pg->ls[off + i] == rls && B->pg->va[off + i] == rva) {
+           glyph_px(off + i) == rpx && glyph_set(off + i) == rset && B->pg->ls[off + i] == rls &&
+           B->pg->va[off + i] == rva) {
       int nb = utf8_seqlen((unsigned char)B->pg->text[off + i]);
       if (i + nb > len)
         nb = 1;
@@ -98,35 +114,31 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
         break;
       unsigned cp;
       utf8_decode(&B->pg->text[off + i], &B->pg->text[off + len], &cp);
-      rw += body_cp_adv(&g_ui, cp, rpx) + rls;
+      rw += body_cp_adv(&g_ui, cp, rpx, rset) + rls;
       for (int b = 0; b < nb; b++)
         run[rl++] = B->pg->text[off + i++];
     }
     run[rl] = '\0';
     if (bgc != BG_NONE && !(a & ST_HIDDEN))
       gfx_fill_rect(x, y, rw, line_h, bgc);
-    int ital = (a & ST_ITALIC) ? 1 : 0;
+    int ital = (a & ST_ITALIC) ? 1 : 0, bold = (a & ST_BOLD) ? 1 : 0;
     if (!(a & ST_HIDDEN)) {
       if (rls) { /* letter-spaced: place each glyph on its own */
         int gx = x;
         for (int p = 0; p < rl;) {
           unsigned cp;
           int n = utf8_decode(&run[p], &run[rl], &cp);
-          int adv = body_cp_adv(&g_ui, cp, rpx);
+          int adv = body_cp_adv(&g_ui, cp, rpx, rset);
           char one[5]; /* body_draw_run reads to the terminator */
           for (int q = 0; q < n; q++)
             one[q] = run[p + q];
           one[n] = '\0';
-          body_draw_run(gx, y + rva, one, n, adv, fg, ct, cb, rpx, base, ital);
-          if (a & ST_BOLD)
-            body_draw_run(gx + 1, y + rva, one, n, adv, fg, ct, cb, rpx, base, ital);
+          body_draw_run(gx, y + rva, one, n, adv, fg, ct, cb, rpx, rset, base, ital, bold);
           gx += adv + rls;
           p += n;
         }
       } else {
-        body_draw_run(x, y + rva, run, rl, rw, fg, ct, cb, rpx, base, ital);
-        if (a & ST_BOLD)
-          body_draw_run(x + 1, y + rva, run, rl, rw, fg, ct, cb, rpx, base, ital);
+        body_draw_run(x, y + rva, run, rl, rw, fg, ct, cb, rpx, rset, base, ital, bold);
       }
       if (a & ST_UNDER)
         gfx_fill_rect(x, y + base + 1, rw, 1, fg);
@@ -153,8 +165,9 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     }
   }
   if (ellipsis) {
-    int rpx = glyph_px(off);
-    body_draw_run(x, y, "...", 3, 3 * body_cp_adv(&g_ui, '.', rpx), B->pg->fg[off], ct, cb, rpx, base, 0);
+    int rpx = glyph_px(off), rset = glyph_set(off);
+    body_draw_run(x, y, "...", 3, 3 * body_cp_adv(&g_ui, '.', rpx, rset), B->pg->fg[off], ct, cb, rpx, rset, base, 0,
+                  0);
   }
   return x0;
 }

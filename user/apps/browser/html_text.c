@@ -21,6 +21,119 @@ static unsigned char block_byte(void)
                          ((W_indent & 7) << BP_INDENT_SH));
 }
 
+#define FAM_MAX 255
+static char (*g_fams)[CSS_FAM_STACK]; /* g_fams[i - 1] is stack id i */
+static int g_nfams, g_fams_cap;
+static struct {
+  unsigned char fam;
+  short weight;
+  bool italic;
+  int set;
+} g_fset_memo = {.set = -1};
+
+void fonts_walk_reset(void)
+{
+  g_nfams = 0;
+  g_fset_memo.set = -1;
+}
+
+void fonts_page_reset(void)
+{
+  fonts_walk_reset();
+  browser_buf_lock();
+  B->pg->n_fsets = 0;
+  browser_buf_unlock();
+}
+
+unsigned char fam_intern(const char *stack)
+{
+  for (int i = 0; i < g_nfams; i++)
+    if (streq(g_fams[i], stack))
+      return (unsigned char)(i + 1);
+  if (g_nfams == FAM_MAX)
+    return 0;
+  if (g_nfams == g_fams_cap) {
+    int nc = g_fams_cap ? g_fams_cap * 2 : 16;
+    char (*n)[CSS_FAM_STACK] = realloc(g_fams, (unsigned)nc * sizeof *n);
+    if (!n)
+      return 0;
+    g_fams = n;
+    g_fams_cap = nc;
+  }
+  int k = 0;
+  for (; stack[k] && k < CSS_FAM_STACK - 1; k++)
+    g_fams[g_nfams][k] = stack[k];
+  g_fams[g_nfams][k] = '\0';
+  return (unsigned char)++g_nfams;
+}
+
+/* The page font set for a family stack, weight and style, added on first use; 0 (the UI font) when the table
+ * is full. Sets are only ever appended, so ids the glyph caches hold stay valid across walks. */
+static int fset_find(const char *stack, short weight, bool italic)
+{
+  struct page *pg = B->pg;
+  if (!pg->n_fsets) { /* set 0: the UI font, regular */
+    if (!pg->fsets_cap) {
+      browser_buf_lock();
+      pg->fsets = malloc(16 * sizeof *pg->fsets);
+      pg->fsets_cap = pg->fsets ? 16 : 0;
+      browser_buf_unlock();
+      if (!pg->fsets)
+        return 0;
+    }
+    pg->fsets[0].stack[0] = '\0';
+    pg->fsets[0].weight = 400;
+    pg->fsets[0].italic = false;
+    pg->n_fsets = 1;
+  }
+  if (!stack[0] && weight == 400 && !italic)
+    return 0;
+  for (int i = 1; i < pg->n_fsets; i++)
+    if (pg->fsets[i].weight == weight && pg->fsets[i].italic == italic && streq(pg->fsets[i].stack, stack))
+      return i;
+  if (pg->n_fsets > 255)
+    return 0;
+  if (pg->n_fsets == pg->fsets_cap) {
+    int nc = pg->fsets_cap * 2;
+    browser_buf_lock();
+    struct font_set *n = realloc(pg->fsets, (unsigned)nc * sizeof *n);
+    if (n) {
+      pg->fsets = n;
+      pg->fsets_cap = nc;
+    }
+    browser_buf_unlock();
+    if (!n)
+      return 0;
+  }
+  struct font_set *fs = &pg->fsets[pg->n_fsets];
+  int k = 0;
+  for (; stack[k] && k < CSS_FAM_STACK - 1; k++)
+    fs->stack[k] = stack[k];
+  fs->stack[k] = '\0';
+  fs->weight = weight;
+  fs->italic = italic;
+  return pg->n_fsets++;
+}
+
+/* The current style's font set */
+static unsigned char cur_fset(void)
+{
+  short w = sty_cur.weight ? sty_cur.weight : 400;
+  if (sty_cur.bold && w < 600)
+    w = 700;
+  else if (!sty_cur.bold && w >= 600)
+    w = 400;
+  bool it = sty_cur.italic != 0;
+  if (g_fset_memo.set >= 0 && g_fset_memo.fam == sty_cur.fam && g_fset_memo.weight == w && g_fset_memo.italic == it)
+    return (unsigned char)g_fset_memo.set;
+  const char *stack = sty_cur.fam && sty_cur.fam <= g_nfams ? g_fams[sty_cur.fam - 1] : "";
+  g_fset_memo.fam = sty_cur.fam;
+  g_fset_memo.weight = w;
+  g_fset_memo.italic = it;
+  g_fset_memo.set = fset_find(stack, w, it);
+  return (unsigned char)g_fset_memo.set;
+}
+
 int text_put(int n, char c, unsigned char a)
 {
   if (!browser_ensure_text(n + 1))
@@ -30,6 +143,7 @@ int text_put(int n, char c, unsigned char a)
   B->pg->bp[n] = block_byte();
   B->pg->align[n] = W_center;
   B->pg->fsz[n] = W_fontpx;
+  B->pg->ff[n] = cur_fset();
   B->pg->lh[n] = W_lineheight;
   B->pg->ls[n] = sty_cur.ls;
   B->pg->has_ls |= sty_cur.ls != 0;

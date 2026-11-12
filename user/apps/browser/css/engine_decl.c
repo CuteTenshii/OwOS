@@ -427,9 +427,10 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   }
   /* background-attachment / -origin: parsed and ignored */
   else if (span_is(p, pe, "background-attachment") || span_is(p, pe, "background-origin")) {
-  } else if (span_is(p, pe, "font-weight"))
-    out->bold = parse_weight(val);
-  else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line")) {
+  } else if (span_is(p, pe, "font-weight")) {
+    out->bold = (signed char)parse_weight(val);
+    out->weight = (short)parse_weight_num(val);
+  } else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line")) {
     if (has_ci(val, "underline"))
       out->under = 1;
     else if (has_ci(val, "none"))

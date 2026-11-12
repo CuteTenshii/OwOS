@@ -47,6 +47,8 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->bg = d->bg;
   if (d->bold >= 0)
     out->bold = d->bold;
+  if (d->weight != -1)
+    out->weight = d->weight;
   if (d->under >= 0)
     out->under = d->under;
   if (d->disp)

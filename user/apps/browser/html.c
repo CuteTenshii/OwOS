@@ -458,6 +458,22 @@ void apply_css(const struct css_style *cs)
     sty_cur.fg = (unsigned)cs->color;
   if (cs->bold >= 0)
     sty_cur.bold = cs->bold ? 1 : 0;
+  if (cs->weight > 0 || cs->weight == CSS_W_BOLDER || cs->weight == CSS_W_LIGHTER) {
+    int cur = sty_cur.weight ? sty_cur.weight : 400;
+    if (sty_cur.bold && cur < 600)
+      cur = 700;
+    int w = cs->weight > 0               ? cs->weight
+            : cs->weight == CSS_W_BOLDER ? (cur < 400   ? 400
+                                            : cur < 600 ? 700
+                                                        : 900)
+                                         : (cur < 600   ? 100
+                                            : cur < 800 ? 400
+                                                        : 700);
+    sty_cur.weight = (short)w;
+    sty_cur.bold = w >= 600;
+  }
+  if (cs->fam[0])
+    sty_cur.fam = fam_intern(cs->fam);
   if (cs->under >= 0)
     sty_cur.under = cs->under ? 1 : 0;
   if (cs->strike >= 0)
@@ -602,6 +618,9 @@ static void layout_dom(void)
   compute_page_colors(g_live_dom);
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
+  sty_cur.fam = 0;
+  sty_cur.weight = 0;
+  fonts_walk_reset();
   sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = sty_cur.smallcaps = 0;
   sty_cur.hidden = sty_cur.clip = sty_cur.ellipsis = 0;
   sty_cur.tabsize = 4;
@@ -854,6 +873,9 @@ void plain_to_text(void)
   page_scrollbar_default();
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
+  sty_cur.fam = 0;
+  sty_cur.weight = 0;
+  fonts_walk_reset();
   W_bg = BG_NONE;
   W_size = W_center = W_mono = W_indent = W_pre = W_fontpx = 0;
 
@@ -913,6 +935,7 @@ void doc_message(const char *m)
     B->pg->bp[n] = 0;
     B->pg->align[n] = 0;
     B->pg->fsz[n] = 0;
+    B->pg->ff[n] = 0;
     B->pg->lh[n] = 0;
     B->pg->ls[n] = B->pg->va[n] = 0;
     B->pg->fg[n] = B->pg->page_fg;

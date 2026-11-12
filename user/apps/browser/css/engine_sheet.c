@@ -468,37 +468,191 @@ css_sheet *css_new(void)
   return s;
 }
 
-/* First url(...) in a src value naming a decodable font (SFNT or WOFF/WOFF2), into url[cap]. */
+/* True if a src entry's format() hint names a container font_load reads. */
+static bool src_format_ok(const char *fmt, int n)
+{
+  static const char *const ok[] = {"woff2",
+                                   "woff",
+                                   "truetype",
+                                   "opentype",
+                                   "woff2-variations",
+                                   "woff-variations",
+                                   "truetype-variations",
+                                   "opentype-variations"};
+  for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+    int l = strlen(ok[i]);
+    if (l == n) {
+      int k = 0;
+      while (k < n && (fmt[k] | 32) == ok[i][k])
+        k++;
+      if (k == n)
+        return true;
+    }
+  }
+  return false;
+}
+
+/* First url(...) in a src value naming a decodable font (SFNT or WOFF/WOFF2), into url[cap]. An entry's
+ * format() hint decides; without one, a known font extension or none at all (font_load sniffs the bytes). */
 static void parse_src(const char *v, char *url, int cap)
 {
   url[0] = '\0';
-  for (const char *p = v; *p;) {
+  const char *p = v;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+      p++;
+    const char *ee = p; /* this comma-separated entry is [p, ee) */
+    int depth = 0;
+    char q = 0;
+    while (*ee && (q || depth || *ee != ',')) {
+      if (q) {
+        if (*ee == q)
+          q = 0;
+      } else if (*ee == '"' || *ee == '\'') {
+        q = *ee;
+      } else if (*ee == '(') {
+        depth++;
+      } else if (*ee == ')' && depth) {
+        depth--;
+      }
+      ee++;
+    }
     if (starts_ci(p, "url(")) {
       const char *u = p + 4;
       while (*u == ' ' || *u == '"' || *u == '\'')
         u++;
       char buf[512];
       int k = 0;
-      while (*u && *u != ')' && *u != '"' && *u != '\'' && k < (int)sizeof buf - 1)
+      while (u < ee && *u != ')' && *u != '"' && *u != '\'' && k < (int)sizeof buf - 1)
         buf[k++] = *u++;
       buf[k] = '\0';
-      char base[512];
+      char path[512];
       int bk = 0; /* strip ?query / #frag */
-      for (const char *q = buf; *q && *q != '?' && *q != '#' && bk < (int)sizeof base - 1; q++)
-        base[bk++] = *q;
-      base[bk] = '\0';
-      if (ends_ci(base, ".ttf") || ends_ci(base, ".otf") || ends_ci(base, ".woff2") || ends_ci(base, ".woff")) {
+      for (const char *c = buf; *c && *c != '?' && *c != '#' && bk < (int)sizeof path - 1; c++)
+        path[bk++] = *c;
+      path[bk] = '\0';
+      bool usable;
+      const char *fm = u;
+      while (fm < ee && !starts_ci(fm, "format("))
+        fm++;
+      if (fm < ee) {
+        fm += 7;
+        while (fm < ee && (*fm == ' ' || *fm == '"' || *fm == '\''))
+          fm++;
+        const char *fe = fm;
+        while (fe < ee && *fe != ')' && *fe != '"' && *fe != '\'' && *fe != ' ')
+          fe++;
+        usable = src_format_ok(fm, (int)(fe - fm));
+      } else {
+        usable = !ends_ci(path, ".eot") && !ends_ci(path, ".svg");
+      }
+      if (usable && buf[0]) {
         int j = 0;
         for (; buf[j] && j < cap - 1; j++)
           url[j] = buf[j];
         url[j] = '\0';
         return;
       }
-      p = u;
-    } else {
+    }
+    p = ee;
+  }
+}
+
+static int hexval(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  c |= 32;
+  return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* unicode-range: `U+0-7F, U+0100-024F, U+4??` into [lo,hi] pairs (malloc'd; *n of them). */
+static unsigned *parse_unicode_range(const char *v, int *n)
+{
+  *n = 0;
+  int cap = 0;
+  unsigned *r = 0;
+  const char *p = v;
+  while (*p) {
+    while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+      p++;
+    if ((*p | 32) != 'u' || p[1] != '+') {
+      while (*p && *p != ',')
+        p++;
+      continue;
+    }
+    p += 2;
+    unsigned lo = 0, hi = 0;
+    int digits = 0, wild = 0;
+    while (digits < 6 && (hexval(*p) >= 0 || *p == '?')) {
+      if (*p == '?') {
+        wild++;
+        lo <<= 4;
+        hi = (hi << 4) | 0xf;
+      } else if (wild) {
+        break; /* a hex digit after '?' is invalid */
+      } else {
+        lo = (lo << 4) | (unsigned)hexval(*p);
+        hi = (hi << 4) | (unsigned)hexval(*p);
+      }
+      digits++;
       p++;
     }
+    if (!digits)
+      continue;
+    if (!wild && *p == '-' && hexval(p[1]) >= 0) {
+      p++;
+      hi = 0;
+      for (int d = 0; d < 6 && hexval(*p) >= 0; d++)
+        hi = (hi << 4) | (unsigned)hexval(*p++);
+    }
+    while (*p && *p != ',')
+      p++;
+    if (hi > 0x10ffff)
+      hi = 0x10ffff;
+    if (lo > hi)
+      continue;
+    if (*n == cap) {
+      int nc = cap ? cap * 2 : 8;
+      unsigned *g = realloc(r, (unsigned)nc * 2 * sizeof *g);
+      if (!g)
+        break;
+      r = g;
+      cap = nc;
+    }
+    r[*n * 2] = lo;
+    r[*n * 2 + 1] = hi;
+    (*n)++;
   }
+  if (!*n) {
+    free(r);
+    r = 0;
+  }
+  return r;
+}
+
+/* One font-weight value: a number or normal/bold; 0 if it is neither. */
+static int face_weight(const char **pp)
+{
+  const char *p = *pp;
+  while (*p == ' ')
+    p++;
+  int w = 0;
+  if (starts_ci(p, "normal")) {
+    w = 400;
+    p += 6;
+  } else if (starts_ci(p, "bold")) {
+    w = 700;
+    p += 4;
+  } else {
+    while (*p >= '0' && *p <= '9')
+      w = w * 10 + (*p++ - '0');
+    if (*p == '.')
+      while (*++p >= '0' && *p <= '9')
+        ;
+  }
+  *pp = p;
+  return w >= 1 && w <= 1000 ? w : 0;
 }
 
 /* Parse an @font-face block [s,end); registers the face if family and a usable src exist. */
@@ -508,6 +662,9 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
   family[0] = '\0';
   char url[512];
   url[0] = '\0';
+  int wmin = 400, wmax = 400, nranges = 0;
+  bool italic = false;
+  unsigned *ranges = 0;
   while (s < end) {
     const char *semi = s;
     while (semi < end && *semi != ';')
@@ -537,14 +694,32 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
         first_family(val, family, CSS_FAM_MAX);
       else if (span_is(p, pe, "src"))
         parse_src(val, url, sizeof url);
+      else if (span_is(p, pe, "font-weight")) {
+        const char *w = val;
+        int a = face_weight(&w), b = face_weight(&w);
+        if (a) {
+          wmin = a;
+          wmax = b >= a ? b : a;
+        }
+      } else if (span_is(p, pe, "font-style"))
+        italic = starts_ci(val, "italic") || starts_ci(val, "oblique");
+      else if (span_is(p, pe, "unicode-range")) {
+        free(ranges);
+        ranges = parse_unicode_range(val, &nranges);
+      }
     }
     s = (semi < end) ? semi + 1 : end;
   }
-  if (!family[0] || !url[0])
+  struct css_face *fc = family[0] && url[0] ? malloc(sizeof *fc) : 0;
+  if (!fc) {
+    free(ranges);
     return;
-  struct css_face *fc = malloc(sizeof *fc);
-  if (!fc)
-    return;
+  }
+  fc->wmin = (short)wmin;
+  fc->wmax = (short)wmax;
+  fc->italic = italic;
+  fc->ranges = ranges;
+  fc->nranges = nranges;
   int i = 0;
   for (; family[i]; i++)
     fc->family[i] = family[i];
@@ -552,6 +727,7 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
   int ul = strlen(url);
   fc->url = malloc((unsigned)ul + 1);
   if (!fc->url) {
+    free(fc->ranges);
     free(fc);
     return;
   }
@@ -1137,6 +1313,7 @@ void css_free(css_sheet *sh)
     struct css_face *n = fc->next;
     free(fc->url);
     free(fc->base);
+    free(fc->ranges);
     free(fc);
     fc = n;
   }
@@ -1160,20 +1337,31 @@ int css_fontface_count(const css_sheet *sh)
   return n;
 }
 
-void css_fontface_at(const css_sheet *sh, int i, const char **family, const char **url, const char **base)
+bool css_fontface_get(const css_sheet *sh, int i, struct css_fontface *out)
 {
-  *family = 0;
-  *url = 0;
-  if (base)
-    *base = 0;
-  if (!sh)
-    return;
-  for (struct css_face *fc = sh->faces; fc; fc = fc->next, i--)
-    if (i == 0) {
-      *family = fc->family;
-      *url = fc->url;
-      if (base)
-        *base = fc->base;
-      return;
-    }
+  int n = css_fontface_count(sh);
+  if (i < 0 || i >= n)
+    return false;
+  struct css_face *fc = sh->faces; /* the list is newest-first */
+  for (int k = n - 1 - i; k > 0; k--)
+    fc = fc->next;
+  out->family = fc->family;
+  out->url = fc->url;
+  out->base = fc->base;
+  out->wmin = fc->wmin;
+  out->wmax = fc->wmax;
+  out->italic = fc->italic;
+  out->ranges = fc->ranges;
+  out->nranges = fc->nranges;
+  return true;
+}
+
+bool css_fontface_covers(const struct css_fontface *f, unsigned cp)
+{
+  if (!f->nranges)
+    return true;
+  for (int i = 0; i < f->nranges; i++)
+    if (cp >= f->ranges[2 * i] && cp <= f->ranges[2 * i + 1])
+      return true;
+  return false;
 }

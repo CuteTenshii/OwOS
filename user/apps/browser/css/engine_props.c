@@ -5,6 +5,7 @@ void css_style_reset(struct css_style *s)
 {
   s->color = s->bg = -1;
   s->bold = s->under = s->strike = -1;
+  s->weight = -1;
   s->disp = CSS_DISP_UNSET;
   s->center = -1;
   s->width = s->height = -1;
@@ -219,12 +220,12 @@ static void parse_track_token(const char *a, const char *b, struct css_track *t)
     return;
   int n = (int)strlen(buf);
   if (n >= 2 && (buf[n - 1] == 'r' || buf[n - 1] == 'R') && (buf[n - 2] == 'f' || buf[n - 2] == 'F')) { /* <n>fr */
-    int fr = 0;
+    int fr = 0, scale = 100;
     const char *s = buf;
-    while (*s >= '0' && *s <= '9')
+    while (*s >= '0' && *s <= '9' && fr < 30000)
       fr = fr * 10 + (*s++ - '0');
     t->kind = CSS_TRK_FR;
-    t->v = (short)(fr > 0 ? fr : 1);
+    t->v = (short)(fr > 0 && fr <= 32767 ? fr : fr > 0 ? 32767 : 100);
     return;
   }
   int pct;
@@ -592,11 +593,13 @@ void parse_font_shorthand(const char *v, struct css_style *out)
     out->italic = 0;
     out->small_caps = 0;
     out->bold = 0;
+    out->weight = 400;
     copy_family_stack("sans-serif", out->fam, CSS_FAM_STACK);
     return;
   }
 
   signed char italic = -1, scaps = -1, bold = -1;
+  short weight = -1;
   const char *size_tok = 0;
   const char *p = v;
   for (;;) {
@@ -608,19 +611,20 @@ void parse_font_shorthand(const char *v, struct css_style *out)
       scaps = 1;
     else if (starts_ci(p, "italic") || starts_ci(p, "oblique"))
       italic = 1;
-    else if (starts_ci(p, "bold"))
-      bold = 1; /* bold, bolder */
-    else if (starts_ci(p, "lighter"))
-      bold = 0;
-    else if (font_tok_is_size(p) || starts_ci(p, "xx-small") || starts_ci(p, "x-small") || starts_ci(p, "smaller") ||
-             starts_ci(p, "small") || starts_ci(p, "xx-large") || starts_ci(p, "x-large") || starts_ci(p, "larger") ||
-             starts_ci(p, "large") || starts_ci(p, "medium")) {
+    else if (starts_ci(p, "bold") || starts_ci(p, "lighter")) {
+      weight = (short)parse_weight_num(p);
+      bold = (signed char)parse_weight(p);
+    } else if (font_tok_is_size(p) || starts_ci(p, "xx-small") || starts_ci(p, "x-small") || starts_ci(p, "smaller") ||
+               starts_ci(p, "small") || starts_ci(p, "xx-large") || starts_ci(p, "x-large") || starts_ci(p, "larger") ||
+               starts_ci(p, "large") || starts_ci(p, "medium")) {
       size_tok = p;
       break;
     } else if (*p >= '0' && *p <= '9') {
       int w = parse_weight(p);
-      if (w >= 0)
-        bold = w;
+      if (w >= 0) {
+        bold = (signed char)w;
+        weight = (short)parse_weight_num(p);
+      }
     }
     /* normal / stretch (condensed/expanded/…) / unknown: neutral, skip */
     while (*p && *p != ' ' && *p != '\t')
@@ -663,6 +667,7 @@ void parse_font_shorthand(const char *v, struct css_style *out)
   out->italic = (italic >= 0) ? italic : 0;
   out->small_caps = (scaps >= 0) ? scaps : 0;
   out->bold = (bold >= 0) ? bold : 0;
+  out->weight = weight != -1 ? weight : 400;
 }
 
 /* opacity: 0..1 number or N% -> 0..100, -1 if unparseable. */

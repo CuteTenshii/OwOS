@@ -25,7 +25,15 @@ struct sty {
   unsigned char tabsize;        /* tab-size, in spaces */
   unsigned char hidden;         /* inherited visibility:hidden */
   unsigned char clip, ellipsis; /* the enclosing block clips overflow, and shows an ellipsis */
+  unsigned char fam;            /* inherited font-family stack, a fam_intern id (0 = none) */
+  short weight;                 /* inherited font-weight, 0 = whatever `bold` implies */
 };
+
+/* font-family stacks the walk has met; resets with each walk. */
+unsigned char fam_intern(const char *stack);
+void fonts_walk_reset(void);
+/* Start the page's font sets over (after its faces change). */
+void fonts_page_reset(void);
 
 struct css_src {
   const char *text;

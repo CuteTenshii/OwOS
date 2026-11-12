@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 
+#include "css.h"
 #include "dom.h"
 #include "features/csp/csp.h"
 #include "features/permissions/permissions.h"
@@ -158,6 +159,7 @@ struct page {
   unsigned char *bp;
   unsigned char *align;         /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
   unsigned char *fsz;           /* per-glyph CSS font-size px (0 = default body font) */
+  unsigned char *ff;            /* per-glyph font set, an index into fsets */
   unsigned char *lh;            /* per-glyph CSS line-height px (0 = font-derived default) */
   signed char *ls;              /* per-glyph letter-spacing px */
   signed char *va;              /* per-glyph vertical-align shift, px down */
@@ -200,14 +202,25 @@ struct page {
   unsigned perm_policy;  /* Permissions-Policy: bitmap of blocked features (permissions.h) */
   char *perm_policy_hdr; /* the Permissions-Policy header text, for Client Hints delegation */
 
-  /* @font-face faces; body_font is the face the body text uses, or NULL for the UI font. */
+  /* @font-face faces, plus the installed families the page names; text picks among them through its font set. */
   struct loaded_face {
-    char family[48];
+    char family[CSS_FAM_MAX];
+    short wmin, wmax;
+    bool italic;
+    unsigned *ranges; /* nranges [lo,hi] unicode-range pairs, 0 = every codepoint */
+    int nranges;
     struct font *font;
     unsigned char *data;
   } *faces;
   int n_faces, faces_cap;
-  struct font *body_font;
+  unsigned font_gen; /* bumped when the faces change, so glyph caches and layouts drop stale fonts */
+  /* A font-family stack with a weight and style; fsets[0] is the default, the UI font at 400. */
+  struct font_set {
+    char stack[CSS_FAM_STACK];
+    short weight;
+    bool italic;
+  } *fsets;
+  int n_fsets, fsets_cap;
 };
 
 /* One wrapped text run of a flex-row item, tagged with its absolute band row and column. */
@@ -341,6 +354,7 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
 int browser_ensure_raw(int need);
 int browser_grow_cap(int cap, int init, int need);
 int browser_ensure_text(int need);
+void fonts_preload_emoji(void); /* load the emoji fallback font now (text.c) */
 int browser_ensure_links(int need);
 int browser_ensure_regs(int need);
 int browser_ensure_imgs(int need);

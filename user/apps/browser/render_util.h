@@ -386,9 +386,9 @@ static inline void ru_imgcache_clear(struct ru_imgcache *c)
 
 struct ru_gent {
   unsigned cp, px;
-  unsigned char *bm;
+  unsigned char *bm; /* coverage bytes, or w*h ARGB words when `color` */
   int w, h, ox, oy, adv;
-  bool used;
+  bool used, color;
 };
 
 struct ru_gtab {
@@ -437,7 +437,7 @@ static inline void ru_gtab_slot(struct ru_gent *e, unsigned cap, const struct ru
 /* Store a copy of *g (the table then owns g->bm) */
 static inline struct ru_gent *ru_gtab_put(struct ru_gtab *t, const struct ru_gent *g)
 {
-  unsigned long add = (unsigned long)(g->w > 0 && g->h > 0 ? g->w * g->h : 0);
+  unsigned long add = (unsigned long)(g->w > 0 && g->h > 0 ? g->w * g->h : 0) * (g->color ? 4 : 1);
   if (t->budget && t->bytes + add > t->budget)
     ru_gtab_clear(t);
   if ((t->n + 1) * 10 > t->cap * 7) {

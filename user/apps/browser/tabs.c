@@ -91,6 +91,8 @@ static void page_free(struct page *p)
   free(p->bp);
   free(p->align);
   free(p->fsz);
+  free(p->ff);
+  free(p->fsets);
   free(p->lh);
   free(p->ls);
   free(p->va);
@@ -107,6 +109,7 @@ static void page_free(struct page *p)
     if (p->faces[i].font)
       font_free(p->faces[i].font);
     free(p->faces[i].data);
+    free(p->faces[i].ranges);
   }
   free(p->faces);
   if (p->csp)

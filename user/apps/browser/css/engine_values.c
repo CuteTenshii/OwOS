@@ -462,6 +462,28 @@ int parse_weight(const char *v)
   return -1;
 }
 
+/* font-weight as a number: 1..1000, normal 400, bold 700, CSS_W_BOLDER/LIGHTER; -1 if unparseable. */
+int parse_weight_num(const char *v)
+{
+  while (*v == ' ')
+    v++;
+  if (starts_ci(v, "bolder"))
+    return CSS_W_BOLDER;
+  if (starts_ci(v, "lighter"))
+    return CSS_W_LIGHTER;
+  if (starts_ci(v, "bold"))
+    return 700;
+  if (starts_ci(v, "normal"))
+    return 400;
+  int n = 0;
+  bool any = false;
+  while (*v >= '0' && *v <= '9' && n <= 1000) {
+    n = n * 10 + (*v++ - '0');
+    any = true;
+  }
+  return any && n >= 1 && n <= 1000 ? n : -1;
+}
+
 int parse_border_style(const char *v)
 {
   while (*v) {

@@ -160,11 +160,16 @@ struct css_idx {
   struct css_idx *next;
 };
 
-/* @font-face: family, raw src url, and the stylesheet base URL a relative src resolves against. */
+/* @font-face: family, raw src url, the stylesheet base URL a relative src resolves against, and the
+ * weight/style/unicode-range descriptors that select it. */
 struct css_face {
   char family[CSS_FAM_MAX];
   char *url;
   char *base;
+  short wmin, wmax;
+  bool italic;
+  unsigned *ranges; /* nranges [lo,hi] codepoint pairs; 0 ranges = all of Unicode */
+  int nranges;
   struct css_face *next;
 };
 
@@ -260,6 +265,7 @@ int parse_paint_val(const char *v);
 bool parse_selector(const char *s, const char *e, struct selector *sel);
 int parse_tracks(const char *v, struct css_track *out, int max);
 int parse_weight(const char *v);
+int parse_weight_num(const char *v);
 char *resolve_vars_dup(const char *in, int inlen);
 const char *scan_top(const char *s, const char *e, const char *stop);
 void selector_free(struct selector *sel);

@@ -89,5 +89,8 @@ int main(void)
   chk("font-size: x-large", 24, -1, -1, -1, -1, -1, NULL);
   chk("font-size: 120%", -1, 120, -1, -1, -1, -1, NULL);
 
+  test("weight_numbers", weight_numbers);
+  test("fontface_descriptors", fontface_descriptors);
+  test("fontface_src_choice", fontface_src_choice);
   return 0;
 }
