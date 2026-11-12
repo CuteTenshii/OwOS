@@ -26,6 +26,7 @@ struct hfs_mount {
   struct extent cat_ext[8]; /* catalog file fork extents */
   uint32_t node_size;       /* catalog B-tree node size */
   uint32_t first_leaf;      /* first leaf node index */
+  uint32_t max_nodes;       /* nodes the catalog can hold: bounds a leaf-chain walk */
   char label[64];
   uint8_t nodebuf[MAX_NODE]; /* one catalog node, reused per-mount */
 };
@@ -163,9 +164,8 @@ static void rec_to_obj(const struct catrec *c, struct obj *o)
 static int for_each_leaf(struct hfs_mount *m, int (*visit)(struct hfs_mount *, const struct catrec *, void *),
                          void *ctx)
 {
-  uint32_t node = m->first_leaf;
-  int guard = 0;
-  while (node && guard++ < 1 << 20) {
+  uint32_t node = m->first_leaf, mark = node, mark_at = 1, hops = 0;
+  while (node && node < m->max_nodes) {
     if (read_node(m, node) != 0)
       return 0;
     if (m->nodebuf[8] != 0xFF) /* kind: leaf == 0xFF */
@@ -182,6 +182,13 @@ static int for_each_leaf(struct hfs_mount *m, int (*visit)(struct hfs_mount *, c
       int r = visit(m, &c, ctx);
       if (r)
         return r;
+    }
+    /* Untrusted links: a chain longer than the tree, or one that returns to a node (Brent), is corrupt. */
+    if (++hops >= m->max_nodes || fLink == mark)
+      return 0;
+    if (hops == mark_at) {
+      mark = fLink;
+      mark_at *= 2;
     }
     node = fLink;
   }
@@ -326,6 +333,11 @@ static int hfs_mount(struct hfs_mount *m, uint32_t base_lba)
   m->node_size = load_be16(hr + 18);
   if (m->node_size < 512 || m->node_size > MAX_NODE || (m->node_size % 512) != 0)
     return -1;
+  uint64_t cat_bytes = 0;
+  for (int i = 0; i < 8; i++)
+    cat_bytes += (uint64_t)m->cat_ext[i].count * m->block_size;
+  uint64_t fit = cat_bytes / m->node_size, total = load_be32(hr + 22); /* BTHeaderRec.totalNodes */
+  m->max_nodes = (uint32_t)(total < fit ? total : fit);
 
   m->label[0] = '\0';
   for_each_leaf(m, visit_label, NULL);
