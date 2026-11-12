@@ -312,10 +312,10 @@ static int utf16_to_ascii(const uint8_t *src, uint32_t units, char *dst, uint32_
   return (int)n;
 }
 
-/* Locate the unnamed $DATA of `rec`: resident ptr/len, or non-resident mapping pairs [*mp,*mp_end). Compressed or
- * encrypted data is refused. 0 / -1. */
+/* Locate the unnamed $DATA of `rec`: resident ptr/len, or non-resident mapping pairs [*mp,*mp_end) whose bytes past
+ * *init_size read as zero. Compressed or encrypted data is refused. 0 / -1. */
 static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, const uint8_t **res_ptr,
-                     uint32_t *res_len, const uint8_t **mp, const uint8_t **mp_end, uint64_t *size)
+                     uint32_t *res_len, const uint8_t **mp, const uint8_t **mp_end, uint64_t *size, uint64_t *init_size)
 {
   uint32_t used = load_le32(rec + 0x18);
   if (used > m->mft_rec_size)
@@ -349,18 +349,21 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, co
         *res_ptr = a + voff;
         *res_len = vlen;
         *size = vlen;
+        *init_size = vlen;
         return 0;
       } else {
         if (alen < 0x40)
           return -1;
         uint16_t mp_off = load_le16(a + 0x20);
         uint64_t real_sz = load_le64(a + 0x30);
+        uint64_t init_sz = load_le64(a + 0x38);
         if (mp_off < 0x40 || mp_off >= alen)
           return -1;
         *resident = 0;
         *mp = a + mp_off;
         *mp_end = a + alen;
         *size = real_sz;
+        *init_size = init_sz < real_sz ? init_sz : real_sz;
         return 0;
       }
     }
@@ -375,8 +378,8 @@ static uint64_t data_size(struct ntfs_mount *m, const uint8_t *rec)
   int resident;
   const uint8_t *rp, *mp, *mpe;
   uint32_t rl;
-  uint64_t sz;
-  if (find_data(m, rec, &resident, &rp, &rl, &mp, &mpe, &sz) != 0)
+  uint64_t sz, init;
+  if (find_data(m, rec, &resident, &rp, &rl, &mp, &mpe, &sz, &init) != 0)
     return 0;
   return sz;
 }
@@ -387,8 +390,8 @@ static int read_data(struct ntfs_mount *m, const uint8_t *rec, uint64_t off, uin
   int resident;
   const uint8_t *rp, *mp, *mpe;
   uint32_t rl;
-  uint64_t sz;
-  if (find_data(m, rec, &resident, &rp, &rl, &mp, &mpe, &sz) != 0)
+  uint64_t sz, init;
+  if (find_data(m, rec, &resident, &rp, &rl, &mp, &mpe, &sz, &init) != 0)
     return -1;
   if (off >= sz)
     return 0;
@@ -404,7 +407,16 @@ static int read_data(struct ntfs_mount *m, const uint8_t *rec, uint64_t off, uin
     memcpy(dst, rp + off, len);
     return (int)len;
   }
-  return read_runlist(m, mp, mpe, off, dst, len);
+  uint32_t head = 0;
+  if (off < init)
+    head = init - off < len ? (uint32_t)(init - off) : len;
+  if (head) {
+    int got = read_runlist(m, mp, mpe, off, dst, head);
+    if (got < 0 || (uint32_t)got < head)
+      return got;
+  }
+  memset(dst + head, 0, len - head);
+  return (int)len;
 }
 
 /* A decoded index entry; `nspace` is the filename namespace byte. */
