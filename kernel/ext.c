@@ -175,6 +175,7 @@ struct ext_mount {
   uint32_t cs_n, cs_max, clock;
   int32_t chash[CACHE_HASH];
   uint8_t *gd_ok;
+  uint8_t *gd_bad;
   struct ext_ino *sl[NSLOT];
   struct htab jmap;
 
@@ -471,14 +472,18 @@ static int group_desc(struct ext_mount *m, uint32_t group, struct gdesc *g)
   if (!d)
     return -EXT_ERR_IO;
   d += (size_t)di * m->desc_size;
-  bool checked = m->gd_ok && (m->gd_ok[group >> 3] & (1u << (group & 7)));
-  bool good = true;
+  uint8_t bit = (uint8_t)(1u << (group & 7));
+  bool checked = m->gd_ok && (m->gd_ok[group >> 3] & bit);
+  bool good = !(checked && (m->gd_bad[group >> 3] & bit));
   if ((m->metacsum || m->gdt_csum) && !checked) {
     good = gd_csum_ok(m, group, d);
     if (!good)
       note_csum(m, "group descriptor");
-    if (m->gd_ok)
-      m->gd_ok[group >> 3] |= (uint8_t)(1u << (group & 7));
+    if (m->gd_ok) {
+      m->gd_ok[group >> 3] |= bit;
+      if (!good)
+        m->gd_bad[group >> 3] |= bit;
+    }
   }
   g->itable = load_le32(d + 8);
   if (m->desc_size >= 64)
@@ -1437,6 +1442,7 @@ static void mount_release(struct ext_mount *m)
   kfree(m->cs);
   kfree(m->spare);
   kfree(m->gd_ok);
+  kfree(m->gd_bad);
   kfree(m->memo);
   memset(m, 0, sizeof *m);
 }
@@ -1519,9 +1525,18 @@ static bool mount_alloc(struct ext_mount *m)
     m->sl[i]->raw = (uint8_t *)(m->sl[i] + 1);
   }
   if (m->ngroups <= (1u << 22) && (m->metacsum || m->gdt_csum)) {
-    m->gd_ok = kmalloc((m->ngroups + 7) / 8);
-    if (m->gd_ok)
-      memset(m->gd_ok, 0, (m->ngroups + 7) / 8);
+    uint32_t n = (m->ngroups + 7) / 8;
+    m->gd_ok = kmalloc(n);
+    m->gd_bad = kmalloc(n);
+    if (m->gd_ok && m->gd_bad) {
+      memset(m->gd_ok, 0, n);
+      memset(m->gd_bad, 0, n);
+    } else {
+      /* without both bitmaps every lookup re-verifies, which stays correct */
+      kfree(m->gd_ok);
+      kfree(m->gd_bad);
+      m->gd_ok = m->gd_bad = NULL;
+    }
   }
   return true;
 }

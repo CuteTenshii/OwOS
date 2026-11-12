@@ -1470,6 +1470,14 @@ static void csum_case(void)
   if (m)
     ext_close(m);
   gd[12] ^= 0x01;
+  /* A descriptor that failed its checksum must stay distrusted on every later lookup, not just the first. */
+  gd[18] ^= EB_GD_INODE_UNINIT;
+  m = mnt(img, c.len);
+  expect(m != NULL && csum_reads(m) && csum_reads(m));
+  expect(log_count("group descriptor checksum mismatch") == 1);
+  if (m)
+    ext_close(m);
+  gd[18] ^= EB_GD_INODE_UNINIT;
   if (mc) {
     img[1024 + 16] ^= 1;
     gd[12] ^= 1;
