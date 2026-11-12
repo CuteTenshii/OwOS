@@ -28,6 +28,19 @@ static bool access_denied(struct registers *r, const char *abs, int want)
   return true;
 }
 
+/* The single stream belongs to the process that began it; 0 when none is open. */
+static uint32_t stream_owner;
+
+static bool stream_mine(void) { return stream_owner != 0 && stream_owner == sched_current_process_id(); }
+
+void syscall_fs_process_exiting(uint32_t pid)
+{
+  if (stream_owner == pid) {
+    fs_stream_abort();
+    stream_owner = 0;
+  }
+}
+
 void syscall_fs_stream_begin(struct registers *r)
 {
   char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
@@ -41,20 +54,31 @@ void syscall_fs_stream_begin(struct registers *r)
   }
   if (access_denied(r, abs, FS_W | FS_ACC_CREATE))
     return;
-  r->eax = (uint32_t)fs_stream_begin(abs);
+  int rc = fs_stream_begin(abs);
+  if (rc == 0)
+    stream_owner = sched_current_process_id();
+  r->eax = (uint32_t)rc;
 }
 
 void syscall_fs_stream_write(struct registers *r)
 {
   uint32_t buf = r->ebx, len = r->ecx;
-  if (!user_range(buf, len)) {
+  if (!stream_mine() || !user_range(buf, len)) {
     r->eax = (uint32_t)-1;
     return;
   }
   r->eax = (uint32_t)fs_stream_write((const void *)(uintptr_t)buf, len);
 }
 
-void syscall_fs_stream_end(struct registers *r) { r->eax = (uint32_t)fs_stream_end(); }
+void syscall_fs_stream_end(struct registers *r)
+{
+  if (!stream_mine()) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  stream_owner = 0;
+  r->eax = (uint32_t)fs_stream_end();
+}
 
 static void simple_path_op(struct registers *r, int op)
 {

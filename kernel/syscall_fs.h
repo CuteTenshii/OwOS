@@ -1,11 +1,14 @@
 #ifndef OWOS_SYSCALL_FS_H
 #define OWOS_SYSCALL_FS_H
 
+#include <stdint.h>
+
 struct registers;
 
 void syscall_fs_stream_begin(struct registers *r);
 void syscall_fs_stream_write(struct registers *r);
 void syscall_fs_stream_end(struct registers *r);
+void syscall_fs_process_exiting(uint32_t pid); /* aborts a stream the process left open */
 void syscall_fs_mkdir(struct registers *r);
 void syscall_fs_rmdir(struct registers *r);
 void syscall_fs_delete(struct registers *r);

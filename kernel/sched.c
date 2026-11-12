@@ -16,6 +16,7 @@
 #include "signal.h"
 #include "smp.h"
 #include "syscall.h"
+#include "syscall_fs.h"
 #include "syscall_nr.h"
 #include "timer.h"
 #include "uaccess.h"
@@ -945,8 +946,10 @@ void sched_exit(int status)
 {
   uwin_task_exiting(current->id);  /* tear down any GUI windows it owns */
   audio_task_exiting(current->id); /* release the PCM stream if it held it */
-  if (!current->as || current->as_owner)
+  if (!current->as || current->as_owner) {
     net_sock_close_owner(sched_current_process_id());
+    syscall_fs_process_exiting(sched_current_process_id());
+  }
   fds_close_all(current);
   current->exit_status = status;
   current->state = TASK_ZOMBIE;

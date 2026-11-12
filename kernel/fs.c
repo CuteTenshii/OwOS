@@ -1589,6 +1589,14 @@ int fs_stream_write(const void *data, uint32_t size)
   return 0;
 }
 
+void fs_stream_abort(void)
+{
+  if (!strm_active)
+    return;
+  run_mark(strm_start, strm_reserved, 0);
+  strm_active = false;
+}
+
 int fs_stream_end(void)
 {
   if (!strm_active)

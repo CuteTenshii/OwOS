@@ -92,6 +92,8 @@ int fs_selftest(void);
 int fs_stream_begin(const char *name);
 int fs_stream_write(const void *data, uint32_t size);
 int fs_stream_end(void);
+/* Drop an unfinished stream and release the space begin reserved; no-op when none is active. */
+void fs_stream_abort(void);
 
 int fs_file_count(void);      /* number of files                          */
 uint32_t fs_used_bytes(void); /* total bytes across all files             */
