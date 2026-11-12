@@ -80,9 +80,10 @@ int bind_mode(void)
   struct fbinfo fi;
   if (fb_info(&fi) < 0)
     return -1;
-  hw = fb_map();
-  if (!hw)
+  unsigned *mapped = fb_map();
+  if (!mapped)
     return -1;
+  hw = mapped;
   hw_w = fi.w;
   hw_h = fi.h;
   hw_pitch = fi.pitch;
