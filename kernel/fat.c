@@ -1223,6 +1223,7 @@ static int dirent_commit(struct fat_mount *m, struct dirent *d, bool touch)
   if (meta_read(m, l->sec, b) != 0)
     return FAT_EIO;
   uint8_t *e = b + l->off;
+  uint32_t cl = d->cluster == BADCLUS ? 0 : d->cluster; /* BADCLUS stands in for an on-disk 0 */
   memcpy(e, d->sfn, 11);
   e[11] = d->attr;
   e[12] = d->ntres;
@@ -1230,10 +1231,10 @@ static int dirent_commit(struct fat_mount *m, struct dirent *d, bool touch)
   put_le16(e + 14, d->ctime);
   put_le16(e + 16, d->cdate);
   put_le16(e + 18, d->adate);
-  put_le16(e + 20, d->cluster >> 16);
+  put_le16(e + 20, cl >> 16);
   put_le16(e + 22, d->mtime);
   put_le16(e + 24, d->mdate);
-  put_le16(e + 26, d->cluster);
+  put_le16(e + 26, cl);
   put_le32(e + 28, d->is_dir ? 0 : d->size);
   return meta_write(m, l->sec, b) == 0 ? 0 : FAT_EIO;
 }

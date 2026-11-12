@@ -1671,6 +1671,28 @@ static void corrupt_entry_clusters(void)
   fat_ops()->close(fs);
 }
 
+/* A directory entry with cluster 0 is read as an internal "do not follow" marker that must never reach the disk. */
+static void dir_cluster0_setattr(void)
+{
+  expect(fmt_dev(32, 100000, 512, 1, NULL) == 0);
+  void *fs = mnt();
+  expect(fat_ops()->mkdir(fs, "/z") == 0);
+  fat_ops()->close(fs);
+  check_volume(g_img, 0, 0);
+  uint8_t *dir = g_img + (size_t)(g_ck.root0 + (g_ck.rootc - 2) * g_ck.spc) * 512, *ent = NULL;
+  for (int i = 0; i < 16; i++)
+    if (memcmp(dir + i * 32, "Z          ", 11) == 0)
+      ent = dir + i * 32;
+  expect(ent != NULL);
+  if (!ent)
+    return;
+  ent[20] = ent[21] = ent[26] = ent[27] = 0;
+  fs = mnt();
+  expect(fat_setattr(fs, "/z", FAT_ATTR_ARCHIVE, 0) == 0);
+  fat_ops()->close(fs);
+  expect(ent[20] == 0 && ent[21] == 0 && ent[26] == 0 && ent[27] == 0);
+}
+
 /* A full directory cluster whose FAT entry points at itself has no end marker: entries must not repeat. */
 static void dir_full_cycle(void)
 {
@@ -1730,6 +1752,7 @@ static void t_corrupt(void)
   test("entry pointing at cluster 0, 1 or beyond the volume", corrupt_entry_clusters);
   test("size near 4 GiB keeps its chain on truncate", huge_size_truncate);
   test("full directory cluster linked to itself", dir_full_cycle);
+  test("directory at cluster 0 keeps it through setattr", dir_cluster0_setattr);
   alarm(0);
 }
 
