@@ -417,6 +417,7 @@ static void walk_element_inner(struct dom_node *el)
   int sv_ol = W_olnum;
   signed char sv_lrev = W_listrev, sv_ldef = W_listdef;
   unsigned char sv_lh = W_lineheight;
+  short sv_lhf = W_lhfactor;
   signed char sv_ls = W_liststyle;
   int linked = streq(name, "a") ? open_link(el) : 0;
 
@@ -491,12 +492,16 @@ static void walk_element_inner(struct dom_node *el)
     sty_cur.nowrap = 0;
   }
 
-  /* line-height: a px value, else a percent/unitless multiple of the resolved font-size */
-  if (cs.line_height >= 0)
+  /* line-height: a px value, else a multiple of the font-size, which (unitless) children inherit as a multiple */
+  if (cs.line_height >= 0) {
     W_lineheight = (unsigned char)(cs.line_height > 255 ? 255 : cs.line_height);
-  else if (cs.lh_pct >= 0) {
+    W_lhfactor = -1;
+  } else if (cs.lh_pct >= 0) {
+    W_lhfactor = cs.lh_pct;
+  }
+  if (W_lhfactor >= 0) {
     int base = W_fontpx ? W_fontpx : HTML_BASE_FONT;
-    int lh = base * cs.lh_pct / 100;
+    int lh = base * W_lhfactor / 100;
     W_lineheight = (unsigned char)(lh > 255 ? 255 : (lh < 0 ? 0 : lh));
   }
 
@@ -597,6 +602,7 @@ static void walk_element_inner(struct dom_node *el)
   W_listrev = sv_lrev;
   W_listdef = sv_ldef;
   W_lineheight = sv_lh;
+  W_lhfactor = sv_lhf;
   W_liststyle = sv_ls;
   /* The ordered-list counter is list-scoped, not element-scoped */
   if (streq(name, "ul") || streq(name, "ol"))

@@ -67,6 +67,7 @@ extern int W_olnum;
 extern signed char W_listrev;
 extern signed char W_listdef;
 extern unsigned char W_lineheight;
+extern short W_lhfactor;
 extern signed char W_liststyle;
 extern const unsigned char ua_h_px[6];
 extern int W_n, W_run_nl;

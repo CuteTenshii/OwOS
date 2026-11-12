@@ -10,6 +10,7 @@ int W_olnum;                               /* <ol> running item number (last ass
 signed char W_listrev;                     /* <ol reversed>: -1 counts down, +1 up     */
 signed char W_listdef = CSS_LST_DEFAULT;   /* list's presentational default (type="") */
 unsigned char W_lineheight;                /* current CSS line-height px (0 = font-derived) */
+short W_lhfactor = -1;                     /* inherited line-height multiplier, percent; -1 = a fixed px value */
 signed char W_liststyle = CSS_LST_DEFAULT; /* inherited list-style-type    */
 
 /* CSS base font (px) that percent/relative sizes resolve against, plus the heading UA sizes */

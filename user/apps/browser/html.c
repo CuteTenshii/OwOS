@@ -628,6 +628,7 @@ static void layout_dom(void)
   B->pg->has_ls = false;
   W_bg = BG_NONE;
   W_lineheight = 0;
+  W_lhfactor = -1;
   W_liststyle = CSS_LST_DEFAULT;
   W_listtype = 0;
   W_olnum = 0;
