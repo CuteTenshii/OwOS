@@ -507,8 +507,8 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   const struct ltab *t = &g_fr->lt;
   int row = im->start_row;
   bool recorded = (row >= 0 && row < t->n);
-  int x0 = recorded ? t->x[row] : 4;
-  int rw = recorded ? t->w[row] : (paw < 1 ? 1 : paw);
+  int x0 = recorded ? (im->lx >= 0 ? im->lx : t->x[row]) : 4;
+  int rw = recorded ? (im->lx >= 0 ? im->lw : t->w[row]) : (paw < 1 ? 1 : paw);
   int dw = 0, dh = 0;
   img_disp_size(im, rw, &dw, &dh);
   int bw = im->bw > 0 ? im->bw : 0, bdw = dw, bdh = dh; /* border box; the picture sits bw inside it */

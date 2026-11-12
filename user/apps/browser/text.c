@@ -606,7 +606,7 @@ int line_height(int maxpx, int lhmax)
 /* While a flex-row item is being flowed, every wrapped line is captured into the overlay */
 bool g_ov_active; /* 1 = redirect add_line to the flex overlay */
 int g_ov_base;    /* absolute band row that the item's first line maps to */
-int g_ov_n;       /* lines emitted for the current item so far */
+int g_ov_n;       /* band rows the current item's lines fill so far */
 
 void add_line(int off, int len, int x, int w, int h, int maxpx)
 {
@@ -617,7 +617,7 @@ void add_line(int off, int len, int x, int w, int h, int maxpx)
       o->fs = p;
       p[o->n_fs++] = (struct fslice){g_ov_base + g_ov_n, off, len, x, w, h > 0 ? h : LINE_H, maxpx};
     }
-    g_ov_n++;
+    g_ov_n += ((h > 0 ? h : LINE_H) + BAND_PX - 1) / BAND_PX;
     return;
   }
   struct ltab *t = &o->lt;

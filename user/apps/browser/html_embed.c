@@ -280,6 +280,7 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;
+  im->lx = -1;
   if (!carried) {
     img_clear(im);
     /* currentColor resolves to the SVG's own CSS color if it sets one, else the inherited text */
@@ -347,6 +348,7 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;
+  im->lx = -1;
   B->pg->n_imgs++;
   W_n = text_put(W_n, '\n', 0);
   W_run_nl = 1;
@@ -392,6 +394,7 @@ void handle_canvas(struct dom_node *el, const struct css_style *cs)
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;
+  im->lx = -1;
   im->want = 0;
   im->fetched = 1; /* nothing to fetch */
   B->pg->n_imgs++;

@@ -116,13 +116,13 @@ void browser_viewport_px(int *w, int *h)
 /* CSS box layer, behind a flag; inline text still flows through the shared wrap. */
 bool g_box_layout = true;
 
-static int rows_for(int px) { return px > 0 ? (px + LINE_H - 1) / LINE_H : 0; }
+static int rows_for(int px) { return px > 0 ? (px + BAND_PX - 1) / BAND_PX : 0; }
 static int max0(int v) { return v > 0 ? v : 0; }
-/* Reserve `n` LINE_H-tall blank lines. */
+/* Reserve `n` band rows, BAND_PX tall each. */
 static void add_n_blanks(int n, int off, int x, int w)
 {
   while (n-- > 0)
-    add_line(off, 0, x, w, LINE_H, (int)BODY_PX);
+    add_line(off, 0, x, w, BAND_PX, (int)BODY_PX);
 }
 /* Reserve one blank line of exactly `h` px; no-op for h<=0. */
 static void add_blank_px(int h, int off, int x, int w)
@@ -192,6 +192,7 @@ static void flow_slice(int t0, int t1, int base_x, int w)
         if (img < o->n_img) {
           o->img_rows[img] = 1; /* one display line, exact px tall */
           o->img_row[img] = o->lt.n;
+          o->img_fs[img] = g_ov_active ? o->n_fs : -1; /* the slice add_line makes for it */
         }
         add_line(i, 0, base_x, w, dh > 0 ? dh : LINE_H, (int)BODY_PX);
       } else if (g_has_media && (me = media_at_text_pos(i)) != 0) {
@@ -523,7 +524,7 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
     flow_slice(it->t0, it->t1, x + fl, cw);
     g_ov_active = false;
     int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
-    int content_px = g_ov_n * LINE_H;
+    int content_px = g_ov_n * BAND_PX;
     int minch = box_min_content_h(it, vframe, main_sz[k]);
     if (minch > content_px)
       content_px = minch;
@@ -566,8 +567,8 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
     struct lgeom *g = &geo[items[k]];
     g->x = item_x[k];
     g->w = main_sz[k];
-    g->y = band_top_y + off_rows * LINE_H;
-    g->h = h_rows * LINE_H;
+    g->y = band_top_y + off_rows * BAND_PX;
+    g->h = h_rows * BAND_PX;
     g->cx = item_x[k] + fl;
     g->cw = main_sz[k] - fl - fr;
     if (g->cw < 4)
@@ -756,7 +757,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     flow_slice(it->t0, it->t1, it_x[k] + fl, cw);
     g_ov_active = false;
     int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
-    int content_px = g_ov_n * LINE_H;
+    int content_px = g_ov_n * BAND_PX;
     int minch = box_min_content_h(it, vframe, iw);
     if (minch > content_px)
       content_px = minch;
@@ -840,8 +841,8 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     struct lgeom *g = &geo[items[k]];
     g->x = it_x[k];
     g->w = it_w[k];
-    g->y = band_top_y + base_row * LINE_H;
-    g->h = h_rows * LINE_H;
+    g->y = band_top_y + base_row * BAND_PX;
+    g->h = h_rows * BAND_PX;
     g->cx = it_x[k] + fl;
     g->cw = it_w[k] - fl - fr;
     if (g->cw < 4)
@@ -1041,8 +1042,10 @@ static void layout_overlays(int paw)
     rec.h = o->geo[i].h;
     rec.modal = b->node && (dom_get_attr(b->node, "dialog-modal") || dom_get_attr(b->node, "fs-top"));
     for (int q = 0; q < o->n_img; q++) /* overlay images are not painted */
-      if (o->img_pos[q] >= b->t0 && o->img_pos[q] < b->t1)
+      if (o->img_pos[q] >= b->t0 && o->img_pos[q] < b->t1) {
         o->img_row[q] = -1;
+        o->img_fs[q] = -1;
+      }
     struct lovl *np = grow_arr(o->ov, &o->cap_ov, o->n_ov + 1, sizeof *np);
     if (!np)
       break;
@@ -1128,6 +1131,14 @@ static void layout_apply(const struct layout_out *o)
     pg->imgs[q].start_row = o->img_row[q];
     if (o->img_rows[q] >= 0)
       pg->imgs[q].rows = o->img_rows[q];
+    pg->imgs[q].lx = -1;
+    int s = o->img_fs[q];
+    if (s >= 0 && s < o->n_fs && o->fs[s].off == pg->imgs[q].text_pos) { /* in a flex/grid band */
+      pg->imgs[q].start_row = o->fs[s].row;
+      pg->imgs[q].rows = (o->fs[s].h + BAND_PX - 1) / BAND_PX;
+      pg->imgs[q].lx = o->fs[s].x;
+      pg->imgs[q].lw = o->fs[s].w;
+    }
   }
   for (int q = n; q < pg->n_imgs; q++)
     pg->imgs[q].start_row = -1;
@@ -1242,7 +1253,7 @@ void rewrap(int paw)
   int ni = B->pg->n_imgs;
   if (ni > o->cap_img) {
     int nc = browser_grow_cap(o->cap_img, 64, ni);
-    int *m = realloc(o->img_pos, (unsigned long)nc * 3 * sizeof *m);
+    int *m = realloc(o->img_pos, (unsigned long)nc * 4 * sizeof *m);
     if (m) {
       o->img_pos = m;
       o->cap_img = nc;
@@ -1251,10 +1262,12 @@ void rewrap(int paw)
   if (ni <= o->cap_img) {
     o->img_row = o->img_pos + o->cap_img;
     o->img_rows = o->img_pos + 2 * o->cap_img;
+    o->img_fs = o->img_pos + 3 * o->cap_img;
     for (int q = 0; q < ni; q++) {
       o->img_pos[q] = B->pg->imgs[q].text_pos;
       o->img_row[q] = -1;
       o->img_rows[q] = -1;
+      o->img_fs[q] = -1;
     }
     o->n_img = ni;
   }

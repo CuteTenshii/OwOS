@@ -73,6 +73,7 @@ struct layout_out {
   struct lgeom *geo; /* per-box geometry, indexed like the box pool */
   int n_geo, cap_geo;
   int *img_pos, *img_row, *img_rows;
+  int *img_fs; /* for an image inside a flex/grid item, its line slice in fs (which knows its column), else -1 */
   int n_img, cap_img;
   struct lmedia *med;
   int n_med, cap_med;
@@ -185,6 +186,8 @@ int run_ascent(int px, int set);
 int line_height(int maxpx, int lhmax);
 extern bool g_ov_active;
 extern int g_ov_base;
+/* Flex and grid bands reserve page rows this many px tall, so each item line keeps its own height. */
+#define BAND_PX 1
 extern int g_ov_n;
 void add_line(int off, int len, int x, int w, int h, int maxpx);
 void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh);

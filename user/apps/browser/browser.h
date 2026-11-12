@@ -132,6 +132,7 @@ struct inl_img {
   } xf;
   short fbright;              /* filter brightness permille, 1000 = none */
   signed char fgray, finvert; /* filter grayscale / invert percent */
+  int lx, lw;                 /* inside a flex/grid item: its column's x and width (lx -1 = use the row's) */
   short radius;               /* border-radius px (9999 = pill), 0 = square */
   short bw;                   /* uniform border width px around the image */
   unsigned bcol;              /* its colour, 0xRRGGBB */
