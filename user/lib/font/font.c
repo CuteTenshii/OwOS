@@ -31,8 +31,9 @@ struct font {
   int asc, desc, lgap;                         /* font units */
   unsigned head, maxp, hhea, hmtx, loca, glyf; /* table offsets (0 = absent) */
   unsigned cmap_sub;
-  int cmap_fmt; /* chosen cmap subtable        */
-  unsigned cff; /* CFF table offset; 0 = TrueType outlines */
+  int cmap_fmt;        /* chosen cmap subtable        */
+  unsigned cff;        /* CFF table offset; 0 = TrueType outlines */
+  unsigned cblc, cbdt; /* colour bitmap tables; both 0 unless the font has CBDT glyphs */
   unsigned charstrings, gsubrs, lsubrs, fdselect;
   unsigned *fd_subrs; /* per-Font-DICT local subrs of a CID-keyed CFF */
   int n_fd;
@@ -150,7 +151,12 @@ struct font *font_load(const unsigned char *data, int len)
   f->loca = find_table(data, len, "loca");
   f->glyf = find_table(data, len, "glyf");
   f->cff = ver == 0x4f54544f ? find_table(data, len, "CFF ") : 0;
-  if (!f->head || !f->maxp || !f->hhea || !f->hmtx || (f->cff ? 0 : (!f->loca || !f->glyf))) {
+  f->cblc = find_table(data, len, "CBLC");
+  f->cbdt = find_table(data, len, "CBDT");
+  if (!off_ok(f->cblc, 8, len) || !off_ok(f->cbdt, 4, len))
+    f->cblc = f->cbdt = 0;
+  int outlines = f->cff || (f->loca && f->glyf);
+  if (!f->head || !f->maxp || !f->hhea || !f->hmtx || (!outlines && !f->cblc)) {
     free(f->owned);
     free(f);
     return 0;
@@ -1066,6 +1072,8 @@ static void load_glyph(const struct font *f, int gi, struct ras *r, struct xf m,
     cff_glyph(f, gi, r);
     return;
   }
+  if (!f->loca || !f->glyf)
+    return; /* bitmap-only font: no outlines */
   unsigned o0, o1;
   if (f->loc_long) {
     if (!off_ok(f->loca, gi * 4 + 8, f->len))
@@ -1289,3 +1297,149 @@ int font_family(const struct font *f, char *out, int n)
   out[o] = '\0';
   return o;
 }
+
+/* ------------------------------------------------ colour bitmaps (CBLC/CBDT) */
+
+/* Image data of glyph `gi` in the index subtable at CBLC offset `ist` whose range starts at `first`: CBDT offset +
+ * length, plus the subtable's shared big metrics (formats 2/5) when it has them. */
+static int cblc_locate(const struct font *f, unsigned ist, int first, int gi, unsigned *off, unsigned *len,
+                       const unsigned char **bigm)
+{
+  if (!off_ok(ist, 8, f->len))
+    return 0;
+  int ifmt = (int)rd16(f->d + ist);
+  unsigned base = f->cbdt + rd32(f->d + ist + 4), o0, o1;
+  int i = gi - first;
+  *bigm = 0;
+  if (ifmt == 1 || ifmt == 3) {
+    int sz = ifmt == 1 ? 4 : 2;
+    if (!off_ok(ist + 8, (i + 2) * sz, f->len))
+      return 0;
+    const unsigned char *t = f->d + ist + 8 + i * sz;
+    o0 = sz == 4 ? rd32(t) : rd16(t);
+    o1 = sz == 4 ? rd32(t + 4) : rd16(t + 2);
+  } else if (ifmt == 2) {
+    if (!off_ok(ist + 8, 12, f->len))
+      return 0;
+    unsigned isz = rd32(f->d + ist + 8);
+    *bigm = f->d + ist + 12;
+    o0 = isz * (unsigned)i;
+    o1 = o0 + isz;
+  } else if (ifmt == 4 || ifmt == 5) {
+    unsigned n, at;
+    if (ifmt == 4) {
+      if (!off_ok(ist + 8, 4, f->len))
+        return 0;
+      n = rd32(f->d + ist + 8);
+      at = ist + 12;
+      if (n > (unsigned)f->len / 4 || !off_ok(at, (int)(n + 1) * 4, f->len))
+        return 0;
+      unsigned k = 0;
+      while (k < n && (int)rd16(f->d + at + k * 4) != gi)
+        k++;
+      if (k == n)
+        return 0;
+      o0 = rd16(f->d + at + k * 4 + 2);
+      o1 = rd16(f->d + at + k * 4 + 6);
+    } else {
+      if (!off_ok(ist + 8, 16, f->len))
+        return 0;
+      unsigned isz = rd32(f->d + ist + 8);
+      *bigm = f->d + ist + 12;
+      n = rd32(f->d + ist + 20);
+      at = ist + 24;
+      if (n > (unsigned)f->len / 2 || !off_ok(at, (int)n * 2, f->len))
+        return 0;
+      unsigned k = 0;
+      while (k < n && (int)rd16(f->d + at + k * 2) != gi)
+        k++;
+      if (k == n)
+        return 0;
+      o0 = isz * k;
+      o1 = o0 + isz;
+    }
+  } else {
+    return 0;
+  }
+  if (o1 <= o0 || base > (unsigned)f->len || o1 > (unsigned)f->len - base)
+    return 0;
+  *off = base + o0;
+  *len = o1 - o0;
+  return 1;
+}
+
+int font_glyph_png(const struct font *f, int gi, float px, struct font_png *out)
+{
+  if (!f || !f->cblc || gi <= 0 || gi >= f->num_glyphs)
+    return 0;
+  const unsigned char *c = f->d + f->cblc;
+  unsigned nsz = rd32(c + 4);
+  if (nsz > 256)
+    nsz = 256;
+  /* Smallest strike at least px tall (less to scale down), else the largest. */
+  unsigned best = 0;
+  int best_ppem = 0;
+  for (unsigned s = 0; s < nsz; s++) {
+    unsigned rec = f->cblc + 8 + s * 48;
+    if (!off_ok(rec, 48, f->len))
+      break;
+    int first = (int)rd16(f->d + rec + 40), last = (int)rd16(f->d + rec + 42), ppem = f->d[rec + 44];
+    if (gi < first || gi > last)
+      continue;
+    int better = !best_ppem || (best_ppem < px ? ppem > best_ppem : (ppem >= px && ppem < best_ppem));
+    if (better) {
+      best = rec;
+      best_ppem = ppem;
+    }
+  }
+  if (!best_ppem)
+    return 0;
+  unsigned arr = f->cblc + rd32(f->d + best), nsub = rd32(f->d + best + 8);
+  for (unsigned k = 0; k < nsub; k++) {
+    unsigned e = arr + k * 8;
+    if (!off_ok(e, 8, f->len))
+      return 0;
+    int first = (int)rd16(f->d + e), last = (int)rd16(f->d + e + 2);
+    if (gi < first || gi > last)
+      continue;
+    unsigned ist = arr + rd32(f->d + e + 4), off, len;
+    const unsigned char *bigm;
+    if (!off_ok(ist, 4, f->len) || !cblc_locate(f, ist, first, gi, &off, &len, &bigm))
+      return 0;
+    int ifmt_img = (int)rd16(f->d + ist + 2);
+    const unsigned char *g = f->d + off;
+    unsigned hdr;
+    if (ifmt_img == 17) { /* smallGlyphMetrics: h, w, bearingX, bearingY, advance */
+      if (len < 9)
+        return 0;
+      out->h = g[0];
+      out->w = g[1];
+      out->bx = (signed char)g[2];
+      out->by = (signed char)g[3];
+      out->adv = g[4];
+      hdr = 5;
+    } else if (ifmt_img == 18 || ifmt_img == 19) { /* bigGlyphMetrics, inline (18) or in the index (19) */
+      const unsigned char *m = ifmt_img == 18 ? g : bigm;
+      hdr = ifmt_img == 18 ? 8 : 0;
+      if (!m || len < hdr + 4)
+        return 0;
+      out->h = m[0];
+      out->w = m[1];
+      out->bx = (signed char)m[2];
+      out->by = (signed char)m[3];
+      out->adv = m[4];
+    } else {
+      return 0; /* uncompressed bitmap formats: not used by colour fonts */
+    }
+    unsigned dl = rd32(g + hdr);
+    if (dl > len - hdr - 4)
+      return 0;
+    out->png = g + hdr + 4;
+    out->len = (int)dl;
+    out->ppem = best_ppem;
+    return 1;
+  }
+  return 0;
+}
+
+int font_has_color(const struct font *f) { return f && f->cblc; }

@@ -6,9 +6,9 @@
  * font picker, …) — it has no dependency on the browser. Outlines are flattened
  * to polygons and scanline-filled with supersampled antialiasing.
  *
- * Scope: cmap formats 0/4/6/12, simple + composite glyf outlines, horizontal
- * metrics, hhea/OS2 vertical metrics. NOT yet: CFF/Type2 (PostScript) outlines
- * — a pure-CFF .otf returns NULL from font_load for now. */
+ * Scope: cmap formats 0/4/6/12, simple + composite glyf outlines, CFF outlines,
+ * horizontal metrics, hhea/OS2 vertical metrics, and CBDT colour bitmaps (as
+ * PNG bytes; decoding them is the caller's job, so this stays PNG-free). */
 #ifndef OWOS_FONT_H
 #define OWOS_FONT_H
 
@@ -48,5 +48,23 @@ void font_glyph_hmetrics(const struct font *f, int gi, float px, int *advance, i
  * pointers (except the returned bitmap) must be non-NULL. */
 unsigned char *font_render_glyph(const struct font *f, int gi, float px, int *w, int *h, int *ox, int *oy,
                                  int *advance);
+
+/* A colour (CBDT) glyph: its PNG bytes, which point into the font data, and its placement in the pixels of the
+ * strike it was drawn for. */
+struct font_png {
+  const unsigned char *png;
+  int len;
+  int ppem;   /* the strike's pixels per em */
+  int w, h;   /* bitmap size */
+  int bx, by; /* left bearing, and the top edge's height above the baseline */
+  int adv;    /* pen advance */
+};
+
+/* True if the font carries colour bitmaps (a CBLC/CBDT pair). */
+int font_has_color(const struct font *f);
+
+/* Glyph `gi`'s colour bitmap from the strike nearest `px`: the smallest at least that size, else the largest.
+ * Returns 1, or 0 if the font has none for it (then the glyph is an outline, or absent). */
+int font_glyph_png(const struct font *f, int gi, float px, struct font_png *out);
 
 #endif /* OWOS_FONT_H */

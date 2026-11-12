@@ -1,5 +1,5 @@
 /* Host test for the font library (user/lib/font): family names, CFF (OpenType PostScript) outlines on a
- * font built in this file, and WOFF2 decoding. */
+ * font built in this file, WOFF2 decoding, and CBDT colour bitmaps. */
 #define OWOS_SUITE_TEST
 #include "font.h"
 #include "test.h"
@@ -51,6 +51,70 @@ static void woff2(void)
   char fam[64];
   family_of("fonts/LiberationSans-Regular.woff2", fam, sizeof fam);
   expect_string(fam, "Liberation Sans");
+}
+
+static unsigned char *slurp(const char *path, int *len)
+{
+  FILE *fp = fopen(path, "rb");
+  if (!fp)
+    return 0;
+  fseek(fp, 0, SEEK_END);
+  long n = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+  unsigned char *b = malloc((size_t)n);
+  if (b && fread(b, 1, (size_t)n, fp) != (size_t)n) {
+    free(b);
+    b = 0;
+  }
+  fclose(fp);
+  *len = (int)n;
+  return b;
+}
+
+/* A CBDT-only font loads, maps U+1F33A to a PNG bitmap, and rasterizes nothing as an outline. */
+static void color_emoji(void)
+{
+  int len = 0;
+  unsigned char *b = slurp("fonts/NotoColorEmoji.ttf", &len);
+  expect(b != NULL);
+  if (!b)
+    return;
+  struct font *f = font_load(b, len);
+  expect(f != NULL);
+  if (f) {
+    expect(font_has_color(f));
+    int gi = font_glyph_index(f, 0x1F33A);
+    expect(gi > 0);
+    struct font_png p;
+    expect(font_glyph_png(f, gi, 20, &p) == 1);
+    expect(p.ppem == 109 && p.w > 0 && p.h > 0 && p.adv > 0 && p.len > 8);
+    static const unsigned char sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    expect(memcmp(p.png, sig, 8) == 0);
+    expect(p.png + p.len <= b + len);
+    int w, h, ox, oy, adv;
+    expect(font_render_glyph(f, gi, 20, &w, &h, &ox, &oy, &adv) == NULL);
+    expect(adv > 0);
+    expect(font_glyph_png(f, 0, 20, &p) == 0);
+    font_free(f);
+  }
+  free(b);
+}
+
+/* An outline font has no colour glyphs. */
+static void no_color_in_outline_font(void)
+{
+  int len = 0;
+  unsigned char *b = slurp("fonts/LiberationSans-Regular.ttf", &len);
+  expect(b != NULL);
+  struct font *f = b ? font_load(b, len) : 0;
+  expect(f != NULL);
+  if (f) {
+    struct font_png p;
+    expect(!font_has_color(f));
+    expect(font_glyph_png(f, font_glyph_index(f, 'A'), 15, &p) == 0);
+    font_free(f);
+  }
+  free(b);
 }
 
 static void put16(unsigned char *p, unsigned v)
@@ -180,5 +244,7 @@ int main(void)
   test("cff_square", cff_square);
   test("glyph_index_by_encoding", glyph_index_by_encoding);
   test("cff_bad_charstrings_offset", cff_bad_charstrings_offset);
+  test("color_emoji", color_emoji);
+  test("no_color_in_outline_font", no_color_in_outline_font);
   return 0;
 }
