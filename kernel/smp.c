@@ -2,6 +2,7 @@
 
 #include "smp.h"
 #include "console.h"
+#include "creg.h"
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
@@ -222,6 +223,8 @@ static void lapic_timer_start(void)
 /* AP C entry with paging on (kernel CR3): adopt the shared IDT and own TSS, init the scheduler and LAPIC timer. */
 void ap_main(uint32_t idx)
 {
+  /* The trampoline sets only CR0.PG; without WP, ring-0 copyout writes through user COW pages. */
+  write_cr0(read_cr0() | 0x10000);
   gdt_load_ap();
   idt_load();
   tss_load_ap();
