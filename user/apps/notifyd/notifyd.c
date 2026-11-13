@@ -462,7 +462,7 @@ static void draw_card(const struct note *n, int x, int y, int w, int newest)
     int bx[NOTIFY_MAX_BUTTONS], bw[NOTIFY_MAX_BUTTONS];
     int nb = button_layout(n, &g, bx, bw);
     for (int k = 0; k < nb; k++)
-      button_draw(bx[k], g.btn_y, bw[k], GUI_BTN_H, n->btn_label[k], BTN_NORMAL);
+      button_draw(bx[k], g.btn_y, bw[k], GUI_BTN_H, n->btn_label[k], BTN_NORMAL, NULL);
   }
 
   draw_x(g.close_x, g.close_y, C_DIM);
@@ -501,14 +501,14 @@ static void render(int win_w, int win_h)
   gfx_fill_rect(0, HDR_H, win_w, 1, C_SEP);
   gfx_ui_text(PAD, (HDR_H - UIFONT_H) / 2, "Notifications", C_TXT);
   if (nhist)
-    button_draw(win_w - PAD - 84, (HDR_H - 22) / 2, 84, 22, "Clear all", BTN_NORMAL);
+    button_draw(win_w - PAD - 84, (HDR_H - 22) / 2, 84, 22, "Clear all", BTN_NORMAL, NULL);
   else
     gfx_ui_text((win_w - gfx_ui_width("No notifications")) / 2, HDR_H + (win_h - HDR_H - UIFONT_H) / 2,
                 "No notifications", C_DIM);
 
   int visible = win_h - HDR_H;
   int total = content_height(win_w);
-  scrollbar_draw(win_w - SBW, HDR_H, SBW, visible, g_scroll, total, visible);
+  scrollbar_draw(win_w - SBW, HDR_H, SBW, visible, g_scroll, total, visible, NULL);
 }
 
 /* input */
@@ -519,7 +519,7 @@ static void run_command(const char *cmd);
 static int handle_click(int mx, int my, int win_w, int win_h)
 {
   if (my < HDR_H) { /* header */
-    if (nhist && button_hit(win_w - PAD - 84, (HDR_H - 22) / 2, 84, 22, mx, my)) {
+    if (nhist && button_hit(win_w - PAD - 84, (HDR_H - 22) / 2, 84, 22, mx, my, NULL)) {
       hist_clear();
       g_scroll = 0;
       return 1;
@@ -530,14 +530,14 @@ static int handle_click(int mx, int my, int win_w, int win_h)
   int visible = win_h - HDR_H;
   int total = content_height(win_w);
   if (mx >= win_w - SBW) { /* scrollbar */
-    int reg = scrollbar_hit(win_w - SBW, HDR_H, SBW, visible, mx, my);
+    int reg = scrollbar_hit(win_w - SBW, HDR_H, SBW, visible, mx, my, NULL);
     if (reg == SCROLLBAR_UP)
       g_scroll -= 40;
     else if (reg == SCROLLBAR_DOWN)
       g_scroll += 40;
     else if (reg == SCROLLBAR_TRACK) {
       g_sb_drag = 1;
-      g_scroll = scrollbar_pos(win_w - SBW, HDR_H, SBW, visible, mx, my, g_scroll, total, visible);
+      g_scroll = scrollbar_pos(win_w - SBW, HDR_H, SBW, visible, mx, my, g_scroll, total, visible, NULL);
     }
     clamp_scroll(win_w, win_h);
     return 1;
@@ -559,7 +559,7 @@ static int handle_click(int mx, int my, int win_w, int win_h)
         int bx[NOTIFY_MAX_BUTTONS], bw[NOTIFY_MAX_BUTTONS];
         int nb = button_layout(hist[i], &g, bx, bw);
         for (int k = 0; k < nb; k++)
-          if (button_hit(bx[k], g.btn_y, bw[k], GUI_BTN_H, mx, my)) {
+          if (button_hit(bx[k], g.btn_y, bw[k], GUI_BTN_H, mx, my, NULL)) {
             char cmd[NOTIFY_BCMD_MAX];
             strcpy(cmd, hist[i]->btn_cmd[k]);
             hist_remove(i); /* dismiss on action (Plasma-style) */
@@ -692,7 +692,8 @@ int main(void)
       } else if (ev.type == WEV_DRAG) {
         if (g_sb_drag) {
           int visible = g_h - HDR_H;
-          g_scroll = scrollbar_pos(g_w - SBW, HDR_H, SBW, visible, ev.a, ev.b, g_scroll, content_height(g_w), visible);
+          g_scroll =
+              scrollbar_pos(g_w - SBW, HDR_H, SBW, visible, ev.a, ev.b, g_scroll, content_height(g_w), visible, NULL);
           clamp_scroll(g_w, g_h);
           dirty = true;
         }

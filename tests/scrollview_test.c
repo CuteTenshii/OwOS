@@ -3,6 +3,7 @@
 #include "gfx.h"
 #include "owos.h"
 #include "test.h"
+#include <stddef.h>
 
 static int clip[4] = {0, 0, 640, 480};
 static int bars_drawn;
@@ -21,8 +22,9 @@ void gfx_set_clip(int x, int y, int w, int h)
   clip[2] = w;
   clip[3] = h;
 }
-void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible)
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible, const struct gfx_style *st)
 {
+  (void)st;
   (void)x;
   (void)y;
   (void)w;
@@ -33,15 +35,17 @@ void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visib
   bars_drawn++;
 }
 /* Whole bar is track; the position maps linearly from the pointer's y */
-int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my, const struct gfx_style *st)
 {
+  (void)st;
   if (mx < x || mx >= x + w || my < y || my >= y + h)
     return SCROLLBAR_NONE;
   return my < y + 10 ? SCROLLBAR_UP : my >= y + h - 10 ? SCROLLBAR_DOWN : SCROLLBAR_TRACK;
 }
-int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible)
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
+                  const struct gfx_style *st)
 {
-  if (scrollbar_hit(x, y, w, h, mx, my) != SCROLLBAR_TRACK)
+  if (scrollbar_hit(x, y, w, h, mx, my, st) != SCROLLBAR_TRACK)
     return scroll;
   return (my - y - 10) * (total - visible) / (h - 20);
 }
@@ -137,9 +141,24 @@ static void check_nested_clip(void)
   expect_eq(clip[3], 30);
 }
 
+static void check_styled_bar_width(void)
+{
+  struct gfx_style bar = *gfx_theme(GFX_W_SCROLLBAR);
+  bar.width = 16;
+  struct scrollview wide;
+  scrollview_init(&wide, 20, &bar);
+  scrollview_begin(&wide, 0, 0, 200, 100, 400);
+  expect_eq(scrollview_content_w(&wide), 200 - 16);
+  scrollview_end(&wide);
+  bar.margin[GFX_LEFT] = 4; /* the bar's margin is room taken from the content too */
+  scrollview_begin(&wide, 0, 0, 200, 100, 400);
+  expect_eq(scrollview_content_w(&wide), 200 - 20);
+  scrollview_end(&wide);
+}
+
 int main(void)
 {
-  scrollview_init(&sv, 20);
+  scrollview_init(&sv, 20, NULL);
 
   test("fits: no bar, no scrolling", check_fits);
   test("overflow: wheel, clamp, content width", check_overflow);
@@ -148,5 +167,6 @@ int main(void)
   test("reveal", check_reveal);
   test("scrollbar press and drag", check_press_drag);
   test("nested clip is respected", check_nested_clip);
+  test("a styled bar sets its own width", check_styled_bar_width);
   return 0;
 }

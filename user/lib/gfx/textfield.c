@@ -3,12 +3,6 @@
 
 /* text field */
 
-#define TF_BG 0xffffffu     /* field background */
-#define TF_FG 0x101418u     /* text colour */
-#define TF_BORDER 0x3a3f48u /* idle border */
-#define TF_FOCUS 0x2f6bd8u  /* focused border accent + caret */
-#define TF_PAD 4            /* inner horizontal padding (px) */
-
 void textfield_init(struct textfield *tf, char *buf, int cap)
 {
   tf->buf = buf;
@@ -89,13 +83,22 @@ void textfield_set(struct textfield *tf, const char *s)
   tf->scroll = 0;
 }
 
-/* Pixel width of buf[a..b) in the proportional UI font */
-static int tf_span(const struct textfield *tf, int a, int b)
+/* Pixel width of buf[a..b) in font f */
+static int tf_span(const struct textfield *tf, int a, int b, const struct gfx_font *f)
 {
   int w = 0;
   for (int i = a; i < b; i++)
-    w += gfx_ui_cw((unsigned char)tf->buf[i]);
+    w += gfx_font_cw((unsigned char)tf->buf[i], f);
   return w;
+}
+
+/* The field's content box: where text sits and the caret moves */
+static void tf_content(const struct gfx_style *st, int x, int y, int w, int h, struct gfx_box *b, struct gfx_box *c)
+{
+  gfx_style_box(st, x, y, w, h, b);
+  gfx_style_content(st, b, c);
+  if (c->w < 1)
+    c->w = 1;
 }
 
 int textfield_selection(const struct textfield *tf, int *start, int *end)
@@ -124,87 +127,101 @@ static int tf_delete_selection(struct textfield *tf)
   return 1;
 }
 
-void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused)
+void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused, const struct gfx_style *st)
 {
-  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_TEXTFIELD, 0, focused ? GFX_A11Y_FOCUSED : 0, x, y, w, h), tf->buf);
-  gfx_fill_rect(x, y, w, h, TF_BG);
-  gfx_rect(x, y, w, h, focused ? TF_FOCUS : TF_BORDER);
+  st = gfx_style_of(GFX_W_TEXTFIELD, st);
+  struct gfx_box b, c;
+  tf_content(st, x, y, w, h, &b, &c);
+  struct gfx_font f;
+  gfx_style_font(st, &f);
+  const struct gfx_colors *field = &st->color[BTN_NORMAL], *acc = &st->accent[BTN_NORMAL];
+  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_TEXTFIELD, 0, focused ? GFX_A11Y_FOCUSED : 0, b.x, b.y, b.w, b.h), tf->buf);
+  struct gfx_colors frame = *field;
+  if (focused)
+    frame.border = acc->border;
+  gfx_style_paint(st, &b, &frame);
 
-  int inner = x + TF_PAD;
-  int avail = w - 2 * TF_PAD;
-  if (avail < 1)
-    avail = 1;
-  int ty = y + (h - UIFONT_H) / 2;
+  int avail = c.w, fh = gfx_font_height(&f);
+  int ty = c.y + (c.h - fh) / 2;
 
   /* Scroll so the caret stays visible: never left of `scroll` */
   if (tf->scroll > tf->len)
     tf->scroll = tf->len;
   if (tf->caret < tf->scroll)
     tf->scroll = tf->caret;
-  while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret) > avail - 2)
+  while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret, &f) > avail - 2)
     tf->scroll++;
   /* After a deletion, pull the view left while all the text fits */
-  while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len) <= avail - 2)
+  while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len, &f) <= avail - 2)
     tf->scroll--;
 
   int s0, s1;
   int has_sel = textfield_selection(tf, &s0, &s1);
-  int px = inner;
+  int px = c.x;
   int caret_px = -1;
   for (int i = tf->scroll; i <= tf->len; i++) {
     if (i == tf->caret)
       caret_px = px;
     if (i == tf->len)
       break;
-    int cw = gfx_ui_cw((unsigned char)tf->buf[i]);
-    if (px - inner + cw > avail)
+    int cw = gfx_font_cw((unsigned char)tf->buf[i], &f);
+    if (px - c.x + cw > avail)
       break;
     char one[2] = {tf->buf[i], '\0'};
     int sel = has_sel && i >= s0 && i < s1;
     if (sel)
-      gfx_fill_rect(px, ty, cw, UIFONT_H, TF_FOCUS);
-    gfx_ui_text(px, ty, one, sel ? TF_BG : TF_FG);
+      gfx_fill_rect(px, ty, cw, fh, acc->bg);
+    gfx_font_text(px, ty, one, sel ? acc->fg : field->fg, &f);
     px += cw;
   }
   if (focused && caret_px >= 0) {
-    if (caret_px > inner + avail - 1)
-      caret_px = inner + avail - 1;
-    gfx_fill_rect(caret_px, ty, 1, UIFONT_H, TF_FOCUS);
+    if (caret_px > c.x + avail - 1)
+      caret_px = c.x + avail - 1;
+    gfx_fill_rect(caret_px, ty, 1, fh, acc->bg);
   }
 }
 
 /* Character index nearest to pixel column mx, using the scroll from the last draw */
-static int tf_index_at(const struct textfield *tf, int mx, int x, int w)
+static int tf_index_at(const struct textfield *tf, int mx, const struct gfx_box *c, const struct gfx_font *f)
 {
-  int inner = x + TF_PAD;
-  int avail = w - 2 * TF_PAD;
-  int px = inner;
+  int px = c->x;
   for (int i = tf->scroll; i < tf->len; i++) {
-    int cw = gfx_ui_cw((unsigned char)tf->buf[i]);
-    if (px - inner + cw > avail || mx < px + cw / 2)
+    int cw = gfx_font_cw((unsigned char)tf->buf[i], f);
+    if (px - c->x + cw > c->w || mx < px + cw / 2)
       return i;
     px += cw;
   }
   return tf->len;
 }
 
-int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h)
+int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h, const struct gfx_style *st)
 {
-  if (mx < x || mx >= x + w || my < y || my >= y + h)
+  st = gfx_style_of(GFX_W_TEXTFIELD, st);
+  struct gfx_box b, c;
+  tf_content(st, x, y, w, h, &b, &c);
+  if (mx < b.x || mx >= b.x + b.w || my < b.y || my >= b.y + b.h)
     return 0;
-  tf->caret = tf->anchor = tf_index_at(tf, mx, x, w);
+  struct gfx_font f;
+  gfx_style_font(st, &f);
+  tf->caret = tf->anchor = tf_index_at(tf, mx, &c, &f);
   tf->last_edit = EDIT_NONE;
   return 1;
 }
 
-void textfield_drag(struct textfield *tf, int mx, int x, int w)
+void textfield_drag(struct textfield *tf, int mx, int x, int w, const struct gfx_style *st)
 {
-  if (mx < x)
+  st = gfx_style_of(GFX_W_TEXTFIELD, st);
+  struct gfx_box b, c;
+  tf_content(st, x, 0, w, TEXTFIELD_H, &b, &c);
+  if (mx < b.x)
     tf->caret = tf->scroll > 0 ? tf->scroll - 1 : 0;
-  else if (mx >= x + w)
+  else if (mx >= b.x + b.w)
     tf->caret = tf->caret < tf->len ? tf->caret + 1 : tf->len;
-  else
-    tf->caret = tf_index_at(tf, mx, x, w);
+  else {
+    struct gfx_font f;
+    gfx_style_font(st, &f);
+    tf->caret = tf_index_at(tf, mx, &c, &f);
+  }
 }
 
 int textfield_key(struct textfield *tf, char c, int mods)

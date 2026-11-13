@@ -532,36 +532,55 @@ static unsigned composite_over(unsigned dst, unsigned src)
 static void page_scrollbar_default(void)
 {
   B->pg->sb_w = SCROLL_W;
-  B->pg->sb_st = SCROLLBAR_DEFAULT;
+  B->pg->sb_st = *gfx_theme(GFX_W_SCROLLBAR);
+  B->pg->sb_thumb_set = false;
 }
+
+static void sb_arrows(struct gfx_style *st, bool on)
+{
+  if (on)
+    st->flags &= ~GFX_STYLE_NO_ARROWS;
+  else
+    st->flags |= GFX_STYLE_NO_ARROWS;
+}
+
+/* A colour the page set, or the theme's when it left it unset (negative) */
+static unsigned sb_color(int page, unsigned theme) { return page >= 0 ? (unsigned)page : theme; }
 
 /* Fold the root element's scrollbar-width, scrollbar-color and ::-webkit-scrollbar* rules into the page's scrollbar. */
 static void page_scrollbar_style(struct dom_node *el, const struct css_style *cs)
 {
-  struct scrollbar_style *st = &B->pg->sb_st;
+  struct gfx_style *st = &B->pg->sb_st;
+  const struct gfx_style *def = gfx_theme(GFX_W_SCROLLBAR);
   if (cs->sb_w != -1) {
     B->pg->sb_w = cs->sb_w >= 0 ? cs->sb_w : SCROLL_W;
-    st->arrows = cs->sb_w < 0 || cs->sb_w >= SCROLL_W;
+    sb_arrows(st, cs->sb_w < 0 || cs->sb_w >= SCROLL_W);
   }
   if (cs->sb_thumb != -1) {
-    st->thumb = cs->sb_thumb;
-    st->track = cs->sb_track;
+    st->accent[BTN_NORMAL].bg = sb_color(cs->sb_thumb, def->accent[BTN_NORMAL].bg);
+    st->color[BTN_NORMAL].bg = sb_color(cs->sb_track, def->color[BTN_NORMAL].bg);
+    B->pg->sb_thumb_set = cs->sb_thumb >= 0;
   }
   struct css_sbparts p;
-  if (!css_scrollbar_parts(sheet_for(el), el, &p))
-    return;
-  if (p.hidden)
-    B->pg->sb_w = 0;
-  else if (p.width >= 0) {
-    B->pg->sb_w = p.width > 24 ? 24 : p.width;
-    st->arrows = 0; /* a restyled bar has no buttons unless the page draws them */
+  if (css_scrollbar_parts(sheet_for(el), el, &p)) {
+    if (p.hidden)
+      B->pg->sb_w = 0;
+    else if (p.width >= 0) {
+      B->pg->sb_w = p.width > 24 ? 24 : p.width;
+      sb_arrows(st, false); /* a restyled bar has no buttons unless the page draws them */
+    }
+    if (p.track >= 0)
+      st->color[BTN_NORMAL].bg = (unsigned)p.track;
+    if (p.thumb >= 0) {
+      st->accent[BTN_NORMAL].bg = (unsigned)p.thumb;
+      B->pg->sb_thumb_set = true;
+    }
+    if (p.radius >= 0)
+      st->radius = p.radius;
   }
-  if (p.track >= 0)
-    st->track = p.track;
-  if (p.thumb >= 0)
-    st->thumb = p.thumb;
-  if (p.radius >= 0)
-    st->radius = p.radius;
+  /* A bare thumb in the theme colour runs edge to edge; with arrows or a page colour it sits 1px in */
+  int inset = !(st->flags & GFX_STYLE_NO_ARROWS) || B->pg->sb_thumb_set;
+  st->padding[GFX_LEFT] = st->padding[GFX_RIGHT] = inset;
 }
 
 static void compute_page_colors(struct dom_node *root)

@@ -639,7 +639,7 @@ static void on_click(int mx, int my)
   if (my < MENU_H || menu_is_open()) {
     struct menu *leaf;
     int item;
-    if (menubar_click(&mbar, mx, my, &leaf, &item) && item >= 0)
+    if (menubar_click(&mbar, mx, my, &leaf, &item, NULL, NULL) && item >= 0)
       menu_action(leaf, item);
     return;
   }
@@ -689,8 +689,10 @@ static void render(void)
   else
     snprintf(line, sizeof line, "%s", load_error ? load_error : "[no document]");
   status_set(&sbar, line);
-  status_draw(&sbar, 0, H - STATUS_H, W, prompt_on ? 0xffe08a : COL_TEXT, 0x161d28);
-  menubar_draw(&mbar);
+  struct gfx_style bar_st = *gfx_theme(GFX_W_STATUS);
+  bar_st.color[BTN_NORMAL].fg = prompt_on ? 0xffe08a : COL_TEXT;
+  status_draw(&sbar, 0, H - STATUS_H, W, &bar_st);
+  menubar_draw(&mbar, NULL, NULL);
 }
 
 int main(int argc, char **argv)

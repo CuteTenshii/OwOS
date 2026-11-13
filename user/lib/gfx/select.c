@@ -1,13 +1,8 @@
 #include "gfx.h"
 #include "owos.h"
 
-#define SEL_BG 0xffffffu
-#define SEL_FG 0x101418u
-#define SEL_BORDER 0x3a3f48u
-#define SEL_ACCENT 0x2f6bd8u
-#define SEL_HILITE 0xdce8fcu
-#define SEL_CHEVRON 0x5a6472u
-#define SEL_PAD 4
+#define SEL_CHEVRON_W 8   /* the chevron's width */
+#define SEL_CHEVRON_GAP 4 /* between the chevron and the content's right edge */
 
 void select_init(struct select_box *s, const char *const *options, int count, int selected)
 {
@@ -19,42 +14,89 @@ void select_init(struct select_box *s, const char *const *options, int count, in
   s->focused = 0;
 }
 
-void select_draw(struct select_box *s, int x, int y, int w, int h)
+static int sel_row_h(const struct gfx_style *st)
 {
+  if (st->row_h > 0)
+    return st->row_h;
+  struct gfx_font f;
+  gfx_style_font(st, &f);
+  return gfx_font_height(&f);
+}
+
+/* The closed box's border and content boxes, and the open list's border box below it */
+static void sel_geom(const struct select_box *s, const struct gfx_style *st, int x, int y, int w, int h,
+                     struct gfx_box *b, struct gfx_box *c, struct gfx_box *list)
+{
+  gfx_style_box(st, x, y, w, h, b);
+  gfx_style_content(st, b, c);
+  int bw = st->border > 0 ? st->border : 0;
+  list->x = b->x;
+  list->y = b->y + b->h;
+  list->w = b->w;
+  list->h = s->count * sel_row_h(st) + 2 * bw;
+}
+
+/* The list row under (mx,my), or -1 */
+static int sel_row_at(const struct select_box *s, const struct gfx_style *st, const struct gfx_box *list, int mx,
+                      int my)
+{
+  int bw = st->border > 0 ? st->border : 0;
+  if (mx < list->x || mx >= list->x + list->w || my < list->y + bw || my >= list->y + list->h - bw)
+    return -1;
+  int row = (my - list->y - bw) / sel_row_h(st);
+  return row < s->count ? row : -1;
+}
+
+void select_draw(struct select_box *s, int x, int y, int w, int h, const struct gfx_style *st)
+{
+  st = gfx_style_of(GFX_W_SELECT, st);
+  struct gfx_box b, c, list;
+  sel_geom(s, st, x, y, w, h, &b, &c, &list);
   const char *lbl = (s->selected >= 0 && s->selected < s->count) ? s->options[s->selected] : "";
-  unsigned st = GFX_A11Y_HASPOPUP | (s->open ? GFX_A11Y_EXPANDED : 0) | (s->focused ? GFX_A11Y_FOCUSED : 0);
-  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_SELECT, 0, st, x, y, w, h), lbl);
+  unsigned a11y = GFX_A11Y_HASPOPUP | (s->open ? GFX_A11Y_EXPANDED : 0) | (s->focused ? GFX_A11Y_FOCUSED : 0);
+  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_SELECT, 0, a11y, b.x, b.y, b.w, b.h), lbl);
 
+  const struct gfx_colors *box = &st->color[BTN_NORMAL], *acc = &st->accent[BTN_NORMAL];
   if (s->focused)
-    gfx_focus_ring(x, y, w, h);
-  gfx_fill_rect(x, y, w, h, SEL_BG);
-  gfx_rect(x, y, w, h, s->open ? SEL_ACCENT : SEL_BORDER);
+    gfx_focus_ring(b.x, b.y, b.w, b.h, st);
+  struct gfx_colors frame = *box;
+  frame.detail = frame.bg; /* detail is the chevron here, not a lit edge */
+  if (s->open)
+    frame.border = acc->border;
+  gfx_style_paint(st, &b, &frame);
 
-  gfx_ui_text(x + SEL_PAD, y + (h - UIFONT_H) / 2, lbl, SEL_FG);
+  struct gfx_box text = c;
+  text.w -= SEL_CHEVRON_W + SEL_CHEVRON_GAP + st->gap;
+  gfx_style_label(st, &text, lbl, box->fg);
 
-  int tx = x + w - 16, ty = y + (h - 4) / 2;
+  int tx = c.x + c.w - SEL_CHEVRON_W - SEL_CHEVRON_GAP, ty = b.y + (b.h - 4) / 2;
   for (int r = 0; r < 4; r++)
-    gfx_fill_rect(tx + r, ty + r, 8 - 2 * r, 1, SEL_CHEVRON);
+    gfx_fill_rect(tx + r, ty + r, SEL_CHEVRON_W - 2 * r, 1, box->detail);
 
   if (s->open && s->count > 0) {
-    int ly = y + h, lh = s->count * GUI_ROW_H;
-    gfx_fill_rect(x, ly, w, lh, SEL_BG);
+    int bw = st->border > 0 ? st->border : 0, rh = sel_row_h(st);
+    gfx_fill_rect(list.x, list.y, list.w, list.h, box->bg);
     for (int i = 0; i < s->count; i++) {
-      int ry = ly + i * GUI_ROW_H;
+      int ry = list.y + bw + i * rh;
       int lit = i == s->hover || (s->hover < 0 && i == s->selected);
       unsigned ost = (i == s->selected ? GFX_A11Y_SELECTED : 0) | (lit ? GFX_A11Y_HOVER : 0);
-      gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_OPTION, s->options[i], ost, x, ry, w, GUI_ROW_H), i + 1, 0, s->count);
+      gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_OPTION, s->options[i], ost, list.x, ry, list.w, rh), i + 1, 0, s->count);
       if (lit)
-        gfx_fill_rect(x + 1, ry, w - 2, GUI_ROW_H, SEL_HILITE);
-      gfx_ui_text(x + SEL_PAD, ry + (GUI_ROW_H - UIFONT_H) / 2, s->options[i], SEL_FG);
+        gfx_fill_rect(list.x + bw, ry, list.w - 2 * bw, rh, acc->bg);
+      struct gfx_box row = {c.x, ry, c.w, rh};
+      gfx_style_label(st, &row, s->options[i], lit ? acc->fg : box->fg);
     }
-    gfx_rect(x, ly, w, lh, SEL_BORDER);
+    if (bw)
+      gfx_round_rect(list.x, list.y, list.w, list.h, 0, bw, box->border);
   }
 }
 
-int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my)
+int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my, const struct gfx_style *st)
 {
-  int in_box = mx >= x && mx < x + w && my >= y && my < y + h;
+  st = gfx_style_of(GFX_W_SELECT, st);
+  struct gfx_box b, c, list;
+  sel_geom(s, st, x, y, w, h, &b, &c, &list);
+  int in_box = mx >= b.x && mx < b.x + b.w && my >= b.y && my < b.y + b.h;
   if (!s->open) {
     if (in_box) {
       s->open = 1;
@@ -67,26 +109,24 @@ int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int m
     s->open = 0;
     return -1;
   }
-  int ly = y + h, lh = s->count * GUI_ROW_H;
-  if (mx >= x && mx < x + w && my >= ly && my < ly + lh) {
-    int row = (my - ly) / GUI_ROW_H;
-    if (row >= 0 && row < s->count) {
-      s->selected = row;
-      s->open = 0;
-      return 1;
-    }
+  int row = sel_row_at(s, st, &list, mx, my);
+  if (row >= 0) {
+    s->selected = row;
+    s->open = 0;
+    return 1;
   }
   s->open = 0;
   return 0;
 }
 
-int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my)
+int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my, const struct gfx_style *st)
 {
   if (!s->open)
     return 0;
-  int ly = y + h, lh = s->count * GUI_ROW_H, nh = -1;
-  if (mx >= x && mx < x + w && my >= ly && my < ly + lh)
-    nh = (my - ly) / GUI_ROW_H;
+  st = gfx_style_of(GFX_W_SELECT, st);
+  struct gfx_box b, c, list;
+  sel_geom(s, st, x, y, w, h, &b, &c, &list);
+  int nh = sel_row_at(s, st, &list, mx, my);
   if (nh != s->hover) {
     s->hover = nh;
     return 1;

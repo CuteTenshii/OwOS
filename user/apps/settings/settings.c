@@ -40,7 +40,7 @@ static void render(void)
   gfx_clear(BG_PANEL);
 
   /* Sidebar: the widget paints the panel base, divider and resize grip */
-  sidebar_draw(&sb, 0, 0, sbw, H, BG_SIDE, BG_DIVIDER);
+  sidebar_draw(&sb, 0, 0, sbw, H, NULL);
   gfx_fill_rect(0, 0, sbw, HEADER_H, BG_HEADER);
   gfx_ui_text(8, 2, "Settings", FG_TITLE);
   for (int i = 0; i < NCATS; i++) {

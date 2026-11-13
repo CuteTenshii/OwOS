@@ -4,12 +4,6 @@
 
 static int is_enter(int key) { return key == '\n' || key == '\r'; }
 
-void gfx_focus_ring(int x, int y, int w, int h)
-{
-  gfx_rect(x - 2, y - 2, w + 4, h + 4, GFX_FOCUS_COLOR);
-  gfx_rect(x - 3, y - 3, w + 6, h + 6, GFX_FOCUS_COLOR);
-}
-
 void gfx_focus_init(struct gfx_focus *f, int n, int cur, const unsigned char *disabled)
 {
   f->n = n > 0 ? n : 0;

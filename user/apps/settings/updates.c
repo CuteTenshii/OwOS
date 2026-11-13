@@ -110,7 +110,7 @@ void updates_poll(void)
 
 void updates_click(int cx, int mx, int my)
 {
-  if (upd_state != UPD_CHECKING && button_hit(cx + 16, UPD_BTN_Y, UPD_BTN_W, GUI_BTN_H, mx, my))
+  if (upd_state != UPD_CHECKING && button_hit(cx + 16, UPD_BTN_Y, UPD_BTN_W, GUI_BTN_H, mx, my, NULL))
     upd_start();
 }
 
@@ -138,5 +138,5 @@ void updates_draw(int cx, int cw)
   }
   gfx_ui_text_clip(cx + 16, CONTROLS_Y0 + 50, msg, fg, maxw);
   button_draw(cx + 16, UPD_BTN_Y, UPD_BTN_W, GUI_BTN_H, "Check for updates",
-              upd_state == UPD_CHECKING ? BTN_DISABLED : BTN_NORMAL);
+              upd_state == UPD_CHECKING ? BTN_DISABLED : BTN_NORMAL, NULL);
 }

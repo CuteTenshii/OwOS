@@ -613,7 +613,7 @@ static void click(int mx, int my)
   if (my < MENU_H || filemenu.open || editmenu.open) { /* bar or open dropdown */
     struct menu *leaf;
     int item;
-    if (menubar_click(&mbar, mx, my, &leaf, &item) && item >= 0)
+    if (menubar_click(&mbar, mx, my, &leaf, &item, NULL, NULL) && item >= 0)
       menu_action(leaf, item);
     return;
   }
@@ -717,7 +717,7 @@ static void render(void)
   apnd(line, &p, sizeof line, "  -  ");
   apnd(line, &p, sizeof line, sbar.msg);
   status_set(&bar, line);
-  status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
+  status_draw(&bar, 0, sy, W, NULL);
 
   /* Cursor position + encoding, right-aligned over the bar the widget just drew */
   char rstat[40];
@@ -736,7 +736,7 @@ static void render(void)
 
   /* The menu bar, drawn last so an open dropdown overlays the text */
   sync_edit_flags();
-  menubar_draw(&mbar);
+  menubar_draw(&mbar, NULL, NULL);
 }
 
 int main(int argc, char **argv)

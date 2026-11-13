@@ -264,8 +264,8 @@ static void draw(struct picker *p)
   geom_top(p, &pathw);
   int fx = W - PAD - FILTER_W;
 
-  button_draw(PAD, PAD, UP_W, TEXTFIELD_H, "Up", p->up ? p->hot == 2 ? BTN_HOVER : BTN_NORMAL : BTN_DISABLED);
-  textfield_draw(&p->pathtf, PAD + UP_W + GAP, PAD, pathw, TEXTFIELD_H, p->focus == 1);
+  button_draw(PAD, PAD, UP_W, TEXTFIELD_H, "Up", p->up ? p->hot == 2 ? BTN_HOVER : BTN_NORMAL : BTN_DISABLED, NULL);
+  textfield_draw(&p->pathtf, PAD + UP_W + GAP, PAD, pathw, TEXTFIELD_H, p->focus == 1, NULL);
   gfx_a11y_set_name(gfx_a11y_last(), "Folder");
 
   int ly = list_y(), lh = list_h(p);
@@ -282,7 +282,8 @@ static void draw(struct picker *p)
 
   if (has_name(p)) {
     gfx_ui_text(PAD, name_y() + (TEXTFIELD_H - UIFONT_H) / 2, "Name", COL_DIM);
-    textfield_draw(&p->nametf, PAD + NAME_LABEL_W, name_y(), W - 2 * PAD - NAME_LABEL_W, TEXTFIELD_H, p->focus == 0);
+    textfield_draw(&p->nametf, PAD + NAME_LABEL_W, name_y(), W - 2 * PAD - NAME_LABEL_W, TEXTFIELD_H, p->focus == 0,
+                   NULL);
     gfx_a11y_set_name(gfx_a11y_last(), "Name");
   }
 
@@ -290,21 +291,22 @@ static void draw(struct picker *p)
   if (p->status[0])
     gfx_a11y_add(GFX_ROLE_LABEL, p->status, 0, PAD, btn_y(), sw, GUI_BTN_H);
   gfx_ui_text_clip(PAD, btn_y() + (GUI_BTN_H - UIFONT_H) / 2, p->status, COL_ERR, sw);
-  button_draw(cancel_x(), btn_y(), BTN_W, GUI_BTN_H, "Cancel", p->hot == 0 ? BTN_HOVER : BTN_NORMAL);
-  button_draw(primary_x(), btn_y(), BTN_W, GUI_BTN_H, k_primary[p->o->mode], p->hot == 1 ? BTN_HOVER : BTN_NORMAL);
+  button_draw(cancel_x(), btn_y(), BTN_W, GUI_BTN_H, "Cancel", p->hot == 0 ? BTN_HOVER : BTN_NORMAL, NULL);
+  button_draw(primary_x(), btn_y(), BTN_W, GUI_BTN_H, k_primary[p->o->mode], p->hot == 1 ? BTN_HOVER : BTN_NORMAL,
+              NULL);
 
   if (has_filter(p))
-    select_draw(&p->filter, fx, PAD + (TEXTFIELD_H - GUI_SELECT_H) / 2, FILTER_W, GUI_SELECT_H);
+    select_draw(&p->filter, fx, PAD + (TEXTFIELD_H - GUI_SELECT_H) / 2, FILTER_W, GUI_SELECT_H, NULL);
 }
 
 /* The hovered button for a pointer at (mx,my): 0 cancel, 1 primary, 2 up, or -1 */
 static int button_at(const struct picker *p, int mx, int my)
 {
-  if (button_hit(cancel_x(), btn_y(), BTN_W, GUI_BTN_H, mx, my))
+  if (button_hit(cancel_x(), btn_y(), BTN_W, GUI_BTN_H, mx, my, NULL))
     return 0;
-  if (button_hit(primary_x(), btn_y(), BTN_W, GUI_BTN_H, mx, my))
+  if (button_hit(primary_x(), btn_y(), BTN_W, GUI_BTN_H, mx, my, NULL))
     return 1;
-  if (p->up && button_hit(PAD, PAD, UP_W, TEXTFIELD_H, mx, my))
+  if (p->up && button_hit(PAD, PAD, UP_W, TEXTFIELD_H, mx, my, NULL))
     return 2;
   return -1;
 }
@@ -316,7 +318,7 @@ static int on_mouse(struct picker *p, int mx, int my, char *out, int outsz, int 
   geom_top(p, &pathw);
   int fy = PAD + (TEXTFIELD_H - GUI_SELECT_H) / 2;
   if (has_filter(p)) {
-    int r = select_click(&p->filter, W - PAD - FILTER_W, fy, FILTER_W, GUI_SELECT_H, mx, my);
+    int r = select_click(&p->filter, W - PAD - FILTER_W, fy, FILTER_W, GUI_SELECT_H, mx, my, NULL);
     if (r == 1)
       reload(p);
     if (r || p->filter.open)
@@ -336,13 +338,13 @@ static int on_mouse(struct picker *p, int mx, int my, char *out, int outsz, int 
     go_parent(p);
     return 0;
   }
-  if (textfield_click(&p->pathtf, mx, my, PAD + UP_W + GAP, PAD, pathw, TEXTFIELD_H)) {
+  if (textfield_click(&p->pathtf, mx, my, PAD + UP_W + GAP, PAD, pathw, TEXTFIELD_H, NULL)) {
     p->focus = 1;
     p->drag = 1;
     return 0;
   }
-  if (has_name(p) &&
-      textfield_click(&p->nametf, mx, my, PAD + NAME_LABEL_W, name_y(), W - 2 * PAD - NAME_LABEL_W, TEXTFIELD_H)) {
+  if (has_name(p) && textfield_click(&p->nametf, mx, my, PAD + NAME_LABEL_W, name_y(), W - 2 * PAD - NAME_LABEL_W,
+                                     TEXTFIELD_H, NULL)) {
     p->focus = 0;
     p->drag = 0;
     return 0;
@@ -425,7 +427,7 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
   p->focus = o->mode == FILEPICK_FOLDER ? 1 : 0;
   textfield_init(&p->pathtf, p->pathbuf, sizeof p->pathbuf);
   textfield_init(&p->nametf, p->namebuf, sizeof p->namebuf);
-  scrollview_init(&p->sv, ROW_H);
+  scrollview_init(&p->sv, ROW_H, NULL);
   const char *const filters[2] = {o->filter_label ? o->filter_label : "Supported files", "All files"};
   select_init(&p->filter, filters, 2, 0);
   textfield_set(&p->nametf, o->name ? o->name : "");
@@ -483,9 +485,9 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
           int pathw;
           geom_top(p, &pathw);
           if (p->drag == 1)
-            textfield_drag(&p->pathtf, ev.a, PAD + UP_W + GAP, pathw);
+            textfield_drag(&p->pathtf, ev.a, PAD + UP_W + GAP, pathw, NULL);
           else
-            textfield_drag(&p->nametf, ev.a, PAD + NAME_LABEL_W, W - 2 * PAD - NAME_LABEL_W);
+            textfield_drag(&p->nametf, ev.a, PAD + NAME_LABEL_W, W - 2 * PAD - NAME_LABEL_W, NULL);
         } else
           scrollview_drag(&p->sv, ev.a, ev.b);
         break;
@@ -496,7 +498,7 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
         p->hot = ev.a < 0 ? -1 : button_at(p, ev.a, ev.b);
         if (has_filter(p) && ev.a >= 0)
           select_motion(&p->filter, W - PAD - FILTER_W, PAD + (TEXTFIELD_H - GUI_SELECT_H) / 2, FILTER_W, GUI_SELECT_H,
-                        ev.a, ev.b);
+                        ev.a, ev.b, NULL);
         break;
       }
     }

@@ -33,7 +33,7 @@ static int g_state = ST_EMPTY;
 static int g_win;
 static int g_quit;             /* leave the main loop: closed, or handed off to a new instance */
 static int g_W = CW, g_H = CH; /* actual window client size */
-static bool g_fs;               /* the window covers the screen */
+static bool g_fs;              /* the window covers the screen */
 static bool g_is_video;
 
 static int g_press = -1, g_press_ticks;
@@ -561,7 +561,7 @@ static void draw_controls(int top, unsigned bg, unsigned pos_ms, unsigned dur_ms
   char el[8], tt[8];
   gfx_fill_rect(0, top, g_W, g_H - top, bg);
   progress_draw(BAR_X, bar_y, g_W - 2 * BAR_X, GUI_PROGRESS_H, (int)(dur_ms && pos_ms > dur_ms ? dur_ms : pos_ms),
-                (int)(dur_ms ? dur_ms : 1), 0);
+                (int)(dur_ms ? dur_ms : 1), 0, NULL);
   fmt_time(pos_ms / 1000, el);
   gfx_ui_text(BAR_X, time_y, el, COL_DIM);
   if (dur_ms) {
@@ -579,7 +579,7 @@ static void draw_controls(int top, unsigned bg, unsigned pos_ms, unsigned dur_ms
   layout_buttons();
   for (int i = 0; i < NBTN; i++) {
     int st = (g_press == i && g_press_ticks > 0) ? BTN_PRESSED : BTN_NORMAL;
-    button_draw(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, g_blabel[i], st);
+    button_draw(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, g_blabel[i], st, NULL);
   }
   if (g_press_ticks > 0 && --g_press_ticks == 0)
     g_press = -1;
@@ -602,7 +602,7 @@ static void render_audio(void)
     gfx_ui_text((g_W - gfx_ui_width(h2)) / 2, 78 + UIFONT_H + 4, h2, COL_TITLE);
     layout_buttons();
     for (int i = 0; i < NBTN; i++)
-      button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], i == 0 ? BTN_NORMAL : BTN_DISABLED);
+      button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], i == 0 ? BTN_NORMAL : BTN_DISABLED, NULL);
     return;
   }
   unsigned pos = media_position_ms(g_dec), dur = media_duration_ms(g_dec);
@@ -627,7 +627,7 @@ static void render_audio(void)
     gfx_ui_text_clip(g_W / 2 - sw / 2, HDR_H + 14 + g_ext, sub, COL_DIM, tw);
   }
   progress_draw(BAR_X, bar_y, g_W - 2 * BAR_X, GUI_PROGRESS_H, (int)(dur && pos > dur ? dur : pos),
-                (int)(dur ? dur : 1), 0);
+                (int)(dur ? dur : 1), 0, NULL);
   char el[8], tt[8];
   fmt_time(pos / 1000, el);
   gfx_ui_text(BAR_X, TIME_Y, el, COL_DIM);
@@ -645,7 +645,7 @@ static void render_audio(void)
   layout_buttons();
   for (int i = 0; i < NBTN; i++) {
     int st = (g_press == i && g_press_ticks > 0) ? BTN_PRESSED : BTN_NORMAL;
-    button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], st);
+    button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], st, NULL);
   }
   if (g_press_ticks > 0 && --g_press_ticks == 0)
     g_press = -1;
@@ -676,7 +676,7 @@ static int open_file(void)
 
 static void on_click(int mx, int my)
 {
-  if (g_state == ST_EMPTY && !button_hit(g_bx[0], BTN_Y, g_bw[0], GUI_BTN_H, mx, my))
+  if (g_state == ST_EMPTY && !button_hit(g_bx[0], BTN_Y, g_bw[0], GUI_BTN_H, mx, my, NULL))
     return;
 
   if (!g_is_video && mx >= BAR_X && mx < g_W - BAR_X && my >= BAR_Y - 4 && my < BAR_Y + GUI_PROGRESS_H + 4) {
@@ -686,7 +686,7 @@ static void on_click(int mx, int my)
 
   int btn_y = g_is_video ? g_H - GUI_BTN_H - 14 : BTN_Y;
   for (int i = 0; i < NBTN; i++) {
-    if (button_hit(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, mx, my)) {
+    if (button_hit(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, mx, my, NULL)) {
       g_press = i;
       g_press_ticks = 4;
       if (i == 0)

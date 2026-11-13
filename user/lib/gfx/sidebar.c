@@ -1,7 +1,5 @@
 #include "gfx.h"
 
-#define SB_GRIP_DOT 0x33415au
-
 static int sb_clamp(const struct sidebar *sb, int w)
 {
   if (w < sb->min_w)
@@ -24,14 +22,17 @@ void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w)
 
 void sidebar_set_width(struct sidebar *sb, int w) { sb->w = sb_clamp(sb, w); }
 
-void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg, unsigned divider)
+void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, const struct gfx_style *st)
 {
-  gfx_fill_rect(x, y, w, h, bg);
-  gfx_fill_rect(x + w, y, 1, h, divider);
+  st = gfx_style_of(GFX_W_SIDEBAR, st);
+  const struct gfx_colors *c = &st->color[BTN_NORMAL];
+  int dw = st->border > 0 ? st->border : 1;
+  gfx_fill_rect(x, y, w, h, c->bg);
+  gfx_fill_rect(x + w, y, dw, h, c->border);
   if (sb->resizable && h > 24) {
     int cy = y + h / 2 - 9;
     for (int i = 0; i < 4; i++)
-      gfx_fill_rect(x + w - 1, cy + i * 5, 2, 2, SB_GRIP_DOT);
+      gfx_fill_rect(x + w - 1, cy + i * 5, dw + 1, 2, c->detail);
   }
 }
 
@@ -59,15 +60,20 @@ int sidebar_drag(struct sidebar *sb, int x, int mx)
   return 1;
 }
 
-void gfx_separator(int x, int y, int len, int vertical)
+void gfx_separator(int x, int y, int len, int vertical, const struct gfx_style *st)
 {
+  st = gfx_style_of(GFX_W_SEPARATOR, st);
   if (len <= 0)
     return;
+  const struct gfx_colors *c = &st->color[BTN_NORMAL];
+  int t = st->border > 0 ? st->border : 1;
+  x += st->margin[GFX_LEFT];
+  y += st->margin[GFX_TOP];
   if (vertical) {
-    gfx_fill_rect(x, y, 1, len, 0x05070au);
-    gfx_fill_rect(x + 1, y, 1, len, 0x3a4658u);
+    gfx_fill_rect(x, y, t, len, c->border);
+    gfx_fill_rect(x + t, y, 1, len, c->detail);
   } else {
-    gfx_fill_rect(x, y, len, 1, 0x05070au);
-    gfx_fill_rect(x, y + 1, len, 1, 0x3a4658u);
+    gfx_fill_rect(x, y, len, t, c->border);
+    gfx_fill_rect(x, y + t, len, 1, c->detail);
   }
 }

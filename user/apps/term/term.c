@@ -286,7 +286,7 @@ static void redraw(void)
     gfx_fill_rect((cc < cols ? cc : cols - 1) * FONT_W, (cl - vt) * FONT_H + FONT_H - 2, FONT_W, 2, FG);
 
   /* Scrollbar down the right edge: `scroll` is the top visible line (vt) */
-  scrollbar_draw(winw - GUI_SCROLL_W, 0, GUI_SCROLL_W, winh, bottom - view, nlines, rows);
+  scrollbar_draw(winw - GUI_SCROLL_W, 0, GUI_SCROLL_W, winh, bottom - view, nlines, rows, NULL);
 
   win_present(win);
   dirty = false;
@@ -379,7 +379,7 @@ static void on_click(int mx, int my)
   if (maxoff <= 0)
     return; /* nothing to scroll */
   int sbx = winw - GUI_SCROLL_W;
-  int part = scrollbar_hit(sbx, 0, GUI_SCROLL_W, winh, mx, my);
+  int part = scrollbar_hit(sbx, 0, GUI_SCROLL_W, winh, mx, my, NULL);
   int scroll = maxoff - view;
   if (part == SCROLLBAR_UP)
     sb_set(scroll - 3);
@@ -387,7 +387,7 @@ static void on_click(int mx, int my)
     sb_set(scroll + 3);
   else if (part == SCROLLBAR_TRACK) {
     sb_drag = 1;
-    sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, mx, my, scroll, nlines, rows));
+    sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, mx, my, scroll, nlines, rows, NULL));
   }
 }
 
@@ -399,7 +399,7 @@ static void on_drag(int mx, int my)
     return;
   int maxoff = nlines > rows ? nlines - rows : 0;
   int sbx = winw - GUI_SCROLL_W;
-  sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, sbx + GUI_SCROLL_W / 2, my, maxoff - view, nlines, rows));
+  sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, sbx + GUI_SCROLL_W / 2, my, maxoff - view, nlines, rows, NULL));
 }
 
 static void on_resize(int w, int h)

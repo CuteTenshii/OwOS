@@ -747,7 +747,9 @@ static void render(void)
     p = as(p, prompt_buf);
     as(p, "_");
     status_set(&bar, line);
-    status_draw(&bar, 0, sy, W, 0xffe08a, 0x161d28);
+    struct gfx_style prompt_st = *gfx_theme(GFX_W_STATUS);
+    prompt_st.color[BTN_NORMAL].fg = 0xffe08a;
+    status_draw(&bar, 0, sy, W, &prompt_st);
   } else {
     p = as(line, load_ok ? basename_of(curpath) : "[no image]");
     if (load_ok) {
@@ -759,7 +761,7 @@ static void render(void)
       p = as(p, fmt == FMT_WEBP ? "WebP" : fmt == FMT_GIF ? "GIF" : color_name(meta_valid ? meta.color : 2));
     }
     status_set(&bar, line);
-    status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
+    status_draw(&bar, 0, sy, W, NULL);
   }
 
   if (props_open)
@@ -767,7 +769,7 @@ static void render(void)
 
   /* Menu bar drawn last so an open dropdown overlays the panel */
   view_flags[0] = props_open ? MENU_CHECKED : 0;
-  menubar_draw(&mbar);
+  menubar_draw(&mbar, NULL, NULL);
 }
 
 /* input */
@@ -829,7 +831,7 @@ static void on_click(int mx, int my)
   if (my < MENU_H || filemenu.open || viewmenu.open) { /* bar or open dropdown */
     struct menu *leaf;
     int item;
-    if (menubar_click(&mbar, mx, my, &leaf, &item) && item >= 0)
+    if (menubar_click(&mbar, mx, my, &leaf, &item, NULL, NULL) && item >= 0)
       menu_action(leaf, item);
   }
 }

@@ -33,6 +33,8 @@ struct button {
   bool enabled;
 };
 
+static const struct gfx_font head_font = {.px = HEAD_PX};
+
 static int win;
 static enum screen screen = LIST;
 static struct install_disk disks[MAX_DISKS];
@@ -162,7 +164,7 @@ static void draw_lines(int y, const char *a, const char *b, unsigned fg)
 
 static void draw_list(void)
 {
-  gfx_ui_text_px(PAD, PAD, "Install OwOS", FG_HEAD, HEAD_PX);
+  gfx_font_text(PAD, PAD, "Install OwOS", FG_HEAD, &head_font);
   draw_lines(58, "Choose the disk to install OwOS on.", "Everything on that disk will be erased.", FG_TEXT);
   if (denied) {
     draw_lines(LIST_Y, problem_text(INSTALL_DENIED), "Start the Installer as root, or with sudo.", FG_TEXT);
@@ -179,7 +181,7 @@ static void draw_list(void)
     snprintf(label, sizeof label, "%s  %s", disks[i].dev, disks[i].model);
     size_text(disks[i].sectors, size, sizeof size);
     int state = !usable ? BTN_DISABLED : hover_row == i ? BTN_HOVER : BTN_NORMAL;
-    radio_draw(PAD, y, label, i == selected, state, gfx_focus_is(&focus, 0) && i == selected);
+    radio_draw(PAD, y, label, i == selected, state, gfx_focus_is(&focus, 0) && i == selected, NULL);
     if (disks[i].sectors)
       gfx_ui_text(W - PAD - gfx_ui_width(size), y, size, usable ? FG_TEXT : FG_DIM);
     if (!usable)
@@ -200,20 +202,20 @@ static void draw(void)
     draw_list();
     break;
   case INSTALLING:
-    gfx_ui_text_px(PAD, PAD, "Installing OwOS", FG_HEAD, HEAD_PX);
+    gfx_font_text(PAD, PAD, "Installing OwOS", FG_HEAD, &head_font);
     snprintf(line, sizeof line, "On %s.", target);
     draw_lines(58, line, 0, FG_TEXT);
     draw_lines(LIST_Y, prog.stage, 0, FG_TEXT);
-    progress_draw(PAD, LIST_Y + 30, W - 2 * PAD, GUI_PROGRESS_H, (int)prog.done, (int)prog.total, 1);
+    progress_draw(PAD, LIST_Y + 30, W - 2 * PAD, GUI_PROGRESS_H, (int)prog.done, (int)prog.total, 1, NULL);
     draw_lines(LIST_Y + 66, "Keep this window open until the install finishes.", 0, FG_DIM);
     break;
   case DONE:
-    gfx_ui_text_px(PAD, PAD, "OwOS is installed", FG_HEAD, HEAD_PX);
+    gfx_font_text(PAD, PAD, "OwOS is installed", FG_HEAD, &head_font);
     snprintf(line, sizeof line, "It is on %s.", target);
     draw_lines(58, line, "Remove the USB stick or disc OwOS started from, then restart.", FG_TEXT);
     break;
   case FAILED:
-    gfx_ui_text_px(PAD, PAD, "The install stopped", FG_HEAD, HEAD_PX);
+    gfx_font_text(PAD, PAD, "The install stopped", FG_HEAD, &head_font);
     snprintf(line, sizeof line, "It failed at: %s.", prog.stage);
     draw_lines(58, line, "The disk won't start OwOS. Try again, or choose another disk.", FG_TEXT);
     break;
@@ -221,7 +223,7 @@ static void draw(void)
   for (int i = 0; i < nbuttons; i++) {
     struct button *b = &buttons[i];
     int state = !b->enabled ? BTN_DISABLED : hover_button == i ? BTN_HOVER : BTN_NORMAL;
-    button_draw(b->x, BTN_Y, b->w, GUI_BTN_H, b->label, state | (gfx_focus_is(&focus, i + 1) ? GFX_FOCUSED : 0));
+    button_draw(b->x, BTN_Y, b->w, GUI_BTN_H, b->label, state | (gfx_focus_is(&focus, i + 1) ? GFX_FOCUSED : 0), NULL);
   }
   win_present(win);
 }
@@ -285,7 +287,7 @@ static int row_at(int x, int y)
 static int button_at(int x, int y)
 {
   for (int i = 0; i < nbuttons; i++)
-    if (buttons[i].enabled && button_hit(buttons[i].x, BTN_Y, buttons[i].w, GUI_BTN_H, x, y))
+    if (buttons[i].enabled && button_hit(buttons[i].x, BTN_Y, buttons[i].w, GUI_BTN_H, x, y, NULL))
       return i;
   return -1;
 }

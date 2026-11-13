@@ -85,8 +85,8 @@ static void draw_icon(int type, int x, int y)
   int cx = x + ICON_SZ / 2, cy = y + ICON_SZ / 2;
   fill_disc(cx, cy, ICON_SZ / 2 - 1, col);
   int px = 24;
-  int w = gfx_ui_width_px(sym, px);
-  gfx_ui_text_px(cx - w / 2, cy - px / 2, sym, 0xffffff, px);
+  int w = gfx_font_width(sym, &(struct gfx_font){.px = px});
+  gfx_font_text(cx - w / 2, cy - px / 2, sym, 0xffffff, &(struct gfx_font){.px = px});
 }
 
 /* What the icon tells a sighted user, for the dialog's a11y node */
@@ -311,7 +311,7 @@ static void draw_button(int x, int y, int w, const char *label, int primary, int
   gfx_a11y_add(GFX_ROLE_BUTTON, label, st, x, y, w, BTN_H);
   unsigned bg = primary ? (hot ? BTN_PRIMH : BTN_PRIM) : (hot ? BTN_HOT : BTN_NORM);
   if (focused)
-    gfx_focus_ring(x, y, w, BTN_H);
+    gfx_focus_ring(x, y, w, BTN_H, NULL);
   gfx_fill_rect(x, y, w, BTN_H, bg);
   gfx_rect(x, y, w, BTN_H, BORDER);
   int tx = x + (w - gfx_ui_width(label)) / 2;
@@ -515,7 +515,7 @@ int dialog_prompt(int parent, const char *title, const char *message, const char
         int i = button_at(b, 2, W, H, ev.a, ev.b);
         if (i >= 0)
           result = b[i].result;
-        else if (button_hit(PAD, inputy, iw, INPUT_H, ev.a, ev.b))
+        else if (button_hit(PAD, inputy, iw, INPUT_H, ev.a, ev.b, NULL))
           focus.cur = FOCUS_BODY;
       } else if (ev.type == WEV_MOVE) {
         hot = ev.a < 0 ? -1 : button_at(b, 2, W, H, ev.a, ev.b);
@@ -532,7 +532,7 @@ int dialog_prompt(int parent, const char *title, const char *message, const char
                                             PAD, inputy, iw, INPUT_H);
       gfx_a11y_set_text(field, buf);
       if (in_field)
-        gfx_focus_ring(PAD, inputy, iw, INPUT_H);
+        gfx_focus_ring(PAD, inputy, iw, INPUT_H, NULL);
       gfx_fill_rect(PAD, inputy, iw, INPUT_H, 0x0d1420);
       gfx_rect(PAD, inputy, iw, INPUT_H, 0x3a4658);
       /* Show the tail if the text overflows the box; caret sits at the end. */
@@ -647,7 +647,7 @@ int dialog_list(int parent, const char *title, const char *message, const char *
         gfx_ui_text(PAD, PAD + i * LINE_H + (LINE_H - UIFONT_H) / 2, lines[i], DLG_TEXT);
       gfx_a11y_add(GFX_ROLE_LIST, nl ? message : title, 0, PAD, listy, lw, rows * LIST_ROW_H);
       if (in_list)
-        gfx_focus_ring(PAD, listy, lw, rows * LIST_ROW_H);
+        gfx_focus_ring(PAD, listy, lw, rows * LIST_ROW_H, NULL);
       gfx_fill_rect(PAD, listy, lw, rows * LIST_ROW_H, LIST_BG);
       gfx_rect(PAD, listy, lw, rows * LIST_ROW_H, 0x3a4658);
       for (int r = 0; r < rows && top + r < nitems; r++) {

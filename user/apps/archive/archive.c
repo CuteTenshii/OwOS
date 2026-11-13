@@ -274,7 +274,7 @@ static void render(void)
   gfx_fill_rect(0, MENU_H, W, PATH_H, COL_PATHBAR);
   gfx_ui_text(PAD, MENU_H + (PATH_H - UIFONT_H) / 2, "Archive", COL_DIM);
   int fx = PAD + gfx_ui_width("Archive") + PAD;
-  textfield_draw(&path_tf, fx, MENU_H + 3, W - fx - PAD, PATH_H - 6, path_focus);
+  textfield_draw(&path_tf, fx, MENU_H + 3, W - fx - PAD, PATH_H - 6, path_focus, NULL);
 
   gfx_fill_rect(0, MENU_H + PATH_H, W, HDR_H, COL_HDR);
   int hy = MENU_H + PATH_H + (HDR_H - UIFONT_H) / 2;
@@ -310,13 +310,16 @@ static void render(void)
     }
   }
   if (arc_count > vis)
-    scrollbar_draw(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, scroll, arc_count, vis);
+    scrollbar_draw(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, scroll, arc_count, vis, NULL);
 
-  status_draw(&status, 0, H - STATUS_H, W, COL_DIM, COL_PATHBAR);
+  struct gfx_style status_st = *gfx_theme(GFX_W_STATUS);
+  status_st.color[BTN_NORMAL].fg = COL_DIM;
+  status_st.color[BTN_NORMAL].bg = status_st.color[BTN_NORMAL].detail = COL_PATHBAR;
+  status_draw(&status, 0, H - STATUS_H, W, &status_st);
 
   /* The menu bar last, so an open dropdown overlays the list */
   gfx_fill_rect(0, 0, W, MENU_H, COL_BAR);
-  menubar_draw(&mbar);
+  menubar_draw(&mbar, NULL, NULL);
 }
 
 static int row_at(int y)
@@ -332,24 +335,24 @@ static void on_click(int x, int y)
   struct menu *leaf;
   int item;
   if (y < MENU_H || file_menu.open || help_menu.open) {
-    if (menubar_click(&mbar, x, y, &leaf, &item) && item >= 0)
+    if (menubar_click(&mbar, x, y, &leaf, &item, NULL, NULL) && item >= 0)
       menu_action(leaf, item);
     return;
   }
   int fx = PAD + gfx_ui_width("Archive") + PAD;
-  path_focus = textfield_click(&path_tf, x, y, fx, MENU_H + 3, W - fx - PAD, PATH_H - 6);
+  path_focus = textfield_click(&path_tf, x, y, fx, MENU_H + 3, W - fx - PAD, PATH_H - 6, NULL);
   if (path_focus)
     return;
 
   int vis = visible_rows();
   if (arc_count > vis && x >= W - GUI_SCROLL_W) {
-    int hit = scrollbar_hit(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, x, y);
+    int hit = scrollbar_hit(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, x, y, NULL);
     if (hit == SCROLLBAR_UP)
       scroll--;
     else if (hit == SCROLLBAR_DOWN)
       scroll++;
     else if (hit == SCROLLBAR_TRACK)
-      scroll = scrollbar_pos(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, x, y, scroll, arc_count, vis);
+      scroll = scrollbar_pos(W - GUI_SCROLL_W, LIST_TOP, GUI_SCROLL_W, vis * ROW_H, x, y, scroll, arc_count, vis, NULL);
     clamp_scroll();
     return;
   }
@@ -504,7 +507,7 @@ int main(int argc, char **argv)
           extract_selected();
       } else if (ev.type == WEV_DRAG && path_focus) {
         int fx = PAD + gfx_ui_width("Archive") + PAD;
-        textfield_drag(&path_tf, ev.a, fx, W - fx - PAD);
+        textfield_drag(&path_tf, ev.a, fx, W - fx - PAD, NULL);
       } else if (ev.type == WEV_MOVE) {
         hover = ev.a < 0 ? -1 : row_at(ev.b);
       } else if (ev.type == WEV_SCROLL) {

@@ -170,16 +170,17 @@ struct page {
   unsigned char *attr;
   int text_len, text_cap;
   unsigned char *bp;
-  unsigned char *align;         /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
-  unsigned char *fsz;           /* per-glyph CSS font-size px (0 = default body font) */
-  unsigned char *ff;            /* per-glyph font set, an index into fsets */
-  unsigned char *lh;            /* per-glyph CSS line-height px (0 = font-derived default) */
-  signed char *ls;              /* per-glyph letter-spacing px */
-  signed char *va;              /* per-glyph vertical-align shift, px down */
-  unsigned sid;                 /* sessionStorage scope: assigned on first use, dies with the tab */
-  int sb_w;                     /* page scrollbar width, px (0 = hidden); SCROLL_W unless the page restyles it */
-  struct scrollbar_style sb_st; /* its colours, thumb radius and arrows */
-  bool has_ls;                  /* some glyph has letter-spacing (the layout signature must see it) */
+  unsigned char *align;   /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
+  unsigned char *fsz;     /* per-glyph CSS font-size px (0 = default body font) */
+  unsigned char *ff;      /* per-glyph font set, an index into fsets */
+  unsigned char *lh;      /* per-glyph CSS line-height px (0 = font-derived default) */
+  signed char *ls;        /* per-glyph letter-spacing px */
+  signed char *va;        /* per-glyph vertical-align shift, px down */
+  unsigned sid;           /* sessionStorage scope: assigned on first use, dies with the tab */
+  int sb_w;               /* page scrollbar width, px (0 = hidden); SCROLL_W unless the page restyles it */
+  struct gfx_style sb_st; /* its colours, thumb radius and arrows */
+  bool sb_thumb_set;      /* the page chose the thumb colour */
+  bool has_ls;            /* some glyph has letter-spacing (the layout signature must see it) */
   unsigned *fg;
   unsigned *bg;
   /* Page canvas colours from the <html>/<body> cascade. */

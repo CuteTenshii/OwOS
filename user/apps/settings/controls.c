@@ -60,7 +60,7 @@ static void slider_set(int val)
 static void slider_at(int mx, int cx, int cw)
 {
   int bw = ctrl_box_w(cw);
-  slider_set(slider_value(cx + 16, bw, mx, 100));
+  slider_set(slider_value(cx + 16, bw, mx, 100, NULL));
 }
 
 static void draw_slider(int cx, int cw)
@@ -73,7 +73,7 @@ static void draw_slider(int cx, int cw)
   strcat(t, "%");
   gfx_ui_text(x, slider_y(), slider_label, FG_TEXT);
   gfx_ui_text(x + bw - gfx_ui_width(t), slider_y(), t, FG_DIM);
-  slider_draw(x, slider_box_y(), bw, slider_val, 100, 0);
+  slider_draw(x, slider_box_y(), bw, slider_val, 100, 0, NULL);
   gfx_a11y_set_name(gfx_a11y_last(), slider_label);
 }
 
@@ -123,10 +123,10 @@ void controls_draw(int cx, int cw)
       open = i;
       continue;
     }
-    select_draw(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H);
+    select_draw(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, NULL);
   }
   if (open >= 0)
-    select_draw(ctrls[open].sel, cx + 16, ctrl_box_y(open), bw, GUI_SELECT_H);
+    select_draw(ctrls[open].sel, cx + 16, ctrl_box_y(open), bw, GUI_SELECT_H, NULL);
   else
     draw_slider(cx, cw);
 }
@@ -140,7 +140,7 @@ void controls_click(int cx, int cw, int mx, int my)
       opened = i;
 
   slider_grab = false;
-  if (opened < 0 && slider_path && slider_hit(cx + 16, slider_box_y(), bw, mx, my)) {
+  if (opened < 0 && slider_path && slider_hit(cx + 16, slider_box_y(), bw, mx, my, NULL)) {
     slider_grab = true;
     slider_at(mx, cx, cw);
     seq++;
@@ -156,7 +156,7 @@ void controls_click(int cx, int cw, int mx, int my)
 
   for (int k = 0; k < no; k++) {
     int i = order[k];
-    int r = select_click(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, mx, my);
+    int r = select_click(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, mx, my, NULL);
     if (r == 0)
       continue;
     if (r == 1)
@@ -176,7 +176,7 @@ void controls_move(int cx, int cw, int mx, int my)
   for (int i = 0; i < nctrl; i++) {
     if (!ctrls[i].sel->open)
       continue;
-    if (select_motion(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, mx, my))
+    if (select_motion(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, mx, my, NULL))
       seq++;
     break;
   }

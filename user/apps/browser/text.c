@@ -405,7 +405,7 @@ static const struct ru_gent *gcache_get(struct bctx *c, int face, unsigned cp, i
     else
       n.bm = font_render_glyph(f, gi, (float)px, &n.w, &n.h, &n.ox, &n.oy, &n.adv);
   } else {
-    n.adv = gfx_ui_cw_cp_px(cp, px);
+    n.adv = gfx_font_cw(cp, &(struct gfx_font){.px = px});
   }
   if ((g = ru_gtab_put(&c->gt, &n)))
     return g;
@@ -420,7 +420,7 @@ static int adv_measure(int face, unsigned cp, int px)
 {
   const struct font *f = face_font(face);
   if (!f)
-    return gfx_ui_cw_cp_px(cp, px);
+    return gfx_font_cw(cp, &(struct gfx_font){.px = px});
   int adv = 0;
   font_glyph_hmetrics(f, font_glyph_index(f, (int)cp), (float)px, &adv, 0);
   return adv;
@@ -775,7 +775,7 @@ int run_ascent(int px, int set)
     }
   }
   if (!f)
-    return gfx_ui_ascent_px(px);
+    return gfx_font_ascent(&(struct gfx_font){.px = px});
   int a = 0;
   font_vmetrics(f, (float)px, &a, 0, 0);
   return a;

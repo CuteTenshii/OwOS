@@ -293,13 +293,13 @@ static void draw(int hover)
   gfx_rect(PAD, PAD, W - 2 * PAD, DISP_H, 0x000000u);
   const char *txt = error ? "Error" : buf;
   int px = 30;
-  int tw = gfx_ui_width_px(txt, px);
+  int tw = gfx_font_width(txt, &(struct gfx_font){.px = px});
   while (tw > W - 2 * PAD - 16 && px > 14) {
     px -= 2;
-    tw = gfx_ui_width_px(txt, px);
+    tw = gfx_font_width(txt, &(struct gfx_font){.px = px});
   }
   int ty = PAD + (DISP_H - px) / 2;
-  gfx_ui_text_px(W - PAD - 8 - tw, ty, txt, error ? 0xff6b6bu : DISP_FG, px);
+  gfx_font_text(W - PAD - 8 - tw, ty, txt, error ? 0xff6b6bu : DISP_FG, &(struct gfx_font){.px = px});
 
   /* Keypad. */
   for (int i = 0; i < COLS * ROWS; i++) {

@@ -1,4 +1,4 @@
-/* gfx.h — tiny user-space drawing helpers over a window's pixel buffer.
+/* gfx.h: tiny user-space drawing helpers over a window's pixel buffer.
  *
  * Call gfx_init() once with the buffer from win_fb() and the window's client
  * width/height, then draw with the rect/glyph/text primitives. Colors are
@@ -36,30 +36,169 @@ int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg);
  * (fully transparent pixels skipped). Used for tab favicons. */
 void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb);
 
-/* Proportional sans-serif UI font for chrome (menus, titles, tabs, status).
- * Variable per-glyph advance; cell is UIFONT_W x UIFONT_H. gfx_ui_text blends
- * fg over the existing pixels (fill the background first), so it has no bg
- * argument. gfx_ui_width gives a string's pixel width for layout/centring. */
+/* Draw a filled rectangle with corners rounded to radius r (clamped to half the shorter side); r <= 0 is a plain
+ * gfx_fill_rect. */
+void gfx_fill_round(int x, int y, int w, int h, int r, unsigned color);
+/* Outline [x,y,w,h] with a stroke t px thick inside it, corners rounded to radius r; r = 0, t = 1 is gfx_rect. */
+void gfx_round_rect(int x, int y, int w, int h, int r, int t, unsigned color);
+
+/*
+ * Fonts. A struct gfx_font names a face by family, pixel size, weight and slant. Every text call takes one, and
+ * NULL means the base font: the font of the base style, gfx_theme(GFX_W_BASE). A zero field also comes from the
+ * base font (family NULL, px 0, weight 0), so a style can change just the size or just the weight.
+ *
+ * `family` is an installed family name ("Liberation Serif"), or "sans-serif" / "monospace" for the faces chosen in
+ * Settings; an unknown family falls back to sans-serif. It is not copied and must stay valid while it is in use.
+ * When no installed face of the family has the weight or slant asked for, the nearest one is drawn thicker (weight
+ * 600 and up) or slanted (italic). Lighter weights need an installed face.
+ */
+#define GFX_WEIGHT_NORMAL 400
+#define GFX_WEIGHT_BOLD 700
+
+struct gfx_font {
+  const char *family;
+  int px;     /* em size in pixels */
+  int weight; /* 100..900 */
+  int italic;
+};
+
+/* Proportional UTF-8 text with the line's top at y. It blends fg over the existing pixels, so fill the background
+ * first. */
+void gfx_font_text(int x, int y, const char *s, unsigned fg, const struct gfx_font *f);
+/* Like gfx_font_text, but text wider than maxw pixels is cut and ends in ".."; nothing is drawn for maxw <= 0. */
+void gfx_font_text_clip(int x, int y, const char *s, unsigned fg, const struct gfx_font *f, int maxw);
+int gfx_font_width(const char *s, const struct gfx_font *f); /* pixel width of a UTF-8 string */
+int gfx_font_cw(unsigned cp, const struct gfx_font *f);      /* pen advance of one codepoint */
+int gfx_font_ascent(const struct gfx_font *f);               /* line top to baseline */
+int gfx_font_height(const struct gfx_font *f);               /* line height, 6/5 of the em */
+/* *f with every unset field filled from the base font (f NULL: the base font itself) */
+void gfx_font_resolve(const struct gfx_font *f, struct gfx_font *out);
+struct font;
+struct font *gfx_ui_font(void); /* the base font's face (owned by gfx), or NULL if it failed to load */
+
+/* Shorthands for the base font. UIFONT_H is its line height under the built-in theme (gfx_font_height(NULL) in
+ * general), UIFONT_W the widest cell. */
 #define UIFONT_W 16
 #define UIFONT_H 18
-void gfx_ui_text(int x, int y, const char *s, unsigned fg); /* UTF-8 */
-int gfx_ui_width(const char *s);                            /* UTF-8 string pixel width */
-int gfx_ui_cw(unsigned char c);                             /* one byte/ASCII glyph's pen advance */
-int gfx_ui_cw_cp(unsigned cp);                              /* one Unicode codepoint's pen advance         */
-/* Like gfx_ui_text, but a string wider than maxw pixels is cut and ends in "..";
- * nothing is drawn for maxw <= 0. */
+void gfx_ui_text(int x, int y, const char *s, unsigned fg);
 void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw);
+int gfx_ui_width(const char *s);
+int gfx_ui_cw(unsigned char c);
+int gfx_ui_cw_cp(unsigned cp);
 
-/* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y
- * is the line top; the baseline is derived from the px ascent. */
-void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px);
-void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int ct,
-                         int cb); /* rows clipped to [ct,cb); ct>=cb = none */
-int gfx_ui_width_px(const char *s, int px);
-int gfx_ui_cw_cp_px(unsigned cp, int px);
-int gfx_ui_ascent_px(int px);
-struct font;
-struct font *gfx_ui_font(void); /* the UI sans face itself (owned by gfx), or NULL if it failed to load */
+/*
+ * Styles. Every widget is drawn from a struct gfx_style: its box (margin, border, padding, size), its font, and its
+ * colours in each BTN_* state. Each draw and hit-test call takes one as its last argument, and NULL means the
+ * widget's theme style, gfx_theme(GFX_W_<kind>). Pass the same style to a widget's draw and hit-test calls so they
+ * agree on its geometry.
+ *
+ * To restyle one widget, copy its theme style and change what you need:
+ *
+ *   struct gfx_style st = *gfx_theme(GFX_W_BUTTON);
+ *   st.radius = 6;
+ *   st.font.weight = GFX_WEIGHT_BOLD;
+ *   st.color[BTN_NORMAL].bg = 0x2f6bd8;
+ *   button_draw(x, y, w, h, "Save", state, &st);
+ *
+ * To restyle every widget of a kind in the app, gfx_theme_set() it. The base style (GFX_W_BASE) holds the font that
+ * plain text and every widget font inherits from, and the focus ring colour for NULL styles.
+ *
+ * The box model follows CSS with box-sizing: border-box. A widget drawn at (x, y) with a size w x h fills that
+ * margin box: its border box starts margin[GFX_LEFT] and margin[GFX_TOP] in from (x, y) and is `width` x `height`
+ * when those are set, else what is left of w x h after the margins. Widgets that take no size from the caller (a
+ * checkbox, a status bar's height) size themselves from their font, padding and parts unless `width` or `height`
+ * is set. The border is drawn inside the border box and the content sits inside the border and padding. Hit tests
+ * cover the border box, never the margin.
+ */
+enum { GFX_TOP, GFX_RIGHT, GFX_BOTTOM, GFX_LEFT };         /* margin[] and padding[] order, as in CSS */
+enum { GFX_ALIGN_START, GFX_ALIGN_CENTER, GFX_ALIGN_END }; /* a label's place in the content box */
+#define GFX_STATES 4                                       /* BTN_NORMAL .. BTN_DISABLED */
+
+/* gfx_style.flags */
+#define GFX_STYLE_NO_ARROWS 0x01 /* a scrollbar without its arrow buttons */
+#define GFX_STYLE_NO_FOCUS 0x02  /* never draw the focus ring (the app shows focus itself) */
+
+struct gfx_colors {
+  unsigned bg, fg, border;
+  /* The widget's secondary mark: a button's lit top edge (equal to bg for none), a menu item's shortcut hint, a
+   * select's chevron, a tab's close box, a scrollbar's arrow buttons, a sidebar's grip, a separator's light line */
+  unsigned detail;
+};
+
+struct gfx_style {
+  int margin[4];      /* GFX_TOP, GFX_RIGHT, GFX_BOTTOM, GFX_LEFT; outside the border */
+  int padding[4];     /* inside the border */
+  int width, height;  /* border box; 0 = the caller's size, or the widget's natural size */
+  int min_w, max_w;   /* clamp a width the widget computes itself (a tab); 0 = no bound */
+  int part_w, part_h; /* the inner part: a check box, radio or switch, a slider thumb, a tab icon; 0 = default */
+  int row_h;          /* a menu or dropdown row, or a scrollbar's shortest thumb; 0 = the line height */
+  int track;          /* a slider track's thickness; 0 = default */
+  int border;         /* border width */
+  int radius;         /* corner radius */
+  int gap;            /* between a part and its label, or between menu bar titles */
+  int align;          /* GFX_ALIGN_* of the label */
+  unsigned flags;     /* GFX_STYLE_* */
+  struct gfx_font font;
+  struct gfx_colors color[GFX_STATES];  /* the widget's body, by BTN_* state */
+  struct gfx_colors accent[GFX_STATES]; /* what is on, filled or chosen: a tick, a bar's fill, a selection */
+  unsigned focus;                       /* focus ring */
+};
+
+/* Widget kinds, the index into the theme */
+enum {
+  GFX_W_BASE = 0, /* plain text, and the font everything inherits */
+  GFX_W_BUTTON,
+  GFX_W_CHECKBOX,
+  GFX_W_RADIO,
+  GFX_W_SWITCH,
+  GFX_W_TEXTFIELD,
+  GFX_W_SELECT,
+  GFX_W_PROGRESS,
+  GFX_W_SLIDER,
+  GFX_W_SCROLLBAR,
+  GFX_W_MENUBAR, /* the title row of a menu or menu bar */
+  GFX_W_MENU,    /* a dropdown, submenu or popup menu */
+  GFX_W_TABBAR,
+  GFX_W_STATUS,
+  GFX_W_SIDEBAR,
+  GFX_W_SEPARATOR,
+  GFX_W_COUNT
+};
+
+/* The app's style for a kind (GFX_W_BASE for an unknown kind). The pointer stays valid; gfx_theme_set changes what
+ * it points to. */
+const struct gfx_style *gfx_theme(int kind);
+/* Replace a kind's style with a copy of *st, or restore the built-in one when st is NULL. */
+void gfx_theme_set(int kind, const struct gfx_style *st);
+/* The built-in style for a kind, whatever the theme now holds */
+const struct gfx_style *gfx_theme_default(int kind);
+/* st itself, or the theme style of `kind` when st is NULL */
+const struct gfx_style *gfx_style_of(int kind, const struct gfx_style *st);
+/* The style's font with every unset field filled from the base font */
+void gfx_style_font(const struct gfx_style *st, struct gfx_font *out);
+/* The border-box height of a one-line widget: `height` if set, else its line height plus padding and border */
+int gfx_style_text_h(const struct gfx_style *st);
+/* Set all four sides of a margin[] or padding[] array */
+void gfx_sides(int *sides, int top, int right, int bottom, int left);
+
+struct gfx_box {
+  int x, y, w, h;
+};
+/* The border box of a widget whose margin box is (x, y, w, h), per the rules above */
+void gfx_style_box(const struct gfx_style *st, int x, int y, int w, int h, struct gfx_box *out);
+/* The content box inside a border box: less the border and the padding */
+void gfx_style_content(const struct gfx_style *st, const struct gfx_box *border, struct gfx_box *out);
+/* The margin-box size of a widget whose border box is w x h (for laying out natural-size widgets) */
+int gfx_style_outer_w(const struct gfx_style *st, int w);
+int gfx_style_outer_h(const struct gfx_style *st, int h);
+/* Paint a border box: its border in colors->border, its inside in colors->bg, both rounded by st->radius, and a
+ * colors->detail line along the top of the inside when that differs from bg (a raised look). */
+void gfx_style_paint(const struct gfx_style *st, const struct gfx_box *b, const struct gfx_colors *colors);
+/* Draw a one-line label in the content box c, placed by st->align and centred vertically, in the style's font. A
+ * label wider than c is cut with "..". */
+void gfx_style_label(const struct gfx_style *st, const struct gfx_box *c, const char *s, unsigned fg);
+/* Clamp a BTN_* state (GFX_FOCUSED cleared) into 0..GFX_STATES-1 */
+int gfx_state_index(int state);
 
 /*
  * Keyboard focus. OR GFX_FOCUSED into the BTN_* state a widget is drawn with (or set the widget's `focused`
@@ -70,10 +209,10 @@ struct font *gfx_ui_font(void); /* the UI sans face itself (owned by gfx), or NU
  * and Alt+Tab are left to the app and the window manager.
  */
 #define GFX_FOCUSED 0x100
-#define GFX_FOCUS_COLOR 0x8fb4f5u
 
-/* The 2px ring around [x,y,w,h], 1px clear of it */
-void gfx_focus_ring(int x, int y, int w, int h);
+/* The 2px ring around [x,y,w,h], 1px clear of it, in st->focus (NULL: the base style's), following st->radius. A
+ * style with GFX_STYLE_NO_FOCUS draws nothing. */
+void gfx_focus_ring(int x, int y, int w, int h, const struct gfx_style *st);
 
 struct gfx_focus {
   int cur;                       /* focused entry, or -1 when every entry is disabled */
@@ -174,9 +313,9 @@ int gfx_a11y_describe(const struct gfx_a11y *a, char *buf, int sz);
 /* --------------------------------------------------------------- GUI widgets
  */
 /*
- * Reusable pieces every windowed app tends to want, so they aren't reinvented
- * per app: a status line that owns its message, and a one-menu dropdown bar.
- * Standard metrics (8px glyphs):
+ * Reusable pieces every windowed app tends to want, so they aren't reinvented per app. The GUI_* sizes below are
+ * the built-in theme's; a style can change any of them, so lay out from the widget's own size helpers when the
+ * style is not the built-in one.
  */
 #define GUI_BAR_H 18   /* menu / status bar height */
 #define GUI_ROW_H 16   /* dropdown item height     */
@@ -187,10 +326,11 @@ struct status_bar {
   char msg[64];
 };
 void status_set(struct status_bar *s, const char *msg);
-void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg,
-                 unsigned bg); /* fills the bar and shows msg */
+/* Fill the bar across [x, x+w) from y in color[BTN_NORMAL].bg and show msg in its fg. */
+void status_draw(const struct status_bar *s, int x, int y, int w, const struct gfx_style *st);
+int status_height(const struct gfx_style *st); /* the bar's margin-box height */
 
-/* Per-item state bits for the optional `flags` array (mutable — apps toggle
+/* Per-item state bits for the optional `flags` array (mutable; apps toggle
  * them at runtime). DISABLED items are dimmed and inert (no click, no
  * accelerator); CHECKED items show a checkmark in a left gutter. */
 #define MENU_DISABLED 0x01
@@ -203,12 +343,17 @@ void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg,
  * parent item.
  *
  * Optional parallel arrays (NULL = absent), each indexed by item:
- *  - `hints`/`keys`: a keyboard accelerator — `hints[i]` is the right-aligned
+ *  - `hints`/`keys`: a keyboard accelerator: `hints[i]` is the right-aligned
  *    label ("Ctrl+S"), `keys[i]` the KEY_* byte fed to menu_shortcut().
  *  - `flags`: MENU_DISABLED|MENU_CHECKED state bits (mutable; reserves a check
  *    gutter for the whole menu when present).
  *  - `subs`: a child submenu per item (subs[i] != NULL makes item i a parent
- * that opens subs[i] to its right instead of firing an action). */
+ * that opens subs[i] to its right instead of firing an action).
+ *
+ * Two styles shape a menu: `bar` (GFX_W_MENUBAR) its title, and `pop` (GFX_W_MENU) its dropdown and submenus. A
+ * closed title is not filled, an open one is in color[BTN_PRESSED]. In the dropdown, color[BTN_NORMAL] is an item,
+ * color[BTN_DISABLED] a disabled one (detail: the shortcut hint), accent[].fg the checkmark, and a pop->width of 0
+ * fits the widest item. Every geometry call takes the same pair. */
 struct menu {
   const char *title;
   const char *const *items;
@@ -219,16 +364,17 @@ struct menu {
   unsigned char *flags;      /* optional: per-item MENU_DISABLED|MENU_CHECKED */
   struct menu *const *subs;  /* optional: per-item submenu (NULL = none)      */
 };
-void menu_draw(const struct menu *m, int x, int y);
+void menu_draw(const struct menu *m, int x, int y, const struct gfx_style *bar, const struct gfx_style *pop);
 /* Route a click at (mx,my) given the menu title's top-left (x,y).
  * Toggles/closes m->open (and any submenus) as needed; returns the chosen item
  * index of `m`, or -1 if nothing in `m` fired (a disabled item, an opened
  * submenu, a chosen *submenu* item, or a miss). Use menu_click_ex to dispatch
  * submenu items. */
-int menu_click(struct menu *m, int mx, int my, int x, int y);
+int menu_click(struct menu *m, int mx, int my, int x, int y, const struct gfx_style *bar, const struct gfx_style *pop);
 /* Like menu_click but reports the leaf menu that owns the fired item via *leaf
  * (which may be a submenu, not `m`). Returns that menu's item index, or -1. */
-int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf);
+int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf, const struct gfx_style *bar,
+                  const struct gfx_style *pop);
 /* Map a pressed key to a menu item via the `keys` tables (searches submenus
  * too, skips disabled items): returns the item index, or -1 if none. */
 int menu_shortcut(const struct menu *m, int key);
@@ -236,13 +382,19 @@ int menu_shortcut(const struct menu *m, int key);
  * is unused and submenus are not supported. menu_popup_click returns the enabled
  * item under (mx,my), or -1 for a miss or a disabled item. The app owns when it is
  * open and closes it after any click. */
-void menu_popup_draw(const struct menu *m, int x, int y);
-int menu_popup_click(const struct menu *m, int mx, int my, int x, int y);
+void menu_popup_draw(const struct menu *m, int x, int y, const struct gfx_style *pop);
+int menu_popup_click(const struct menu *m, int mx, int my, int x, int y, const struct gfx_style *pop);
+/* The popup's margin-box size, to keep it on screen */
+int menu_popup_w(const struct menu *m, const struct gfx_style *pop);
+int menu_popup_h(const struct menu *m, const struct gfx_style *pop);
+/* A title's margin-box width and the title row's height */
+int menu_title_w(const struct menu *m, const struct gfx_style *bar);
+int menu_bar_h(const struct gfx_style *bar);
 
 /* A row of dropdown menus sharing one bar (File / Edit / View ...). Holds an
- * array of `struct menu` pointers laid out left-to-right from (x,y); the
- * helpers keep at most one dropdown open at a time, so the owning app gets a
- * real menu bar without re-implementing the open/close bookkeeping per app. */
+ * array of `struct menu` pointers laid out left-to-right from (x,y), bar->gap
+ * apart; the helpers keep at most one dropdown open at a time, so the owning app
+ * gets a real menu bar without re-implementing the open/close bookkeeping per app. */
 struct menubar {
   struct menu *const *menus;
   int n;
@@ -251,13 +403,14 @@ struct menubar {
 /* Draw every title on the bar, then the open menu's dropdown last (on top). The
  * app still fills the full-width bar background itself, then calls this last.
  */
-void menubar_draw(const struct menubar *mb);
+void menubar_draw(const struct menubar *mb, const struct gfx_style *bar, const struct gfx_style *pop);
 /* Route a click. Returns 1 if it hit the bar or an open dropdown (the app
  * should repaint and not process the click further), 0 if it was elsewhere.
  * When an item is chosen, *leaf and *item give the leaf menu (a bar menu OR one
- * of its submenus — dispatch by pointer) and its item index; otherwise *item is
+ * of its submenus; dispatch by pointer) and its item index; otherwise *item is
  * -1 (only open/close state changed). Clicking off an open menu closes it. */
-int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item);
+int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item, const struct gfx_style *bar,
+                  const struct gfx_style *pop);
 /* Map a pressed key to any menu's accelerator (submenus included): returns the
  * item index and sets *leaf to the owning menu, or -1 (with *leaf = NULL). */
 int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf);
@@ -267,16 +420,17 @@ void menubar_close(struct menubar *mb);
 
 /* --------------------------------------------------------------- text field */
 /*
- * A single-line editable text field — an address bar, a rename box, any "type a
- * string and press Enter" input — so apps don't re-roll caret/scroll/editing by
+ * A single-line editable text field (an address bar, a rename box, any "type a
+ * string and press Enter" input), so apps don't re-roll caret/scroll/editing by
  * hand. The app owns the character buffer (NUL-terminated); the widget tracks
- * the caret and horizontal scroll, drawing the proportional UI font in a white
- * field that scrolls to keep the caret in view.
+ * the caret and horizontal scroll, drawing the style's font in a field that
+ * scrolls to keep the caret in view.
  *
  * Bind once with textfield_init(&tf, buf, cap), set initial text with
  * textfield_set, then each frame draw it and feed WEV_KEY chars to
  * textfield_key. The current text is just tf.buf (NUL-terminated, tf.len
- * chars).
+ * chars). Style: color[BTN_NORMAL] is the field, accent[BTN_NORMAL] the focused
+ * border (border), the caret and selection (bg) and selected text (fg).
  */
 #define TEXTFIELD_H 26 /* a comfortable single-line field height */
 
@@ -303,15 +457,15 @@ void textfield_init(struct textfield *tf, char *buf, int cap);
 void textfield_set(struct textfield *tf, const char *s); /* replace text; caret to end; clears undo */
 /* Draw the field box filling [x,y,w,h]; `focused` shows a caret and a bright
  * border. Updates tf->scroll to keep the caret visible. */
-void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused);
+void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused, const struct gfx_style *st);
 /* Place the caret from a click and report focus: returns 1 if (mx,my) fell
  * inside [x,y,w,h] (the app should treat the field as focused), 0 otherwise.
  * Uses the scroll left by the last textfield_draw, so call draw first each
  * frame. */
-int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h);
+int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h, const struct gfx_style *st);
 /* Extend the selection while the button is held after a textfield_click; the
  * caret follows mx and the view scrolls past the field's edges. */
-void textfield_drag(struct textfield *tf, int mx, int x, int w);
+void textfield_drag(struct textfield *tf, int mx, int x, int w, const struct gfx_style *st);
 /* Selected range [*start,*end); returns 1 if non-empty. */
 int textfield_selection(const struct textfield *tf, int *start, int *end);
 void textfield_select_all(struct textfield *tf);
@@ -330,9 +484,15 @@ int textfield_key(struct textfield *tf, char c, int mods);
  * button, the way a tabbed browser/editor lays out documents. The app owns the
  * tab list and its bookkeeping; this only draws `labels[0..n)` (highlighting
  * `active`) and maps a click back to an action. Tabs share the available width
- * evenly (clamped), labels are truncated to fit, and every tab has a close box.
- * When the tabs don't fit at their minimum width, the strip shows a window of
+ * evenly (clamped to [min_w, max_w]), labels are truncated to fit, and every tab
+ * has a close box. When the tabs don't fit at min_w, the strip shows a window of
  * them between scroll arrows.
+ *
+ * Style: color[BTN_NORMAL] is an inactive tab (border: the strip behind the tabs,
+ * detail: the close box), accent[BTN_NORMAL] the active one (border: its top
+ * stripe and focus outline), color[BTN_HOVER].fg the "+" and scroll arrows and
+ * color[BTN_DISABLED].fg a spent arrow. part_w is the icon size, padding[GFX_LEFT]
+ * its inset and gap the space after it.
  */
 #define GUI_TAB_H 24 /* tab strip height */
 
@@ -347,42 +507,43 @@ struct tabbar {
  * SCROLL means an arrow moved the strip and the app should repaint. */
 enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW, TABBAR_SCROLL };
 
-/* Draw the strip filling [x, x+w) at height GUI_TAB_H from y. The app fills no
+/* Draw the strip filling [x, x+w) at tabbar_height() from y. The app fills no
  * background itself; the widget paints the whole strip. icons[i] is an
  * optional 16x16 ARGB favicon for tab i (NULL -> a default globe); pass a NULL
  * icons array to give every tab the globe. */
 void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labels, const unsigned *const *icons, int n,
-                 int active);
+                 int active, const struct gfx_style *st);
 /* Hit-test a click at (mx,my) against the geometry of the last draw. Returns a
  * TABBAR_* code; for SELECT/CLOSE sets *index to the tab index. */
-int tabbar_hit(struct tabbar *tb, int x, int y, int w, int n, int mx, int my, int *index);
+int tabbar_hit(struct tabbar *tb, int x, int y, int w, int n, int mx, int my, int *index, const struct gfx_style *st);
 /* Scroll an overflowing strip by `delta` tabs (positive = right) */
-void tabbar_scroll(struct tabbar *tb, int w, int n, int delta);
+void tabbar_scroll(struct tabbar *tb, int w, int n, int delta, const struct gfx_style *st);
 /* Keys for a focused strip: Left/Right (wrapping) and Home/End change *active. Returns 1 if it changed. */
 int tabbar_key(int key, int n, int *active);
+int tabbar_height(const struct gfx_style *st); /* the strip's margin-box height */
 
 /* --------------------------------------------------------------- button */
 /*
- * A clickable push button with a centred label — an "OK"/"Cancel"/"Connect"
- * the way a dialog or toolbar wants one. Stateless like the tab strip: the app
- * owns no widget struct, it just draws the button each frame with the visual
- * state it's tracking and hit-tests clicks against the same rectangle.
+ * A clickable push button with a label, an "OK"/"Cancel"/"Connect" the way a
+ * dialog or toolbar wants one. Stateless like the tab strip: the app owns no
+ * widget struct, it just draws the button each frame with the visual state it's
+ * tracking and hit-tests clicks against the same rectangle.
  *
- * `state` selects the look. The app decides it: BTN_HOVER while the pointer is
- * over the button (track the last mouse-move), BTN_PRESSED between mouse-down
- * and mouse-up on it, BTN_DISABLED for an inert/dimmed button (button_hit still
- * returns 0 for it so it can't fire), else BTN_NORMAL.
+ * `state` selects the look, color[state]. The app decides it: BTN_HOVER while the
+ * pointer is over the button (track the last mouse-move), BTN_PRESSED between
+ * mouse-down and mouse-up on it, BTN_DISABLED for an inert/dimmed button
+ * (button_hit still returns 0 for it so it can't fire), else BTN_NORMAL.
  */
 #define GUI_BTN_H 26 /* a comfortable button height */
 
 enum { BTN_NORMAL = 0, BTN_HOVER, BTN_PRESSED, BTN_DISABLED };
 
-/* Draw the button filling [x,y,w,h] with `label` centred, in the given state.
- */
-void button_draw(int x, int y, int w, int h, const char *label, int state);
-/* Returns 1 if (mx,my) falls inside [x,y,w,h], 0 otherwise (geometry only — the
- * app gates on its own disabled state before treating a hit as a press). */
-int button_hit(int x, int y, int w, int h, int mx, int my);
+/* Draw the button in the margin box [x,y,w,h] with `label` placed by st->align, in the given state. */
+void button_draw(int x, int y, int w, int h, const char *label, int state, const struct gfx_style *st);
+/* Returns 1 if (mx,my) falls inside the border box of [x,y,w,h], 0 otherwise
+ * (geometry only: the app gates on its own disabled state before treating a
+ * hit as a press). */
+int button_hit(int x, int y, int w, int h, int mx, int my, const struct gfx_style *st);
 /* 1 if a WEV_KEY presses the focused button: Space or Enter */
 int button_key(int key);
 
@@ -394,7 +555,12 @@ int button_key(int key);
  * flips its value when control_hit() reports a click on an enabled control.
  * A radio group is the app's business: set the clicked one, clear the rest.
  * `focused` (or GFX_FOCUSED in `state`) draws a focus ring; feed keys to control_key().
- * The control occupies [x, x + control_width()) by GUI_CTRL_H from y.
+ *
+ * Style: part_w x part_h is the box, radio or switch and gap the space before the
+ * label. color[state] is the box when off (bg), its edge (border) and the label
+ * (fg); accent[state] is the box when on (bg, and border for its edge) and the
+ * tick, dot or knob (fg). The control's margin box is control_width() x
+ * control_height() from (x, y).
  */
 #define GUI_CTRL_H 18     /* row height, label included */
 #define GUI_CHECK_SIZE 14 /* checkbox and radio box */
@@ -403,58 +569,66 @@ int button_key(int key);
 
 enum { GFX_CTRL_CHECKBOX = 0, GFX_CTRL_RADIO, GFX_CTRL_SWITCH };
 
-void checkbox_draw(int x, int y, const char *label, int checked, int state, int focused);
-void radio_draw(int x, int y, const char *label, int checked, int state, int focused);
-void switch_draw(int x, int y, const char *label, int on, int state, int focused);
-/* Total width of a GFX_CTRL_* kind with its label. */
-int control_width(int kind, const char *label);
+void checkbox_draw(int x, int y, const char *label, int checked, int state, int focused, const struct gfx_style *st);
+void radio_draw(int x, int y, const char *label, int checked, int state, int focused, const struct gfx_style *st);
+void switch_draw(int x, int y, const char *label, int on, int state, int focused, const struct gfx_style *st);
+/* Margin-box width of a GFX_CTRL_* kind with its label, and its height */
+int control_width(int kind, const char *label, const struct gfx_style *st);
+int control_height(int kind, const struct gfx_style *st);
 /* 1 if (mx,my) is on the box or its label (geometry only, like button_hit). */
-int control_hit(int kind, int x, int y, const char *label, int mx, int my);
+int control_hit(int kind, int x, int y, const char *label, int mx, int my, const struct gfx_style *st);
 /* Space on a focused control flips *value (a radio only turns on). Returns 1 if *value changed. */
 int control_key(int kind, int key, int *value);
 
 /* --------------------------------------------------------------- progress bar
  */
 /*
- * A horizontal progress bar: a sunken trough with an accent-blue fill showing
- * `value`/`max` (clamped to 0..max), for a download/copy/load. Stateless — the
- * app passes the current counts each frame. With show_pct != 0 it overlays a
- * centred "NN%" label; a value/max of N/0 reads as 0%.
+ * A horizontal progress bar: a trough (color[BTN_NORMAL]) with a fill
+ * (accent[BTN_NORMAL], detail its lit top edge) showing `value`/`max` (clamped
+ * to 0..max), for a download/copy/load. Stateless: the app passes the current
+ * counts each frame. With show_pct != 0 it overlays a centred "NN%" label, in
+ * accent fg over the fill and color fg over the trough; a value/max of N/0 reads
+ * as 0%.
  */
 #define GUI_PROGRESS_H 16 /* a comfortable bar height */
 
-void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct);
+void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct, const struct gfx_style *st);
 
 /* --------------------------------------------------------------- slider */
 /*
- * A horizontal value slider: a sunken track filled up to a white thumb, for a
- * volume or brightness level. Stateless like the progress bar: the app keeps
- * `value` (0..max) and a "grabbed" flag. On a press inside slider_hit(), set the
- * flag; while it is set, feed each mouse x through slider_value() to get the new
- * value. The box is [x,y,w,GUI_SLIDER_H]; the thumb stays inside it.
+ * A horizontal value slider: a track filled up to a thumb, for a volume or
+ * brightness level. Stateless like the progress bar: the app keeps `value`
+ * (0..max) and a "grabbed" flag. On a press inside slider_hit(), set the flag;
+ * while it is set, feed each mouse x through slider_value() to get the new
+ * value. The box is [x, y, w, slider_height()]; the thumb stays inside it.
+ *
+ * Style: part_w x part_h is the thumb (accent fg), `track` the track's
+ * thickness; color[BTN_NORMAL] is the empty track and accent[BTN_NORMAL].bg its
+ * filled part.
  */
 #define GUI_SLIDER_H 14 /* thumb height, and the box height */
 
-void slider_draw(int x, int y, int w, int value, int max, int focused);
+void slider_draw(int x, int y, int w, int value, int max, int focused, const struct gfx_style *st);
 /* 1 if (mx,my) is on the box or within a few pixels of it (a forgiving grab). */
-int slider_hit(int x, int y, int w, int mx, int my);
+int slider_hit(int x, int y, int w, int mx, int my, const struct gfx_style *st);
 /* The value 0..max for a pointer at mx, clamped. */
-int slider_value(int x, int w, int mx, int max);
+int slider_value(int x, int w, int mx, int max, const struct gfx_style *st);
 /* Keys for a focused slider: Right/Up and Left/Down move by step (<= 0: a tenth of max), Home/End jump to the
  * ends. Returns 1 if *value changed. */
 int slider_key(int key, int *value, int max, int step);
+int slider_height(const struct gfx_style *st); /* the box's margin-box height */
 
 /* --------------------------------------------------------------- scrollbar */
 /*
  * A vertical scrollbar: an up arrow, a track groove with a draggable thumb
- * sized to the visible fraction of the content, and a down arrow — the way a
+ * sized to the visible fraction of the content, and a down arrow, the way a
  * scrolling document pane (the browser, a long listing) wants one. Stateless
  * like the button/progress bar: the app owns the scroll position and passes the
  * current counts each frame; the widget draws the chrome and maps a click back
  * to either an arrow step or a new thumb position.
  *
- * Units are caller-defined — whatever `scroll` counts in (lines, rows, pixels)
- * — as long as the three agree:
+ * Units are caller-defined (whatever `scroll` counts in: lines, rows, pixels)
+ * as long as the three agree:
  *  - `total`    total content extent
  *  - `visible`  how much of it fits in the pane at once
  *  - `scroll`   current top position, 0..(total - visible)
@@ -463,6 +637,11 @@ int slider_key(int key, int *value, int max, int step);
  * tall enough to hold them plus a grabbable thumb; in a very short bar they
  * collapse to a plain track, and scrollbar_hit then reports the whole bar as
  * the track.
+ *
+ * Style: color[BTN_NORMAL] is the track (bg) and arrow buttons (detail: their
+ * face, fg: the arrowhead); accent[BTN_NORMAL].bg is the thumb, rounded by
+ * radius and inset by padding[GFX_LEFT] / padding[GFX_RIGHT]. row_h is the
+ * shortest thumb; GFX_STYLE_NO_ARROWS drops the arrow buttons.
  */
 #define GUI_SCROLL_W 10 /* a comfortable vertical scrollbar width */
 
@@ -471,32 +650,18 @@ int slider_key(int key, int *value, int max, int step);
  * a track grab. */
 enum { SCROLLBAR_NONE = 0, SCROLLBAR_UP, SCROLLBAR_DOWN, SCROLLBAR_TRACK };
 
-/* Look of a scrollbar: track and thumb colours (0xRRGGBB, -1 = the default), thumb corner radius, and whether the
- * arrow buttons are shown. The plain functions below use SCROLLBAR_DEFAULT; the _ex forms take a style and must be
- * given the same one for drawing and hit-testing. */
-struct scrollbar_style {
-  int track, thumb;
-  int radius;
-  int arrows;
-};
-extern const struct scrollbar_style SCROLLBAR_DEFAULT;
-void scrollbar_draw_ex(int x, int y, int w, int h, int scroll, int total, int visible,
-                       const struct scrollbar_style *st);
-int scrollbar_hit_ex(int x, int y, int w, int h, int mx, int my, const struct scrollbar_style *st);
-int scrollbar_pos_ex(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
-                     const struct scrollbar_style *st);
-
 /* Draw the scrollbar filling [x,y,w,h]: arrows top/bottom, then the track and a
  * thumb reflecting scroll/total/visible (no thumb when everything fits). */
-void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible);
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible, const struct gfx_style *st);
 /* Hit-test a click at (mx,my) against the same geometry: returns a SCROLLBAR_*
  * region code (SCROLLBAR_NONE when the point is off the bar). */
-int scrollbar_hit(int x, int y, int w, int h, int mx, int my);
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my, const struct gfx_style *st);
 /* Map a track click/drag at (mx,my) to a new scroll position, centring the
  * thumb on the cursor, clamped to 0..(total - visible). Returns the unchanged
  * `scroll` when (mx,my) is outside the track region, so it can be called
  * unconditionally. */
-int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible);
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
+                  const struct gfx_style *st);
 
 /* --------------------------------------------------------------- cursor */
 /* Set window `win`'s client-area cursor to a WIN_CURSOR_* shape (owos.h): arrow, hand, text, busy, the four
@@ -523,15 +688,17 @@ void gfx_cursor(int win, int shape);
 #define SCROLLVIEW_STEP 24 /* default px per wheel notch / arrow / key */
 
 struct scrollview {
-  int x, y, w, h; /* viewport from the last scrollview_begin, scrollbar included */
-  int content_h;  /* content height in px */
-  int scroll;     /* px scrolled from the top, 0..content_h - h */
-  int step;       /* px per wheel notch / arrow / key */
-  int dragging;   /* a scrollbar thumb drag is in progress */
+  int x, y, w, h;              /* viewport from the last scrollview_begin, scrollbar included */
+  int content_h;               /* content height in px */
+  int scroll;                  /* px scrolled from the top, 0..content_h - h */
+  int step;                    /* px per wheel notch / arrow / key */
+  int dragging;                /* a scrollbar thumb drag is in progress */
+  const struct gfx_style *bar; /* the scrollbar's style (NULL: the theme's); its width is the bar's */
   int saved_clip[4];
 };
 
-void scrollview_init(struct scrollview *sv, int step);
+/* `bar` styles the scrollbar and must stay valid for the view's life; a bar width of 0 is GUI_SCROLL_W. */
+void scrollview_init(struct scrollview *sv, int step, const struct gfx_style *bar);
 /* Place the viewport, clamp the scroll to the new content height, and clip drawing to the content area.
  * Returns the screen y of the content's top edge (y - scroll). */
 int scrollview_begin(struct scrollview *sv, int x, int y, int w, int h, int content_h);
@@ -549,13 +716,13 @@ int scrollview_reveal(struct scrollview *sv, int y, int h);
 
 /* --------------------------------------------------------------- sidebar */
 /*
- * A resizable left navigation pane — the "Places / Devices" rail a file manager
+ * A resizable left navigation pane: the "Places / Devices" rail a file manager
  * (or any master/detail window) puts down the left edge. The widget owns the
  * pane's *width as a live property*: the app reads sb.w back to lay its content
  * out, sets it directly with sidebar_set_width() (so the width is
- * customizable), and — when `resizable` — the user drags the divider to change
+ * customizable), and, when `resizable`, the user drags the divider to change
  * it, clamped to [min_w, max_w]. The widget paints the panel background plus a
- * 1px divider and a grip dimple at the right edge; the app draws its own rows
+ * divider and a grip dimple at the right edge; the app draws its own rows
  * into [x, x+w).
  *
  * Bind once with sidebar_init(). Each frame: sidebar_draw() paints the panel +
@@ -565,13 +732,13 @@ int scrollview_reveal(struct scrollview *sv, int y, int h);
  * row click). A press that misses the grip clears any drag state.
  *  - WEV_DRAG   -> sidebar_drag(): while a resize is live, sets the width from
  *                  the pointer x (clamped); returns 1 if the width changed.
- * The drag ends on its own when the button is released (no release event — the
+ * The drag ends on its own when the button is released (no release event; the
  * stop of WEV_DRAG ends it, and the next WEV_MOUSE re-evaluates the grip).
  */
 #define SIDEBAR_GRIP 6 /* width of the divider's draggable hit zone (px) */
 
 struct sidebar {
-  int w;         /* current width — the live, app-readable property         */
+  int w;         /* current width: the live, app-readable property          */
   int min_w;     /* lower clamp for a drag / set_width                       */
   int max_w;     /* upper clamp for a drag / set_width                       */
   int resizable; /* 0 = a fixed pane: no grip, no drag (still has a divider) */
@@ -583,11 +750,12 @@ struct sidebar {
 void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w);
 /* Set the width property directly (clamped to [min_w, max_w]). */
 void sidebar_set_width(struct sidebar *sb, int w);
-/* Paint the panel [x, x+w) x [y, y+h) in `bg`, the 1px divider at its right
- * edge in `divider`, and (when resizable) a centred grip dimple on the divider.
- * Pass the *effective* width the app is rendering (it may cap sb->w against the
- * window); the divider/grip land at x+w. */
-void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg, unsigned divider);
+/* Paint the panel [x, x+w) x [y, y+h) in color[BTN_NORMAL].bg, a divider
+ * st->border wide (at least 1px) at its right edge in .border, and (when
+ * resizable) a centred grip dimple on the divider in .detail. Pass the
+ * *effective* width the app is rendering (it may cap sb->w against the window);
+ * the divider/grip land at x+w. */
+void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, const struct gfx_style *st);
 /* Hit-test a left-press at (mx,my) against the divider grip drawn at x+w over
  * [y, y+h). On a hit, begin a resize and return 1; otherwise clear any stale
  * drag and return 0. A non-resizable pane always returns 0. */
@@ -597,15 +765,20 @@ int sidebar_press(struct sidebar *sb, int x, int y, int w, int h, int mx, int my
 int sidebar_drag(struct sidebar *sb, int x, int mx);
 
 /* --- separator ----------------------------------------------------------- *
- * A thin themed divider line. Horizontal spans [x, x+len) at row y; vertical
- * spans [y, y+len) at column x (pass vertical = 1). Stateless. */
-void gfx_separator(int x, int y, int len, int vertical);
+ * A thin themed divider: a color[BTN_NORMAL].border line st->border px thick
+ * (at least 1) and a .detail line after it. Horizontal spans [x, x+len) from
+ * row y; vertical spans [y, y+len) from column x (pass vertical = 1). Margins
+ * offset it. Stateless. */
+void gfx_separator(int x, int y, int len, int vertical, const struct gfx_style *st);
 
 /* --- select (dropdown) --------------------------------------------------- *
  * A combobox: a closed box showing the current option + a chevron, and an
  * option list that drops below when open. The app owns the `options` array (one
  * NUL-terminated label per entry) for the widget's lifetime. Draw the select
- * LAST so its open list overlays the rest of the UI (like a menu). */
+ * LAST so its open list overlays the rest of the UI (like a menu).
+ * Style: color[BTN_NORMAL] is the box and list (detail: the chevron),
+ * accent[BTN_NORMAL] the open box's border and the hovered row (bg, fg); row_h
+ * is a list row's height. */
 #define GUI_SELECT_H 24 /* a comfortable closed-box height */
 struct select_box {
   const char *const *options;
@@ -616,13 +789,13 @@ struct select_box {
   int focused;  /* has keyboard focus: draws the focus ring       */
 };
 void select_init(struct select_box *s, const char *const *options, int count, int selected);
-void select_draw(struct select_box *s, int x, int y, int w, int h);
+void select_draw(struct select_box *s, int x, int y, int w, int h, const struct gfx_style *st);
 /* Click: returns 1 if the selection changed (s->selected updated, list closed),
  * -1 if consumed (opened/closed), 0 if the click missed the widget entirely. */
-int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my, const struct gfx_style *st);
 /* Update the hovered row from pointer motion while open; returns 1 if it
  * changed. */
-int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my, const struct gfx_style *st);
 /* Keyboard control for a focused select: Up/Down (move, or change when closed),
  * Home/End (ends), Enter/Space (open / confirm), Esc (close). Same returns as
  * select_click: 1 = selection changed, -1 = consumed, 0 = key not handled. */

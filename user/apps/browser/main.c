@@ -258,7 +258,7 @@ int main(int argc, char **argv)
       } else if (ev.type == WEV_SCROLL) {
         /* The wheel scrolls whichever surface the pointer is over */
         if (last_my >= MENU_H && last_my < MENU_H + TAB_H) {
-          tabbar_scroll(&tab_strip, BW, n_tabs, -ev.a);
+          tabbar_scroll(&tab_strip, BW, n_tabs, -ev.a, NULL);
           B->seq++;
         } else if (bm_panel_open && last_mx >= 0 && last_mx < BM_PANEL_W && last_my >= MENU_H + TAB_H + ADDR_H) {
           bm_panel_scroll -= ev.a;

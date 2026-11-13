@@ -24,7 +24,6 @@ static int W = 560, H = 400; /* client size; changes on resize */
 #define COL_SIZE_W 76 /* Size column */
 
 #define COL_BG 0x12161e
-#define COL_SIDE 0x0e1218
 #define COL_BAR 0x232a36
 #define COL_HDR 0x1d2430
 #define COL_DIV 0x05070a
@@ -364,7 +363,7 @@ static int path_y(void) { return MENU_H + (TB_H - TEXTFIELD_H) / 2; }
 static int tb_btn_at(int mx, int my)
 {
   for (int i = 0; i < 3; i++)
-    if (button_hit(tb_btn_x(i), tb_btn_y(), TB_BTN_W, GUI_BTN_H, mx, my))
+    if (button_hit(tb_btn_x(i), tb_btn_y(), TB_BTN_W, GUI_BTN_H, mx, my, NULL))
       return i;
   return -1;
 }
@@ -456,7 +455,7 @@ static void render(void)
   int sidebar_h = H - TOP_Y - STATUS_H;
 
   /* Sidebar: the widget paints the panel base, the right divider and the resize grip */
-  sidebar_draw(&sb, 0, TOP_Y, sbw, sidebar_h, COL_SIDE, COL_DIV);
+  sidebar_draw(&sb, 0, TOP_Y, sbw, sidebar_h, NULL);
   gfx_fill_rect(0, TOP_Y, sbw, HEADER_H, 0x161d28);
   gfx_ui_text(8, TOP_Y + (HEADER_H - UIFONT_H) / 2, "Places", COL_DIM);
   int ty = (ROW_H - UIFONT_H) / 2;
@@ -540,8 +539,9 @@ static void render(void)
     button_draw(tb_btn_x(i), tb_btn_y(), TB_BTN_W, GUI_BTN_H, tb_label[i],
                 !tb_btn_enabled(i) ? BTN_DISABLED
                 : hot_btn == i     ? BTN_HOVER
-                                   : BTN_NORMAL);
-  textfield_draw(&pathtf, path_x(), path_y(), path_w(), TEXTFIELD_H, path_focus);
+                                   : BTN_NORMAL,
+                NULL);
+  textfield_draw(&pathtf, path_x(), path_y(), path_w(), TEXTFIELD_H, path_focus, NULL);
 
   /* Status bar: a message, else the selection, else the folder's counts */
   gfx_fill_rect(0, H - STATUS_H, W, STATUS_H, COL_BAR);
@@ -576,7 +576,7 @@ static void render(void)
 
   /* Top menu bar over everything, then its dropdown drawn last so it overlays the listing */
   gfx_fill_rect(0, 0, W, MENU_H, COL_BAR);
-  menu_draw(&gomenu, 2, 0);
+  menu_draw(&gomenu, 2, 0, NULL, NULL);
 
   ctx_draw(); /* right-click popup overlays everything */
 }
@@ -943,7 +943,7 @@ static void ctx_open(enum ctx_kind kind, int target, const char *name, int mx, i
 static void ctx_draw(void)
 {
   if (ctx.open)
-    menu_popup_draw(&ctx.menu, ctx.x, ctx.y);
+    menu_popup_draw(&ctx.menu, ctx.x, ctx.y, NULL);
 }
 
 static void activate_entry(int e)
@@ -1046,7 +1046,7 @@ static void ctx_run(int act, int id)
 /* Route a left-press while the popup is open: fire an item, or dismiss */
 static void ctx_click(int id, int mx, int my)
 {
-  int i = menu_popup_click(&ctx.menu, mx, my, ctx.x, ctx.y);
+  int i = menu_popup_click(&ctx.menu, mx, my, ctx.x, ctx.y, NULL);
   ctx.open = false;
   if (i >= 0)
     ctx_run(ctx.acts[i], id);
@@ -1133,7 +1133,7 @@ static void click(int id, int mx, int my)
     return;
   } /* popup eats the click */
   if (my < MENU_H || gomenu.open) { /* menu bar or open dropdown */
-    int it = menu_click(&gomenu, mx, my, 2, 0);
+    int it = menu_click(&gomenu, mx, my, 2, 0, NULL, NULL);
     if (it >= 0)
       menu_action(it);
     seq++;
@@ -1147,7 +1147,7 @@ static void click(int id, int mx, int my)
       else
         go_hist(b ? 1 : -1);
     }
-    if (textfield_click(&pathtf, mx, my, path_x(), path_y(), path_w(), TEXTFIELD_H)) {
+    if (textfield_click(&pathtf, mx, my, path_x(), path_y(), path_w(), TEXTFIELD_H, NULL)) {
       path_focus = 1;
       path_drag = 1;
     } else if (path_focus) {
@@ -1236,7 +1236,7 @@ static void dblclick(int id, int mx, int my)
 static void drag(int mx, int my)
 {
   if (path_drag)
-    textfield_drag(&pathtf, mx, path_x(), path_w());
+    textfield_drag(&pathtf, mx, path_x(), path_w(), NULL);
   else if (sidebar_drag(&sb, 0, mx) | scrollview_drag(&sv, mx, my))
     seq++;
 }
@@ -1348,7 +1348,7 @@ int main(void)
   }
   gfx_init(win_fb(), W, H);
   sidebar_init(&sb, SIDEBAR_W, SIDEBAR_MIN, SIDEBAR_MAX);
-  scrollview_init(&sv, ROW_H);
+  scrollview_init(&sv, ROW_H, NULL);
   textfield_init(&pathtf, pathbuf, sizeof pathbuf);
   set_path("/", true);
 

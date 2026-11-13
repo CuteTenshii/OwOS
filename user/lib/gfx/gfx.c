@@ -182,44 +182,6 @@ struct gcache_e {
   int w, h, ox, oy, adv;
   int valid;
 };
-#define FACE_CACHE 512
-/* No member initialisers here */
-struct gfx_face {
-  struct font *font;
-  int px, baseline, tried;
-  struct gcache_e cache[FACE_CACHE];
-};
-static struct gfx_face g_sans, g_mono;
-
-#define SANS_PX 15
-#define MONO_PX 13
-
-static int face_ready(struct gfx_face *f, int role, int px)
-{
-  if (!f->tried) {
-    char path[96];
-    f->tried = 1;
-    f->px = px;
-    fontstore_path(role, path, sizeof path);
-    struct statinfo st;
-    if (stat(path, &st) < 0 || st.is_dir || st.size == 0)
-      return 0;
-    unsigned char *buf = malloc(st.size); /* kept for the font's lifetime */
-    if (!buf)
-      return 0;
-    if (readfile_at(path, 0, buf, st.size) != (int)st.size) {
-      free(buf);
-      return 0;
-    }
-    f->font = font_load(buf, (int)st.size);
-    if (!f->font) {
-      free(buf);
-      return 0;
-    }
-    font_vmetrics(f->font, (float)px, &f->baseline, 0, 0);
-  }
-  return f->font != 0;
-}
 
 /* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss */
 static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *cache, int n, unsigned cp)
@@ -238,28 +200,145 @@ static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *
   return g;
 }
 
-static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
+/* Font files loaded so far, shared by every size drawn from them; a file that failed to load keeps font = 0 */
+#define FONT_FILES 8
+struct font_file {
+  char path[96];
+  struct font *font;
+  int weight, italic;
+};
+static struct font_file g_files[FONT_FILES];
+static int g_nfiles;
+
+/* Index of the loaded file at `path`, or -1 */
+static int file_open(const char *path)
 {
-  return cache_glyph(f->font, f->px, f->cache, FACE_CACHE, cp);
+  for (int i = 0; i < g_nfiles; i++)
+    if (strcmp(g_files[i].path, path) == 0)
+      return g_files[i].font ? i : -1;
+  if (g_nfiles == FONT_FILES)
+    return -1;
+  struct font_file *ff = &g_files[g_nfiles];
+  snprintf(ff->path, sizeof ff->path, "%s", path);
+  ff->font = 0;
+  int i = g_nfiles++;
+  struct statinfo st;
+  if (stat(path, &st) < 0 || st.is_dir || st.size == 0)
+    return -1;
+  unsigned char *buf = malloc(st.size); /* kept for the font's lifetime */
+  if (!buf)
+    return -1;
+  if (readfile_at(path, 0, buf, st.size) != (int)st.size) {
+    free(buf);
+    return -1;
+  }
+  ff->font = font_load(buf, (int)st.size);
+  if (!ff->font) {
+    free(buf);
+    return -1;
+  }
+  font_style(ff->font, &ff->weight, &ff->italic);
+  return i;
 }
 
-/* Per-size sans cache pool (e.g. headings), LRU-reclaimed; g_sans is pinned at SANS_PX */
-#define SIZED_FACES 6
-#define SIZED_CACHE 256
+static int ieq(const char *a, const char *b)
+{
+  for (; *a && *b; a++, b++)
+    if ((*a | 32) != (*b | 32))
+      return 0;
+  return !*a && !*b;
+}
+
+/* Which file serves a (family, weight, slant), and what has to be synthesised on top of it */
+#define FONT_MEMO 12
+struct font_memo {
+  char family[48];
+  int weight, italic;
+  int file;
+  int bold, slant;
+  int used;
+};
+static struct font_memo g_memo[FONT_MEMO];
+static int g_memo_next;
+
+static int file_differs(int file, int weight, int italic)
+{
+  int d = g_files[file].weight - weight;
+  return d >= 100 || d <= -100 || (g_files[file].italic != 0) != (italic != 0);
+}
+
+static int role_file(int role, int weight, int italic)
+{
+  char path[96];
+  fontstore_path(role, path, sizeof path);
+  int file = file_open(path);
+  if (file < 0 || !file_differs(file, weight, italic))
+    return file;
+  /* The face chosen in Settings is one weight; another installed face of its family may fit better */
+  char fam[64];
+  if (font_family(g_files[file].font, fam, sizeof fam) &&
+      fontstore_match(fam, weight, italic, path, sizeof path, 0, 0)) {
+    int alt = file_open(path);
+    if (alt >= 0)
+      return alt;
+  }
+  return file;
+}
+
+static void font_lookup(const char *family, int weight, int italic, struct font_memo *m)
+{
+  int role = -1;
+  if (!family || !*family || ieq(family, "sans-serif") || ieq(family, "sans") || ieq(family, "system-ui"))
+    role = FONT_SANS;
+  else if (ieq(family, "monospace") || ieq(family, "mono"))
+    role = FONT_MONO;
+  int file = -1;
+  char path[96];
+  if (role < 0 && fontstore_match(family, weight, italic, path, sizeof path, 0, 0))
+    file = file_open(path);
+  if (file < 0)
+    file = role_file(role < 0 ? FONT_SANS : role, weight, italic);
+  if (file < 0 && role == FONT_MONO)
+    file = role_file(FONT_SANS, weight, italic);
+  m->file = file;
+  m->bold = file >= 0 && weight >= 600 && g_files[file].weight < 600;
+  m->slant = file >= 0 && italic && !g_files[file].italic;
+}
+
+static const struct font_memo *font_memo(const char *family, int weight, int italic)
+{
+  const char *key = family ? family : "";
+  for (int i = 0; i < FONT_MEMO; i++) {
+    struct font_memo *m = &g_memo[i];
+    if (m->used && m->weight == weight && m->italic == italic && strcmp(m->family, key) == 0)
+      return m;
+  }
+  struct font_memo *m = &g_memo[g_memo_next];
+  g_memo_next = (g_memo_next + 1) % FONT_MEMO;
+  snprintf(m->family, sizeof m->family, "%s", key);
+  m->weight = weight;
+  m->italic = italic;
+  m->used = 1;
+  font_lookup(family, weight, italic, m);
+  return m;
+}
+
+/* Glyph caches, one per (file, px), reclaimed least recently used first */
+#define SIZED_FACES 10
+#define SIZED_CACHE 384
 struct sized_face {
-  int px, baseline;
+  int file, px, baseline;
   unsigned lru;
   struct gcache_e cache[SIZED_CACHE];
 };
 static struct sized_face g_sized[SIZED_FACES];
 static unsigned g_lru_tick;
 
-/* Return the pool slot serving `px` (g_sans.font assumed loaded) */
-static struct sized_face *sized_slot(int px)
+static struct sized_face *sized_slot(int file, int px)
 {
   int empty = -1, lru = 0;
   for (int i = 0; i < SIZED_FACES; i++) {
-    if (g_sized[i].px == px) {
+    if (g_sized[i].px == px && g_sized[i].file == file) {
       g_sized[i].lru = ++g_lru_tick;
       return &g_sized[i];
     }
@@ -275,65 +354,67 @@ static struct sized_face *sized_slot(int px)
       s->cache[i].bm = 0;
       s->cache[i].valid = 0;
     }
+  s->file = file;
   s->px = px;
-  font_vmetrics(g_sans.font, (float)px, &s->baseline, 0, 0);
+  font_vmetrics(g_files[file].font, (float)px, &s->baseline, 0, 0);
   s->lru = ++g_lru_tick;
   return s;
 }
 
-/* A resolved sans face at some px: the shared font, its baseline, and the glyph cache to use */
+/* A face ready to draw: the font, its glyph cache at px, and the synthetic bold (extra px) and slant to apply */
 struct face_view {
   struct font *font;
   int px, baseline;
+  int bold, slant;
   struct gcache_e *cache;
   int n;
 };
 
-static int sans_view(int px, struct face_view *v)
+static int font_view(const struct gfx_font *spec, struct face_view *v)
 {
-  if (px <= 0)
-    px = SANS_PX;
-  if (!face_ready(&g_sans, FONT_SANS, SANS_PX))
+  struct gfx_font f;
+  gfx_font_resolve(spec, &f);
+  const struct font_memo *m = font_memo(f.family, f.weight, f.italic != 0);
+  if (m->file < 0)
     return 0;
-  if (px == SANS_PX) {
-    v->font = g_sans.font;
-    v->px = SANS_PX;
-    v->baseline = g_sans.baseline;
-    v->cache = g_sans.cache;
-    v->n = FACE_CACHE;
-  } else {
-    struct sized_face *s = sized_slot(px);
-    v->font = g_sans.font;
-    v->px = px;
-    v->baseline = s->baseline;
-    v->cache = s->cache;
-    v->n = SIZED_CACHE;
-  }
+  struct sized_face *s = sized_slot(m->file, f.px);
+  v->font = g_files[m->file].font;
+  v->px = f.px;
+  v->baseline = s->baseline;
+  v->bold = m->bold ? (f.px + 12) / 24 : 0;
+  v->slant = m->slant;
+  v->cache = s->cache;
+  v->n = SIZED_CACHE;
   return 1;
 }
 
-/* Blit a cached glyph with its top-left at (x + ox, baseline + oy) */
-/* Blit one glyph at `baseline`, additionally clipping rows to [ct,cb) */
-static void face_blit_clip(int x, int baseline, const struct gcache_e *g, unsigned fg, int ct, int cb)
+static struct gcache_e *view_glyph(const struct face_view *v, unsigned cp)
+{
+  return cache_glyph(v->font, v->px, v->cache, v->n, cp);
+}
+
+/* Blit a cached glyph with its top-left at (x + ox, baseline + oy). `bold` widens each row by that many px, taking the
+ * strongest coverage under it; `slant` shears rows right in proportion to their height above the baseline. */
+static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg, int bold, int slant)
 {
   if (!g->bm)
     return;
   for (int gy = 0; gy < g->h; gy++) {
     int sy = baseline + g->oy + gy;
-    if ((unsigned)sy >= (unsigned)g_h)
+    if ((unsigned)sy >= (unsigned)g_h || sy < g_cy0 || sy >= g_cy1)
       continue;
-    if (sy < g_cy0 || sy >= g_cy1)
-      continue;
-    if (ct < cb && (sy < ct || sy >= cb))
-      continue;
+    int shift = slant ? -(g->oy + gy) * 13 / 64 : 0;
     const unsigned char *srow = g->bm + gy * g->w;
-    for (int gx = 0; gx < g->w; gx++) {
-      int sx = x + g->ox + gx;
-      if ((unsigned)sx >= (unsigned)g_w)
+    for (int gx = 0; gx < g->w + bold; gx++) {
+      int sx = x + g->ox + gx + shift;
+      if ((unsigned)sx >= (unsigned)g_w || sx < g_cx0 || sx >= g_cx1)
         continue;
-      if (sx < g_cx0 || sx >= g_cx1)
-        continue;
-      unsigned a = srow[gx];
+      unsigned a = 0;
+      for (int k = 0; k <= bold; k++) {
+        int c = gx - k;
+        if (c >= 0 && c < g->w && srow[c] > a)
+          a = srow[c];
+      }
       if (a) {
         unsigned *px = &g_fb[sy * g_w + sx];
         *px = gfx_blend(fg, *px, a);
@@ -342,9 +423,25 @@ static void face_blit_clip(int x, int baseline, const struct gcache_e *g, unsign
   }
 }
 
-static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg)
+/* The terminal and editor grid: the monospace face at a fixed cell */
+#define MONO_PX 13
+#define FACE_CACHE 512
+static struct {
+  int file, baseline, tried;
+  struct gcache_e cache[FACE_CACHE];
+} g_mono;
+
+static int mono_ready(void)
 {
-  face_blit_clip(x, baseline, g, fg, 0, 0);
+  if (!g_mono.tried) {
+    char path[96];
+    g_mono.tried = 1;
+    fontstore_path(FONT_MONO, path, sizeof path);
+    g_mono.file = file_open(path);
+    if (g_mono.file >= 0)
+      font_vmetrics(g_files[g_mono.file].font, (float)MONO_PX, &g_mono.baseline, 0, 0);
+  }
+  return g_mono.file >= 0;
 }
 
 /* One monospace cell: optional opaque background */
@@ -352,9 +449,10 @@ void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 {
   if (!(bg & GFX_TRANSPARENT))
     gfx_fill_rect(x, y, GFX_FONT_W, GFX_FONT_H, bg);
-  if (!face_ready(&g_mono, FONT_MONO, MONO_PX))
+  if (!mono_ready())
     return;
-  face_blit(x, y + g_mono.baseline, face_glyph(&g_mono, ch), fg);
+  struct gcache_e *g = cache_glyph(g_files[g_mono.file].font, MONO_PX, g_mono.cache, FACE_CACHE, ch);
+  face_blit(x, y + g_mono.baseline, g, fg, 0, 0);
 }
 
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
@@ -432,49 +530,84 @@ int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg)
   return x;
 }
 
-/* Proportional UI text (UTF-8) */
-int gfx_ui_cw_cp_px(unsigned cp, int px)
+/* Proportional text in any font */
+int gfx_font_cw(unsigned cp, const struct gfx_font *f)
 {
   struct face_view v;
-  if (!sans_view(px, &v))
-    return GFX_FONT_W; /* sans missing: mono cell */
-  return cache_glyph(v.font, v.px, v.cache, v.n, cp)->adv;
+  if (!font_view(f, &v))
+    return GFX_FONT_W; /* no face: the mono cell */
+  return view_glyph(&v, cp)->adv + v.bold;
 }
-int gfx_ui_cw_cp(unsigned cp) { return gfx_ui_cw_cp_px(cp, SANS_PX); }
 
-struct font *gfx_ui_font(void) { return face_ready(&g_sans, FONT_SANS, SANS_PX) ? g_sans.font : 0; }
-int gfx_ui_cw(unsigned char c) { return gfx_ui_cw_cp(c); }
-
-int gfx_ui_width_px(const char *s, int px)
+int gfx_font_width(const char *s, const struct gfx_font *f)
 {
+  struct face_view v;
+  int have = font_view(f, &v);
   const char *end = s + strlen(s);
   int w = 0;
   unsigned cp;
   while (s < end) {
     s += utf8_decode(s, end, &cp);
-    w += gfx_ui_cw_cp_px(cp, px);
+    w += have ? view_glyph(&v, cp)->adv + v.bold : GFX_FONT_W;
   }
   return w;
 }
-int gfx_ui_width(const char *s) { return gfx_ui_width_px(s, SANS_PX); }
+
+int gfx_font_ascent(const struct gfx_font *f)
+{
+  struct face_view v;
+  if (font_view(f, &v))
+    return v.baseline;
+  struct gfx_font r;
+  gfx_font_resolve(f, &r);
+  return r.px;
+}
+
+int gfx_font_height(const struct gfx_font *f)
+{
+  struct gfx_font r;
+  gfx_font_resolve(f, &r);
+  return r.px * 6 / 5;
+}
+
+void gfx_font_text(int x, int y, const char *s, unsigned fg, const struct gfx_font *f)
+{
+  const char *end = s + strlen(s);
+  unsigned cp;
+  struct face_view v;
+  if (font_view(f, &v)) {
+    while (s < end) {
+      s += utf8_decode(s, end, &cp);
+      struct gcache_e *g = view_glyph(&v, cp);
+      face_blit(x, y + v.baseline, g, fg, v.bold, v.slant);
+      x += g->adv + v.bold;
+    }
+    return;
+  }
+  while (s < end) { /* no face: mono fallback */
+    s += utf8_decode(s, end, &cp);
+    gfx_glyph(x, y, cp < 0x80 ? (unsigned char)cp : '?', fg, GFX_TRANSPARENT);
+    x += GFX_FONT_W;
+  }
+}
 
 #define CLIP_MAX 255 /* longest prefix kept before the ".." */
 
-void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw)
+void gfx_font_text_clip(int x, int y, const char *s, unsigned fg, const struct gfx_font *f, int maxw)
 {
   if (maxw <= 0)
     return;
-  if (gfx_ui_width(s) <= maxw) {
-    gfx_ui_text(x, y, s, fg);
+  if (gfx_font_width(s, f) <= maxw) {
+    gfx_font_text(x, y, s, fg, f);
     return;
   }
   char buf[CLIP_MAX + 3];
   const char *end = s + strlen(s);
-  int n = 0, w = 0, dots = 2 * gfx_ui_cw('.');
+  int n = 0, w = 0, dots = 2 * gfx_font_cw('.', f);
   unsigned cp;
-  for (;;) {
+  while (s + n < end) {
     int len = utf8_decode(s + n, end, &cp);
-    int cw = gfx_ui_cw_cp(cp);
+    int cw = gfx_font_cw(cp, f);
     if (n + len > CLIP_MAX || w + cw + dots > maxw)
       break;
     memcpy(buf + n, s + n, (unsigned)len);
@@ -484,43 +617,20 @@ void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw)
   buf[n] = '.';
   buf[n + 1] = '.';
   buf[n + 2] = '\0';
-  gfx_ui_text(x, y, buf, fg);
+  gfx_font_text(x, y, buf, fg, f);
 }
 
-int gfx_ui_ascent_px(int px)
+struct font *gfx_ui_font(void)
 {
   struct face_view v;
-  if (!sans_view(px, &v))
-    return px <= 0 ? SANS_PX : px;
-  return v.baseline;
+  return font_view(0, &v) ? v.font : 0;
 }
 
-/* Proportional UTF-8 text at any pixel size */
-/* Sized UI text, rows clipped to [ct,cb); ct>=cb disables the vertical clip */
-void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int ct, int cb)
-{
-  const char *end = s + strlen(s);
-  unsigned cp;
-  struct face_view v;
-  if (sans_view(px, &v)) {
-    while (s < end) {
-      s += utf8_decode(s, end, &cp);
-      struct gcache_e *g = cache_glyph(v.font, v.px, v.cache, v.n, cp);
-      face_blit_clip(x, y + v.baseline, g, fg, ct, cb);
-      x += g->adv;
-    }
-    return;
-  }
-  while (s < end) { /* sans missing: mono fallback */
-    s += utf8_decode(s, end, &cp);
-    gfx_glyph(x, y, cp < 0x80 ? (unsigned char)cp : '?', fg, GFX_TRANSPARENT);
-    x += GFX_FONT_W;
-  }
-}
-
-void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px) { gfx_ui_text_px_clip(x, y, s, fg, px, 0, 0); }
-
-void gfx_ui_text(int x, int y, const char *s, unsigned fg) { gfx_ui_text_px(x, y, s, fg, SANS_PX); }
+void gfx_ui_text(int x, int y, const char *s, unsigned fg) { gfx_font_text(x, y, s, fg, 0); }
+void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw) { gfx_font_text_clip(x, y, s, fg, 0, maxw); }
+int gfx_ui_width(const char *s) { return gfx_font_width(s, 0); }
+int gfx_ui_cw_cp(unsigned cp) { return gfx_font_cw(cp, 0); }
+int gfx_ui_cw(unsigned char c) { return gfx_font_cw(c, 0); }
 
 /* GUI widgets */
 
@@ -532,20 +642,34 @@ void status_set(struct status_bar *s, const char *msg)
   s->msg[i] = '\0';
 }
 
-void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg, unsigned bg)
+int status_height(const struct gfx_style *st)
 {
-  gfx_a11y_add(GFX_ROLE_LABEL, s->msg, 0, x, y, w, GUI_BAR_H);
-  gfx_fill_rect(x, y, w, GUI_BAR_H, bg);
-  gfx_ui_text(x + 6, y + (GUI_BAR_H - UIFONT_H) / 2, s->msg, fg);
+  st = gfx_style_of(GFX_W_STATUS, st);
+  return gfx_style_outer_h(st, gfx_style_text_h(st));
 }
 
-#define MENU_BG 0x2a3342u  /* dropdown background */
-#define MENU_FG 0xe0e6eeu  /* enabled item text */
-#define MENU_DIM 0x636b78u /* disabled item text / dimmed hint */
-
-/* A small checkmark drawn in a row's left gutter (the cell is GUI_ROW_H tall) */
-static void menu_check(int x, int y, unsigned c)
+void status_draw(const struct status_bar *s, int x, int y, int w, const struct gfx_style *st)
 {
+  st = gfx_style_of(GFX_W_STATUS, st);
+  struct gfx_box b, c;
+  gfx_style_box(st, x, y, w, status_height(st), &b);
+  gfx_a11y_add(GFX_ROLE_LABEL, s->msg, 0, b.x, b.y, b.w, b.h);
+  gfx_style_paint(st, &b, &st->color[BTN_NORMAL]);
+  gfx_style_content(st, &b, &c);
+  gfx_style_label(st, &c, s->msg, st->color[BTN_NORMAL].fg);
+}
+
+/* menus */
+
+#define MENU_CHECK_W 8   /* the checkmark's width; the gutter adds pop->gap */
+#define MENU_ARROW_W 8   /* a submenu's arrow cell */
+#define MENU_HINT_GAP 16 /* least space between an item and its hint, when the popup fits its items */
+#define MENU_OVERLAP 2   /* a submenu overlaps its parent by this much */
+
+/* A small checkmark in a row's left gutter, centred in a row rh tall */
+static void menu_check(int x, int y, int rh, unsigned c)
+{
+  y += (rh - GUI_ROW_H) / 2;
   gfx_fill_rect(x + 0, y + 8, 2, 2, c);
   gfx_fill_rect(x + 1, y + 9, 2, 2, c);
   gfx_fill_rect(x + 2, y + 10, 2, 2, c); /* vertex */
@@ -555,57 +679,180 @@ static void menu_check(int x, int y, unsigned c)
   gfx_fill_rect(x + 6, y + 2, 2, 2, c);
 }
 
-/* Draw a popup list (no title bar) at (px,py): one row per item, with the check gutter */
-static void menu_popup(const struct menu *m, int px, int py)
+static int menu_border(const struct gfx_style *st) { return st->border > 0 ? st->border : 0; }
+
+static int pop_row_h(const struct gfx_style *pop)
 {
-  int gutter = m->flags ? 10 : 0; /* reserve a check column */
-  gfx_fill_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, MENU_BG);
+  if (pop->row_h > 0)
+    return pop->row_h;
+  struct gfx_font f;
+  gfx_style_font(pop, &f);
+  return gfx_font_height(&f);
+}
+
+static int pop_gutter(const struct menu *m, const struct gfx_style *pop)
+{
+  return m->flags ? MENU_CHECK_W + pop->gap : 0;
+}
+
+/* The popup's border box size */
+static int pop_box_w(const struct menu *m, const struct gfx_style *pop)
+{
+  if (pop->width > 0)
+    return pop->width;
+  struct gfx_font f;
+  gfx_style_font(pop, &f);
+  int widest = 0;
   for (int i = 0; i < m->n; i++) {
-    int ry = py + i * GUI_ROW_H;
+    int w = gfx_font_width(m->items[i], &f);
+    if (m->subs && m->subs[i])
+      w += MENU_HINT_GAP + MENU_ARROW_W;
+    else if (m->hints && m->hints[i] && m->hints[i][0])
+      w += MENU_HINT_GAP + gfx_font_width(m->hints[i], &f);
+    if (w > widest)
+      widest = w;
+  }
+  return widest + pop_gutter(m, pop) + pop->padding[GFX_LEFT] + pop->padding[GFX_RIGHT] + 2 * menu_border(pop);
+}
+
+static int pop_box_h(const struct menu *m, const struct gfx_style *pop)
+{
+  if (pop->height > 0)
+    return pop->height;
+  return m->n * pop_row_h(pop) + pop->padding[GFX_TOP] + pop->padding[GFX_BOTTOM] + 2 * menu_border(pop);
+}
+
+int menu_popup_w(const struct menu *m, const struct gfx_style *pop)
+{
+  pop = gfx_style_of(GFX_W_MENU, pop);
+  return gfx_style_outer_w(pop, pop_box_w(m, pop));
+}
+
+int menu_popup_h(const struct menu *m, const struct gfx_style *pop)
+{
+  pop = gfx_style_of(GFX_W_MENU, pop);
+  return gfx_style_outer_h(pop, pop_box_h(m, pop));
+}
+
+/* The popup whose margin box starts at (x,y): its border and content boxes */
+static void pop_boxes(const struct menu *m, const struct gfx_style *pop, int x, int y, struct gfx_box *b,
+                      struct gfx_box *c)
+{
+  gfx_style_box(pop, x, y, gfx_style_outer_w(pop, pop_box_w(m, pop)), gfx_style_outer_h(pop, pop_box_h(m, pop)), b);
+  gfx_style_content(pop, b, c);
+}
+
+/* Margin-box origin of item i's submenu, so its first row lines up with item i */
+static void pop_sub_origin(const struct gfx_style *pop, const struct gfx_box *b, const struct gfx_box *c, int i,
+                           int *sx, int *sy)
+{
+  *sx = b->x + b->w - MENU_OVERLAP - pop->margin[GFX_LEFT];
+  *sy = c->y + i * pop_row_h(pop) - (c->y - b->y) - pop->margin[GFX_TOP];
+}
+
+/* Draw a popup list (no title bar) with its margin box at (x,y): one row per item, with the check gutter */
+static void menu_popup(const struct menu *m, int x, int y, const struct gfx_style *pop)
+{
+  struct gfx_box b, c;
+  pop_boxes(m, pop, x, y, &b, &c);
+  int rh = pop_row_h(pop), gutter = pop_gutter(m, pop);
+  struct gfx_font f;
+  gfx_style_font(pop, &f);
+  int fh = gfx_font_height(&f);
+  gfx_style_paint(pop, &b, &pop->color[BTN_NORMAL]);
+  for (int i = 0; i < m->n; i++) {
+    int ry = c.y + i * rh;
     unsigned char fl = m->flags ? m->flags[i] : 0;
     int dis = (fl & MENU_DISABLED) != 0;
-    unsigned fg = dis ? MENU_DIM : MENU_FG;
+    const struct gfx_colors *cs = &pop->color[dis ? BTN_DISABLED : BTN_NORMAL];
     const struct menu *sub = m->subs ? m->subs[i] : 0;
     unsigned st = (dis ? GFX_A11Y_DISABLED : 0) | ((fl & MENU_CHECKED) ? GFX_A11Y_CHECKED : 0) |
                   (sub ? GFX_A11Y_HASPOPUP : 0) | (sub && sub->open ? GFX_A11Y_EXPANDED : 0);
-    struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_MENUITEM, m->items[i], st, px, ry, GUI_MENU_W, GUI_ROW_H);
+    struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_MENUITEM, m->items[i], st, b.x, ry, b.w, rh);
     if (!sub && m->hints)
       gfx_a11y_set_shortcut(a, m->hints[i]);
     if (fl & MENU_CHECKED)
-      menu_check(px + 2, ry, dis ? MENU_DIM : 0x8fd98f);
-    gfx_ui_text(px + 6 + gutter, ry, m->items[i], fg);
-    if (m->subs && m->subs[i]) /* submenu: a right arrow (►) */
-      gfx_glyph(px + GUI_MENU_W - 12, ry, 0x10, fg, MENU_BG);
-    else if (m->hints && m->hints[i] && m->hints[i][0]) {
-      int hw = gfx_ui_width(m->hints[i]);
-      gfx_ui_text(px + GUI_MENU_W - 6 - hw, ry, m->hints[i], dis ? MENU_DIM : 0x8a93a0);
+      menu_check(c.x, ry, rh, pop->accent[dis ? BTN_DISABLED : BTN_NORMAL].fg);
+    int ty = ry + (rh - fh) / 2, right = c.x + c.w;
+    if (sub) { /* a right arrow (►) */
+      gfx_glyph(right - MENU_ARROW_W + 2, ry + (rh - GFX_FONT_H) / 2, 0x10, cs->fg, GFX_TRANSPARENT);
+      right -= MENU_ARROW_W + pop->gap;
+    } else if (m->hints && m->hints[i] && m->hints[i][0]) {
+      int hw = gfx_font_width(m->hints[i], &f);
+      gfx_font_text(right - hw, ty, m->hints[i], cs->detail, &f);
+      right -= hw + pop->gap;
     }
+    gfx_font_text_clip(c.x + gutter, ty, m->items[i], cs->fg, &f, right - c.x - gutter);
   }
-  gfx_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, 0x05070a);
   for (int i = 0; i < m->n; i++)
-    if (m->subs && m->subs[i] && m->subs[i]->open)
-      menu_popup(m->subs[i], px + GUI_MENU_W - 2, py + i * GUI_ROW_H);
+    if (m->subs && m->subs[i] && m->subs[i]->open) {
+      int sx, sy;
+      pop_sub_origin(pop, &b, &c, i, &sx, &sy);
+      menu_popup(m->subs[i], sx, sy, pop);
+    }
 }
 
-void menu_draw(const struct menu *m, int x, int y)
+int menu_bar_h(const struct gfx_style *bar)
 {
-  unsigned bg = m->open ? 0x3a4a60 : 0x232a36;
-  int tw = gfx_ui_width(m->title) + 6;
-  gfx_a11y_add(GFX_ROLE_MENU, m->title, GFX_A11Y_HASPOPUP | (m->open ? GFX_A11Y_EXPANDED : 0), x, y, tw, GUI_BAR_H);
-  if (m->open)
-    gfx_fill_rect(x, y, tw, GUI_BAR_H, bg);
-  gfx_ui_text(x + 3, y + (GUI_BAR_H - UIFONT_H) / 2, m->title, 0xe0e6ee);
-  if (m->open)
-    menu_popup(m, x, y + GUI_BAR_H);
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
+  return gfx_style_outer_h(bar, gfx_style_text_h(bar));
 }
 
-void menu_popup_draw(const struct menu *m, int x, int y) { menu_popup(m, x, y); }
-
-int menu_popup_click(const struct menu *m, int mx, int my, int x, int y)
+/* A title's border box width */
+static int title_box_w(const struct menu *m, const struct gfx_style *bar)
 {
-  if (mx < x || mx >= x + GUI_MENU_W || my < y || my >= y + m->n * GUI_ROW_H)
+  if (bar->width > 0)
+    return bar->width;
+  struct gfx_font f;
+  gfx_style_font(bar, &f);
+  return gfx_font_width(m->title, &f) + bar->padding[GFX_LEFT] + bar->padding[GFX_RIGHT] + 2 * menu_border(bar);
+}
+
+int menu_title_w(const struct menu *m, const struct gfx_style *bar)
+{
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
+  return gfx_style_outer_w(bar, title_box_w(m, bar));
+}
+
+void menu_draw(const struct menu *m, int x, int y, const struct gfx_style *bar, const struct gfx_style *pop)
+{
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
+  pop = gfx_style_of(GFX_W_MENU, pop);
+  struct gfx_box b, c;
+  gfx_style_box(bar, x, y, menu_title_w(m, bar), menu_bar_h(bar), &b);
+  gfx_a11y_add(GFX_ROLE_MENU, m->title, GFX_A11Y_HASPOPUP | (m->open ? GFX_A11Y_EXPANDED : 0), b.x, b.y, b.w, b.h);
+  int state = m->open ? BTN_PRESSED : BTN_NORMAL;
+  if (m->open) /* a closed title sits on the app's bar */
+    gfx_style_paint(bar, &b, &bar->color[state]);
+  gfx_style_content(bar, &b, &c);
+  gfx_style_label(bar, &c, m->title, bar->color[state].fg);
+  if (m->open)
+    menu_popup(m, x, y + menu_bar_h(bar), pop);
+}
+
+void menu_popup_draw(const struct menu *m, int x, int y, const struct gfx_style *pop)
+{
+  menu_popup(m, x, y, gfx_style_of(GFX_W_MENU, pop));
+}
+
+/* Item index under (mx,my) in the popup at (x,y): -1 off the popup, -2 on it but between rows */
+static int pop_row_at(const struct menu *m, const struct gfx_style *pop, int x, int y, int mx, int my)
+{
+  struct gfx_box b, c;
+  pop_boxes(m, pop, x, y, &b, &c);
+  if (mx < b.x || mx >= b.x + b.w || my < b.y || my >= b.y + b.h)
     return -1;
-  int i = (my - y) / GUI_ROW_H;
+  if (my < c.y)
+    return -2;
+  int i = (my - c.y) / pop_row_h(pop);
+  return i < m->n ? i : -2;
+}
+
+int menu_popup_click(const struct menu *m, int mx, int my, int x, int y, const struct gfx_style *pop)
+{
+  int i = pop_row_at(m, gfx_style_of(GFX_W_MENU, pop), x, y, mx, my);
+  if (i < 0)
+    return -1;
   return m->flags && (m->flags[i] & MENU_DISABLED) ? -1 : i;
 }
 
@@ -622,17 +869,24 @@ static void menu_subs_close(struct menu *m)
 }
 
 /* Route a click in m's popup, recursing into open submenus first */
-static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct menu **fm, int *fi)
+static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct menu **fm, int *fi,
+                          const struct gfx_style *pop)
 {
+  struct gfx_box b, c;
+  pop_boxes(m, pop, px, py, &b, &c);
   for (int i = 0; i < m->n; i++)
     if (m->subs && m->subs[i] && m->subs[i]->open) {
-      int r = menu_popup_hit(m->subs[i], px + GUI_MENU_W - 2, py + i * GUI_ROW_H, mx, my, fm, fi);
+      int sx, sy;
+      pop_sub_origin(pop, &b, &c, i, &sx, &sy);
+      int r = menu_popup_hit(m->subs[i], sx, sy, mx, my, fm, fi, pop);
       if (r)
         return r;
     }
-  if (mx < px || mx >= px + GUI_MENU_W || my < py || my >= py + m->n * GUI_ROW_H)
+  int i = pop_row_at(m, pop, px, py, mx, my);
+  if (i == -1)
     return 0;
-  int i = (my - py) / GUI_ROW_H;
+  if (i == -2)
+    return 1; /* the popup's frame: swallow, stay open */
   unsigned char fl = m->flags ? m->flags[i] : 0;
   if (fl & MENU_DISABLED)
     return 1;                  /* inert: swallow, stay open */
@@ -649,13 +903,16 @@ static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct
   return 2;
 }
 
-int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf)
+int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf, const struct gfx_style *bar,
+                  const struct gfx_style *pop)
 {
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
+  pop = gfx_style_of(GFX_W_MENU, pop);
   if (leaf)
     *leaf = 0;
-  int tw = gfx_ui_width(m->title) + 6;
-  if (my >= y && my < y + GUI_BAR_H) { /* the title row */
-    m->open = (mx >= x && mx < x + tw) ? !m->open : 0;
+  int bh = menu_bar_h(bar);
+  if (my >= y && my < y + bh) { /* the title row */
+    m->open = (mx >= x && mx < x + menu_title_w(m, bar)) ? !m->open : 0;
     if (!m->open)
       menu_subs_close(m);
     return -1;
@@ -663,7 +920,7 @@ int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **le
   if (m->open) {
     struct menu *fm = 0;
     int fi = -1;
-    int r = menu_popup_hit(m, x, y + GUI_BAR_H, mx, my, &fm, &fi);
+    int r = menu_popup_hit(m, x, y + bh, mx, my, &fm, &fi, pop);
     if (r == 2) { /* a leaf fired -> close everything */
       m->open = 0;
       menu_subs_close(m);
@@ -679,11 +936,11 @@ int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **le
   return -1;
 }
 
-int menu_click(struct menu *m, int mx, int my, int x, int y)
+int menu_click(struct menu *m, int mx, int my, int x, int y, const struct gfx_style *bar, const struct gfx_style *pop)
 {
   struct menu *leaf;
-  int it = menu_click_ex(m, mx, my, x, y, &leaf);
-  return (leaf == m) ? it : -1; /* back-compat: only this menu's items */
+  int it = menu_click_ex(m, mx, my, x, y, &leaf, bar, pop);
+  return (leaf == m) ? it : -1; /* only this menu's items */
 }
 
 /* Search m (and its submenus) for an enabled item whose accelerator is `key` */
@@ -714,19 +971,17 @@ int menu_shortcut(const struct menu *m, int key)
     return -1;
   struct menu *leaf = 0;
   int it = menu_shortcut_walk(m, key, &leaf);
-  return (leaf == m) ? it : -1; /* back-compat: only this menu's items */
+  return (leaf == m) ? it : -1; /* only this menu's items */
 }
 
 /* menu bar */
 
-#define MENUBAR_GAP 4 /* px between adjacent titles on the bar */
-
-/* x of menu i's title: the bar origin plus the widths of the titles before it */
-static int menubar_title_x(const struct menubar *mb, int i)
+/* x of menu i's title: the bar origin plus the titles before it and the gaps between them */
+static int menubar_title_x(const struct menubar *mb, int i, const struct gfx_style *bar)
 {
   int x = mb->x;
   for (int k = 0; k < i; k++)
-    x += gfx_ui_width(mb->menus[k]->title) + 6 + MENUBAR_GAP;
+    x += menu_title_w(mb->menus[k], bar) + bar->gap;
   return x;
 }
 
@@ -738,8 +993,9 @@ void menubar_close(struct menubar *mb)
   }
 }
 
-void menubar_draw(const struct menubar *mb)
+void menubar_draw(const struct menubar *mb, const struct gfx_style *bar, const struct gfx_style *pop)
 {
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
   /* Closed titles first; the open one last so its dropdown overlays a neighbouring title */
   int openi = -1;
   for (int i = 0; i < mb->n; i++) {
@@ -747,23 +1003,24 @@ void menubar_draw(const struct menubar *mb)
       openi = i;
       continue;
     }
-    menu_draw(mb->menus[i], menubar_title_x(mb, i), mb->y);
+    menu_draw(mb->menus[i], menubar_title_x(mb, i, bar), mb->y, bar, pop);
   }
   if (openi >= 0)
-    menu_draw(mb->menus[openi], menubar_title_x(mb, openi), mb->y);
+    menu_draw(mb->menus[openi], menubar_title_x(mb, openi, bar), mb->y, bar, pop);
 }
 
-int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item)
+int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item, const struct gfx_style *bar,
+                  const struct gfx_style *pop)
 {
+  bar = gfx_style_of(GFX_W_MENUBAR, bar);
   *leaf = 0;
   *item = -1;
 
   /* On the title row: toggle the clicked title and close the others */
-  if (my >= mb->y && my < mb->y + GUI_BAR_H) {
+  if (my >= mb->y && my < mb->y + menu_bar_h(bar)) {
     for (int i = 0; i < mb->n; i++) {
-      int x = menubar_title_x(mb, i);
-      int tw = gfx_ui_width(mb->menus[i]->title) + 6;
-      if (mx >= x && mx < x + tw) {
+      int x = menubar_title_x(mb, i, bar);
+      if (mx >= x && mx < x + menu_title_w(mb->menus[i], bar)) {
         int wasopen = mb->menus[i]->open;
         menubar_close(mb);
         mb->menus[i]->open = !wasopen;
@@ -779,7 +1036,7 @@ int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *i
     if (!mb->menus[i]->open)
       continue;
     struct menu *lf = 0;
-    int it = menu_click_ex(mb->menus[i], mx, my, menubar_title_x(mb, i), mb->y, &lf);
+    int it = menu_click_ex(mb->menus[i], mx, my, menubar_title_x(mb, i, bar), mb->y, &lf, bar, pop);
     if (it >= 0) {
       *leaf = lf;
       *item = it;
@@ -812,50 +1069,35 @@ int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf)
 
 /* button */
 
-/* Per-state face: fill, a 1px top highlight, label colour */
-struct btn_face {
-  unsigned bg, top, fg;
-};
-static const struct btn_face btn_faces[] = {
-    [BTN_NORMAL] = {0x3a4658u, 0x4a5a70u, 0xe6ebf2u},
-    [BTN_HOVER] = {0x46546au, 0x586a84u, 0xffffffu},
-    [BTN_PRESSED] = {0x2a3342u, 0x2a3342u, 0xc8d0dcu},
-    [BTN_DISABLED] = {0x2a3038u, 0x2a3038u, 0x636b78u},
-};
-
-void button_draw(int x, int y, int w, int h, const char *label, int state)
+void button_draw(int x, int y, int w, int h, const char *label, int state, const struct gfx_style *st)
 {
-  gfx_a11y_add(GFX_ROLE_BUTTON, label, gfx_a11y_state(state), x, y, w, h);
+  st = gfx_style_of(GFX_W_BUTTON, st);
+  struct gfx_box b, c;
+  gfx_style_box(st, x, y, w, h, &b);
+  gfx_a11y_add(GFX_ROLE_BUTTON, label, gfx_a11y_state(state), b.x, b.y, b.w, b.h);
   int focused = state & GFX_FOCUSED;
-  state &= ~GFX_FOCUSED;
-  if (state < 0 || state > BTN_DISABLED)
-    state = BTN_NORMAL;
+  state = gfx_state_index(state);
   if (focused)
-    gfx_focus_ring(x, y, w, h);
-  const struct btn_face *f = &btn_faces[state];
-  gfx_fill_rect(x, y, w, h, f->bg);
-  if (f->top != f->bg) /* raised: lit top edge */
-    gfx_fill_rect(x + 1, y + 1, w - 2, 1, f->top);
-  gfx_rect(x, y, w, h, 0x05070a);
-
-  /* Centre the label; nudge it down a pixel while pressed so it "sinks" */
-  int tw = gfx_ui_width(label);
-  int tx = x + (w - tw) / 2;
-  int ty = y + (h - UIFONT_H) / 2 + (state == BTN_PRESSED ? 1 : 0);
-  gfx_ui_text(tx, ty, label, f->fg);
+    gfx_focus_ring(b.x, b.y, b.w, b.h, st);
+  gfx_style_paint(st, &b, &st->color[state]);
+  gfx_style_content(st, &b, &c);
+  if (state == BTN_PRESSED) /* the label sinks a pixel */
+    c.y++;
+  gfx_style_label(st, &c, label, st->color[state].fg);
 }
 
-int button_hit(int x, int y, int w, int h, int mx, int my) { return mx >= x && mx < x + w && my >= y && my < y + h; }
+int button_hit(int x, int y, int w, int h, int mx, int my, const struct gfx_style *st)
+{
+  struct gfx_box b;
+  gfx_style_box(gfx_style_of(GFX_W_BUTTON, st), x, y, w, h, &b);
+  return mx >= b.x && mx < b.x + b.w && my >= b.y && my < b.y + b.h;
+}
 
 /* progress bar */
 
-#define PROG_TROUGH 0x1c2330u /* sunken background */
-#define PROG_FILL 0x2f6bd8u   /* accent-blue done portion */
-#define PROG_TOP 0x5a8fe0u    /* lit top edge of the fill */
-#define PROG_BORDER 0x05070au
-
-void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
+void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct, const struct gfx_style *st)
 {
+  st = gfx_style_of(GFX_W_PROGRESS, st);
   if (max < 0)
     max = 0;
   if (value < 0)
@@ -863,19 +1105,22 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
   if (value > max)
     value = max;
   int pct = max > 0 ? value * 100 / max : 0;
-  gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_PROGRESS, 0, 0, x, y, w, h), value, 0, max);
+  struct gfx_box b, c;
+  gfx_style_box(st, x, y, w, h, &b);
+  gfx_style_content(st, &b, &c);
+  gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_PROGRESS, 0, 0, b.x, b.y, b.w, b.h), value, 0, max);
 
-  gfx_fill_rect(x, y, w, h, PROG_TROUGH);
-
-  /* Fill the inner area (inside the 1px border) proportionally */
-  int inner = w - 2;
-  int fw = max > 0 && inner > 0 ? (int)((long)inner * value / max) : 0;
+  const struct gfx_colors *trough = &st->color[BTN_NORMAL], *fill = &st->accent[BTN_NORMAL];
+  int bw = st->border > 0 ? st->border : 0;
+  gfx_fill_round(b.x, b.y, b.w, b.h, st->radius, trough->bg);
+  int fw = max > 0 && c.w > 0 ? (int)((long)c.w * value / max) : 0;
   if (fw > 0) {
-    gfx_fill_rect(x + 1, y + 1, fw, h - 2, PROG_FILL);
-    if (h > 3)
-      gfx_fill_rect(x + 1, y + 1, fw, 1, PROG_TOP);
+    gfx_fill_round(c.x, c.y, fw, c.h, st->radius - bw, fill->bg);
+    if (c.h > 1 && fill->detail != fill->bg) /* lit top edge */
+      gfx_fill_rect(c.x, c.y, fw, 1, fill->detail);
   }
-  gfx_rect(x, y, w, h, PROG_BORDER);
+  if (bw)
+    gfx_round_rect(b.x, b.y, b.w, b.h, st->radius, bw, trough->border);
 
   if (show_pct) {
     char buf[5]; /* "100%" + NUL */
@@ -891,77 +1136,103 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
     }
     buf[k++] = '%';
     buf[k] = '\0';
-    int tw = gfx_ui_width(buf);
-    int tx = x + (w - tw) / 2;
-    int ty = y + (h - UIFONT_H) / 2;
-    /* White over the blue done-portion, light grey over the trough */
-    unsigned fg = (w / 2 < 1 + fw) ? 0xffffffu : 0xc8d0dcu;
-    gfx_ui_text(tx, ty, buf, fg);
+    struct gfx_font f;
+    gfx_style_font(st, &f);
+    int tw = gfx_font_width(buf, &f);
+    int tx = b.x + (b.w - tw) / 2;
+    int ty = b.y + (b.h - gfx_font_height(&f)) / 2;
+    /* The fill's colour once it reaches the middle, the trough's before */
+    unsigned fg = (b.x + b.w / 2 < c.x + fw) ? fill->fg : trough->fg;
+    gfx_font_text(tx, ty, buf, fg, &f);
   }
 }
 
 /* slider */
 
-#define SLIDER_THUMB_W 6
-#define SLIDER_TRACK_H 6
 #define SLIDER_GRAB 4 /* extra hit margin around the box */
 
-static int slider_travel(int w) { return w - SLIDER_THUMB_W > 1 ? w - SLIDER_THUMB_W : 1; }
+struct slider_geom {
+  struct gfx_box b; /* border box */
+  int thumb_w, thumb_h, track;
+};
 
-void slider_draw(int x, int y, int w, int value, int max, int focused)
+static void slider_geom(const struct gfx_style *st, int x, int y, int w, struct slider_geom *g)
 {
+  g->thumb_w = st->part_w > 0 ? st->part_w : 6;
+  g->thumb_h = st->part_h > 0 ? st->part_h : GUI_SLIDER_H;
+  g->track = st->track > 0 ? st->track : 6;
+  gfx_style_box(st, x, y, w, slider_height(st), &g->b);
+}
+
+int slider_height(const struct gfx_style *st)
+{
+  st = gfx_style_of(GFX_W_SLIDER, st);
+  int h = st->height > 0 ? st->height : st->part_h > 0 ? st->part_h : GUI_SLIDER_H;
+  return gfx_style_outer_h(st, h);
+}
+
+static int slider_travel(const struct slider_geom *g) { return g->b.w - g->thumb_w > 1 ? g->b.w - g->thumb_w : 1; }
+
+void slider_draw(int x, int y, int w, int value, int max, int focused, const struct gfx_style *st)
+{
+  st = gfx_style_of(GFX_W_SLIDER, st);
+  struct slider_geom g;
+  slider_geom(st, x, y, w, &g);
   if (value < 0)
     value = 0;
   if (value > max)
     value = max;
-  struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_SLIDER, 0, focused ? GFX_A11Y_FOCUSED : 0, x, y, w, GUI_SLIDER_H);
+  struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_SLIDER, 0, focused ? GFX_A11Y_FOCUSED : 0, g.b.x, g.b.y, g.b.w, g.b.h);
   gfx_a11y_set_value(a, value, 0, max);
   if (focused)
-    gfx_focus_ring(x, y, w, GUI_SLIDER_H);
-  int tx = x + (max > 0 ? (int)((long)slider_travel(w) * value / max) : 0);
-  int ty = y + (GUI_SLIDER_H - SLIDER_TRACK_H) / 2;
-  gfx_fill_rect(x, ty, w, SLIDER_TRACK_H, PROG_TROUGH);
-  gfx_fill_rect(x, ty, tx - x + SLIDER_THUMB_W / 2, SLIDER_TRACK_H, PROG_FILL);
-  gfx_rect(x, ty, w, SLIDER_TRACK_H, PROG_BORDER);
-  gfx_fill_rect(tx, y, SLIDER_THUMB_W, GUI_SLIDER_H, 0xffffffu);
+    gfx_focus_ring(g.b.x, g.b.y, g.b.w, g.b.h, st);
+  const struct gfx_colors *track = &st->color[BTN_NORMAL], *on = &st->accent[BTN_NORMAL];
+  int bw = st->border > 0 ? st->border : 0;
+  int tx = g.b.x + (max > 0 ? (int)((long)slider_travel(&g) * value / max) : 0);
+  int ty = g.b.y + (g.b.h - g.track) / 2;
+  gfx_fill_round(g.b.x, ty, g.b.w, g.track, st->radius, track->bg);
+  gfx_fill_round(g.b.x, ty, tx - g.b.x + g.thumb_w / 2, g.track, st->radius, on->bg);
+  if (bw)
+    gfx_round_rect(g.b.x, ty, g.b.w, g.track, st->radius, bw, track->border);
+  gfx_fill_round(tx, g.b.y + (g.b.h - g.thumb_h) / 2, g.thumb_w, g.thumb_h, st->radius, on->fg);
 }
 
-int slider_hit(int x, int y, int w, int mx, int my)
+int slider_hit(int x, int y, int w, int mx, int my, const struct gfx_style *st)
 {
-  return button_hit(x - SLIDER_GRAB, y - SLIDER_GRAB, w + 2 * SLIDER_GRAB, GUI_SLIDER_H + 2 * SLIDER_GRAB, mx, my);
+  struct slider_geom g;
+  slider_geom(gfx_style_of(GFX_W_SLIDER, st), x, y, w, &g);
+  return mx >= g.b.x - SLIDER_GRAB && mx < g.b.x + g.b.w + SLIDER_GRAB && my >= g.b.y - SLIDER_GRAB &&
+         my < g.b.y + g.b.h + SLIDER_GRAB;
 }
 
-int slider_value(int x, int w, int mx, int max)
+int slider_value(int x, int w, int mx, int max, const struct gfx_style *st)
 {
-  long v = ((long)(mx - x - SLIDER_THUMB_W / 2) * max + slider_travel(w) / 2) / slider_travel(w);
+  struct slider_geom g;
+  slider_geom(gfx_style_of(GFX_W_SLIDER, st), x, 0, w, &g);
+  int travel = slider_travel(&g);
+  long v = ((long)(mx - g.b.x - g.thumb_w / 2) * max + travel / 2) / travel;
   return v < 0 ? 0 : v > max ? max : (int)v;
 }
 
 /* scrollbar */
 
-#define SCROLL_TRACK 0xc8ccd2u    /* light track groove */
-#define SCROLL_THUMB 0x6b7686u    /* draggable slate thumb */
-#define SCROLL_ARROW_BG 0xb4b9c2u /* arrow-button face */
-#define SCROLL_ARROW_FG 0x4a5564u /* arrowhead */
-#define SCROLL_MIN_THUMB 12       /* keep the thumb grabbable */
-
-const struct scrollbar_style SCROLLBAR_DEFAULT = {-1, -1, 0, 1};
+static int scroll_min_thumb(const struct gfx_style *st) { return st->row_h > 0 ? st->row_h : 12; }
 
 /* Square arrow-button height for a w-wide, h-tall bar */
-static int scrollbar_arrow_h(int w, int h, const struct scrollbar_style *st)
+static int scrollbar_arrow_h(int w, int h, const struct gfx_style *st)
 {
   int a = w;
-  if (!st->arrows || a < 4 || h < 2 * a + SCROLL_MIN_THUMB)
+  if ((st->flags & GFX_STYLE_NO_ARROWS) || a < 4 || h < 2 * a + scroll_min_thumb(st))
     return 0;
   return a;
 }
 
 /* Thumb height + top offset within a track of height `tr` for the current counts */
-static void scrollbar_thumb(int tr, int scroll, int total, int visible, int *th, int *ty)
+static void scrollbar_thumb(int tr, int scroll, int total, int visible, int min_thumb, int *th, int *ty)
 {
   int t = (int)((long)tr * visible / total);
-  if (t < SCROLL_MIN_THUMB)
-    t = SCROLL_MIN_THUMB;
+  if (t < min_thumb)
+    t = min_thumb;
   if (t > tr)
     t = tr;
   int maxs = total - visible;
@@ -992,90 +1263,74 @@ static void scrollbar_tri(int bx, int by, int w, int a, int up, unsigned color)
   }
 }
 
-void scrollbar_draw_ex(int x, int y, int w, int h, int scroll, int total, int visible, const struct scrollbar_style *st)
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible, const struct gfx_style *st)
 {
-  int a = scrollbar_arrow_h(w, h, st);
-  int tr = h - 2 * a; /* track region height */
-  unsigned track = st->track >= 0 ? (unsigned)st->track : SCROLL_TRACK;
-  unsigned thumb = st->thumb >= 0 ? (unsigned)st->thumb : SCROLL_THUMB;
-  struct gfx_a11y *node = gfx_a11y_add(GFX_ROLE_SCROLLBAR, 0, 0, x, y, w, h);
+  st = gfx_style_of(GFX_W_SCROLLBAR, st);
+  struct gfx_box b;
+  gfx_style_box(st, x, y, w, h, &b);
+  int a = scrollbar_arrow_h(b.w, b.h, st);
+  int tr = b.h - 2 * a; /* track region height */
+  const struct gfx_colors *c = &st->color[BTN_NORMAL];
+  struct gfx_a11y *node = gfx_a11y_add(GFX_ROLE_SCROLLBAR, 0, 0, b.x, b.y, b.w, b.h);
   gfx_a11y_set_value(node, scroll, 0, total > visible ? total - visible : 0);
 
-  gfx_fill_rect(x, y, w, h, track);
+  gfx_fill_rect(b.x, b.y, b.w, b.h, c->bg);
   if (a > 0) {
-    gfx_fill_rect(x, y, w, a, SCROLL_ARROW_BG);         /* up box */
-    gfx_fill_rect(x, y + h - a, w, a, SCROLL_ARROW_BG); /* down box */
-    scrollbar_tri(x, y, w, a, 1, SCROLL_ARROW_FG);
-    scrollbar_tri(x, y + h - a, w, a, 0, SCROLL_ARROW_FG);
+    gfx_fill_rect(b.x, b.y, b.w, a, c->detail);           /* up box */
+    gfx_fill_rect(b.x, b.y + b.h - a, b.w, a, c->detail); /* down box */
+    scrollbar_tri(b.x, b.y, b.w, a, 1, c->fg);
+    scrollbar_tri(b.x, b.y + b.h - a, b.w, a, 0, c->fg);
   }
-  if (total > visible && visible > 0 && tr > 0 && w > 2) {
+  int il = st->padding[GFX_LEFT], tw = b.w - il - st->padding[GFX_RIGHT];
+  if (total > visible && visible > 0 && tr > 0 && tw > 0) {
     int th, ty;
-    scrollbar_thumb(tr, scroll, total, visible, &th, &ty);
-    int inset = st->arrows || st->thumb >= 0 ? 1 : 0, tw = w - 2 * inset, r = st->radius;
-    if (r * 2 > tw)
-      r = tw / 2;
-    if (r * 2 > th)
-      r = th / 2;
-    for (int row = 0; row < th; row++) { /* a rounded thumb trims each end row by the corner arc */
-      int d = row < r ? r - row : row >= th - r ? row - (th - 1 - r) : 0, cut = 0;
-      for (; d > 0 && (r - cut - 1) * (r - cut - 1) + d * d > r * r; cut++)
-        ;
-      gfx_fill_rect(x + inset + cut, y + a + ty + row, tw - 2 * cut, 1, thumb);
-    }
+    scrollbar_thumb(tr, scroll, total, visible, scroll_min_thumb(st), &th, &ty);
+    gfx_fill_round(b.x + il, b.y + a + ty, tw, th, st->radius, st->accent[BTN_NORMAL].bg);
   }
 }
 
-void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible)
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my, const struct gfx_style *st)
 {
-  scrollbar_draw_ex(x, y, w, h, scroll, total, visible, &SCROLLBAR_DEFAULT);
-}
-
-int scrollbar_hit_ex(int x, int y, int w, int h, int mx, int my, const struct scrollbar_style *st)
-{
-  if (mx < x || mx >= x + w || my < y || my >= y + h)
+  st = gfx_style_of(GFX_W_SCROLLBAR, st);
+  struct gfx_box b;
+  gfx_style_box(st, x, y, w, h, &b);
+  if (mx < b.x || mx >= b.x + b.w || my < b.y || my >= b.y + b.h)
     return SCROLLBAR_NONE;
-  int a = scrollbar_arrow_h(w, h, st);
+  int a = scrollbar_arrow_h(b.w, b.h, st);
   if (a > 0) {
-    if (my < y + a)
+    if (my < b.y + a)
       return SCROLLBAR_UP;
-    if (my >= y + h - a)
+    if (my >= b.y + b.h - a)
       return SCROLLBAR_DOWN;
   }
   return SCROLLBAR_TRACK;
 }
 
-int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
+                  const struct gfx_style *st)
 {
-  return scrollbar_hit_ex(x, y, w, h, mx, my, &SCROLLBAR_DEFAULT);
-}
-
-int scrollbar_pos_ex(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
-                     const struct scrollbar_style *st)
-{
-  if (scrollbar_hit_ex(x, y, w, h, mx, my, st) != SCROLLBAR_TRACK)
+  st = gfx_style_of(GFX_W_SCROLLBAR, st);
+  if (scrollbar_hit(x, y, w, h, mx, my, st) != SCROLLBAR_TRACK)
     return scroll;
   int maxs = total - visible;
   if (maxs <= 0)
     return 0;
-  int a = scrollbar_arrow_h(w, h, st);
-  int tr = h - 2 * a; /* track region height */
+  struct gfx_box b;
+  gfx_style_box(st, x, y, w, h, &b);
+  int a = scrollbar_arrow_h(b.w, b.h, st);
+  int tr = b.h - 2 * a; /* track region height */
   if (tr <= 0)
     return scroll;
   int th, ty;
-  scrollbar_thumb(tr, scroll, total, visible, &th, &ty);
+  scrollbar_thumb(tr, scroll, total, visible, scroll_min_thumb(st), &th, &ty);
   int span = tr - th;
-  int rel = my - (y + a) - th / 2; /* centre the thumb on the cursor */
+  int rel = my - (b.y + a) - th / 2; /* centre the thumb on the cursor */
   int s = (span > 0) ? (int)((long)rel * maxs / span) : 0;
   if (s < 0)
     s = 0;
   if (s > maxs)
     s = maxs;
   return s;
-}
-
-int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible)
-{
-  return scrollbar_pos_ex(x, y, w, h, mx, my, scroll, total, visible, &SCROLLBAR_DEFAULT);
 }
 
 void gfx_get_clip(int *x, int *y, int *w, int *h)

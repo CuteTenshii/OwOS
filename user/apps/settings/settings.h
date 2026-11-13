@@ -14,9 +14,7 @@
 
 /* Theme (matches the Files explorer) */
 #define BG_PANEL 0x12161eu
-#define BG_SIDE 0x0e1218u
 #define BG_HEADER 0x161d28u
-#define BG_DIVIDER 0x05070au
 #define BG_SEL 0x24405cu
 #define FG_TITLE 0x8aa0b8u
 #define FG_TEXT 0xc8d0dcu

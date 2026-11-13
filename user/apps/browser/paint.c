@@ -923,8 +923,8 @@ void draw_crash_page(int py, int pw, int phh)
   int cy = py + phh / 2;
 
   int face_px = 64;
-  int fw = gfx_ui_width_px(":(", face_px);
-  gfx_ui_text_px(cx - fw / 2, cy - 96, ":(", 0xb0b6be, face_px);
+  int fw = gfx_font_width(":(", &(struct gfx_font){.px = face_px});
+  gfx_font_text(cx - fw / 2, cy - 96, ":(", 0xb0b6be, &(struct gfx_font){.px = face_px});
 
   int hw = gfx_ui_width(head);
   gfx_ui_text(cx - hw / 2, cy - 12, head, 0x303840);
@@ -952,5 +952,5 @@ void draw_crash_page(int py, int pw, int phh)
   crash_reload_rect.y = dy + 3 * UIFONT_H + 12;
   crash_reload_rect.w = bw;
   crash_reload_rect.h = bh;
-  button_draw(crash_reload_rect.x, crash_reload_rect.y, bw, bh, "Reload", BTN_NORMAL);
+  button_draw(crash_reload_rect.x, crash_reload_rect.y, bw, bh, "Reload", BTN_NORMAL, NULL);
 }

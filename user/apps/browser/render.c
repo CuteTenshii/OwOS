@@ -53,7 +53,7 @@ static void dim_rect(int x, int y, int w, int h, int ct, int cb, unsigned argb)
 static void draw_page_scrollbar(int pw, int py, int phh, int scroll, int total, int visible)
 {
   if (PAGE_SCROLL_W > 0)
-    scrollbar_draw_ex(pw, py, PAGE_SCROLL_W, phh, scroll, total, visible, &B->pg->sb_st);
+    scrollbar_draw(pw, py, PAGE_SCROLL_W, phh, scroll, total, visible, &B->pg->sb_st);
 }
 
 /* Paint the position:fixed / top-layer boxes bottom to top: those with a negative z-index under the page's
@@ -329,7 +329,7 @@ void render(void)
     icons[i] = tabs[i]->page.favicon_ok ? tabs[i]->page.favicon : 0;
   }
   if (!g_fullscreen) {
-    tabbar_draw(&tab_strip, 0, MENU_H, BW, labels, icons, shown, active_tab < shown ? active_tab : 0);
+    tabbar_draw(&tab_strip, 0, MENU_H, BW, labels, icons, shown, active_tab < shown ? active_tab : 0, NULL);
 
     /* address bar (below the tab strip) */
     gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
@@ -337,11 +337,11 @@ void render(void)
     addr_layout(&rb, &rf, &rrl, &rtf, &rst);
     struct tab *at = tabs[active_tab];
     button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90", /* ← */
-                hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
+                hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED, NULL);
     button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92", /* → */
-                hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+                hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED, NULL);
     reload_btn_draw(&rrl);
-    textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
+    textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1, NULL);
     star_btn_draw(&rst);
   }
 
@@ -397,7 +397,7 @@ void render(void)
   bookmarks_menu_sync();
   if (!g_fullscreen) {
     gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
-    menubar_draw(&menubar);
+    menubar_draw(&menubar, NULL, NULL);
   }
   field_menu_draw();
 
@@ -559,10 +559,10 @@ void render_addr(void)
   struct rect rb, rf, rrl, rtf, rst;
   addr_layout(&rb, &rf, &rrl, &rtf, &rst);
   struct tab *at = tabs[active_tab];
-  button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90", hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
-  button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92", hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+  button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90", hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED, NULL);
+  button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92", hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED, NULL);
   reload_btn_draw(&rrl);
-  textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
+  textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1, NULL);
   star_btn_draw(&rst);
   browser_buf_unlock();
 }

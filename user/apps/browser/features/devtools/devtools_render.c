@@ -284,10 +284,10 @@ void devtools_render(void)
   gfx_fill_rect(left, top, w, DT_HDR, 0x14171c); /* header row */
   gfx_fill_rect(left, top, 1, h, 0x000000);      /* splitter line */
 
-  button_draw(left, top, DT_PICK_W, DT_HDR, DT_PICK_GLYPH, dt_pick ? BTN_PRESSED : BTN_NORMAL);
+  button_draw(left, top, DT_PICK_W, DT_HDR, DT_PICK_GLYPH, dt_pick ? BTN_PRESSED : BTN_NORMAL, NULL);
   for (int i = 0; i < N_TABS; i++)
-    button_draw(left + tab_x(i), top, tab_w(i), DT_HDR, tab_names[i], i == dt_tab ? BTN_PRESSED : BTN_NORMAL);
-  button_draw(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL); /* × */
+    button_draw(left + tab_x(i), top, tab_w(i), DT_HDR, tab_names[i], i == dt_tab ? BTN_PRESSED : BTN_NORMAL, NULL);
+  button_draw(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL, NULL); /* × */
 
   int ct = content_top(top), rows = dt_content_rows(top), cw = content_w();
   int tx = left + 6;
@@ -382,7 +382,7 @@ void devtools_render(void)
       }
     }
 
-  scrollbar_draw(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, *sc, total, rows);
+  scrollbar_draw(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, *sc, total, rows, NULL);
 
   if (dt_tab == TAB_CONSOLE) { /* REPL input + filter/clear toolbar */
     int iy = BH - DT_INPUT_H;
@@ -392,13 +392,13 @@ void devtools_render(void)
     gfx_fill_rect(left, iy, w, 1, 0x000000);                             /* separator above the field */
     gfx_text_utf8(left + 5, iy + (DT_INPUT_H - GLYPH_H) / 2, "\xc2\xbb", /* » prompt */
                   0x7cb7e8, GFX_TRANSPARENT);
-    textfield_draw(&dt_input_tf, left + 20, iy + 2, (ftx - 4) - (left + 20), DT_INPUT_H - 4, dt_input_focused);
+    textfield_draw(&dt_input_tf, left + 20, iy + 2, (ftx - 4) - (left + 20), DT_INPUT_H - 4, dt_input_focused, NULL);
     button_draw(ftx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2,
                 dt_con_filter == 0   ? "All"
                 : dt_con_filter == 1 ? "Warn"
                                      : "Err",
-                dt_con_filter ? BTN_PRESSED : BTN_NORMAL);
-    button_draw(fbx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, "Clear", BTN_NORMAL);
+                dt_con_filter ? BTN_PRESSED : BTN_NORMAL, NULL);
+    button_draw(fbx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, "Clear", BTN_NORMAL, NULL);
   }
 
   if (dt_tab == TAB_ELEMENTS && dt_ncrumbs > 0) { /* ancestor breadcrumb */
@@ -427,7 +427,7 @@ void devtools_render(void)
     gfx_fill_rect(left, iy, w, 1, 0x000000);
     gfx_text_utf8(left + 5, iy + (DT_INPUT_H - GLYPH_H) / 2, "/", /* find prompt */
                   0x9aa0a6, GFX_TRANSPARENT);
-    textfield_draw(&dt_find_tf, left + 20, iy + 2, w - 24, DT_INPUT_H - 4, dt_find_focused);
+    textfield_draw(&dt_find_tf, left + 20, iy + 2, w - 24, DT_INPUT_H - 4, dt_find_focused, NULL);
   }
 
   if (dt_tab == TAB_NETWORK) { /* request detail (above) + summary bar */
@@ -435,8 +435,8 @@ void devtools_render(void)
       int dy = net_detail_top(), dbot = BH - DT_NETBAR_H;
       struct netinfo *ni = &dt_netinfo[(dt_net_start + dt_net_sel) % NET_MAX];
       gfx_fill_rect(left, dy, w, DT_NETDETAIL_H, 0x14171c);
-      gfx_fill_rect(left, dy, w, 1, 0x000000);                                      /* separator above */
-      button_draw(BW - DT_CLOSE_W, dy, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL); /* × close */
+      gfx_fill_rect(left, dy, w, 1, 0x000000);                                            /* separator above */
+      button_draw(BW - DT_CLOSE_W, dy, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL, NULL); /* × close */
       int lx = left + 8, ly = dy + 4;
       char b[256];
       int k;
@@ -525,7 +525,7 @@ void devtools_render(void)
           draw_style_line(lx, ly + r * GLYPH_H, b); /* "Name: value" colouring */
         }
         if (hn > hrows)
-          scrollbar_draw(BW - SCROLL_W, ly, SCROLL_W, hrows * GLYPH_H, dt_nd_scroll, hn, hrows);
+          scrollbar_draw(BW - SCROLL_W, ly, SCROLL_W, hrows * GLYPH_H, dt_nd_scroll, hn, hrows, NULL);
       }
     }
 
@@ -534,7 +534,7 @@ void devtools_render(void)
     gfx_fill_rect(left, by, w, 1, 0x000000);
     int fbw = 56;
     button_draw(left + 2, by + 1, fbw, DT_NETBAR_H - 2, dt_net_filter_names[dt_net_filter],
-                dt_net_filter ? BTN_PRESSED : BTN_NORMAL);
+                dt_net_filter ? BTN_PRESSED : BTN_NORMAL, NULL);
     int nshow = 0, failed = 0, pending = 0;
     long bytes = 0;
     for (int i = 0; i < dt_net_count; i++) {
@@ -682,16 +682,16 @@ int devtools_handle_click(int mx, int my)
   } /* not ours: blur */
 
   if (my < top + DT_HDR) { /* header buttons */
-    if (button_hit(left, top, DT_PICK_W, DT_HDR, mx, my)) {
+    if (button_hit(left, top, DT_PICK_W, DT_HDR, mx, my, NULL)) {
       devtools_pick_toggle();
       return 1; /* inspect-element toggle */
     }
-    if (button_hit(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, mx, my)) {
+    if (button_hit(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, mx, my, NULL)) {
       devtools_toggle();
       return 1;
     }
     for (int i = 0; i < N_TABS; i++)
-      if (button_hit(left + tab_x(i), top, tab_w(i), DT_HDR, mx, my)) {
+      if (button_hit(left + tab_x(i), top, tab_w(i), DT_HDR, mx, my, NULL)) {
         dt_tab = i;
         dt_input_focused = (i == TAB_CONSOLE); /* the Console tab focuses its REPL */
         dt_find_focused = false;
@@ -705,13 +705,13 @@ int devtools_handle_click(int mx, int my)
   if (dt_tab == TAB_CONSOLE && my >= BH - DT_INPUT_H) { /* REPL input + filter/clear toolbar */
     int iy = BH - DT_INPUT_H;
     int ftx = BW - 2 * DT_FBTN_W, fbx = BW - DT_FBTN_W;
-    if (button_hit(ftx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, mx, my)) {
+    if (button_hit(ftx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, mx, my, NULL)) {
       dt_con_filter = (dt_con_filter + 1) % 3;
       dt_con_follow = true;
       B->seq++;
       return 1;
     }
-    if (button_hit(fbx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, mx, my)) {
+    if (button_hit(fbx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, mx, my, NULL)) {
       dt_con_clear();
       B->seq++;
       return 1;
@@ -759,7 +759,7 @@ int devtools_handle_click(int mx, int my)
 
   if (dt_tab == TAB_NETWORK && my >= BH - DT_NETBAR_H) { /* summary / type-filter bar */
     int by = BH - DT_NETBAR_H, fbw = 56;
-    if (button_hit(left + 2, by + 1, fbw, DT_NETBAR_H - 2, mx, my)) {
+    if (button_hit(left + 2, by + 1, fbw, DT_NETBAR_H - 2, mx, my, NULL)) {
       dt_net_filter = (dt_net_filter + 1) % NF_N; /* cycle the resource-type filter */
       dt_scroll[TAB_NETWORK] = 0;
       if (dt_net_sel >= 0) { /* close the detail if it's now hidden */
@@ -774,7 +774,7 @@ int devtools_handle_click(int mx, int my)
   }
 
   if (dt_tab == TAB_NETWORK && dt_net_sel >= 0 && my >= net_detail_top()) { /* request detail */
-    if (button_hit(BW - DT_CLOSE_W, net_detail_top(), DT_CLOSE_W, DT_HDR, mx, my)) {
+    if (button_hit(BW - DT_CLOSE_W, net_detail_top(), DT_CLOSE_W, DT_HDR, mx, my, NULL)) {
       dt_net_sel = -1;
       B->seq++; /* × closes the detail and restores the list height */
     }
@@ -786,15 +786,15 @@ int devtools_handle_click(int mx, int my)
   int total = active_lines();
   mutex_unlock(&dt_lk);
 
-  int part = scrollbar_hit(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, mx, my);
+  int part = scrollbar_hit(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, mx, my, NULL);
   if (part != SCROLLBAR_NONE) { /* scrollbar (reused widget) */
     if (part == SCROLLBAR_UP)
       dt_scroll[dt_tab] -= 1;
     else if (part == SCROLLBAR_DOWN)
       dt_scroll[dt_tab] += 1;
     else
-      dt_scroll[dt_tab] =
-          scrollbar_pos(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, mx, my, dt_scroll[dt_tab], total, rows);
+      dt_scroll[dt_tab] = scrollbar_pos(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, mx, my, dt_scroll[dt_tab],
+                                        total, rows, NULL);
     dt_scroll[dt_tab] = clamp_scroll(dt_scroll[dt_tab], total, rows);
     if (dt_tab == TAB_CONSOLE)
       dt_con_follow = (dt_scroll[dt_tab] >= total - rows);

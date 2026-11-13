@@ -18,9 +18,7 @@
 
 /* Same palette as Settings and Files, so the system apps read as one family */
 #define BG_PANEL 0x12161eu
-#define BG_SIDE 0x0e1218u
 #define BG_HEADER 0x161d28u
-#define BG_DIVIDER 0x05070au
 #define BG_SEL 0x24405cu
 #define LINE_RULE 0x232c3au
 #define FG_TITLE 0x8aa0b8u
@@ -169,7 +167,7 @@ static void render(void)
   int sbw = sidebar_w();
   gfx_clear(BG_PANEL);
 
-  sidebar_draw(&sb, 0, 0, sbw, H, BG_SIDE, BG_DIVIDER);
+  sidebar_draw(&sb, 0, 0, sbw, H, NULL);
   gfx_fill_rect(0, 0, sbw, HEADER_H, BG_HEADER);
   gfx_ui_text_clip(8, (HEADER_H - UIFONT_H) / 2, "Device Hub", FG_TITLE, sbw - 16);
   for (int i = 0; i < nvisible; i++) {
@@ -280,7 +278,7 @@ int main(void)
   gfx_init(win_fb(), W, H);
   win_resizable(id, 1);
   sidebar_init(&sb, SIDEBAR_W, SIDEBAR_MIN, SIDEBAR_MAX);
-  scrollview_init(&sv, LINE_H);
+  scrollview_init(&sv, LINE_H, NULL);
 
   refresh_visible();
   show(id, nvisible ? visible[0] : 0);

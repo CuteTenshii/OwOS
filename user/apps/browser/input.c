@@ -394,12 +394,12 @@ int field_key(struct textfield *tf, char c, int mods)
 void field_menu_draw(void)
 {
   if (field_ctx.open)
-    menu_popup_draw(&field_ctx, ctx_x, ctx_y);
+    menu_popup_draw(&field_ctx, ctx_x, ctx_y, NULL);
 }
 
 static bool field_menu_click(int mx, int my)
 {
-  int item = menu_popup_click(&field_ctx, mx, my, ctx_x, ctx_y);
+  int item = menu_popup_click(&field_ctx, mx, my, ctx_x, ctx_y, NULL);
   field_ctx.open = 0;
   B->seq++;
   switch (item) {
@@ -457,7 +457,7 @@ void handle_rclick(int mx, int my)
   }
   int a, b;
   if (!textfield_selection(tf, &a, &b))
-    textfield_click(tf, mx, my, fx, fy, fw, fh);
+    textfield_click(tf, mx, my, fx, fy, fw, fh, NULL);
   char mime[8];
   void *data;
   int len, has_sel = textfield_selection(tf, &a, &b);
@@ -474,7 +474,7 @@ void handle_rclick(int mx, int my)
 
 void drag_field(struct textfield *tf, int mx, int my, int x, int y, int w, int h)
 {
-  if (textfield_click(tf, mx, my, x, y, w, h)) {
+  if (textfield_click(tf, mx, my, x, y, w, h, NULL)) {
     drag_tf = tf;
     drag_x = x;
     drag_w = w;
@@ -503,7 +503,7 @@ void handle_click(int mx, int my)
     bookmarks_menu_sync();
     struct menu *leaf;
     int item;
-    if (menubar_click(&menubar, mx, my, &leaf, &item)) {
+    if (menubar_click(&menubar, mx, my, &leaf, &item, NULL, NULL)) {
       if (item >= 0)
         menu_action(leaf, item);
       B->seq++;
@@ -516,7 +516,7 @@ void handle_click(int mx, int my)
   if (my >= MENU_H && my < MENU_H + TAB_H) { /* tab strip */
     blur_content_control();
     int idx = 0;
-    switch (tabbar_hit(&tab_strip, 0, MENU_H, BW, n_tabs, mx, my, &idx)) {
+    switch (tabbar_hit(&tab_strip, 0, MENU_H, BW, n_tabs, mx, my, &idx, NULL)) {
     case TABBAR_SELECT:
       select_tab(idx);
       break;
@@ -535,16 +535,16 @@ void handle_click(int mx, int my)
     struct rect rb, rf, rrl, rtf, rst;
     addr_layout(&rb, &rf, &rrl, &rtf, &rst);
     struct tab *at = tabs[active_tab];
-    if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
+    if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my, NULL)) {
       go_back();
-    } else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my)) {
+    } else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my, NULL)) {
       go_fwd();
-    } else if (button_hit(rrl.x, rrl.y, rrl.w, rrl.h, mx, my)) {
+    } else if (button_hit(rrl.x, rrl.y, rrl.w, rrl.h, mx, my, NULL)) {
       if (is_loading())
         do_stop();
       else
         do_reload();
-    } else if (B->pg->cur_url[0] && button_hit(rst.x, rst.y, rst.w, rst.h, mx, my)) {
+    } else if (B->pg->cur_url[0] && button_hit(rst.x, rst.y, rst.w, rst.h, mx, my, NULL)) {
       toggle_current_bookmark();
     } else {
       drag_field(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
@@ -558,7 +558,7 @@ void handle_click(int mx, int my)
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   int right = devtools_visible() ? devtools_left() : BW;
-  int sbpart = scrollbar_hit_ex(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, &B->pg->sb_st);
+  int sbpart = scrollbar_hit(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, &B->pg->sb_st);
   if (sbpart != SCROLLBAR_NONE) { /* scrollbar */
     int target;
     if (sbpart == SCROLLBAR_UP)
@@ -566,15 +566,15 @@ void handle_click(int mx, int my)
     else if (sbpart == SCROLLBAR_DOWN)
       target = B->pg->scroll + 3 * LINE_H;
     else
-      target = scrollbar_pos_ex(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh,
-                                &B->pg->sb_st);
+      target = scrollbar_pos(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh,
+                             &B->pg->sb_st);
     scroll_set(target);
     return;
   }
   if (my >= py && my < py + phh) { /* content pane click */
     /* Crashed tab: the only thing in the pane is the Reload button. */
     if (tabs[active_tab]->crashed) {
-      if (button_hit(crash_reload_rect.x, crash_reload_rect.y, crash_reload_rect.w, crash_reload_rect.h, mx, my))
+      if (button_hit(crash_reload_rect.x, crash_reload_rect.y, crash_reload_rect.w, crash_reload_rect.h, mx, my, NULL))
         do_reload();
       return;
     }
@@ -729,7 +729,7 @@ void handle_move(int mx, int my) { pointer_moved(mx, my, 0); }
 void handle_drag(int mx, int my)
 {
   if (drag_tf) {
-    textfield_drag(drag_tf, mx, drag_x, drag_w);
+    textfield_drag(drag_tf, mx, drag_x, drag_w, NULL);
     B->seq++;
     return;
   }

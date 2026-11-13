@@ -3,6 +3,12 @@
 
 static int overflows(const struct scrollview *sv) { return sv->content_h > sv->h; }
 
+static int bar_w(const struct scrollview *sv)
+{
+  const struct gfx_style *st = gfx_style_of(GFX_W_SCROLLBAR, sv->bar);
+  return st->width > 0 ? gfx_style_outer_w(st, st->width) : GUI_SCROLL_W;
+}
+
 static int max_scroll(const struct scrollview *sv) { return overflows(sv) ? sv->content_h - sv->h : 0; }
 
 static int set_scroll(struct scrollview *sv, int pos)
@@ -14,10 +20,11 @@ static int set_scroll(struct scrollview *sv, int pos)
   return changed;
 }
 
-void scrollview_init(struct scrollview *sv, int step)
+void scrollview_init(struct scrollview *sv, int step, const struct gfx_style *bar)
 {
   *sv = (struct scrollview){0};
   sv->step = step > 0 ? step : SCROLLVIEW_STEP;
+  sv->bar = bar;
 }
 
 int scrollview_begin(struct scrollview *sv, int x, int y, int w, int h, int content_h)
@@ -44,12 +51,12 @@ void scrollview_end(struct scrollview *sv)
 {
   gfx_set_clip(sv->saved_clip[0], sv->saved_clip[1], sv->saved_clip[2], sv->saved_clip[3]);
   if (overflows(sv))
-    scrollbar_draw(sv->x + sv->w - GUI_SCROLL_W, sv->y, GUI_SCROLL_W, sv->h, sv->scroll, sv->content_h, sv->h);
+    scrollbar_draw(sv->x + sv->w - bar_w(sv), sv->y, bar_w(sv), sv->h, sv->scroll, sv->content_h, sv->h, sv->bar);
 }
 
 int scrollview_content_x(const struct scrollview *sv) { return sv->x; }
 
-int scrollview_content_w(const struct scrollview *sv) { return overflows(sv) ? sv->w - GUI_SCROLL_W : sv->w; }
+int scrollview_content_w(const struct scrollview *sv) { return overflows(sv) ? sv->w - bar_w(sv) : sv->w; }
 
 int scrollview_wheel(struct scrollview *sv, int dz) { return set_scroll(sv, sv->scroll - dz * sv->step); }
 
@@ -77,8 +84,8 @@ int scrollview_press(struct scrollview *sv, int mx, int my)
   sv->dragging = 0;
   if (!overflows(sv))
     return 0;
-  int bx = sv->x + sv->w - GUI_SCROLL_W;
-  switch (scrollbar_hit(bx, sv->y, GUI_SCROLL_W, sv->h, mx, my)) {
+  int bw = bar_w(sv), bx = sv->x + sv->w - bw;
+  switch (scrollbar_hit(bx, sv->y, bw, sv->h, mx, my, sv->bar)) {
   case SCROLLBAR_UP:
     set_scroll(sv, sv->scroll - sv->step);
     return 1;
@@ -87,7 +94,7 @@ int scrollview_press(struct scrollview *sv, int mx, int my)
     return 1;
   case SCROLLBAR_TRACK:
     sv->dragging = 1;
-    set_scroll(sv, scrollbar_pos(bx, sv->y, GUI_SCROLL_W, sv->h, mx, my, sv->scroll, sv->content_h, sv->h));
+    set_scroll(sv, scrollbar_pos(bx, sv->y, bw, sv->h, mx, my, sv->scroll, sv->content_h, sv->h, sv->bar));
     return 1;
   }
   return 0;
@@ -97,9 +104,10 @@ int scrollview_drag(struct scrollview *sv, int mx, int my)
 {
   if (!sv->dragging)
     return 0;
-  int bx = sv->x + sv->w - GUI_SCROLL_W;
-  /* Keep following the pointer when it strays sideways off the bar */
-  return set_scroll(sv, scrollbar_pos(bx, sv->y, GUI_SCROLL_W, sv->h, bx, my, sv->scroll, sv->content_h, sv->h));
+  int bw = bar_w(sv), bx = sv->x + sv->w - bw;
+  /* Keep following the pointer when it strays sideways off the bar: test at the bar's middle */
+  return set_scroll(sv,
+                    scrollbar_pos(bx, sv->y, bw, sv->h, bx + bw / 2, my, sv->scroll, sv->content_h, sv->h, sv->bar));
 }
 
 int scrollview_reveal(struct scrollview *sv, int y, int h)

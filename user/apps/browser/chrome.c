@@ -69,7 +69,7 @@ void reload_btn_draw(const struct rect *r)
 {
   int d = 12;
   int x0 = r->x + (r->w - d) / 2, y0 = r->y + (r->h - d) / 2;
-  button_draw(r->x, r->y, r->w, r->h, "", BTN_NORMAL);
+  button_draw(r->x, r->y, r->w, r->h, "", BTN_NORMAL, NULL);
   if (is_loading())
     icon_stop(x0, y0, d, 0xe06a5a);
   else
@@ -100,7 +100,7 @@ void star_btn_draw(const struct rect *r)
   bool has_url = B->pg->cur_url[0] != '\0';
   bool marked = has_url && bookmark_find(B->pg->cur_url) != 0;
   int d = 13, x0 = r->x + (r->w - d) / 2, y0 = r->y + (r->h - d) / 2;
-  button_draw(r->x, r->y, r->w, r->h, "", has_url ? BTN_NORMAL : BTN_DISABLED);
+  button_draw(r->x, r->y, r->w, r->h, "", has_url ? BTN_NORMAL : BTN_DISABLED, NULL);
   if (marked)
     icon_bookmark(x0, y0, d, 0xf2c14e, 1); /* filled gold  */
   else
@@ -297,10 +297,10 @@ void bookmarks_panel_render(void)
   gfx_fill_rect(panel.x, panel.y, panel.w, panel.h, 0x1b2129);
   gfx_fill_rect(0, top, BM_PANEL_W, 24, 0x232c38); /* header */
   gfx_ui_text(8, top + 3, "Bookmarks", 0xe8eaee);
-  button_draw(nf.x, nf.y, nf.w, nf.h, "New Folder", BTN_NORMAL);
-  button_draw(del.x, del.y, del.w, del.h, "Delete", bm_selected ? BTN_NORMAL : BTN_DISABLED);
+  button_draw(nf.x, nf.y, nf.w, nf.h, "New Folder", BTN_NORMAL, NULL);
+  button_draw(del.x, del.y, del.w, del.h, "Delete", bm_selected ? BTN_NORMAL : BTN_DISABLED, NULL);
   if (bm_naming)
-    textfield_draw(&bm_name_tf, name.x, name.y, name.w, name.h, 1);
+    textfield_draw(&bm_name_tf, name.x, name.y, name.w, name.h, 1, NULL);
 
   bm_flatten();
   int cap = (bottom - list_y) / BM_ROW_H;
@@ -351,11 +351,11 @@ bool bm_panel_click(int mx, int my)
     return false;
   if (bm_naming)
     return true; /* naming: keys, not clicks */
-  if (button_hit(nf.x, nf.y, nf.w, nf.h, mx, my)) {
+  if (button_hit(nf.x, nf.y, nf.w, nf.h, mx, my, NULL)) {
     begin_new_folder(bm_target_folder());
     return true;
   }
-  if (bm_selected && button_hit(del.x, del.y, del.w, del.h, mx, my)) {
+  if (bm_selected && button_hit(del.x, del.y, del.w, del.h, mx, my, NULL)) {
     bm_delete(bm_selected);
     bm_selected = 0;
     B->seq++;

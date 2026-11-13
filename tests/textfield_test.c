@@ -1,40 +1,22 @@
 /* Host test for the single-line text field (user/lib/gfx/textfield.c) with the gfx primitives stubbed. */
 #define OWOS_SUITE_TEST
 #include "gfx.h"
+#include "gfx_host.h"
 #include "owos.h"
 #include "test.h"
 #include <string.h>
 
-#define CW 8
+#define CW GFX_HOST_CW
 
 static int highlighted;
-int gfx_ui_cw(unsigned char c)
-{
-  (void)c;
-  return CW;
-}
-void gfx_fill_rect(int x, int y, int w, int h, unsigned color)
+
+static void count_highlight(int x, int y, int w, int h, unsigned color)
 {
   (void)x;
   (void)y;
   (void)h;
   if (w == CW && color == 0x2f6bd8u)
     highlighted++;
-}
-void gfx_rect(int x, int y, int w, int h, unsigned color)
-{
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)h;
-  (void)color;
-}
-void gfx_ui_text(int x, int y, const char *s, unsigned fg)
-{
-  (void)x;
-  (void)y;
-  (void)s;
-  (void)fg;
 }
 
 static char buf[16];
@@ -123,17 +105,17 @@ static void check_full_buffer(void)
 static void check_mouse(void)
 {
   fresh("hello");
-  expect(textfield_click(&tf, 4 + 2 * CW + 1, 5, 0, 0, 100, 20));
+  expect(textfield_click(&tf, 4 + 2 * CW + 1, 5, 0, 0, 100, 20, NULL));
   expect_eq(tf.caret, 2);
   expect_eq(tf.anchor, 2);
-  textfield_drag(&tf, 4 + 4 * CW + 1, 0, 100);
+  textfield_drag(&tf, 4 + 4 * CW + 1, 0, 100, NULL);
   expect_eq(tf.caret, 4);
   expect_eq(tf.anchor, 2);
-  textfield_drag(&tf, 500, 0, 100);
+  textfield_drag(&tf, 500, 0, 100, NULL);
   expect_eq(tf.caret, 5);
-  textfield_drag(&tf, -5, 0, 100);
+  textfield_drag(&tf, -5, 0, 100, NULL);
   expect_eq(tf.caret, 0);
-  expect(!textfield_click(&tf, 200, 5, 0, 0, 100, 20));
+  expect(!textfield_click(&tf, 200, 5, 0, 0, 100, 20, NULL));
 }
 
 static void check_draw_highlight(void)
@@ -142,7 +124,9 @@ static void check_draw_highlight(void)
   tf.anchor = 1;
   tf.caret = 4;
   highlighted = 0;
-  textfield_draw(&tf, 0, 0, 100, 20, 1);
+  gfx_host_reset();
+  gfx_host_fill = count_highlight;
+  textfield_draw(&tf, 0, 0, 100, 20, 1, NULL);
   expect_eq(highlighted, 3);
 }
 
@@ -225,6 +209,21 @@ static void check_insert(void)
   expect_string(buf, "0123456789abcdx");
 }
 
+static void check_styled_click(void)
+{
+  struct gfx_style st = *gfx_theme(GFX_W_TEXTFIELD);
+  st.border = 2;
+  gfx_sides(st.padding, 0, 10, 0, 10);
+  gfx_sides(st.margin, 0, 0, 0, 5);
+  fresh("hello");
+  /* Text starts at margin 5 + border 2 + padding 10 */
+  expect(textfield_click(&tf, 17 + 3 * CW + 1, 5, 0, 0, 100, 20, &st));
+  expect_eq(tf.caret, 3);
+  expect(!textfield_click(&tf, 4, 5, 0, 0, 100, 20, &st)); /* inside the margin */
+  expect(textfield_click(&tf, 5, 5, 0, 0, 100, 20, &st));
+  expect_eq(tf.caret, 0);
+}
+
 int main(void)
 {
   test("ctrl+a selects everything", check_select_all);
@@ -234,6 +233,7 @@ int main(void)
   test("ctrl+letter is not inserted", check_ctrl_letters_not_inserted);
   test("full buffer", check_full_buffer);
   test("click and drag", check_mouse);
+  test("click inside margin, border and padding", check_styled_click);
   test("selection is highlighted", check_draw_highlight);
   test("insert replaces the selection and filters", check_insert);
   test("undo and redo", check_undo_redo);
