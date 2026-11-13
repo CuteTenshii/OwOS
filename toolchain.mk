@@ -32,8 +32,11 @@ UCC      := $(UCROSS)gcc
 ULD      := $(UCROSS)ld
 UOBJCOPY := $(UCROSS)objcopy
 
-# grub-mkrescue builds the bootable ISO (make iso).
+# grub-mkrescue builds the bootable ISO (make iso); grub-mkimage the boot images the Installer writes to a disk,
+# from the platform directories under GRUB_DIR.
 GRUB_MKRESCUE ?= grub-mkrescue
+GRUB_MKIMAGE ?= grub-mkimage
+GRUB_DIR ?= /usr/lib/grub
 
 # Per-arch knobs. KELF/KBFD are objcopy's output ELF format and BFD architecture
 # for wrapping a user blob (or font) into a KERNEL object. LINKER is the kernel

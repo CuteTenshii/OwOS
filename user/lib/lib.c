@@ -430,6 +430,9 @@ int volumes(int idx, struct volinfo *out) { return syscall(SYS_VOLUMES, idx, (in
 int umount(const char *point) { return syscall(SYS_UMOUNT, (int)point, 0, 0); }
 
 int mount(const char *dev, const char *point) { return syscall(SYS_MOUNT, (int)dev, (int)point, 0); }
+int install_disk(int index, struct install_disk *out) { return syscall(SYS_INSTALL, INSTALL_LIST, index, (int)out); }
+int install_start(const char *dev) { return syscall(SYS_INSTALL, INSTALL_START, (int)dev, 0); }
+int install_step(struct install_progress *out) { return syscall(SYS_INSTALL, INSTALL_STEP, (int)out, 0); }
 
 int audio_open(void) { return syscall(SYS_AUDIO_OPEN, 0, 0, 0); }
 

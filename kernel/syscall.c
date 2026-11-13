@@ -297,6 +297,7 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_WIN_FULLSCREEN] = syscall_window_fullscreen,
     [SYS_SYMBOLIZE] = syscall_graphics_symbolize,
     [SYS_THREAD_NAME] = syscall_process_thread_name,
+    [SYS_INSTALL] = syscall_fs_install,
 };
 
 void syscall_dispatch(struct registers *r)

@@ -3,6 +3,7 @@
 #define OWOS_USER_H
 
 #include "ascii.h"
+#include "diskinstall.h"
 #include "syscall_nr.h"
 #include "timeval64.h"
 #include <stdarg.h>
@@ -499,6 +500,11 @@ int volumes(int idx, struct volinfo *out);
 
 /* Mount a present removable device `dev` at mount point `point` */
 int mount(const char *dev, const char *point);
+
+/* Installing OwOS onto a disk (the Installer app); root or sudo. See common/diskinstall.h. */
+int install_disk(int index, struct install_disk *out); /* 1 filled, 0 past the end, -1 on error */
+int install_start(const char *dev);                    /* 0, or the negative install_problem */
+int install_step(struct install_progress *out);        /* 0 running, 1 finished, -1 failed */
 
 /* Unmount/eject the removable volume at /media (write-through, so always safe) */
 int umount(const char *point);

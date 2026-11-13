@@ -88,11 +88,30 @@ ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver acc
               battery-low battery-medium battery-full battery-charging \
               network-ethernet network-ethernet-disconnected
 
+# GRUB images the Installer writes to a disk, built when the host has GRUB for every platform. They carry
+# every module they need, since the disk gets no module directory, and find their ESP by a marker file
+# the live ISO lacks.
+GRUB_PLATFORMS := i386-pc i386-efi x86_64-efi
+HAVE_GRUB := $(if $(shell command -v $(GRUB_MKIMAGE) 2>/dev/null),$(if $(strip $(foreach p,$(GRUB_PLATFORMS),$(if $(wildcard $(GRUB_DIR)/$(p)/kernel.img),,missing))),,y))
+GRUB_MODULES := part_gpt fat search search_fs_file configfile normal multiboot2 all_video
+GRUB_IMAGES := build/grub/core.img build/grub/bootia32.efi build/grub/bootx64.efi
+build/grub/early.cfg:
+	@mkdir -p $(@D)
+	printf 'search --no-floppy --set=root --file /boot/grub/owos.id\nset prefix=($$root)/boot/grub\n' > $@
+build/grub/core.img: build/grub/early.cfg
+	$(GRUB_MKIMAGE) -d $(GRUB_DIR)/i386-pc -O i386-pc -c $< -p /boot/grub -o $@ biosdisk $(GRUB_MODULES)
+build/grub/bootia32.efi: build/grub/early.cfg
+	$(GRUB_MKIMAGE) -d $(GRUB_DIR)/i386-efi -O i386-efi -c $< -p /boot/grub -o $@ efi_gop $(GRUB_MODULES)
+build/grub/bootx64.efi: build/grub/early.cfg
+	$(GRUB_MKIMAGE) -d $(GRUB_DIR)/x86_64-efi -O x86_64-efi -c $< -p /boot/grub -o $@ efi_gop $(GRUB_MODULES)
+
 # Everything the kernel embeds and installs at boot (kernel/install.c), as mode:disk-path:source.
 PAYLOAD := $(foreach a,$(APPS),0755:/bin/$(or $(INSTALL_NAME_$(a)),$(a)):user/apps/$(a)/$(a).elf) \
            $(foreach a,$(DESKTOP_APPS),0644:/usr/share/applications/$(a).desktop:user/apps/$(a)/$(a).desktop) \
            $(foreach i,$(ICON_NAMES),0644:/usr/share/icons/$(i).png:icons/$(i).png) \
-           $(foreach f,$(FONT_FILES),0644:/etc/fonts/$(notdir $(f)):$(f))
+           $(foreach f,$(FONT_FILES),0644:/etc/fonts/$(notdir $(f)):$(f)) \
+           $(if $(HAVE_GRUB),0644:/usr/lib/grub/boot.img:$(GRUB_DIR)/i386-pc/boot.img \
+             $(foreach i,$(GRUB_IMAGES),0644:/usr/lib/grub/$(notdir $(i)):$(i)))
 PAYLOAD_SRCS := $(foreach e,$(PAYLOAD),$(word 3,$(subst :, ,$(e))))
 
 # The list is rewritten only when it changes, so dropping an entry still regenerates payload.c.

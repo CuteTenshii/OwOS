@@ -21,6 +21,14 @@ uint32_t install_payload_bytes(void)
   return total;
 }
 
+const struct payload_file *install_payload_find(const char *path)
+{
+  for (unsigned i = 0; i < payload_count; i++)
+    if (streq(payload[i].path, path))
+      return &payload[i];
+  return 0;
+}
+
 /* The whole file in a fresh buffer, its length in *len; NULL if absent or unreadable. */
 static uint8_t *read_file(const char *path, uint32_t *len)
 {
@@ -63,13 +71,7 @@ static int write_file(const char *path, const void *data, uint32_t len, uint32_t
   return 0;
 }
 
-static bool in_payload(const char *path)
-{
-  for (unsigned i = 0; i < payload_count; i++)
-    if (streq(payload[i].path, path))
-      return true;
-  return false;
-}
+static bool in_payload(const char *path) { return install_payload_find(path) != 0; }
 
 static void record(uint8_t *db, uint32_t cap, uint32_t *len, const struct pkg_rec *r)
 {

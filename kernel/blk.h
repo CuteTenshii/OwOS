@@ -22,7 +22,8 @@ struct blk_devinfo {
   const char *dev; /* /dev name: "cd0"/"usb0"/"ide0"/"sata0"/"nvme0"/"sd0"/"scsi0"/"ufs0" */
   const char *kind;
   const char *model;
-  int iso; /* reads 2048-byte ATAPI sectors (a CD/DVD)          */
+  int iso;          /* reads 2048-byte ATAPI sectors (a CD/DVD)          */
+  uint32_t sectors; /* capacity in 512-byte sectors (0 for a CD)   */
 };
 
 /* Enumerate present removable devices without mounting any. Fills out[0..max), returns the count. */

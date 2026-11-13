@@ -962,6 +962,27 @@ void fs_format(void)
   mounted = true;
 }
 
+int fs_format_at(blk_write_fn write, uint32_t base, uint32_t sectors)
+{
+  uint32_t clus = (sectors + FS_MAX_CLUSTERS - 1) / FS_MAX_CLUSTERS;
+  if (clus == 0)
+    clus = 1;
+  uint32_t dir_sectors = (DIR_INIT_ENTRIES * (uint32_t)sizeof(struct owofs_dirent) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+  uint32_t dir_start = (RESERVED_SECTORS + clus - 1) / clus * clus; /* where fs_format's alloc_run puts it */
+  if (dir_start + dir_sectors > sectors)
+    return -1;
+  static const uint8_t zero[SECTOR_SIZE];
+  for (uint32_t i = 0; i < dir_sectors; i++)
+    if (write(base + dir_start + i, zero) != 0)
+      return -1;
+  struct super s;
+  memset(&s, 0, sizeof s);
+  s.magic = FS_MAGIC;
+  s.dir_start = dir_start;
+  s.dir_sectors = dir_sectors;
+  return write(base + SUPER_LBA, &s);
+}
+
 /* Convert a v8 disk: write a v9 directory to a fresh extent, then flip the superblock; the old extent is
  * only released once the new superblock is on disk, so a failure leaves the v8 disk untouched. */
 static int migrate_v8(void)

@@ -18,6 +18,9 @@ extern const unsigned payload_count;
 /* Total size of the payload's files in bytes. */
 uint32_t install_payload_bytes(void);
 
+/* The payload file installed at `path`, or NULL. */
+const struct payload_file *install_payload_find(const char *path);
+
 /* Bring the disk in line with the payload, as recorded in the /var/lib/installed manifest (pkgdb.h): write files
  * that are missing, stale or older than this kernel, keep newer updates, and delete files a previous kernel
  * installed that this one no longer ships. Writes nothing when the disk already matches. */

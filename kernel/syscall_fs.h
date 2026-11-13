@@ -21,6 +21,7 @@ void syscall_fs_rtc_epoch(struct registers *r);
 void syscall_fs_readdir(struct registers *r);
 void syscall_fs_volumes(struct registers *r);
 void syscall_fs_mount(struct registers *r);
+void syscall_fs_install(struct registers *r);
 void syscall_fs_umount(struct registers *r);
 void syscall_fs_stat(struct registers *r);
 void syscall_fs_statfs(struct registers *r);

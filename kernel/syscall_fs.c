@@ -4,6 +4,7 @@
 #include "fsmount.h"
 #include "idt.h"
 #include "kstring.h"
+#include "osinstall.h"
 #include "perm.h"
 #include "procfs.h"
 #include "rtc.h"
@@ -450,4 +451,35 @@ void syscall_fs_uname(struct registers *r)
   strlcpy(out->machine, "i386", sizeof out->machine);
 #endif
   r->eax = 0;
+}
+
+/* Installing erases a whole disk, so it takes the same rights as mounting one. */
+void syscall_fs_install(struct registers *r)
+{
+  if (!may_mount()) {
+    r->eax = r->ebx == INSTALL_START ? (uint32_t)-INSTALL_DENIED : (uint32_t)-1;
+    return;
+  }
+  switch (r->ebx) {
+  case INSTALL_LIST: {
+    struct install_disk d;
+    int got = osinstall_disk((int)r->ecx, &d);
+    r->eax =
+        got && (!user_out_range(r->edx, sizeof d) || copyout(r->edx, &d, sizeof d) != 0) ? (uint32_t)-1 : (uint32_t)got;
+    return;
+  }
+  case INSTALL_START: {
+    char dev[16];
+    r->eax = copyin_str(r->ecx, dev, sizeof dev) != 0 ? (uint32_t)-INSTALL_NO_DEVICE : (uint32_t)-osinstall_start(dev);
+    return;
+  }
+  case INSTALL_STEP: {
+    struct install_progress p;
+    int rc = osinstall_step(&p);
+    r->eax = !user_out_range(r->ecx, sizeof p) || copyout(r->ecx, &p, sizeof p) != 0 ? (uint32_t)-1 : (uint32_t)rc;
+    return;
+  }
+  default:
+    r->eax = (uint32_t)-1;
+  }
 }

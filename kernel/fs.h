@@ -18,12 +18,17 @@
 #ifndef OWOS_FS_H
 #define OWOS_FS_H
 
+#include "fsmount.h"
 #include <stdint.h>
 
 /* Mount owofs from the backing disk, or run live from a RAM disk when it has none; live_sectors is the least the
  * live system's files need. */
 void fs_init(uint32_t live_sectors);
 void fs_format(void);
+/* Write an empty owofs into the `sectors`-sector partition at `base` of another disk, the way fs_format lays out the
+ * mounted one; the superblock goes last, so an interrupted format leaves no owofs. 0, or -1 on a write error or a
+ * partition too small. */
+int fs_format_at(blk_write_fn write, uint32_t base, uint32_t sectors);
 
 /* owofs is now hierarchical: the 64 directory slots form a tree via a parent
  * pointer in each entry, with an implicit root ("/"). Paths may be absolute

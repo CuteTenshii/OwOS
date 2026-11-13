@@ -167,17 +167,18 @@ struct cand {
   int iso; /* reads 2048-byte ATAPI sectors             */
   blk_read_fn r;
   blk_write_fn w;
+  uint32_t (*sectors)(void);
 };
 
 static const struct cand cands[] = {
-    {"cd0", "CD", atapi_present, atapi_model, BK_NONE, 1, atapi_read_sector, 0},
-    {"usb0", "USB", xhci_msc_present, xhci_msc_model, BK_NONE, 0, xhci_msc_read, xhci_msc_write},
-    {"ide0", "IDE", ata_present, ata_model, BK_IDE, 0, ata_read_sector, ata_write_sector},
-    {"sata0", "SATA", ahci_present, ahci_model, BK_AHCI, 0, ahci_read_sector, ahci_write_sector},
-    {"nvme0", "NVMe", nvme_present, nvme_model, BK_NVME, 0, nvme_read_sector, nvme_write_sector},
-    {"sd0", "SD", sd_present, sd_model, BK_SD, 0, sd_read_sector, sd_write_sector},
-    {"scsi0", "SCSI", scsi_present, scsi_model, BK_NONE, 0, scsi_read_sector, scsi_write_sector},
-    {"ufs0", "UFS", ufs_present, ufs_model, BK_NONE, 0, ufs_read_sector, ufs_write_sector},
+    {"cd0", "CD", atapi_present, atapi_model, BK_NONE, 1, atapi_read_sector, 0, 0},
+    {"usb0", "USB", xhci_msc_present, xhci_msc_model, BK_NONE, 0, xhci_msc_read, xhci_msc_write, xhci_msc_sectors},
+    {"ide0", "IDE", ata_present, ata_model, BK_IDE, 0, ata_read_sector, ata_write_sector, ata_sectors},
+    {"sata0", "SATA", ahci_present, ahci_model, BK_AHCI, 0, ahci_read_sector, ahci_write_sector, ahci_sectors},
+    {"nvme0", "NVMe", nvme_present, nvme_model, BK_NVME, 0, nvme_read_sector, nvme_write_sector, nvme_sectors},
+    {"sd0", "SD", sd_present, sd_model, BK_SD, 0, sd_read_sector, sd_write_sector, sd_sectors},
+    {"scsi0", "SCSI", scsi_present, scsi_model, BK_NONE, 0, scsi_read_sector, scsi_write_sector, scsi_sectors},
+    {"ufs0", "UFS", ufs_present, ufs_model, BK_NONE, 0, ufs_read_sector, ufs_write_sector, ufs_sectors},
 };
 #define NCAND (int)(sizeof(cands) / sizeof(cands[0]))
 
@@ -195,6 +196,7 @@ int blk_dev_list(struct blk_devinfo *out, int max)
     out[n].kind = cands[i].kind;
     out[n].model = cands[i].model();
     out[n].iso = cands[i].iso;
+    out[n].sectors = cands[i].sectors ? cands[i].sectors() : 0;
     n++;
   }
   return n;
