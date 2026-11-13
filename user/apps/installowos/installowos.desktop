@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Installer
+Name=Install OwOS
 GenericName=Install OwOS
 Comment=Install OwOS onto a disk
-Exec=installer
+Exec=installowos
 Icon=computer
 Terminal=false
 Categories=System;

@@ -84,7 +84,7 @@ IDE disk (`disk.img`, the owofs boot volume), a SATA disk on an AHCI controller,
 an NVMe SSD, a FAT-formatted USB stick on an xHCI controller, an SD card on an
 SDHCI controller, an ISO 9660 `cd.iso` in an ATAPI CD-ROM, a SLIRP user-mode NIC,
 and (for `run`) Sound Blaster 16 + a USB tablet. `disk.img` starts blank, so OwOS
-runs live from RAM until you install it there with the Installer app; from then on,
+runs live from RAM until you install it there with the Install OwOS app; from then on,
 files persist across reboots.
 
 > **Don't pass `-vga std`.** It leaves the card in a graphics mode where the
@@ -168,16 +168,16 @@ admin/I/O queues). `blk.c` picks **one** of them at boot to back **owofs**, a fl
 first disk (IDE → AHCI → NVMe) with an OwOS root partition in its GPT, else the
 first present disk, whose whole-disk owofs from an older install still mounts.
 Booting never formats a disk. Without owofs on one, OwOS runs live from a RAM disk,
-and only the Installer app writes a disk, after you confirm which one.
+and only the Install OwOS app writes a disk, after you confirm which one.
 
-The Installer lays a disk out as GPT with a 1 MiB BIOS boot partition (GRUB's core
+The Install OwOS app lays a disk out as GPT with a 1 MiB BIOS boot partition (GRUB's core
 image), a 128 MiB FAT32 EFI system partition (GRUB for UEFI, `grub.cfg` and the
 kernel) and an OwOS root partition over the rest, so an installed disk boots on both
 BIOS and UEFI. It copies the kernel image it is running from, which the ISO's GRUB
 loads a second time as a multiboot module; the installed kernel fills its empty root
 partition on first boot. The GRUB images are built with `grub-mkimage` when the host
 has GRUB for `i386-pc`, `i386-efi` and `x86_64-efi` (override `GRUB_DIR`); without
-them the build succeeds but the Installer has nothing to install.
+them the build succeeds but the Install OwOS app has nothing to install.
 
 Removable volumes mount read/write or read-only at **`/media`** via `mount` /
 `eject`:

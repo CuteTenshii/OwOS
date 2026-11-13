@@ -1,4 +1,4 @@
-/* installer.c: the Installer app. Pick a disk, confirm, and install OwOS onto it; kernel/osinstall.c does the
+/* installowos.c: the Install OwOS app. Pick a disk, confirm, and install OwOS onto it; kernel/osinstall.c does the
  * writing, one bounded step per call, so the window stays live and shows progress. */
 #include "dialog.h"
 #include "gfx.h"
@@ -15,7 +15,7 @@
 #define BTN_W 150
 #define BTN_Y (H - PAD - GUI_BTN_H)
 
-/* Settings' panel colours, so the Installer reads as part of the system. */
+/* Settings' panel colours, so Install OwOS reads as part of the system. */
 #define BG 0x12161eu
 #define FG_HEAD 0xffffffu
 #define FG_TEXT 0xc8d0dcu
@@ -167,10 +167,10 @@ static void draw_list(void)
   gfx_font_text(PAD, PAD, "Install OwOS", FG_HEAD, &head_font);
   draw_lines(58, "Choose the disk to install OwOS on.", "Everything on that disk will be erased.", FG_TEXT);
   if (denied) {
-    draw_lines(LIST_Y, problem_text(INSTALL_DENIED), "Start the Installer as root, or with sudo.", FG_TEXT);
+    draw_lines(LIST_Y, problem_text(INSTALL_DENIED), "Open Install OwOS as root, or with sudo.", FG_TEXT);
   } else if (no_image) {
     draw_lines(LIST_Y, problem_text(INSTALL_NO_IMAGE),
-               "Start OwOS from its USB stick or ISO, then open the Installer again.", FG_TEXT);
+               "Start OwOS from its USB stick or ISO, then open Install OwOS again.", FG_TEXT);
   } else if (ndisks == 0) {
     draw_lines(LIST_Y, "No disks found.", "Connect a disk, then choose Refresh.", FG_TEXT);
   }
@@ -346,9 +346,9 @@ static bool handle(const struct win_event *ev)
 
 int main(void)
 {
-  win = win_create(W, H, "Installer");
+  win = win_create(W, H, "Install OwOS");
   if (win < 0) {
-    puts("installer: no window\n");
+    puts("installowos: no window\n");
     return 1;
   }
   gfx_init(win_fb(), W, H);
