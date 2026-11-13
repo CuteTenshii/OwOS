@@ -4,6 +4,7 @@
 
 #include "file.h"
 #include "signal.h"
+#include "syscall_nr.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -92,6 +93,7 @@ struct sched_task_info {
   uint32_t runs;
   char state; /* R runnable, S waiting, Z zombie, E held by its spawner */
   char name[16];
+  char tname[THREAD_NAME_MAX];
 };
 
 /* Copy up to `max` tasks into `out` in run-queue order; returns how many were copied. */

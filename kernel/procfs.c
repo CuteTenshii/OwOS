@@ -122,7 +122,7 @@ static void gen_tasks(struct pb *b)
   pc(b, '\n');
 }
 
-/* One tab-separated line per task: tid pid ppid uid state runs name */
+/* Tab-separated so thread names may hold spaces: tid pid ppid uid state runs name thread-name */
 static void gen_ps(struct pb *b)
 {
   int cap = sched_count() + 16; /* slack for tasks spawned between the count and the snapshot */
@@ -141,6 +141,8 @@ static void gen_ps(struct pb *b)
     pu(b, ti[i].runs);
     pc(b, '\t');
     ps(b, ti[i].name);
+    pc(b, '\t');
+    ps(b, ti[i].tname);
     pc(b, '\n');
   }
   kfree(ti);

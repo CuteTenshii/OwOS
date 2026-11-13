@@ -1512,6 +1512,7 @@ int sched_snapshot(struct sched_task_info *out, int max)
       o->runs = t->runs;
       o->state = task_state_char(t->state);
       info_copy(o->name, sizeof o->name, t->name ? t->name : "task");
+      info_copy(o->tname, sizeof o->tname, t->tname);
     }
     t = t->next;
   } while (t != &main_task);
