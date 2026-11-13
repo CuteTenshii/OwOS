@@ -16,14 +16,20 @@ void select_init(struct select_box *s, const char *const *options, int count, in
   s->selected = (selected >= 0 && selected < count) ? selected : 0;
   s->open = 0;
   s->hover = -1;
+  s->focused = 0;
 }
 
 void select_draw(struct select_box *s, int x, int y, int w, int h)
 {
+  const char *lbl = (s->selected >= 0 && s->selected < s->count) ? s->options[s->selected] : "";
+  unsigned st = GFX_A11Y_HASPOPUP | (s->open ? GFX_A11Y_EXPANDED : 0) | (s->focused ? GFX_A11Y_FOCUSED : 0);
+  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_SELECT, 0, st, x, y, w, h), lbl);
+
+  if (s->focused)
+    gfx_focus_ring(x, y, w, h);
   gfx_fill_rect(x, y, w, h, SEL_BG);
   gfx_rect(x, y, w, h, s->open ? SEL_ACCENT : SEL_BORDER);
 
-  const char *lbl = (s->selected >= 0 && s->selected < s->count) ? s->options[s->selected] : "";
   gfx_ui_text(x + SEL_PAD, y + (h - UIFONT_H) / 2, lbl, SEL_FG);
 
   int tx = x + w - 16, ty = y + (h - 4) / 2;
@@ -35,7 +41,10 @@ void select_draw(struct select_box *s, int x, int y, int w, int h)
     gfx_fill_rect(x, ly, w, lh, SEL_BG);
     for (int i = 0; i < s->count; i++) {
       int ry = ly + i * GUI_ROW_H;
-      if (i == s->hover || (s->hover < 0 && i == s->selected))
+      int lit = i == s->hover || (s->hover < 0 && i == s->selected);
+      unsigned ost = (i == s->selected ? GFX_A11Y_SELECTED : 0) | (lit ? GFX_A11Y_HOVER : 0);
+      gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_OPTION, s->options[i], ost, x, ry, w, GUI_ROW_H), i + 1, 0, s->count);
+      if (lit)
         gfx_fill_rect(x + 1, ry, w - 2, GUI_ROW_H, SEL_HILITE);
       gfx_ui_text(x + SEL_PAD, ry + (GUI_ROW_H - UIFONT_H) / 2, s->options[i], SEL_FG);
     }

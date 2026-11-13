@@ -29,7 +29,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
   $(LIB)/js/value.c $(LIB)/js/interp.c $(LIB)/js/builtins.c $(LIB)/js/bigint.c $(LIB)/js/wasm_js.c \
   $(LIB)/wasm/wasm.c $(LIB)/wasm/wasm_run.c $(LIB)/wasm/wasm_simd.c $(LIB)/math/fmt.c \
   $(LIB)/gc/gc.c tests/host_math.c $(LIB)/opt.c $(LIB)/mutex.c
-MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(wildcard $(BROWSER)/features/svg/*.c) $(BROWSER)/imgdec.c $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/gfx/toggle.c $(LIB)/zlib/crc32.c kernel/crc32c.c kernel/pkgdb.c $(LIB)/stun/stun.c $(LIB)/xml/xml.c $(LIB)/xml/xmltree.c $(LIB)/upnp/upnp.c $(LIB)/ntp/ntp.c $(LIB)/plist/plist.c $(LIB)/uuid/uuid.c \
+MAIN_SRCS := $(COMMON_SRCS) $(LIB)/json/json.c $(wildcard $(BROWSER)/features/svg/*.c) $(BROWSER)/imgdec.c $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/gfx/toggle.c $(LIB)/gfx/a11y.c $(LIB)/zlib/crc32.c kernel/crc32c.c kernel/pkgdb.c $(LIB)/stun/stun.c $(LIB)/xml/xml.c $(LIB)/xml/xmltree.c $(LIB)/upnp/upnp.c $(LIB)/ntp/ntp.c $(LIB)/plist/plist.c $(LIB)/uuid/uuid.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(LIB)/media/tags.c $(LIB)/jpeg/jpeg.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c drivers/usb/hid_pad.c drivers/usb/uvc_desc.c drivers/usb/usb3.c drivers/video/dpaux.c drivers/video/edidparse.c drivers/video/blpwm.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(wildcard $(LIB)/pdf/*.c) \

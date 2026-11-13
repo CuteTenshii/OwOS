@@ -534,6 +534,7 @@ void status_set(struct status_bar *s, const char *msg)
 
 void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg, unsigned bg)
 {
+  gfx_a11y_add(GFX_ROLE_LABEL, s->msg, 0, x, y, w, GUI_BAR_H);
   gfx_fill_rect(x, y, w, GUI_BAR_H, bg);
   gfx_ui_text(x + 6, y + (GUI_BAR_H - UIFONT_H) / 2, s->msg, fg);
 }
@@ -564,6 +565,12 @@ static void menu_popup(const struct menu *m, int px, int py)
     unsigned char fl = m->flags ? m->flags[i] : 0;
     int dis = (fl & MENU_DISABLED) != 0;
     unsigned fg = dis ? MENU_DIM : MENU_FG;
+    const struct menu *sub = m->subs ? m->subs[i] : 0;
+    unsigned st = (dis ? GFX_A11Y_DISABLED : 0) | ((fl & MENU_CHECKED) ? GFX_A11Y_CHECKED : 0) |
+                  (sub ? GFX_A11Y_HASPOPUP : 0) | (sub && sub->open ? GFX_A11Y_EXPANDED : 0);
+    struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_MENUITEM, m->items[i], st, px, ry, GUI_MENU_W, GUI_ROW_H);
+    if (!sub && m->hints)
+      gfx_a11y_set_shortcut(a, m->hints[i]);
     if (fl & MENU_CHECKED)
       menu_check(px + 2, ry, dis ? MENU_DIM : 0x8fd98f);
     gfx_ui_text(px + 6 + gutter, ry, m->items[i], fg);
@@ -584,6 +591,7 @@ void menu_draw(const struct menu *m, int x, int y)
 {
   unsigned bg = m->open ? 0x3a4a60 : 0x232a36;
   int tw = gfx_ui_width(m->title) + 6;
+  gfx_a11y_add(GFX_ROLE_MENU, m->title, GFX_A11Y_HASPOPUP | (m->open ? GFX_A11Y_EXPANDED : 0), x, y, tw, GUI_BAR_H);
   if (m->open)
     gfx_fill_rect(x, y, tw, GUI_BAR_H, bg);
   gfx_ui_text(x + 3, y + (GUI_BAR_H - UIFONT_H) / 2, m->title, 0xe0e6ee);
@@ -817,8 +825,13 @@ static const struct btn_face btn_faces[] = {
 
 void button_draw(int x, int y, int w, int h, const char *label, int state)
 {
+  gfx_a11y_add(GFX_ROLE_BUTTON, label, gfx_a11y_state(state), x, y, w, h);
+  int focused = state & GFX_FOCUSED;
+  state &= ~GFX_FOCUSED;
   if (state < 0 || state > BTN_DISABLED)
     state = BTN_NORMAL;
+  if (focused)
+    gfx_focus_ring(x, y, w, h);
   const struct btn_face *f = &btn_faces[state];
   gfx_fill_rect(x, y, w, h, f->bg);
   if (f->top != f->bg) /* raised: lit top edge */
@@ -850,6 +863,7 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
   if (value > max)
     value = max;
   int pct = max > 0 ? value * 100 / max : 0;
+  gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_PROGRESS, 0, 0, x, y, w, h), value, 0, max);
 
   gfx_fill_rect(x, y, w, h, PROG_TROUGH);
 
@@ -894,12 +908,16 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
 
 static int slider_travel(int w) { return w - SLIDER_THUMB_W > 1 ? w - SLIDER_THUMB_W : 1; }
 
-void slider_draw(int x, int y, int w, int value, int max)
+void slider_draw(int x, int y, int w, int value, int max, int focused)
 {
   if (value < 0)
     value = 0;
   if (value > max)
     value = max;
+  struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_SLIDER, 0, focused ? GFX_A11Y_FOCUSED : 0, x, y, w, GUI_SLIDER_H);
+  gfx_a11y_set_value(a, value, 0, max);
+  if (focused)
+    gfx_focus_ring(x, y, w, GUI_SLIDER_H);
   int tx = x + (max > 0 ? (int)((long)slider_travel(w) * value / max) : 0);
   int ty = y + (GUI_SLIDER_H - SLIDER_TRACK_H) / 2;
   gfx_fill_rect(x, ty, w, SLIDER_TRACK_H, PROG_TROUGH);
@@ -980,6 +998,8 @@ void scrollbar_draw_ex(int x, int y, int w, int h, int scroll, int total, int vi
   int tr = h - 2 * a; /* track region height */
   unsigned track = st->track >= 0 ? (unsigned)st->track : SCROLL_TRACK;
   unsigned thumb = st->thumb >= 0 ? (unsigned)st->thumb : SCROLL_THUMB;
+  struct gfx_a11y *node = gfx_a11y_add(GFX_ROLE_SCROLLBAR, 0, 0, x, y, w, h);
+  gfx_a11y_set_value(node, scroll, 0, total > visible ? total - visible : 0);
 
   gfx_fill_rect(x, y, w, h, track);
   if (a > 0) {

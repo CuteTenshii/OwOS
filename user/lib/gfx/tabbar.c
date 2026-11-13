@@ -10,6 +10,7 @@
 #define TAB_OFF_BG 0x2a3342u
 #define TAB_ON_FG 0x101418u
 #define TAB_OFF_FG 0xb8c0ccu
+#define TAB_ACCENT 0x2f6bd8u
 
 #define TAB_ARROW_W 18
 
@@ -153,9 +154,15 @@ void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labe
     int tx = g.tabs_x + (i - g.first) * tw;
     int on = (i == active);
     unsigned bg = on ? TAB_ON_BG : TAB_OFF_BG;
+    unsigned st = (on ? GFX_A11Y_SELECTED : 0) | (on && tb->focused ? GFX_A11Y_FOCUSED : 0);
+    gfx_a11y_set_value(gfx_a11y_add(GFX_ROLE_TAB, labels[i], st, tx, y, tw - 1, GUI_TAB_H), i + 1, 0, n);
     gfx_fill_rect(tx, y, tw - 1, GUI_TAB_H, bg);
     if (on)
-      gfx_fill_rect(tx, y, tw - 1, 2, 0x2f6bd8);
+      gfx_fill_rect(tx, y, tw - 1, 2, TAB_ACCENT);
+    if (on && tb->focused) { /* inside the tab: the strip has no room around it */
+      gfx_rect(tx, y, tw - 1, GUI_TAB_H, TAB_ACCENT);
+      gfx_rect(tx + 1, y + 1, tw - 3, GUI_TAB_H - 2, TAB_ACCENT);
+    }
     gfx_fill_rect(tx + tw - 1, y, 1, GUI_TAB_H, TAB_STRIP_BG);
 
     int ix = tx + TAB_ICON_PAD;
@@ -173,6 +180,7 @@ void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labe
     tab_arrow(x, y, 1, g.first > 0);
     tab_arrow(g.right_x, y, 0, g.first + g.nvis < n);
   }
+  gfx_a11y_add(GFX_ROLE_BUTTON, "New tab", 0, g.new_x, y, TAB_NEW_W, GUI_TAB_H);
   gfx_ui_text(g.new_x + (TAB_NEW_W - gfx_ui_width("+")) / 2, ty, "+", 0xc8d0dc);
 }
 

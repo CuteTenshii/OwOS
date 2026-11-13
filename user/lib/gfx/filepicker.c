@@ -13,6 +13,7 @@
 #define NAME_LABEL_W 52
 #define CHK_W 28 /* checkbox column of a multiple-selection list */
 #define PATH_MAX_LEN 256
+#define PICK_A11Y_NODES 48 /* widgets plus the ~15 rows the list shows at once */
 
 #define COL_BG 0x161d28
 #define COL_LIST 0x0d1420
@@ -40,6 +41,7 @@ struct picker {
   struct scrollview sv;
   struct select_box filter;
   char status[64];
+  struct gfx_a11y a11y[PICK_A11Y_NODES];
 };
 
 static const char *const k_primary[] = {"Open", "Save", "Select"};
@@ -230,6 +232,11 @@ void filepicker_icon(int x, int y, int is_dir)
 static void draw_row(const struct picker *p, int row, int x, int y, int w)
 {
   const struct filelist_entry *e = row_entry(p, row);
+  int ticked = multi(p) && e && !e->is_dir && p->chk[row - p->up];
+  unsigned st = (row == p->sel ? GFX_A11Y_SELECTED : 0) | (ticked ? GFX_A11Y_CHECKED : 0);
+  struct gfx_a11y *a = gfx_a11y_add(GFX_ROLE_LISTITEM, e ? e->name : "..", st, x, y, w, ROW_H);
+  gfx_a11y_set_text(a, !e ? "parent folder" : e->is_dir ? "folder" : 0);
+  gfx_a11y_set_value(a, row + 1, 0, row_count(p));
   if (row == p->sel)
     gfx_fill_rect(x, y, w, ROW_H, COL_SEL);
   int ix = x + GAP + (multi(p) ? CHK_W - GAP : 0);
@@ -259,6 +266,7 @@ static void draw(struct picker *p)
 
   button_draw(PAD, PAD, UP_W, TEXTFIELD_H, "Up", p->up ? p->hot == 2 ? BTN_HOVER : BTN_NORMAL : BTN_DISABLED);
   textfield_draw(&p->pathtf, PAD + UP_W + GAP, PAD, pathw, TEXTFIELD_H, p->focus == 1);
+  gfx_a11y_set_name(gfx_a11y_last(), "Folder");
 
   int ly = list_y(), lh = list_h(p);
   gfx_fill_rect(PAD, ly, W - 2 * PAD, lh, COL_LIST);
@@ -275,9 +283,12 @@ static void draw(struct picker *p)
   if (has_name(p)) {
     gfx_ui_text(PAD, name_y() + (TEXTFIELD_H - UIFONT_H) / 2, "Name", COL_DIM);
     textfield_draw(&p->nametf, PAD + NAME_LABEL_W, name_y(), W - 2 * PAD - NAME_LABEL_W, TEXTFIELD_H, p->focus == 0);
+    gfx_a11y_set_name(gfx_a11y_last(), "Name");
   }
 
   int sw = cancel_x() - GAP - PAD;
+  if (p->status[0])
+    gfx_a11y_add(GFX_ROLE_LABEL, p->status, 0, PAD, btn_y(), sw, GUI_BTN_H);
   gfx_ui_text_clip(PAD, btn_y() + (GUI_BTN_H - UIFONT_H) / 2, p->status, COL_ERR, sw);
   button_draw(cancel_x(), btn_y(), BTN_W, GUI_BTN_H, "Cancel", p->hot == 0 ? BTN_HOVER : BTN_NORMAL);
   button_draw(primary_x(), btn_y(), BTN_W, GUI_BTN_H, k_primary[p->o->mode], p->hot == 1 ? BTN_HOVER : BTN_NORMAL);
@@ -438,6 +449,9 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
   win_resizable(id, 0);
   if (parent >= 0)
     win_set_parent(id, parent, 1);
+  struct gfx_a11y_tree tree;
+  gfx_a11y_tree_init(&tree, p->a11y, PICK_A11Y_NODES);
+  struct gfx_a11y_tree *caller_tree = gfx_a11y_bind(&tree);
 
   int done = 0, result = 0, need = 1;
   while (!done) {
@@ -489,6 +503,7 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
     if (done)
       break;
     if (need) {
+      gfx_a11y_begin();
       draw(p);
       win_present(id);
       need = 0;
@@ -497,6 +512,7 @@ int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz
   }
   win_close(id);
   gfx_init(save_fb, save_w, save_h);
+  gfx_a11y_bind(caller_tree);
   free(p->ents);
   free(p->chk);
   free(p);

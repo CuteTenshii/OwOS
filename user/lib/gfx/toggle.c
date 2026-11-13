@@ -14,7 +14,6 @@
 #define CTL_MARK 0xffffffu
 #define CTL_MARK_OFF 0x8a93a0u
 #define CTL_TRACK 0x3a4658u
-#define CTL_FOCUS 0x8fb4f5u
 
 static const int ctl_box_w[] = {
     [GFX_CTRL_CHECKBOX] = GUI_CHECK_SIZE, [GFX_CTRL_RADIO] = GUI_CHECK_SIZE, [GFX_CTRL_SWITCH] = GUI_SWITCH_W};
@@ -31,12 +30,17 @@ static void disc(int x, int y, int d, unsigned color)
     }
 }
 
-/* Draws the label and the focus ring, and returns the box's top-left y. */
-static int ctl_frame(int kind, int x, int y, const char *label, int state, int focused)
+static const int ctl_role[] = {
+    [GFX_CTRL_CHECKBOX] = GFX_ROLE_CHECKBOX, [GFX_CTRL_RADIO] = GFX_ROLE_RADIO, [GFX_CTRL_SWITCH] = GFX_ROLE_SWITCH};
+
+/* Draws the label and the focus ring, records the control's a11y node, and returns the box's top-left y. */
+static int ctl_frame(int kind, int x, int y, const char *label, int checked, int state, int focused)
 {
   int bw = ctl_box_w[kind], by = y + (GUI_CTRL_H - ctl_box_h[kind]) / 2;
+  unsigned a11y = gfx_a11y_state(state) | (focused ? GFX_A11Y_FOCUSED : 0) | (checked ? GFX_A11Y_CHECKED : 0);
+  gfx_a11y_add(ctl_role[kind], label, a11y, x, y, control_width(kind, label), GUI_CTRL_H);
   if (focused)
-    gfx_rect(x - 2, y, bw + 4, GUI_CTRL_H, CTL_FOCUS);
+    gfx_rect(x - 2, y, bw + 4, GUI_CTRL_H, GFX_FOCUS_COLOR);
   if (label && *label)
     gfx_ui_text(x + bw + CTL_GAP, y + (GUI_CTRL_H - UIFONT_H) / 2, label,
                 state == BTN_DISABLED ? CTL_LABEL_OFF : CTL_LABEL);
@@ -55,7 +59,9 @@ static unsigned ctl_on(int state)
 
 void checkbox_draw(int x, int y, const char *label, int checked, int state, int focused)
 {
-  int by = ctl_frame(GFX_CTRL_CHECKBOX, x, y, label, state, focused);
+  focused = focused || (state & GFX_FOCUSED);
+  state &= ~GFX_FOCUSED;
+  int by = ctl_frame(GFX_CTRL_CHECKBOX, x, y, label, checked, state, focused);
   unsigned fill = checked                 ? ctl_on(state)
                   : state == BTN_DISABLED ? CTL_BG_OFF
                   : state == BTN_PRESSED  ? CTL_BG_PRESSED
@@ -73,7 +79,9 @@ void checkbox_draw(int x, int y, const char *label, int checked, int state, int 
 
 void radio_draw(int x, int y, const char *label, int checked, int state, int focused)
 {
-  int by = ctl_frame(GFX_CTRL_RADIO, x, y, label, state, focused);
+  focused = focused || (state & GFX_FOCUSED);
+  state &= ~GFX_FOCUSED;
+  int by = ctl_frame(GFX_CTRL_RADIO, x, y, label, checked, state, focused);
   disc(x, by, GUI_CHECK_SIZE, ctl_edge(checked, state));
   disc(x + 1, by + 1, GUI_CHECK_SIZE - 2,
        state == BTN_DISABLED  ? CTL_BG_OFF
@@ -85,7 +93,9 @@ void radio_draw(int x, int y, const char *label, int checked, int state, int foc
 
 void switch_draw(int x, int y, const char *label, int on, int state, int focused)
 {
-  int by = ctl_frame(GFX_CTRL_SWITCH, x, y, label, state, focused);
+  focused = focused || (state & GFX_FOCUSED);
+  state &= ~GFX_FOCUSED;
+  int by = ctl_frame(GFX_CTRL_SWITCH, x, y, label, on, state, focused);
   int h = GUI_SWITCH_H, w = GUI_SWITCH_W;
   unsigned edge = ctl_edge(on, state);
   unsigned track = on ? ctl_on(state) : state == BTN_DISABLED ? CTL_BG_OFF : CTL_TRACK;

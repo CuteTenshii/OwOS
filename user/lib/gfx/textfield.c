@@ -126,6 +126,7 @@ static int tf_delete_selection(struct textfield *tf)
 
 void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused)
 {
+  gfx_a11y_set_text(gfx_a11y_add(GFX_ROLE_TEXTFIELD, 0, focused ? GFX_A11Y_FOCUSED : 0, x, y, w, h), tf->buf);
   gfx_fill_rect(x, y, w, h, TF_BG);
   gfx_rect(x, y, w, h, focused ? TF_FOCUS : TF_BORDER);
 

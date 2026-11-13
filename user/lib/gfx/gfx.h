@@ -61,6 +61,116 @@ int gfx_ui_ascent_px(int px);
 struct font;
 struct font *gfx_ui_font(void); /* the UI sans face itself (owned by gfx), or NULL if it failed to load */
 
+/*
+ * Keyboard focus. OR GFX_FOCUSED into the BTN_* state a widget is drawn with (or set the widget's `focused`
+ * field) and it shows a focus ring. Rings sit up to 3px outside the widget, so leave that margin around it.
+ *
+ * struct gfx_focus is a window's Tab order over its focusable controls, numbered 0..n-1 in visual order: Tab
+ * moves forward and Shift+Tab back, both wrapping and skipping the entries `disabled` marks nonzero. Ctrl+Tab
+ * and Alt+Tab are left to the app and the window manager.
+ */
+#define GFX_FOCUSED 0x100
+#define GFX_FOCUS_COLOR 0x8fb4f5u
+
+/* The 2px ring around [x,y,w,h], 1px clear of it */
+void gfx_focus_ring(int x, int y, int w, int h);
+
+struct gfx_focus {
+  int cur;                       /* focused entry, or -1 when every entry is disabled */
+  int n;                         /* entry count */
+  const unsigned char *disabled; /* optional, per entry: nonzero = skipped */
+};
+/* Focus entry `cur`, or the next enabled one after it. `disabled` may be NULL and stays owned by the app. */
+void gfx_focus_init(struct gfx_focus *f, int n, int cur, const unsigned char *disabled);
+/* Move to the next enabled entry in direction dir (+1 / -1), wrapping. Returns 1 if focus changed. */
+int gfx_focus_move(struct gfx_focus *f, int dir);
+/* Route a WEV_KEY (key, KMOD_* mods): Tab / Shift+Tab move focus. Returns 1 if focus changed. */
+int gfx_focus_key(struct gfx_focus *f, int key, int mods);
+int gfx_focus_is(const struct gfx_focus *f, int i);
+
+/*
+ * Accessibility. Widgets describe themselves as they draw: bind a tree with gfx_a11y_bind(), call
+ * gfx_a11y_begin() at the start of each repaint, and every widget drawn after that appends a node with its role,
+ * label, state and value. Nothing is recorded while no tree is bound. Add nodes for app-drawn content with
+ * gfx_a11y_add(), and name a widget that draws no label (a slider, a text field) through gfx_a11y_last() right
+ * after drawing it. The dialogs and the file picker bind their own tree and restore the caller's on return.
+ */
+enum {
+  GFX_ROLE_NONE = 0,
+  GFX_ROLE_DIALOG,
+  GFX_ROLE_LABEL,
+  GFX_ROLE_BUTTON,
+  GFX_ROLE_CHECKBOX,
+  GFX_ROLE_RADIO,
+  GFX_ROLE_SWITCH,
+  GFX_ROLE_SLIDER,
+  GFX_ROLE_PROGRESS,
+  GFX_ROLE_SCROLLBAR,
+  GFX_ROLE_TEXTFIELD,
+  GFX_ROLE_SELECT,
+  GFX_ROLE_OPTION,
+  GFX_ROLE_TAB,
+  GFX_ROLE_MENU,
+  GFX_ROLE_MENUITEM,
+  GFX_ROLE_LIST,
+  GFX_ROLE_LISTITEM,
+  GFX_ROLE_COUNT
+};
+
+/* gfx_a11y.state bits */
+#define GFX_A11Y_FOCUSED 0x001 /* has keyboard focus (a list's focused row, not the list) */
+#define GFX_A11Y_DISABLED 0x002
+#define GFX_A11Y_CHECKED 0x004 /* box ticked, radio chosen, switch on, menu item checked */
+#define GFX_A11Y_PRESSED 0x008
+#define GFX_A11Y_HOVER 0x010
+#define GFX_A11Y_SELECTED 0x020 /* the active tab, the chosen option or list row */
+#define GFX_A11Y_EXPANDED 0x040 /* its menu or list is open */
+#define GFX_A11Y_HASPOPUP 0x080 /* opens a menu or list */
+#define GFX_A11Y_DEFAULT 0x100  /* a dialog's primary button */
+
+#define GFX_A11Y_TEXT 64
+#define GFX_A11Y_DESC 160
+
+struct gfx_a11y {
+  int role;                 /* GFX_ROLE_* */
+  unsigned state;           /* GFX_A11Y_* */
+  int x, y, w, h;           /* bounds in client coordinates */
+  int value, min, max;      /* slider, progress, scroll position, list row; unused when max <= min */
+  char name[GFX_A11Y_TEXT]; /* label */
+  char text[GFX_A11Y_TEXT]; /* contents: a field's text, a select's choice, a dialog's kind */
+  char desc[GFX_A11Y_DESC]; /* longer help, or a dialog's message */
+  char shortcut[16];        /* accelerator label, e.g. "Ctrl+S" */
+};
+
+struct gfx_a11y_tree {
+  struct gfx_a11y *nodes; /* app-owned storage for cap nodes */
+  int cap, n;
+};
+
+void gfx_a11y_tree_init(struct gfx_a11y_tree *t, struct gfx_a11y *nodes, int cap);
+/* Record into t from now on (NULL stops recording). Returns the previously bound tree. */
+struct gfx_a11y_tree *gfx_a11y_bind(struct gfx_a11y_tree *t);
+/* Empty the bound tree; call at the start of every repaint. */
+void gfx_a11y_begin(void);
+/* Append a node. Returns NULL when no tree is bound or it is full; every setter accepts NULL. */
+struct gfx_a11y *gfx_a11y_add(int role, const char *name, unsigned state, int x, int y, int w, int h);
+/* The node added last since gfx_a11y_begin, or NULL */
+struct gfx_a11y *gfx_a11y_last(void);
+/* The setters copy the string, cutting it at a UTF-8 boundary to fit. */
+void gfx_a11y_set_name(struct gfx_a11y *a, const char *s);
+void gfx_a11y_set_text(struct gfx_a11y *a, const char *s);
+void gfx_a11y_set_desc(struct gfx_a11y *a, const char *s);
+void gfx_a11y_set_shortcut(struct gfx_a11y *a, const char *s);
+void gfx_a11y_set_value(struct gfx_a11y *a, int value, int min, int max);
+/* A BTN_* state, with GFX_FOCUSED, as GFX_A11Y_* bits */
+unsigned gfx_a11y_state(int btn_state);
+/* The first focused node in t, or NULL */
+const struct gfx_a11y *gfx_a11y_focused(const struct gfx_a11y_tree *t);
+/* "button", "check box", ...; "" for GFX_ROLE_NONE and GFX_ROLE_LABEL */
+const char *gfx_a11y_role_name(int role);
+/* The node as one spoken line, e.g. "Volume, slider, 40 of 100". Returns the length written to buf. */
+int gfx_a11y_describe(const struct gfx_a11y *a, char *buf, int sz);
+
 /* --------------------------------------------------------------- GUI widgets
  */
 /*
@@ -230,6 +340,7 @@ int textfield_key(struct textfield *tf, char c, int mods);
 struct tabbar {
   int first;       /* first visible tab while the strip overflows */
   int last_active; /* scroll to reveal `active` only when it changes */
+  int focused;     /* the strip has keyboard focus: outline the active tab */
 };
 
 /* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+";
@@ -247,6 +358,8 @@ void tabbar_draw(struct tabbar *tb, int x, int y, int w, const char *const *labe
 int tabbar_hit(struct tabbar *tb, int x, int y, int w, int n, int mx, int my, int *index);
 /* Scroll an overflowing strip by `delta` tabs (positive = right) */
 void tabbar_scroll(struct tabbar *tb, int w, int n, int delta);
+/* Keys for a focused strip: Left/Right (wrapping) and Home/End change *active. Returns 1 if it changed. */
+int tabbar_key(int key, int n, int *active);
 
 /* --------------------------------------------------------------- button */
 /*
@@ -270,6 +383,8 @@ void button_draw(int x, int y, int w, int h, const char *label, int state);
 /* Returns 1 if (mx,my) falls inside [x,y,w,h], 0 otherwise (geometry only — the
  * app gates on its own disabled state before treating a hit as a press). */
 int button_hit(int x, int y, int w, int h, int mx, int my);
+/* 1 if a WEV_KEY presses the focused button: Space or Enter */
+int button_key(int key);
 
 /* --------------------------------------------------------------- checkbox, radio, switch */
 /*
@@ -278,7 +393,7 @@ int button_hit(int x, int y, int w, int h, int mx, int my);
  * with the BTN_* visual state it tracks (hover, pressed, disabled), and
  * flips its value when control_hit() reports a click on an enabled control.
  * A radio group is the app's business: set the clicked one, clear the rest.
- * `focused` draws a focus ring for keyboard operation (Space toggles).
+ * `focused` (or GFX_FOCUSED in `state`) draws a focus ring; feed keys to control_key().
  * The control occupies [x, x + control_width()) by GUI_CTRL_H from y.
  */
 #define GUI_CTRL_H 18     /* row height, label included */
@@ -295,6 +410,8 @@ void switch_draw(int x, int y, const char *label, int on, int state, int focused
 int control_width(int kind, const char *label);
 /* 1 if (mx,my) is on the box or its label (geometry only, like button_hit). */
 int control_hit(int kind, int x, int y, const char *label, int mx, int my);
+/* Space on a focused control flips *value (a radio only turns on). Returns 1 if *value changed. */
+int control_key(int kind, int key, int *value);
 
 /* --------------------------------------------------------------- progress bar
  */
@@ -318,11 +435,14 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
  */
 #define GUI_SLIDER_H 14 /* thumb height, and the box height */
 
-void slider_draw(int x, int y, int w, int value, int max);
+void slider_draw(int x, int y, int w, int value, int max, int focused);
 /* 1 if (mx,my) is on the box or within a few pixels of it (a forgiving grab). */
 int slider_hit(int x, int y, int w, int mx, int my);
 /* The value 0..max for a pointer at mx, clamped. */
 int slider_value(int x, int w, int mx, int max);
+/* Keys for a focused slider: Right/Up and Left/Down move by step (<= 0: a tenth of max), Home/End jump to the
+ * ends. Returns 1 if *value changed. */
+int slider_key(int key, int *value, int max, int step);
 
 /* --------------------------------------------------------------- scrollbar */
 /*
@@ -493,6 +613,7 @@ struct select_box {
   int selected; /* index of the chosen option (0..count-1)        */
   int open;     /* 1 = list expanded                              */
   int hover;    /* hovered row while open, or -1                  */
+  int focused;  /* has keyboard focus: draws the focus ring       */
 };
 void select_init(struct select_box *s, const char *const *options, int count, int selected);
 void select_draw(struct select_box *s, int x, int y, int w, int h);

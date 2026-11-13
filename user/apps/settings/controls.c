@@ -73,7 +73,8 @@ static void draw_slider(int cx, int cw)
   strcat(t, "%");
   gfx_ui_text(x, slider_y(), slider_label, FG_TEXT);
   gfx_ui_text(x + bw - gfx_ui_width(t), slider_y(), t, FG_DIM);
-  slider_draw(x, slider_box_y(), bw, slider_val, 100);
+  slider_draw(x, slider_box_y(), bw, slider_val, 100, 0);
+  gfx_a11y_set_name(gfx_a11y_last(), slider_label);
 }
 
 void controls_add(const char *label, const char *hint, struct select_box *box, void (*apply)(int))
