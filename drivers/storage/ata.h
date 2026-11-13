@@ -18,6 +18,9 @@ int ata_write(uint32_t lba, const void *buf, uint32_t count);
 /* Non-zero if a drive answers IDENTIFY on the primary master. */
 int ata_present(void);
 
+/* Route writes through the IDE controller's bus-master DMA when it has one; needs PCI and palloc up. */
+void ata_dma_init(void);
+
 /* LBA28 capacity of the primary master in 512-byte sectors (0 if none). */
 uint32_t ata_sectors(void);
 

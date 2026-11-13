@@ -77,9 +77,10 @@ static void cache_invalidate(uint32_t lba, uint32_t count)
 void blk_init(void)
 {
   cache_clear();
-  if (ata_present())
+  if (ata_present()) {
     backend = BK_IDE;
-  else if (ahci_present())
+    ata_dma_init();
+  } else if (ahci_present())
     backend = BK_AHCI;
   else if (nvme_present())
     backend = BK_NVME;

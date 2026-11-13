@@ -1,11 +1,17 @@
-/* ata.c — primary-master ATA disk access via PIO, polled (no IRQ14).
+/* ata.c: primary-master ATA disk access, polled (no IRQ14).
  *
- * Polling keeps this simple and self-contained. Every wait loop is bounded so
- * a missing or wedged drive returns an error instead of hanging the kernel.
+ * Reads use PIO. Writes go through the IDE controller's bus-master DMA when
+ * there is one, because KVM traps every word of a `rep outsw` (about 3 ms per
+ * sector), and fall back to PIO otherwise. Every wait loop is bounded so a
+ * missing or wedged drive returns an error instead of hanging the kernel.
  */
 
 #include "ata.h"
+#include "console.h"
 #include "io.h"
+#include "kstring.h"
+#include "paging.h"
+#include "pci.h"
 #include "spinlock.h"
 
 #define ATA_DATA 0x1F0
@@ -21,13 +27,40 @@
 #define ST_DRQ 0x08
 #define ST_ERR 0x01
 
+#define ST_DF 0x20
+
 #define CMD_READ 0x20
 #define CMD_WRITE 0x30
+#define CMD_WRITE_DMA 0xCA
 #define CMD_FLUSH 0xE7
 
 #define POLL_LIMIT 1000000u
+#define DMA_POLL_LIMIT (16 * POLL_LIMIT)
+
+/* Bus-master IDE registers for the primary channel, relative to BAR4. */
+#define BM_CMD 0
+#define BM_STATUS 2
+#define BM_PRDT 4
+#define BM_START 0x01
+#define BM_ST_ACTIVE 0x01
+#define BM_ST_ERR 0x02
+#define BM_ST_IRQ 0x04
+
+#define PRD_EOT 0x8000
+#define DMA_FRAME 4096u
+/* One LBA28 command moves at most 256 sectors, so 32 frames hold any single transfer. */
+#define DMA_FRAMES (256u * 512u / DMA_FRAME)
+
+struct prd {
+  uint32_t addr;
+  uint16_t bytes;
+  uint16_t flags;
+};
 
 static spinlock_t io_lock;
+static uint16_t bm_base; /* 0 while writes use PIO */
+static volatile struct prd *prdt;
+static uint8_t *dma_frame[DMA_FRAMES];
 
 /* Reading the alternate status 4x gives the drive the ~400ns it needs after
  * a command before its status is meaningful. */
@@ -108,20 +141,72 @@ fail:
 
 int ata_read_sector(uint32_t lba, void *buf) { return ata_read(lba, buf, 1); }
 
+/* Write n (1..256) sectors with one WRITE DMA command, staged through the identity-mapped frames. */
+static int dma_write(uint32_t lba, const uint8_t *p, uint32_t n)
+{
+  uint32_t bytes = n * 512u, i = 0;
+  for (uint32_t off = 0; off < bytes; off += DMA_FRAME, i++) {
+    uint32_t len = bytes - off < DMA_FRAME ? bytes - off : DMA_FRAME;
+    memcpy(dma_frame[i], p + off, len);
+    prdt[i].addr = (uint32_t)(uintptr_t)dma_frame[i];
+    prdt[i].bytes = (uint16_t)len;
+    prdt[i].flags = 0;
+  }
+  prdt[i - 1].flags = PRD_EOT;
+
+  outb((uint16_t)(bm_base + BM_CMD), 0); /* stopped, and direction = memory to disk */
+  outb((uint16_t)(bm_base + BM_STATUS), BM_ST_ERR | BM_ST_IRQ);
+  outl((uint16_t)(bm_base + BM_PRDT), (uint32_t)(uintptr_t)prdt);
+  __asm__ volatile("" ::: "memory");
+  if (issue(lba, CMD_WRITE_DMA, n))
+    return -1;
+  outb((uint16_t)(bm_base + BM_CMD), BM_START);
+
+  uint8_t bm = 0;
+  uint32_t tries = 0;
+  for (; tries < DMA_POLL_LIMIT; tries++) {
+    bm = inb((uint16_t)(bm_base + BM_STATUS));
+    bool settled = (bm & (BM_ST_IRQ | BM_ST_ERR)) || !(bm & BM_ST_ACTIVE);
+    if (settled && !(inb(ATA_CTRL) & ST_BSY))
+      break;
+  }
+  outb((uint16_t)(bm_base + BM_CMD), 0);
+  uint8_t st = inb(ATA_STATUS); /* the plain status read also acknowledges the drive's interrupt */
+  outb((uint16_t)(bm_base + BM_STATUS), BM_ST_ERR | BM_ST_IRQ);
+  if (tries == DMA_POLL_LIMIT || (bm & BM_ST_ERR) || (st & (ST_ERR | ST_DF)))
+    return -1;
+  return 0;
+}
+
+static int pio_write(uint32_t lba, const uint8_t *p, uint32_t n)
+{
+  if (issue(lba, CMD_WRITE, n))
+    return -1;
+  for (uint32_t s = 0; s < n; s++) {
+    if (wait_drq())
+      return -1;
+    outsw(ATA_DATA, p, 256);
+    p += 512;
+  }
+  return 0;
+}
+
 int ata_write(uint32_t lba, const void *buf, uint32_t count)
 {
   uintptr_t flags = spin_lock_irqsave(&io_lock);
   const uint8_t *p = buf;
   while (count > 0) {
     uint32_t n = count > 256 ? 256 : count;
-    if (issue(lba, CMD_WRITE, n))
-      goto fail;
-    for (uint32_t s = 0; s < n; s++) {
-      if (wait_drq())
+    if (bm_base && dma_write(lba, p, n) != 0) {
+      /* A drive or controller that rejects DMA keeps working over PIO. */
+      bm_base = 0;
+      con_write("ata: DMA write failed, falling back to PIO\n");
+      if (wait_not_busy())
         goto fail;
-      outsw(ATA_DATA, p, 256);
-      p += 512;
     }
+    if (!bm_base && pio_write(lba, p, n) != 0)
+      goto fail;
+    p += n * 512u;
     outb(ATA_STATUS, CMD_FLUSH);
     if (wait_not_busy())
       goto fail;
@@ -173,6 +258,35 @@ int ata_present(void)
 {
   uint16_t words[256];
   return identify(words) == 0;
+}
+
+void ata_dma_init(void)
+{
+  struct pci_dev_info d;
+  int idx = 0;
+  while (pci_dev_info(idx, &d) && !(d.class_code == 0x01 && d.subclass == 0x01))
+    idx++;
+  if (!pci_dev_info(idx, &d))
+    return;
+  /* Prog-if bit 7: bus-master capable; bit 0: primary channel in native mode, off the legacy ports this driver uses. */
+  uint8_t progif = (uint8_t)(pci_read32(d.bus, d.slot, d.func, 0x08) >> 8);
+  uint32_t bar4 = pci_read32(d.bus, d.slot, d.func, 0x20);
+  if (!(progif & 0x80) || (progif & 0x01) || !(bar4 & 1) || !(bar4 & 0xFFFCu))
+    return;
+
+  prdt = palloc();
+  if (!prdt)
+    return;
+  for (uint32_t i = 0; i < DMA_FRAMES; i++) {
+    dma_frame[i] = palloc();
+    if (!dma_frame[i])
+      return;
+  }
+
+  uint32_t cmd = pci_read32(d.bus, d.slot, d.func, 0x04);
+  pci_write32(d.bus, d.slot, d.func, 0x04, cmd | 0x5u); /* I/O space + bus master */
+  bm_base = (uint16_t)(bar4 & 0xFFFCu);
+  con_printf("ata: bus-master DMA writes at io 0x%x\n", (uint32_t)bm_base);
 }
 
 uint32_t ata_sectors(void)
