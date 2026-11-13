@@ -369,9 +369,9 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
     return;
   if (r < 0)
     r = 0;
-  if (r * 2 > w)
+  if (r > w / 2) /* not r * 2 > w: Tailwind's rounded-full is 2147483647px, which would overflow */
     r = w / 2;
-  if (r * 2 > h)
+  if (r > h / 2)
     r = h / 2;
   unsigned *fb = browser_surface();
   unsigned sr = (rgb >> 16) & 0xff, sg = (rgb >> 8) & 0xff, sb = rgb & 0xff, ia = 255 - alpha;

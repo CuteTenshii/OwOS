@@ -187,7 +187,7 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->bg = cs->bg >= 0 ? (unsigned)cs->bg : BG_NONE;
   b->bgi = cs->bgi;
   b->border_box = (unsigned char)(cs->box_sizing == 1);
-  b->radius = cs->radius > 0 ? cs->radius : 0;
+  b->radius = cs->radius > 0 ? (cs->radius > 65535 ? 65535 : cs->radius) : 0; /* pill radii are huge; keep r*r finite */
   b->sh_color = cs->sh_color >= 0 ? (unsigned)cs->sh_color : BG_NONE;
   b->sh_dx = cs->sh_dx;
   b->sh_dy = cs->sh_dy;
