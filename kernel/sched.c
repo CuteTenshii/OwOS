@@ -1137,24 +1137,23 @@ uint32_t sched_sigprocmask(int how, uint32_t set, int have_set)
   return old;
 }
 
-/* Saved user context for sigreturn, always 32-bit even under an x86_64 kernel. */
-struct sig_uctx {
-  uint32_t eip, eflags, esp;
-  uint32_t eax, ecx, edx, ebx, ebp, esi, edi;
-};
-
-/* Handler frame on the user stack: [pretcode][sig]; pretcode points at `tramp` (SYS_SIGRETURN). */
+/* Handler frame on the user stack: [pretcode][sig][&info][&uc], the arguments of an SA_SIGINFO handler (a
+ * one-argument handler ignores the last two); pretcode points at `tramp` (SYS_SIGRETURN). */
 struct sigframe {
-  uint32_t pretcode;      /* -> tramp */
-  uint32_t sig;           /* handler argument */
+  uint32_t pretcode; /* -> tramp */
+  uint32_t sig;      /* handler arguments: sig, info, ctx */
+  uint32_t pinfo;
+  uint32_t puc;
   uint32_t saved_blocked; /* mask to restore on sigreturn */
-  struct sig_uctx uc;     /* interrupted context to resume */
-  uint8_t tramp[8];       /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
+  struct k_sigctx uc;     /* interrupted context to resume */
+  struct k_siginfo info;
+  uint8_t tramp[8]; /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
 };
 
 /* Build a signal frame on the user stack (current CR3); 0, or -1 if it doesn't fit. */
-static int sigframe_setup(task_t *t, struct registers *r, int sig)
+static int sigframe_setup(task_t *t, struct registers *r, const struct k_siginfo *info)
 {
+  int sig = info->signo;
   uint32_t sp = (uint32_t)r->useresp;
   uint32_t base = (sp - sizeof(struct sigframe)) & ~3u;
   if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END || base > sp) /* underflow guard */
@@ -1163,6 +1162,9 @@ static int sigframe_setup(task_t *t, struct registers *r, int sig)
   struct sigframe f;
   f.pretcode = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
   f.sig = (uint32_t)sig;
+  f.pinfo = base + (uint32_t)__builtin_offsetof(struct sigframe, info);
+  f.puc = base + (uint32_t)__builtin_offsetof(struct sigframe, uc);
+  f.info = *info;
   f.saved_blocked = t->sig_blocked;
   f.uc.eip = (uint32_t)r->eip;
   f.uc.eflags = (uint32_t)r->eflags;
@@ -1207,22 +1209,38 @@ void sched_signal_deliver(struct registers *r)
     /* A SIG_DFL reaching here terminates (128 + sig). */
     sched_exit(128 + sig); /* never returns */
   }
-  if (sigframe_setup(t, r, sig) < 0)
+  struct k_siginfo info = {sig, SI_USER, 0, SI_TRAP_NONE, 0};
+  if (sigframe_setup(t, r, &info) < 0)
     sched_exit(128 + sig); /* unusable stack: fall back to terminate */
   /* Mask this signal and the handler's mask during the handler; sigreturn restores it. */
   t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
 }
 
-/* Turn a CPU fault into a signal if a handler exists; 1 if the frame was built, else 0. EIP stays at the fault. */
-int sched_fault_signal(struct registers *r, int sig)
+/* Turn a CPU fault into a signal if a handler exists; 1 if the frame was built, else 0. EIP stays at the fault.
+ * `addr` is the faulting address (CR2 for a page fault). */
+int sched_fault_signal(struct registers *r, int sig, uint32_t addr)
 {
   task_t *t = current;
   uint32_t h = t->sig_handler[sig];
   if (h == SIG_DFL || h == SIG_IGN) /* no user handler: fatal, as before */
     return 0;
-  if (t->sig_blocked & SIGBIT(sig))  /* fault while the signal is blocked */
-    return 0;                        /* -> can't deliver safely: terminate */
-  if (sigframe_setup(t, r, sig) < 0) /* stack won't hold the frame */
+  if (t->sig_blocked & SIGBIT(sig)) /* fault while the signal is blocked */
+    return 0;                       /* -> can't deliver safely: terminate */
+  uint32_t vec = (uint32_t)r->int_no, err = (uint32_t)r->err_code;
+  struct k_siginfo info = {sig, 0, 0, vec, err};
+  if (vec == 14) {
+    info.code = err & 1 ? SEGV_ACCERR : SEGV_MAPERR;
+    info.addr = addr;
+  } else if (vec == 6) {
+    info.code = ILL_ILLOPC;
+    info.addr = (uint32_t)r->eip;
+  } else if (vec == 0) {
+    info.code = FPE_INTDIV;
+    info.addr = (uint32_t)r->eip;
+  } else if (sig == SIGSEGV) {
+    info.code = SEGV_ACCERR; /* #GP/#SS: a protection violation, its address unknown */
+  }
+  if (sigframe_setup(t, r, &info) < 0) /* stack won't hold the frame */
     return 0;
   t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
   return 1;

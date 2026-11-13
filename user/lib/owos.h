@@ -236,7 +236,7 @@ struct winrec {
 #define UWIN_F_MAXIMIZED 0x08
 #define UWIN_F_RESIZABLE 0x10
 #define UWIN_F_FULLSCREEN 0x40 /* covers the screen, no chrome */
-#define UWIN_F_MODAL 0x20 /* transient child that blocks its parent family */
+#define UWIN_F_MODAL 0x20      /* transient child that blocks its parent family */
 struct winmap {
   unsigned vaddr;
   int w, h, stride;
@@ -427,7 +427,29 @@ typedef void (*sighandler_t)(int);
 #define SIG_IGN ((sighandler_t)1)
 #define SIG_ERR ((sighandler_t) - 1)
 
-/* sa_flags is accepted but unused: an interrupted blocking syscall returns EINTR */
+/* An interrupted blocking syscall returns EINTR (no SA_RESTART). */
+
+/* SA_SIGINFO handlers are void (*)(int sig, siginfo_t *info, void *ctx), ctx a struct sigcontext *; the kernel
+ * passes all three to every handler. Mirrors kernel/signal.h. */
+#define SA_SIGINFO 4u
+#define SI_USER 0
+#define SEGV_MAPERR 1 /* address not mapped */
+#define SEGV_ACCERR 2 /* mapped, but the access isn't allowed */
+#define ILL_ILLOPC 1
+#define FPE_INTDIV 1
+#define SI_TRAP_NONE 0xFFFFFFFFu
+typedef struct {
+  int si_signo;
+  int si_code;        /* SI_USER, or the SEGV_/ILL_/FPE_ cause of a CPU fault */
+  unsigned si_addr;   /* faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
+  unsigned si_trapno; /* CPU exception vector, SI_TRAP_NONE if no fault raised it */
+  unsigned si_err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
+} siginfo_t;
+/* The interrupted registers; sigreturn resumes from them. */
+struct sigcontext {
+  unsigned eip, eflags, esp;
+  unsigned eax, ecx, edx, ebx, ebp, esi, edi;
+};
 
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1

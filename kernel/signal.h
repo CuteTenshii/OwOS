@@ -45,8 +45,7 @@
 #define SIG_DFL 0u /* default action for the signal                   */
 #define SIG_IGN 1u /* ignore the signal                               */
 
-/* sa_flags is stored per-signal but unused: an interrupted blocking syscall
- * always returns EINTR. */
+/* sa_flags is stored per-signal; an interrupted blocking syscall always returns EINTR (no SA_RESTART). */
 
 /* sigprocmask() `how`. */
 #define SIG_BLOCK 0
@@ -60,6 +59,31 @@ struct k_sigaction {
   uint32_t handler;
   uint32_t mask;
   uint32_t flags;
+};
+
+/* SA_SIGINFO: the handler is void (*)(int sig, struct k_siginfo *info, struct k_sigctx *ctx). Every handler
+ * gets the three arguments; the flag only says the handler was written to read them. */
+#define SA_SIGINFO 4u
+
+/* Why a signal arrived, in the handler frame (32-bit layout under both kernels). */
+#define SI_USER 0     /* sent by kill() or raise() */
+#define SEGV_MAPERR 1 /* address not mapped */
+#define SEGV_ACCERR 2 /* mapped, but the access isn't allowed (write to read-only, user to kernel) */
+#define ILL_ILLOPC 1  /* invalid opcode */
+#define FPE_INTDIV 1  /* integer divide by zero */
+#define SI_TRAP_NONE 0xFFFFFFFFu
+struct k_siginfo {
+  int32_t signo;
+  int32_t code;    /* SI_USER, or the SEGV_/ILL_/FPE_ cause of a CPU fault */
+  uint32_t addr;   /* the faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
+  uint32_t trapno; /* CPU exception vector, SI_TRAP_NONE when no fault raised it */
+  uint32_t err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
+};
+
+/* The interrupted user context, restored by sigreturn (a handler may read it, and rewrite it to resume elsewhere). */
+struct k_sigctx {
+  uint32_t eip, eflags, esp;
+  uint32_t eax, ecx, edx, ebx, ebp, esi, edi;
 };
 
 /* Bit for signal `s` (1..31). Signal 0 is not a real signal (kill(pid,0)

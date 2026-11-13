@@ -322,7 +322,7 @@ void isr_handler(struct registers *r)
 
   /* Ring-3 fault: deliver the signal if handled, else record a crash and kill the process. */
   if (user_fault) {
-    if (sched_fault_signal(r, fault_signal(r->int_no))) {
+    if (sched_fault_signal(r, fault_signal(r->int_no), r->int_no == 14 ? (uint32_t)read_cr2() : 0)) {
       sched_kernel_leave();
       return;
     }
