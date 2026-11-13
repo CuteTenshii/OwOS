@@ -160,7 +160,10 @@ static task_t idle_tasks[SMP_MAX_CPUS];
 static task_t *current_tasks[SMP_MAX_CPUS];
 static task_t *switching_tasks[SMP_MAX_CPUS];
 static volatile uint32_t scheduler_lock;
-static volatile uint32_t kernel_lock;
+/* The big kernel lock is a ticket lock: CPUs get it in arrival order. Kernel threads hold it for a whole time slice,
+ * so with a test-and-set word the APs passed it among themselves and the BSP, which drives the PIT, starved in
+ * switch_in with interrupts off; time stopped and every sleeper with it. */
+static volatile uint32_t kernel_ticket_next, kernel_ticket_serving;
 static volatile int kernel_lock_cpu = -1;
 static int count;
 static uint32_t next_id;
@@ -186,29 +189,44 @@ static void sched_lock(void)
 
 static void sched_unlock(void) { __sync_lock_release(&scheduler_lock); }
 
-void sched_kernel_enter(void)
+static void kernel_lock_acquire(void)
 {
-  int cpu = smp_this_cpu();
-  if (kernel_lock_cpu == cpu) {
-    current->kernel_lock_depth++;
-    return;
-  }
-  while (__sync_lock_test_and_set(&kernel_lock, 1)) {
+  uint32_t ticket = __atomic_fetch_add(&kernel_ticket_next, 1, __ATOMIC_RELAXED);
+  while (__atomic_load_n(&kernel_ticket_serving, __ATOMIC_ACQUIRE) != ticket) {
     smp_tlb_service(); /* the lock holder may be waiting on our flush */
     __asm__ volatile("pause");
   }
+}
+
+static void kernel_lock_release(void)
+{
+  kernel_lock_cpu = -1;
+  __atomic_store_n(&kernel_ticket_serving, kernel_ticket_serving + 1, __ATOMIC_RELEASE);
+}
+
+/* Enter and leave keep interrupts off: a syscall may return with IF=1, and an IRQ landing between the lock word,
+ * kernel_lock_cpu and the depth would nest an enter that spins on its own CPU's lock or releases another CPU's. */
+void sched_kernel_enter(void)
+{
+  uintptr_t flags = irq_save();
+  int cpu = smp_this_cpu();
+  if (kernel_lock_cpu == cpu) {
+    current->kernel_lock_depth++;
+    irq_restore(flags);
+    return;
+  }
+  kernel_lock_acquire();
   kernel_lock_cpu = cpu;
   current->kernel_lock_depth = 1;
+  irq_restore(flags);
 }
 
 void sched_kernel_leave(void)
 {
-  if (!current || current->kernel_lock_depth == 0)
-    return;
-  if (--current->kernel_lock_depth == 0) {
-    kernel_lock_cpu = -1;
-    __sync_lock_release(&kernel_lock);
-  }
+  uintptr_t flags = irq_save();
+  if (current && current->kernel_lock_depth > 0 && --current->kernel_lock_depth == 0)
+    kernel_lock_release();
+  irq_restore(flags);
 }
 
 static void sched_kernel_switch_out(void)
@@ -217,8 +235,7 @@ static void sched_kernel_switch_out(void)
     return;
   current->kernel_lock_reacquire = current->kernel_lock_depth;
   current->kernel_lock_depth = 0;
-  kernel_lock_cpu = -1;
-  __sync_lock_release(&kernel_lock);
+  kernel_lock_release();
 }
 
 void sched_kernel_switch_in(void)
@@ -226,10 +243,7 @@ void sched_kernel_switch_in(void)
   uint8_t depth = current ? current->kernel_lock_reacquire : 0;
   if (!depth)
     return;
-  while (__sync_lock_test_and_set(&kernel_lock, 1)) {
-    smp_tlb_service();
-    __asm__ volatile("pause");
-  }
+  kernel_lock_acquire();
   kernel_lock_cpu = smp_this_cpu();
   current->kernel_lock_depth = depth;
   current->kernel_lock_reacquire = 0;
@@ -1486,6 +1500,12 @@ void schedule(void)
     sched_kernel_switch_in();
   } else {
     sched_unlock();
+    /* Nothing else to run here: still hand the kernel lock to any CPU queued for it. A kernel thread holds it for
+     * its whole slice, so otherwise one with this CPU to itself keeps it while the BSP waits with the PIT stopped. */
+    if (current->kernel_lock_depth && kernel_ticket_next != kernel_ticket_serving + 1) {
+      sched_kernel_switch_out();
+      sched_kernel_switch_in();
+    }
   }
 
   if (flags & 0x200) /* restore the caller's interrupt flag */
