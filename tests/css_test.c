@@ -530,6 +530,28 @@ static void test_inherit_keywords(void)
   css_free(sh);
 }
 
+/* 18. Box shorthands split on top-level spaces only: Tailwind's px-3 is padding-inline: calc(var(--spacing) * 3). */
+static void test_box_shorthand_calc(void)
+{
+  struct dom_node *a = el("a"), *b = el("b");
+  doc(a);
+  doc(b);
+  struct css_style st;
+  css_sheet *sh = sheet(":root { --spacing: 4px } a { padding-inline: calc(var(--spacing) * 3) }"
+                        " b { margin: calc(2px * 2) calc(3px + 1px) 5px }");
+  css_style_reset(&st);
+  css_apply_sheet(sh, a, &st);
+  expect_eq(st.padding[3], 12);
+  expect_eq(st.padding[1], 12);
+  css_style_reset(&st);
+  css_apply_sheet(sh, b, &st);
+  expect_eq(st.margin[0], 4);
+  expect_eq(st.margin[1], 4);
+  expect_eq(st.margin[2], 5);
+  expect_eq(st.margin[3], 4);
+  css_free(sh);
+}
+
 int main(void)
 {
   test("complex :is selectors", test_complex_is_selectors);
@@ -549,6 +571,7 @@ int main(void)
   test("::slotted and ::part", test_slotted_and_part);
   test("escaped identifiers", test_escaped_identifiers);
   test("inherit keywords", test_inherit_keywords);
+  test("box shorthand calc", test_box_shorthand_calc);
 
   free_dom();
   return 0;

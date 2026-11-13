@@ -365,8 +365,8 @@ void parse_box4(const char *v, short out[4], int allow_auto)
     if (!*v)
       break;
     vals[n++] = one_len(v, allow_auto);
-    while (*v && *v != ' ' && *v != '\t')
-      v++;
+    for (int depth = 0; *v && (depth > 0 || (*v != ' ' && *v != '\t')); v++) /* calc(a * b) is one value */
+      depth += *v == '(' ? 1 : *v == ')' && depth > 0 ? -1 : 0;
   }
   if (n == 0)
     return;
