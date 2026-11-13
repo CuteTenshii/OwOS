@@ -271,8 +271,9 @@ struct css_style {
   signed char trans_timing;      /* enum css_easing, -1 unset */
   struct css_bg_image bgi;       /* background image/gradient layer (kind<0 unset) */
   /* ::before / ::after generated content (decoded, "" = none). */
-  char content[80];  /* strings, with attr(name) as CONTENT_ATTR name CONTENT_END */
-  unsigned backdrop; /* modal ::backdrop 0xAARRGGBB when backdrop_set; set by the walk, never cascaded */
+  char content[80];        /* strings, with attr(name) as CONTENT_ATTR name CONTENT_END */
+  signed char has_content; /* 1 = content generates a box (even ""), 0 = none/normal, -1 unset */
+  unsigned backdrop;       /* modal ::backdrop 0xAARRGGBB when backdrop_set; set by the walk, never cascaded */
   signed char backdrop_set;
   char fam[CSS_FAM_STACK];
 };

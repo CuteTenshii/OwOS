@@ -552,6 +552,24 @@ static void test_box_shorthand_calc(void)
   css_free(sh);
 }
 
+/* 19. content: "" still generates a pseudo-element (a fixed backdrop, a clearfix); none and normal don't. */
+static void test_empty_content_generates(void)
+{
+  struct dom_node *h = el("html"), *p = el("p"), *q = el("q");
+  doc(h);
+  doc(p);
+  doc(q);
+  struct css_style st;
+  css_sheet *sh = sheet("html::before { content: \"\"; position: fixed } p::after { content: \"x\" }"
+                        " p::after { content: none } q::before { content: \"a\" } q::before { content: \"\" }");
+  expect(css_pseudo_content(sh, h, CSS_PSEUDO_BEFORE, &st));
+  expect_eq(st.pos, CSS_POS_FIXED);
+  expect(!css_pseudo_content(sh, p, CSS_PSEUDO_AFTER, &st));
+  expect(css_pseudo_content(sh, q, CSS_PSEUDO_BEFORE, &st));
+  expect_eq(st.content[0], 0); /* the later "" replaces "a" */
+  css_free(sh);
+}
+
 /* 20. A translucent background keeps its alpha through the cascade, so the box paints it translucent. */
 static void test_background_alpha(void)
 {
@@ -595,6 +613,7 @@ int main(void)
   test("::slotted and ::part", test_slotted_and_part);
   test("escaped identifiers", test_escaped_identifiers);
   test("inherit keywords", test_inherit_keywords);
+  test("empty content generates", test_empty_content_generates);
   test("box shorthand calc", test_box_shorthand_calc);
   test("background alpha", test_background_alpha);
 

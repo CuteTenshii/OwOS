@@ -731,9 +731,10 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->fill = parse_paint_val(val);
   else if (span_is(p, pe, "stroke"))
     out->stroke = parse_paint_val(val);
-  else if (span_is(p, pe, "content"))
+  else if (span_is(p, pe, "content")) {
     parse_content(val, out->content, sizeof out->content);
-  else if (span_is(p, pe, "font-family"))
+    out->has_content = (signed char)!(starts_ci(val, "none") || starts_ci(val, "normal"));
+  } else if (span_is(p, pe, "font-family"))
     copy_family_stack(val, out->fam, CSS_FAM_STACK);
   else if (span_is(p, pe, "font-size"))
     parse_font_size(val, out);

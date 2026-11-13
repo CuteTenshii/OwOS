@@ -92,6 +92,7 @@ void css_style_reset(struct css_style *s)
   s->trans_timing = -1;
   css_bgi_reset(&s->bgi);
   s->content[0] = '\0';
+  s->has_content = -1;
   s->svg_decl[0] = '\0';
   s->backdrop = 0;
   s->backdrop_set = 0;

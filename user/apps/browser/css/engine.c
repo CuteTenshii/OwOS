@@ -361,7 +361,8 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->bgi.pos_x = d->bgi.pos_x;
   if (d->bgi.pos_y >= 0)
     out->bgi.pos_y = d->bgi.pos_y;
-  if (d->content[0]) {
+  if (d->has_content >= 0) { /* a later content wins even when it is "" or none */
+    out->has_content = d->has_content;
     int i = 0;
     for (; d->content[i] && i < (int)sizeof out->content - 1; i++)
       out->content[i] = d->content[i];
@@ -899,7 +900,7 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
     return 0;
   for (int i = 0; i < nm; i++)
     fold(out, rule_decl(sh->match[i]));
-  return out->content[0] != '\0';
+  return out->has_content == 1;
 }
 
 int css_sheet_has_pseudo(const css_sheet *sh) { return sh && sh->has_pseudo_el; }
