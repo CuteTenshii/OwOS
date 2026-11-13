@@ -99,7 +99,7 @@ int fontstore_install(const char *src, char *name)
 int fontstore_list(int i, char *name)
 {
   struct dirent_u de;
-  for (int idx = 0, seen = 0; readdir(DIR, idx, &de) == 0; idx++) {
+  for (int idx = 0, seen = 0; readdir(DIR, idx, &de) == 1; idx++) {
     if (de.is_dir || !is_font_name(de.name) || !strcmp(de.name, builtin[FONT_EMOJI]) ||
         !strcmp(de.name, builtin[FONT_CJK]))
       continue;
