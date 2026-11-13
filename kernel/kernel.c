@@ -539,6 +539,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(neofetch);
     INSTALL_APP(lspci);
     INSTALL_APP(uname);
+    INSTALL_APP(ps);
     INSTALL_APP(ping);
     INSTALL_APP(dig);
     INSTALL_APP(stun);

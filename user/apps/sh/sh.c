@@ -220,7 +220,6 @@ static const struct builtin builtins[] = {
     {"date", 0, "date"},
     {"journal", 0, "journal"},
     {"lsusb", 0, "usb"},
-    {"ps", 0, "tasks"},
     {"storage", bi_storage},
     {"sleep", bi_sleep},
     {"id", cmd_id},
