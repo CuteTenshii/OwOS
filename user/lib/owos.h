@@ -407,6 +407,12 @@ int uname(struct utsname *out); /* 0/-1 */
 /* Named local IPC ports */
 int port_open(const char *name, int as_server);
 int port_accept(int listen_fd);
+int port_accept_nb(int listen_fd); /* a channel fd, -2 if no client is waiting, -1 on error */
+struct port_peer {
+  int pid, uid, gid;
+};
+int port_peer(int fd, struct port_peer *out);   /* who is at the other end of a channel; 0/-1 */
+int write_nb(int fd, const void *buf, int len); /* all of len / 0 no room yet / -1; len <= 512 */
 
 /* Signals; numbers/flags mirror kernel/signal.h, keep in sync */
 #define SIGHUP 1

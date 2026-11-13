@@ -3,9 +3,10 @@
 #include "ipc.h"
 #include "kstring.h"
 #include "pipe.h"
+#include "sched.h"
 #include "timer.h"
 
-#define IPC_MAX_PORTS 4
+#define IPC_MAX_PORTS 16
 #define IPC_NAME_MAX 16
 
 enum { PEND_NONE = 0, PEND_CLAIMED, PEND_READY }; /* zero = no pending conn */
@@ -16,6 +17,7 @@ struct port {
   char name[IPC_NAME_MAX];
   int pend;     /* PEND_*: guards the connection slot */
   int c2s, s2c; /* pending connection's pipe ids (READY) */
+  struct pipe_peer server;
 };
 
 static struct port ports[IPC_MAX_PORTS];
@@ -38,6 +40,7 @@ int ipc_port_create(const char *name)
       ports[i].used = true;
       ports[i].gen++;
       ports[i].pend = PEND_NONE;
+      ports[i].server = (struct pipe_peer){sched_current_process_id(), sched_uid(), sched_gid(), true};
       int j = 0;
       for (; name[j] && j < IPC_NAME_MAX - 1; j++)
         ports[i].name[j] = name[j];
@@ -97,6 +100,9 @@ int ipc_connect(const char *name, int *rx, int *tx)
     return -1;
   }
 
+  *pipe_peer(s2c) = p->server;
+  *pipe_peer(c2s) = (struct pipe_peer){sched_current_process_id(), sched_uid(), sched_gid(), true};
+
   /* Publish: the server's accept() will pick these up. */
   __asm__ volatile("cli");
   p->c2s = c2s;
@@ -109,7 +115,7 @@ int ipc_connect(const char *name, int *rx, int *tx)
   return 0;
 }
 
-int ipc_accept(int id, int *rx, int *tx)
+int ipc_accept(int id, int *rx, int *tx, bool block)
 {
   if (id < 0 || id >= IPC_MAX_PORTS || !ports[id].used)
     return -1;
@@ -118,6 +124,8 @@ int ipc_accept(int id, int *rx, int *tx)
   while (p->pend != PEND_READY) {
     if (!p->used)
       return -1;
+    if (!block)
+      return 1;
     timer_sleep(10);
   }
 

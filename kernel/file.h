@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define MAX_FD 8
+#define MAX_FD 64 /* the compositor holds one window channel per client thread */
 
 enum {
   FD_NONE = 0,

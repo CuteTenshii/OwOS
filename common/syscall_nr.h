@@ -104,6 +104,11 @@
 #define SYS_INSTALL 98     /* ebx = INSTALL_LIST / _START / _STEP (common/diskinstall.h) */
 #define SYS_SETUID 99      /* ebx = uid for every thread of the process; 0/-1 */
 #define SYS_SETGID 100     /* ebx = gid for every thread of the process; 0/-1 */
+#define SYS_PORT_PEER 102  /* ebx = channel fd, ecx = out {pid, uid, gid} of the other end; 0/-1 */
+#define SYS_WRITE_NB 103   /* as SYS_WRITE on a pipe or channel, but all-or-nothing: len / 0 no room yet / -1 */
+
+/* SYS_PORT_ACCEPT ecx flags */
+#define PORT_ACCEPT_NB 1 /* return -2 at once when no client is waiting */
 
 /* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */
 #define ENV_GET 0   /* copy the value of name into buf (if buf_len > 0); returns its length, -1 if unset */

@@ -645,6 +645,12 @@ int port_open(const char *name, int as_server) { return syscall(SYS_PORT_OPEN, (
 
 int port_accept(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, 0, 0); }
 
+int port_accept_nb(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, PORT_ACCEPT_NB, 0); }
+
+int port_peer(int fd, struct port_peer *out) { return syscall(SYS_PORT_PEER, fd, (int)out, 0); }
+
+int write_nb(int fd, const void *buf, int len) { return syscall(SYS_WRITE_NB, fd, (int)buf, len); }
+
 /* malloc / free */
 /* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads */
 

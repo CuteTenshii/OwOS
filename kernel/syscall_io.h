@@ -10,6 +10,8 @@ void syscall_io_close(struct registers *r);
 void syscall_io_read_nb(struct registers *r);
 void syscall_io_port_open(struct registers *r);
 void syscall_io_port_accept(struct registers *r);
+void syscall_io_port_peer(struct registers *r);
+void syscall_io_write_nb(struct registers *r);
 void syscall_io_tty(struct registers *r);
 
 #endif

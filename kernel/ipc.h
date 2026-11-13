@@ -14,6 +14,8 @@
 #ifndef OWOS_IPC_H
 #define OWOS_IPC_H
 
+#include <stdbool.h>
+
 /* Server side: register a port by name -> port id >=0, or -1 (name taken /
  * full). ipc_port_destroy releases the port and any not-yet-accepted
  * connection. */
@@ -25,8 +27,9 @@ void ipc_port_destroy(int port_id);
  * the pipe pool is exhausted. Blocks while a prior connection awaits accept. */
 int ipc_connect(const char *name, int *rx, int *tx);
 
-/* Server accept: block until a client connects to `port_id`, then return 0 and
- * fill rx/tx with the server's channel pipe ends; -1 if the port went away. */
-int ipc_accept(int port_id, int *rx, int *tx);
+/* Server accept: wait (unless !block) for a client on `port_id`, then return 0 and fill rx/tx with the server's
+ * channel pipe ends; 1 when !block and nobody is waiting; -1 if the port went away. Each side's rx pipe carries the
+ * other side's pid/uid/gid (pipe_peer), recorded at connect. */
+int ipc_accept(int port_id, int *rx, int *tx, bool block);
 
 #endif /* OWOS_IPC_H */

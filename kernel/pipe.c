@@ -3,8 +3,9 @@
 #include "pipe.h"
 #include "sched.h"
 
-#define MAX_PIPES 64 /* spawn_cap uses 1 each; an IPC channel or pty uses 2 (rx+tx) */
-#define PIPE_SIZE 512
+#define MAX_PIPES                                                                                                      \
+  192 /* spawn_cap uses 1 each; an IPC channel or pty uses 2 (rx+tx); struct fd keeps the id in a byte */
+#define PIPE_SIZE 1024
 
 struct pipe {
   bool used;
@@ -12,6 +13,7 @@ struct pipe {
   int head, tail, count;
   int readers, writers;
   struct pipe_tty tty;
+  struct pipe_peer peer;
 };
 
 static struct pipe pipes[MAX_PIPES];
@@ -25,6 +27,7 @@ int pipe_alloc(void)
       pipes[i].readers = 1;
       pipes[i].writers = 1;
       pipes[i].tty = (struct pipe_tty){80, 24, 0};
+      pipes[i].peer = (struct pipe_peer){0, 0, 0, false};
       return i;
     }
   }
@@ -103,4 +106,22 @@ int pipe_write(int id, const char *buf, int len)
   return n;
 }
 
+/* All or nothing, so message framing survives: len bytes, 0 if they don't fit yet, -1 with no reader or len too big. */
+int pipe_write_nb(int id, const char *buf, int len)
+{
+  struct pipe *p = &pipes[id];
+  if (p->readers <= 0 || len <= 0 || len > PIPE_SIZE)
+    return -1;
+  if (PIPE_SIZE - p->count < len)
+    return 0;
+  for (int n = 0; n < len; n++) {
+    p->buf[p->head] = buf[n];
+    p->head = (p->head + 1) % PIPE_SIZE;
+  }
+  p->count += len;
+  return len;
+}
+
 struct pipe_tty *pipe_tty(int id) { return &pipes[id].tty; }
+
+struct pipe_peer *pipe_peer(int id) { return &pipes[id].peer; }

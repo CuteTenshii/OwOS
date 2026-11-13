@@ -73,6 +73,26 @@ void syscall_io_write(struct registers *r)
   }
 }
 
+/* SYS_WRITE_NB: all of a message or nothing, never blocking, so a server can't be stalled by a client that stopped
+ * reading. Returns len, 0 when it doesn't fit yet, -1 on a closed peer or a message over IO_CHUNK. */
+void syscall_io_write_nb(struct registers *r)
+{
+  int fd = (int)r->ebx;
+  uint32_t len = r->edx;
+  if (fd < 0 || fd >= MAX_FD || len == 0 || len > IO_CHUNK || !user_range(r->ecx, len)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  struct fd *f = &sched_fds()[fd];
+  int id = f->type == FD_PIPE_WR ? f->pipe : fd_is_channel(f) ? f->tx : -1;
+  char kbuf[IO_CHUNK];
+  if (id < 0 || copyin(kbuf, r->ecx, len) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  r->eax = (uint32_t)pipe_write_nb(id, kbuf, (int)len);
+}
+
 void syscall_io_read(struct registers *r)
 {
   int fd = (int)r->ebx;
@@ -234,6 +254,7 @@ void syscall_io_port_open(struct registers *r)
   r->eax = (uint32_t)nfd;
 }
 
+/* ebx = listen fd, ecx = PORT_ACCEPT_NB to return -2 at once when nobody is waiting. */
 void syscall_io_port_accept(struct registers *r)
 {
   int lfd = (int)r->ebx;
@@ -243,8 +264,9 @@ void syscall_io_port_accept(struct registers *r)
     return;
   }
   int rx = 0, tx = 0;
-  if (ipc_accept(fds[lfd].pipe, &rx, &tx) < 0) {
-    r->eax = (uint32_t)-1;
+  int got = ipc_accept(fds[lfd].pipe, &rx, &tx, !(r->ecx & PORT_ACCEPT_NB));
+  if (got != 0) {
+    r->eax = (uint32_t)(got > 0 ? -2 : -1);
     return;
   }
   int nfd = -1;
@@ -263,6 +285,29 @@ void syscall_io_port_accept(struct registers *r)
   fds[nfd].pipe = (uint8_t)rx;
   fds[nfd].tx = (uint8_t)tx;
   r->eax = (uint32_t)nfd;
+}
+
+/* SYS_PORT_PEER: ebx = channel fd, ecx = out {pid, uid, gid} of the process at the other end. 0/-1. */
+void syscall_io_port_peer(struct registers *r)
+{
+  int fd = (int)r->ebx;
+  struct port_peer_u {
+    uint32_t pid, uid, gid;
+  } out;
+  if (fd < 0 || fd >= MAX_FD || !user_out_range(r->ecx, sizeof out)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  struct fd *f = &sched_fds()[fd];
+  if (f->type != FD_CHANNEL || !pipe_peer(f->pipe)->known) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  struct pipe_peer *p = pipe_peer(f->pipe);
+  out.pid = p->pid;
+  out.uid = p->uid;
+  out.gid = p->gid;
+  r->eax = copyout(r->ecx, &out, sizeof out) == 0 ? 0 : (uint32_t)-1;
 }
 
 /* SYS_TTY: terminal queries and the pty state (size, foreground job) kept on the slave-to-master pipe. */

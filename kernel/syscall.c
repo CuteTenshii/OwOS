@@ -300,6 +300,8 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_INSTALL] = syscall_fs_install,
     [SYS_SETUID] = syscall_process_setuid,
     [SYS_SETGID] = syscall_process_setgid,
+    [SYS_PORT_PEER] = syscall_io_port_peer,
+    [SYS_WRITE_NB] = syscall_io_write_nb,
 };
 
 void syscall_dispatch(struct registers *r)
