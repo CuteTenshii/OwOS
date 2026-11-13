@@ -148,6 +148,36 @@ static void no_color_in_outline_font(void)
   free(b);
 }
 
+/* Each shipped Noto Sans face names its family and reports the weight and slant the font store matches on. */
+static void noto_sans_faces(void)
+{
+  static const struct {
+    const char *path;
+    int weight, italic;
+  } faces[] = {{"fonts/NotoSans-Regular.ttf", 400, 0},
+               {"fonts/NotoSans-Bold.ttf", 700, 0},
+               {"fonts/NotoSans-Italic.ttf", 400, 1},
+               {"fonts/NotoSans-BoldItalic.ttf", 700, 1}};
+  for (unsigned i = 0; i < sizeof faces / sizeof faces[0]; i++) {
+    int len = 0;
+    unsigned char *b = slurp(faces[i].path, &len);
+    expect(b != NULL);
+    struct font *f = b ? font_load(b, len) : 0;
+    expect(f != NULL);
+    if (f) {
+      char fam[64];
+      int weight, italic;
+      font_family(f, fam, sizeof fam);
+      expect_string(fam, "Noto Sans");
+      font_style(f, &weight, &italic);
+      expect_eq(weight, faces[i].weight);
+      expect_eq(italic, faces[i].italic);
+      font_free(f);
+    }
+    free(b);
+  }
+}
+
 static void put16(unsigned char *p, unsigned v)
 {
   p[0] = (unsigned char)(v >> 8);
@@ -278,5 +308,6 @@ int main(void)
   test("color_emoji", color_emoji);
   test("emoji_ligatures", emoji_ligatures);
   test("no_color_in_outline_font", no_color_in_outline_font);
+  test("noto_sans_faces", noto_sans_faces);
   return 0;
 }
