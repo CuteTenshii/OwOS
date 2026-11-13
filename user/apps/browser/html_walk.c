@@ -431,8 +431,6 @@ static void walk_element_inner(struct dom_node *el)
 
   apply_ua_style(name);
   apply_css(&cs, &saved);
-  if (cs.bg >= 0)
-    W_bg = (unsigned)cs.bg;
 
   /* Block-level browser defaults. */
   if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2])
@@ -532,6 +530,11 @@ static void walk_element_inner(struct dom_node *el)
     cs.bg = -1; /* no box of its own, so no background */
   if (cs.pos == CSS_POS_FIXED || cs.pos == CSS_POS_ABS)
     blk = 1; /* fixed and absolute boxes are blockified so they get a layout box */
+  /* A block's layout box paints its own (rounded, padded) background; only inline boxes tint their glyphs. */
+  if (blk)
+    W_bg = BG_NONE;
+  else if (cs.bg >= 0)
+    W_bg = (unsigned)cs.bg;
 
   if (blk) {
     sty_cur.clip = cs.overflow == 1; /* each block clips (or not) on its own; inline children share their block's */
