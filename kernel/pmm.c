@@ -107,6 +107,17 @@ void pmm_add_region(uint64_t addr, uint64_t len)
   }
 }
 
+void pmm_reserve_range(uint64_t addr, uint64_t len)
+{
+  uint64_t f0 = addr / FRAME_SIZE, f1 = (addr + len + FRAME_SIZE - 1) / FRAME_SIZE;
+  for (uint64_t f = f0; f < f1 && f < total_frames; f++) {
+    if (!frame_test((uint32_t)f)) {
+      frame_set((uint32_t)f);
+      used_frames++;
+    }
+  }
+}
+
 void pmm_reserve_low(uint32_t low_end, uint32_t pool_start)
 {
   low_end_b = low_end;

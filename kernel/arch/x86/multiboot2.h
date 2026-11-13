@@ -17,6 +17,7 @@
 
 #define MB2_TAG_END 0
 #define MB2_TAG_CMDLINE 1 /* the kernel command line (a NUL-term string) */
+#define MB2_TAG_MODULE 3  /* a loaded module and its command line */
 #define MB2_TAG_MMAP 6
 #define MB2_TAG_FRAMEBUFFER 8
 #define MB2_TAG_EFI32 11    /* EFI 32-bit system table ptr (UEFI only)    */
@@ -36,6 +37,13 @@ struct mb2_tag {
 
 /* type 1: the kernel command line. The NUL-terminated string follows the
  * header in place (the tag's `size` covers header + string + NUL). */
+struct mb2_tag_module {
+  uint32_t type;
+  uint32_t size;
+  uint32_t mod_start, mod_end;
+  char string[];
+} __attribute__((packed));
+
 struct mb2_tag_string {
   uint32_t type;
   uint32_t size;

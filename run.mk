@@ -152,7 +152,8 @@ ifeq ($(ARCH),x86_64)
   BOOTARG := -cdrom $(ISO)
   BOOTDEP := $(ISO)
 else
-  BOOTARG := -kernel $(KERNEL)
+  # The kernel also rides along as a module, as on the ISO, so the Installer has an image to copy.
+  BOOTARG := -kernel $(KERNEL) -initrd '$(KERNEL) owos-kernel'
   BOOTDEP := $(KERNEL)
 endif
 
@@ -194,7 +195,7 @@ debug: $(BOOTDEP) $(DISK_IMAGES)
 $(ISO): $(KERNEL)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/$(KERNEL)
-	printf 'set timeout=0\nset default=0\ninsmod all_video\nset gfxmode=1920x1080x32,1366x768x32,1280x1024x32,1024x768x32,800x600x32,auto\nmenuentry "OwOS" {\n\tinsmod all_video\n\tmultiboot2 /boot/$(KERNEL) verbose\n\tboot\n}\n' \
+	printf 'set timeout=0\nset default=0\ninsmod all_video\nset gfxmode=1920x1080x32,1366x768x32,1280x1024x32,1024x768x32,800x600x32,auto\nmenuentry "OwOS" {\n\tinsmod all_video\n\tmultiboot2 /boot/$(KERNEL) verbose\n\tmodule2 /boot/$(KERNEL) owos-kernel\n\tboot\n}\n' \
 		> $(ISODIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISODIR)
 

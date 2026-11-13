@@ -13,6 +13,7 @@
 
 #define MULTIBOOT_FLAG_MEM (1 << 0)  /* mem_lower/mem_upper valid          */
 #define MULTIBOOT_FLAG_CMD (1 << 2)  /* cmdline (a physical char* ) valid  */
+#define MULTIBOOT_FLAG_MODS (1 << 3) /* mods_count/mods_addr valid         */
 #define MULTIBOOT_FLAG_MMAP (1 << 6) /* mmap_length/mmap_addr valid        */
 #define MULTIBOOT_FLAG_FB (1 << 12)  /* framebuffer_* fields valid          */
 
@@ -52,6 +53,13 @@ struct multiboot_info {
   uint8_t framebuffer_bpp;     /* bits per pixel                             */
   uint8_t framebuffer_type;    /* 1 = direct RGB (see MULTIBOOT_FB_TYPE_RGB)  */
   uint8_t color_info[6];       /* RGB field positions/sizes for type 1        */
+} __attribute__((packed));
+
+/* One entry of the mods_addr array. */
+struct multiboot_mod_list {
+  uint32_t mod_start, mod_end;
+  uint32_t cmdline; /* physical char* */
+  uint32_t pad;
 } __attribute__((packed));
 
 /* One memory-map entry. `size` is the entry length NOT counting the size

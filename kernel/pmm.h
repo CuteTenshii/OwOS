@@ -26,6 +26,8 @@ void pmm_init(const struct multiboot_info *mbi);
 void pmm_begin(uint64_t highest, uint64_t installed_bytes);
 void pmm_add_region(uint64_t addr, uint64_t len);
 void pmm_reserve_low(uint32_t low_end, uint32_t pool_start);
+/* Mark [addr, addr+len) used, e.g. memory the bootloader loaded modules into. Call before any allocation. */
+void pmm_reserve_range(uint64_t addr, uint64_t len);
 
 phys_t pmm_alloc_frame(void); /* physical addr of a free frame, or 0 */
 void pmm_free_frame(phys_t phys);

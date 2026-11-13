@@ -6,6 +6,7 @@
 #include "atapi.h"
 #include "backlight.h"
 #include "blk.h"
+#include "bootmod.h"
 #include "console.h"
 #include "entropy.h"
 #include "es1371.h"
@@ -197,7 +198,10 @@ static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
     if (tag->type == MB2_TAG_END)
       break;
 
-    if (tag->type == MB2_TAG_CMDLINE) {
+    if (tag->type == MB2_TAG_MODULE) {
+      struct mb2_tag_module *mod = (struct mb2_tag_module *)p;
+      bootmod_add(mod->mod_start, mod->mod_end, mod->string);
+    } else if (tag->type == MB2_TAG_CMDLINE) {
       /* GRUB's command line. A `verbose` token here shows the boot log
        * on screen, same as the mb1 path below. */
       if (cmdline_has(((struct mb2_tag_string *)p)->string, "verbose"))
@@ -274,6 +278,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   if (magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
     mbi = multiboot2_to_info((uintptr_t)mbi);
+  } else if (magic == MULTIBOOT_BOOTLOADER_MAGIC && (mbi->flags & MULTIBOOT_FLAG_MODS)) {
+    const struct multiboot_mod_list *ml = (const struct multiboot_mod_list *)(uintptr_t)mbi->mods_addr;
+    for (uint32_t i = 0; i < mbi->mods_count; i++)
+      bootmod_add(ml[i].mod_start, ml[i].mod_end, (const char *)(uintptr_t)ml[i].cmdline);
   } else if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
     con_set_color(CON_WHITE, CON_RED);
     con_write("bad multiboot magic -- halting.\n");
@@ -291,6 +299,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
              firmware_name());
 
   pmm_init(mbi);
+  bootmod_reserve();
   con_printf("pmm: %u MiB RAM detected", pmm_installed_kib() / 1024);
   if (pmm_installed_kib() > pmm_total_kib()) {
     /* 32-bit, no PAE: only the low 4 GiB is usable. */
@@ -300,6 +309,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   paging_init();
   con_write("paging: enabled (low 16 MiB identity-mapped).\n");
+  bootmod_relocate();
 
   heap_init();
   con_write("heap: ready.\n");
