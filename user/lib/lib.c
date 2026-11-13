@@ -142,42 +142,7 @@ int net_sendto(int fd, const unsigned char ip[16], int port, const void *buf, in
   return syscall(SYS_NET_SEND, (int)a, 0, 0);
 }
 
-int win_create(int w, int h, const char *title) { return syscall(SYS_WIN_CREATE, w, h, (int)title); }
-
-int win_present(int id) { return syscall(SYS_WIN_PRESENT, id, 0, 0); }
-
-int win_present_rect(int id, int x, int y, int w, int h)
-{
-  if (x < 0 || y < 0 || w <= 0 || h <= 0 || w > 0xFFFF || h > 0xFFFF)
-    return win_present(id);
-  return syscall(SYS_WIN_PRESENT, id, x | y << 16, w | h << 16);
-}
-
-int win_poll(int id, struct win_event *ev) { return syscall(SYS_WIN_POLL, id, (int)ev, 0); }
-
-void win_wait(int id) { syscall(SYS_WIN_POLL, id, 0, 1); /* ev=NULL, block=1: sleep ~one frame */ }
-
-int win_close(int id) { return syscall(SYS_WIN_CLOSE, id, 0, 0); }
-
-int win_owned(int pid) { return syscall(SYS_WIN_OWNS, pid, 0, 0); }
-
-int win_set_parent(int id, int parent, int modal) { return syscall(SYS_WIN_SET_PARENT, id, parent, modal); }
-
-unsigned *win_fb_of(int id)
-{
-  unsigned v = (unsigned)syscall(SYS_WIN_FB, id, 0, 0);
-  return v ? (unsigned *)v : (unsigned *)0;
-}
-
-int win_settitle(int id, const char *title) { return syscall(SYS_WIN_TITLE, id, (int)title, 0); }
-
-int win_resizable(int id, int on) { return syscall(SYS_WIN_RESIZABLE, id, on, 0); }
-
-int win_fullscreen(int id, int on) { return syscall(SYS_WIN_FULLSCREEN, id, on, 0); }
-
-int win_cursor(int id, int shape) { return syscall(SYS_WIN_CURSOR, id, shape, 0); }
-
-/* Phase 1 user-space compositor wrappers (root-only) */
+/* Compositor wrappers (root-only) */
 int fb_info(struct fbinfo *out) { return syscall(SYS_FB_INFO, (int)out, 0, 0); }
 
 unsigned *fb_map(void)
@@ -196,22 +161,6 @@ int fb_cursor_set(const unsigned *argb, int w, int h, int hot_x, int hot_y, int 
 int input_poll(struct inputstate *out) { return syscall(SYS_INPUT_POLL, (int)out, 0, 0); }
 
 int input_set_bounds(int w, int h) { return syscall(SYS_INPUT_SET_BOUNDS, w, h, 0); }
-
-int win_enum(struct winrec *out, int max) { return syscall(SYS_WIN_ENUM, (int)out, max, 0); }
-
-int win_map(int id, struct winmap *m) { return syscall(SYS_WIN_MAP, id, (int)m, 0); }
-
-int win_unmap(int id) { return syscall(SYS_WIN_UNMAP, id, 0, 0); }
-
-int win_set_geom(int id, int x, int y, int w, int h)
-{
-  int g[4] = {x, y, w, h};
-  return syscall(SYS_WIN_SET_GEOM, id, (int)g, 0);
-}
-
-int win_deliver(int id, const struct winevent *ev) { return syscall(SYS_WIN_DELIVER, id, (int)ev, 0); }
-
-int win_key_space(int id) { return syscall(SYS_WIN_KEY_SPACE, id, 0, 0); }
 
 int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, (int)out, max, 0); }
 

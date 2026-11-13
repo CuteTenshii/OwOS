@@ -54,11 +54,9 @@
 #include "syscall_process.h"
 #include "syscall_shm.h"
 #include "syscall_signal.h"
-#include "syscall_window.h"
 #include "sysfs.h"
 #include "timer.h"
 #include "uaccess.h"
-#include "uwin.h"
 #include <stdint.h>
 
 /* Build stamp for SYS_UNAME; the Makefile passes it, this is the fallback. */
@@ -215,22 +213,15 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_NET_SEND] = syscall_net_send,
     [SYS_NET_RECV] = syscall_net_recv,
     [SYS_NET_CLOSE] = syscall_net_close,
-    [SYS_WIN_CREATE] = syscall_window_create,
-    [SYS_WIN_PRESENT] = syscall_window_present,
-    [SYS_WIN_POLL] = syscall_window_poll,
-    [SYS_WIN_CLOSE] = syscall_window_close,
     [SYS_READDIR] = syscall_fs_readdir,
-    [SYS_WIN_TITLE] = syscall_window_title,
     [SYS_THREAD] = syscall_process_thread,
     [SYS_SLEEP] = syscall_process_sleep,
-    [SYS_WIN_RESIZABLE] = syscall_window_resizable,
     [SYS_MSEC] = syscall_process_msec,
     [SYS_FUTEX_WAIT] = syscall_process_futex_wait,
     [SYS_FUTEX_WAKE] = syscall_process_futex_wake,
     [SYS_READFILE_AT] = syscall_fs_readfile_at,
     [SYS_VOLUMES] = syscall_fs_volumes,
     [SYS_UMOUNT] = syscall_fs_umount,
-    [SYS_WIN_CURSOR] = syscall_window_cursor,
     [SYS_STREAM_BEGIN] = syscall_fs_stream_begin,
     [SYS_STREAM_WRITE] = syscall_fs_stream_write,
     [SYS_STREAM_END] = syscall_fs_stream_end,
@@ -266,13 +257,7 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_FB_PRESENT] = syscall_graphics_fb_present,
     [SYS_INPUT_POLL] = syscall_graphics_input_poll,
     [SYS_INPUT_SET_BOUNDS] = syscall_graphics_input_bounds,
-    [SYS_WIN_ENUM] = syscall_graphics_win_enum,
-    [SYS_WIN_MAP] = syscall_graphics_win_map,
-    [SYS_WIN_UNMAP] = syscall_graphics_win_unmap,
-    [SYS_WIN_SET_GEOM] = syscall_graphics_win_geom,
-    [SYS_WIN_DELIVER] = syscall_graphics_win_deliver,
     [SYS_CRASH_POLL] = syscall_graphics_crash_poll,
-    [SYS_WIN_KEY_SPACE] = syscall_graphics_win_key_space,
     [SYS_STACK_ALLOC] = syscall_process_stack_alloc,
     [SYS_STACK_FREE] = syscall_process_stack_free,
     [SYS_SIGACTION] = syscall_signal_action,
@@ -280,9 +265,6 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_SIGRETURN] = syscall_signal_return,
     [SYS_GETPID] = syscall_process_getpid,
     [SYS_GETRANDOM] = syscall_entropy_getrandom,
-    [SYS_WIN_OWNS] = syscall_window_owns,
-    [SYS_WIN_SET_PARENT] = syscall_window_set_parent,
-    [SYS_WIN_FB] = syscall_window_fb,
     [SYS_UNAME] = syscall_fs_uname,
     [SYS_GETTIME] = syscall_net_gettime,
     [SYS_SETTIME] = syscall_net_settime,
@@ -295,7 +277,6 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_ENV] = syscall_env,
     [SYS_FB_CURSOR] = syscall_graphics_fb_cursor,
     [SYS_SET_TLS] = syscall_process_set_tls,
-    [SYS_WIN_FULLSCREEN] = syscall_window_fullscreen,
     [SYS_SYMBOLIZE] = syscall_graphics_symbolize,
     [SYS_THREAD_NAME] = syscall_process_thread_name,
     [SYS_INSTALL] = syscall_fs_install,

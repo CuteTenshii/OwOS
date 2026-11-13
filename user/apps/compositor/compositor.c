@@ -147,7 +147,8 @@ int main(void)
     reap_kids();
     crash_ingest();
 
-    /* Refresh the window set, then (re)pin client buffers to match it */
+    /* Run client requests, then refresh the window set and the buffer views to match it */
+    wms_poll();
     nwin = win_enum(cur, WM_LIST_MAX);
     if (nwin < 0)
       nwin = 0;
@@ -190,6 +191,7 @@ int main(void)
     prev_wheel = in.wheel;
 
     handle_input(in.mx, in.my, in.buttons, dz);
+    wms_flush(); /* this frame's input and resizes reach the apps now, not a frame later */
 
     int mx = in.mx, my = in.my;
     ndmg = 0;

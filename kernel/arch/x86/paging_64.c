@@ -205,7 +205,7 @@ void paging_free_process_dir(uint32_t *dir)
     pfree(upd);
   }
 
-  /* Free only WIN_FB page tables (PAGE_USER); MMIO tables are shared, WIN_FB frames are freed by uwin. */
+  /* Free only high-vaddr page tables (PAGE_USER); MMIO tables are shared, shm frames are freed by shm.c. */
   uint64_t *hpd = (uint64_t *)(uintptr_t)(pdpt[3] & PG_ADDR);
   for (int i = 0; i < 512; i++)
     if ((hpd[i] & PAGE_PRESENT) && (hpd[i] & PAGE_USER))

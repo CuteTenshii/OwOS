@@ -18,10 +18,10 @@
 #include "smp.h"
 #include "syscall.h"
 #include "syscall_fs.h"
+#include "syscall_graphics.h"
 #include "syscall_nr.h"
 #include "timer.h"
 #include "uaccess.h"
-#include "uwin.h"
 #include <stdint.h>
 
 /* Tasks are heap-allocated task_t nodes in a circular run queue; alloc_task() fails when the heap is full. */
@@ -1014,8 +1014,8 @@ void sched_wake_due(uint32_t now)
 
 void sched_exit(int status)
 {
-  uwin_task_exiting(current->id);  /* tear down any GUI windows it owns */
-  audio_task_exiting(current->id); /* release the PCM stream if it held it */
+  graphics_task_exiting(current->id); /* a dying compositor hands the keyboard back to the kernel console */
+  audio_task_exiting(current->id);    /* release the PCM stream if it held it */
   if (!current->as || current->as_owner) {
     net_sock_close_owner(sched_current_process_id());
     syscall_fs_process_exiting(sched_current_process_id());

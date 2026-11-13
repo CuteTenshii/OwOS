@@ -67,13 +67,11 @@ static const struct winmap *client_for(int id)
   return 0;
 }
 
-/* Remap every enumerated window and unmap ids that are gone so the kernel can reclaim frames */
+/* Refresh the cached buffer view of every enumerated window and forget ids that are gone */
 void refresh_maps(void)
 {
-  /* drop maps for gone windows */
   for (int i = 0; i < ncmap;) {
     if (slot_of(cmap[i].id) < 0) {
-      win_unmap(cmap[i].id);
       cmap[i] = cmap[--ncmap];
     } else
       i++;

@@ -8,17 +8,12 @@
 #include "mediactl.h"
 #include "owos.h"
 #include "pngenc.h"
+#include "wmserver.h"
 
 #include <stdbool.h>
 
-#define WM_TITLE_H 22
-#define WM_BORDER 2
-#define WM_BAR_H 28
-#define WM_TITLE_MAX 64
 #define WM_GRIP 14
 #define WM_EDGE 5
-#define WM_MIN_W 140
-#define WM_MIN_H 120
 enum {
   CUR_ARROW = 0,
   CUR_HAND,
@@ -38,7 +33,6 @@ enum {
 };
 #define KEY_TAB '\t'
 #define KEY_ALT_UP 0x1B /* internal: "Alt released" marker (kernel wm KEY_ALT_UP) */
-#define WM_LIST_MAX 64
 #define WM_TITLE_DISP (WM_TITLE_MAX + 18)
 #define START_W 70
 #define SM_ITEM_H 20

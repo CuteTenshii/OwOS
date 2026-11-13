@@ -46,11 +46,11 @@
 #include "smbios.h"
 #include "smp.h"
 #include "syscall.h"
+#include "syscall_graphics.h"
 #include "timer.h"
 #include "ufs.h"
 #include "usb.h"
 #include "users.h"
-#include "uwin.h"
 #include "virtiogpu.h"
 #include "virtioserial.h"
 #include "vmsvga.h"
@@ -431,7 +431,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     char c;
     unsigned char mods;
     /* The kernel drains the keyboard only while no compositor owns it (recovery console). */
-    if (!uwin_compositor_active()) {
+    if (!graphics_fb_owned()) {
       if (keyboard_take_interrupt())
         shell_interrupt_locked();
       while (keyboard_poll_text(&c, &mods))

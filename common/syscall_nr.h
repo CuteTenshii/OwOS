@@ -15,20 +15,13 @@
 #define SYS_NET_SEND 12
 #define SYS_NET_RECV 13
 #define SYS_NET_CLOSE 14
-#define SYS_WIN_CREATE 15
-#define SYS_WIN_PRESENT 16
-#define SYS_WIN_POLL 17
-#define SYS_WIN_CLOSE 18
 #define SYS_READDIR 19
-#define SYS_WIN_TITLE 20
 #define SYS_THREAD 21
 #define SYS_SLEEP 22
-#define SYS_WIN_RESIZABLE 23
 #define SYS_MSEC 24
 #define SYS_READFILE_AT 25
 #define SYS_VOLUMES 26
 #define SYS_UMOUNT 27
-#define SYS_WIN_CURSOR 28
 #define SYS_STREAM_BEGIN 29
 #define SYS_STREAM_WRITE 30
 #define SYS_STREAM_END 31
@@ -64,13 +57,7 @@
 #define SYS_FB_PRESENT 61
 #define SYS_INPUT_POLL 62
 #define SYS_INPUT_SET_BOUNDS 63
-#define SYS_WIN_ENUM 64
-#define SYS_WIN_MAP 65
-#define SYS_WIN_UNMAP 66
-#define SYS_WIN_SET_GEOM 67
-#define SYS_WIN_DELIVER 68
 #define SYS_CRASH_POLL 69
-#define SYS_WIN_KEY_SPACE 70
 #define SYS_STACK_ALLOC 71
 #define SYS_STACK_FREE 72
 #define SYS_SIGACTION 73
@@ -78,9 +65,6 @@
 #define SYS_SIGRETURN 75
 #define SYS_GETPID 76
 #define SYS_GETRANDOM 77
-#define SYS_WIN_OWNS 78
-#define SYS_WIN_SET_PARENT 79
-#define SYS_WIN_FB 80
 #define SYS_UNAME 81
 #define SYS_FUTEX_WAIT 82
 #define SYS_FUTEX_WAKE 83
@@ -94,10 +78,9 @@
 #define SYS_TTY 91
 #define SYS_ENV 92
 #define SYS_FB_CURSOR 93
-#define SYS_WIN_FULLSCREEN 95 /* ebx = window id, ecx = on */
-#define SYS_SET_TLS 94        /* ebx = thread pointer: the base of the %gs segment (0 = none) */
-#define SYS_SYMBOLIZE 96      /* ebx = address in the caller's program, ecx = out, edx = cap: "func+0xNN", 0/-1 */
-#define SYS_THREAD_NAME 97    /* ebx = THREAD_NAME_SET (ecx = name, NULL clears) or _GET (ecx = out, edx = cap) */
+#define SYS_SET_TLS 94     /* ebx = thread pointer: the base of the %gs segment (0 = none) */
+#define SYS_SYMBOLIZE 96   /* ebx = address in the caller's program, ecx = out, edx = cap: "func+0xNN", 0/-1 */
+#define SYS_THREAD_NAME 97 /* ebx = THREAD_NAME_SET (ecx = name, NULL clears) or _GET (ecx = out, edx = cap) */
 #define THREAD_NAME_SET 0
 #define THREAD_NAME_GET 1
 #define THREAD_NAME_MAX 32 /* label bytes including the NUL; longer names are truncated */

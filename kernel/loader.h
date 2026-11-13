@@ -7,7 +7,7 @@
 /* Each process gets a large PRIVATE virtual window at 1 GiB, backed on demand
  * by pmm high memory (>16 MiB) through its own page tables. 1 GiB is clear of
  * the identity map (low 16 MiB), the kernel heap/pool, every device MMIO
- * mapping, and the per-window framebuffer at WIN_FB_VADDR (3 GiB), so it
+ * mapping, and the shm slots at SHM_LOW_BASE (3 GiB), so it
  * collides with nothing. The span is the per-process cap; frames are only
  * allocated for the program image + stack actually used. */
 #define USER_BASE 0x40000000u /* 1 GiB: where user code is loaded      */
@@ -15,7 +15,7 @@
   0x80000000u                                      /* 2 GiB: a ~1 GiB per-process heap window.                         \
                                                                          Backed on demand, so the span is free         \
                                                                          until touched; ends well below                \
-                                                      WIN_FB_VADDR (3 GiB). Physical RAM (make run -m) is the real     \
+                                                      SHM_LOW_BASE (3 GiB). Physical RAM (make run -m) is the real     \
                                                       ceiling now, not this boundary. */
 #define USER_STACK_TOP (USER_REGION_END - 0x1000u) /* stack grows down from the top */
 #define USER_STACK_PAGES                                                                                               \
@@ -49,27 +49,15 @@ void user_stack_free(uint32_t top);
  * the address space; this just clears the bookkeeping). */
 void user_stack_reset_owner(uint32_t *dir);
 
-/* Fixed high VAs for the user-space compositor (Phase 1 of moving the WM to
- * ring 3). Only /bin/compositor (root) maps these; they sit ABOVE WIN_FB_VADDR
- * (0xC0000000, an app's own window buffer) so nothing collides with the
- * ordinary per-process windows the compositor also brokers. COMPOSITOR_FB_VADDR
- * the shared cached-RAM back buffer (SYS_FB_MAP); the compositor draws here,
- * then SYS_FB_PRESENT flushes it. WIN_MAP_BASE         base of one fixed slot
- * per window id (SYS_WIN_MAP), so a window's client buffer maps at WIN_MAP_BASE
- * + id*slot and the compositor blits it zero-copy. A slot holds a full- screen
- * buffer; WIN_MAP_MAX slots span up to the 4 GiB top. */
+/* High VAs above the private user window. COMPOSITOR_FB_VADDR is the framebuffer back buffer that SYS_FB_MAP hands
+ * the compositor. Shared memory (shm.c) maps only at the start of an 8 MiB slot inside [SHM_LOW_BASE, SHM_LOW_END) or
+ * [SHM_HIGH_BASE, 4 GiB); a slot spans whole page tables on both arches, so unmapping one never touches a neighbour,
+ * and the teardown of an address space frees those tables but never their frames. */
 #define COMPOSITOR_FB_VADDR 0xD0000000u /* 3.25 GiB: shared framebuffer back buffer */
-#define WIN_MAP_BASE 0xE0000000u        /* 3.5 GiB: window-buffer map slots */
-#define WIN_MAP_SLOT_BYTES 0x00800000u  /* 8 MiB per slot (>= 1920x1080x4)          */
-#define WIN_MAP_MAX 64u                 /* slots -> 0xE0000000..0x100000000 (4 GiB) */
-
-/* Shared memory (shm.c) maps only at the start of an 8 MiB slot inside [SHM_LOW_BASE, SHM_LOW_END) or
- * [SHM_HIGH_BASE, 4 GiB); a slot spans whole page tables on both arches, so unmapping one never touches a
- * neighbour, and the teardown of an address space frees those tables but never their frames. */
-#define SHM_SLOT_BYTES 0x00800000u
-#define SHM_LOW_BASE 0xC0000000u
+#define SHM_SLOT_BYTES 0x00800000u      /* 8 MiB per slot (>= 1920x1080x4) */
+#define SHM_LOW_BASE 0xC0000000u        /* 32 slots below the back buffer */
 #define SHM_LOW_END COMPOSITOR_FB_VADDR
-#define SHM_HIGH_BASE 0xE0000000u
+#define SHM_HIGH_BASE 0xE0000000u /* 64 slots up to the 4 GiB top */
 
 /* Build a fresh address space from an ELF32 image. On success returns 0 and
  * fills *out_dir / *out_entry / *out_brk (the page-aligned image end, where the

@@ -132,9 +132,10 @@ int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
 #define SHM_HIGH_ADDR 0xE0000000u
 #define SHM_HIGH_SLOTS 64
 
-/* windowing API */
-/* Client buffer is mapped at WIN_FB_ADDR (XRGB8888, pitch = width passed to win_create) */
-#define WIN_FB_ADDR 0xC0000000u
+/* windowing API: a client of the compositor's "wm" port (user/lib/win/win.c, wmproto.h). Use a window from the
+ * thread that created it: events arrive on that thread's connection. */
+/* The first window's buffer is mapped at WIN_FB_ADDR (XRGB8888, pitch = its client width); see win_fb_of */
+#define WIN_FB_ADDR SHM_LOW_ADDR
 
 #define WEV_KEY                                                                                                        \
   1                    /* a = key char (control codes < 0x20 for editing keys),                                        \
@@ -180,7 +181,7 @@ int win_set_parent(int id, int parent, int modal);
 /* Buffer of an owned window; 0 if not owned */
 unsigned *win_fb_of(int id);
 
-/* Cursor over the client area; mirrors UWIN_CURSOR_* in kernel/uwin.h */
+/* Cursor over the client area */
 #define WIN_CURSOR_ARROW 0
 #define WIN_CURSOR_HAND 1        /* pointing hand, over clickable items */
 #define WIN_CURSOR_TEXT 2        /* I-beam, over editable text */
@@ -200,9 +201,6 @@ int win_cursor(int id, int shape);
 
 /* Compositor API (root-only, -1 if not uid 0) */
 #define COMPOSITOR_FB_ADDR 0xD0000000u
-#define WIN_MAP_BASE_ADDR 0xE0000000u
-#define WIN_MAP_SLOT 0x00800000u /* 8 MiB per window slot */
-static inline unsigned *win_map_ptr(int id) { return (unsigned *)(WIN_MAP_BASE_ADDR + (unsigned)id * WIN_MAP_SLOT); }
 
 struct fbinfo {
   int w, h, pitch, bpp;
@@ -227,42 +225,6 @@ struct inputstate {
 };
 int input_poll(struct inputstate *out); /* 0/-1 */
 int input_set_bounds(int w, int h);     /* clamp box after a mode change; 0/-1 */
-
-/* Window brokering */
-struct winrec {
-  int id, x, y, w, h;
-  unsigned flags; /* UWIN_F_* */
-  unsigned present_seq;
-  int dirty_x, dirty_y, dirty_w, dirty_h; /* client damage since last enum; w < 0 = whole frame */
-  int owner_pid, z;
-  int buf_w, buf_h; /* client buffer size (stride = buf_w) */
-  char title[64];
-  int parent; /* transient parent window id, or -1 */
-  int cursor; /* client-area cursor shape, WIN_CURSOR_* */
-};
-#define UWIN_F_VISIBLE 0x01
-#define UWIN_F_FOCUSED 0x02
-#define UWIN_F_MINIMIZED 0x04
-#define UWIN_F_MAXIMIZED 0x08
-#define UWIN_F_RESIZABLE 0x10
-#define UWIN_F_FULLSCREEN 0x40 /* covers the screen, no chrome */
-#define UWIN_F_MODAL 0x20      /* transient child that blocks its parent family */
-struct winmap {
-  unsigned vaddr;
-  int w, h, stride;
-};
-struct winevent {
-  unsigned type;
-  int a, b;
-}; /* type = WEV_*, client-relative */
-
-int win_enum(struct winrec *out, int max);            /* count / -1 */
-int win_map(int id, struct winmap *m);                /* 0/-1 */
-int win_unmap(int id);                                /* 0/-1 */
-int win_set_geom(int id, int x, int y, int w, int h); /* 0/-1 */
-int win_deliver(int id, const struct winevent *ev);   /* 0/-1 */
-/* Free slots in a window's key/input event ring (a huge number if the window doesn't queue) */
-int win_key_space(int id);
 
 /* Pending crash reports; crash_poll consumes up to `max` (root) */
 #define CRASH_TRACE_MAX 12

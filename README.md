@@ -123,7 +123,8 @@ buffer took a laptop from 2 fps to smooth.
 Desktop apps open from the Start menu. Only the About box is kernel-side;
 everything else - the terminal (a self-contained shell), clock, files,
 editor, browser, image viewer - is a **user program** that draws into
-a shared pixel buffer through the windowing syscalls (`uwin.c`): a clock, a file
+a shared-memory pixel buffer the compositor hands it over the `wm` IPC port
+(`user/lib/win/`, `user/apps/compositor/wmserver.c`): a clock, a file
 browser, a text editor, an image viewer, and a real web browser. A user app
 that faults gets a crash window instead of taking down the kernel.
 
@@ -341,8 +342,8 @@ kernel/loader.c    ELF32 loader: load segments into a fresh address space
 kernel/pipe.c      kernel pipe ring buffers
 kernel/file.h      per-process fd table
 
-kernel/wm.c        compositing window manager (one kernel thread)
-kernel/uwin.c      windowing server (user apps own a window)
+kernel/shm.c       shared memory objects granted to other pids (window buffers)
+kernel/ipc.c       named IPC ports; each channel knows the pid/uid at its other end
 kernel/apps.c      desktop app registry / Start menu
 kernel/screenshot.c Print Screen -> PNG capture worker
 kernel/png.c       PNG decoder (over the DEFLATE engine)

@@ -56,6 +56,7 @@ ARCHIVE_HOST_FS   := -Dmkdir=archive_test_mkdir -Dstream_begin=archive_test_stre
                      -Dstream_write=archive_test_stream_write -Dstream_end=archive_test_stream_end -include tests/archive_fs.h
 EXTRA_zstd        := $(ZSTD_RENAME)
 EXTRA_a64_elf     := -Ikernel
+EXTRA_wm          := -Iuser/apps/compositor
 
 # Objects rebuilt with test-specific defines or a fake system layer: impl_<name> := <source> <extra flags>
 # builds $(B)/impl/<name>.o, and bind_<name> the same under $(B)/bind/impl for the bindings binary.
@@ -77,6 +78,9 @@ impl_vary_fs       := tests/vary_fs.c -DCACHE_DIR='"$(RUN)/vary-cache"'
 # The UVC driver against kernel service stand-ins (tests/uvc_host); sched_yield is renamed so the test supplies it
 impl_uvc           := drivers/usb/uvc.c -Itests/uvc_host -Dsched_yield=uvc_host_yield
 impl_tz            := $(LIB)/tz/tz.c -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
+# The window protocol's client and server, over the fake kernel in wm_test.c
+impl_wmclient      := $(LIB)/win/win.c -include tests/wm_host.h
+impl_wmserver      := user/apps/compositor/wmserver.c -Iuser/apps/compositor -include tests/wm_host.h
 impl_desktop       := $(LIB)/desktop/desktop.c -Dreaddir=desktop_test_readdir -include tests/desktop_fs.h
 impl_filelist      := $(LIB)/gfx/filelist.c -Dreaddir=filelist_test_readdir -include tests/filelist_fs.h
 impl_zstd_dec      := $(LIB)/zstd/zstd_dec.c $(ZSTD_RENAME)

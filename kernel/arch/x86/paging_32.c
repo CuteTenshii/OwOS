@@ -140,7 +140,7 @@ void paging_free_process_dir(uint32_t *dir)
     pfree(pt);
     dir[pdi] = 0;
   }
-  /* Free private page tables of high-vaddr client buffers (PAGE_USER PDEs); the frames belong to uwin/fb. */
+  /* Free private page tables of high-vaddr mappings (PAGE_USER PDEs); the frames belong to shm or the framebuffer. */
   for (uint32_t pdi = USER_PDI_HI; pdi < PD_ENTRIES; pdi++) {
     if ((dir[pdi] & PAGE_PRESENT) && (dir[pdi] & PAGE_USER)) {
       pfree((void *)(dir[pdi] & ~0xFFFu));
