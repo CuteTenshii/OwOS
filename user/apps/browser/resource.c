@@ -1501,6 +1501,7 @@ static void par_run_loop(struct par_job *j)
 
 static void par_thread(void)
 {
+  thread_setname("fetch");
   par_run_loop(g_par);
   exit(0);
 } /* a thread fn must not return */
@@ -2427,6 +2428,7 @@ static void img_fetch_loop(void)
 
 static void img_fetcher_thread(void)
 {
+  thread_setname("img-fetch");
   img_fetch_loop();
   exit(0); /* a thread fn must not return */
 }

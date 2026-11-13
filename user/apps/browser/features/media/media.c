@@ -223,6 +223,7 @@ static void loader_run(struct media_el *job)
 
 static void loader_thread(void)
 {
+  thread_setname("media-load");
   for (;;) {
     struct media_el *job = loader_pick();
     if (!job) {
@@ -293,6 +294,7 @@ static bool video_service(struct media_el *m)
 
 static void video_thread(void)
 {
+  thread_setname("video");
   for (;;) {
     bool did = false;
     int i;

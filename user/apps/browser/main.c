@@ -161,6 +161,7 @@ int main(int argc, char **argv)
       {0, "remote-debugging", OPT_FLAG, 'r', 0, "serve the Chrome DevTools Protocol on port 9222"},
       {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
+  thread_setname("ui");
   const char *start = 0;
   int remote_debugging = 0;
   struct optstate st;

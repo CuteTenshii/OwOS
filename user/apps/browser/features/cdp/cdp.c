@@ -704,6 +704,7 @@ static int head_complete(const char *req, int n)
 
 static void cdp_conn_worker(void)
 {
+  thread_setname("cdp-conn");
   int me;
   mutex_lock(&sess_lk);
   me = cdp_wnext++;
@@ -736,6 +737,7 @@ static void cdp_conn_worker(void)
 
 static void cdp_io_fn(void)
 {
+  thread_setname("cdp");
   int lfd = net_listen(CDP_PORT);
   if (lfd < 0) {
     printf("browser: remote debugging unavailable, port %d is in use\n", CDP_PORT);

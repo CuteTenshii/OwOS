@@ -282,6 +282,7 @@ static void worker_dispatch_event(void)
 
 void worker_fn(void)
 {
+  thread_setname("worker");
   worker_install_crash_handlers();
 
   /* Recovery point */

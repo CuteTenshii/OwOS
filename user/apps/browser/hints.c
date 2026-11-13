@@ -48,6 +48,7 @@ static void hint_run(const struct hint *h)
 
 static void hint_thread(void)
 {
+  thread_setname("hints");
   for (;;) {
     struct hint h;
     mutex_lock(&g_lock);
