@@ -33,9 +33,8 @@ require_tool = $(if $(shell command -v $(firstword $(1)) >/dev/null 2>&1 && echo
 need_tool = @command -v $(1) >/dev/null 2>&1 || { echo "error: $(1) not found" >&2; exit 1; }
 .PHONY: check all test format format-check tidy install-hooks run debug iso run-iso run-iso-uefi usb clean distclean
 
-FORMAT_FILES := $(shell find drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
-	! -path 'kernel/font*.h' ! -path kernel/payload.c ! -path 'user/lib/gfx/font*.h' \
-	! -path 'user/lib/mp3/minimp3.h' ! -path 'user/lib/tz/zones.h')
+# Git-visible sources, so gitignored build output and kernel/payload.c stay out; .clang-format-ignore lists the rest.
+FORMAT_FILES := $(wildcard $(shell git ls-files --cached --others --exclude-standard '*.c' '*.h'))
 CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy
 TIDY_FILES ?= $(shell find kernel drivers -type f -name '*.c')

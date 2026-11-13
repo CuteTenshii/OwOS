@@ -1,0 +1,8 @@
+# Generated tables and vendored code, kept byte-for-byte as their sources emit them.
+kernel/font*.h
+user/lib/gfx/font*.h
+user/lib/mp3/minimp3.h
+user/lib/tz/zones.h
+kernel/arch/aarch64/mt6765_clk.h
+tests/*_vectors.h
+tests/jpeg_fixtures.h
