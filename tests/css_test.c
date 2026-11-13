@@ -456,6 +456,50 @@ static void test_slotted_and_part(void)
   css_free(outer);
 }
 
+/* 16. Escaped identifiers: Tailwind variants like .md\:flex and .w-\[80vh\] name classes "md:flex", "w-[80vh]". */
+static int sel_hits(const char *src, const struct dom_node *e)
+{
+  css_sheet *sh = sheet(src);
+  int hit = matches_any(sh, e);
+  css_free(sh);
+  return hit;
+}
+static void test_escaped_identifiers(void)
+{
+  struct dom_node *variant = cls(el("div"), "relative max-md:flex-col");
+  struct dom_node *arbitrary = cls(el("div"), "h-[80vh]");
+  struct dom_node *slash = cls(el("nav"), "bg-gray-700/50");
+  struct dom_node *current = cls(el("a"), "aria-[current=page]:bg-white");
+  struct dom_node *not_current = cls(el("a"), "aria-[current=page]:bg-white");
+  struct dom_node *hex = cls(el("p"), "2xl:p-4");
+  struct dom_node *comma = cls(el("p"), "a,b");
+  struct dom_node *nul = cls(el("p"), "\xef\xbf\xbdx");
+  struct dom_node *id = el("p");
+  struct dom_node *raw = cls(el("p"), "caf\xc3\xa9");
+  struct dom_node *prefix = cls(el("div"), "max-md");
+  set_attr(current, "aria-current", "page");
+  set_attr(id, "id", "caf\xc3\xa9");
+  struct dom_node *all[] = {variant, arbitrary, slash, current, not_current, hex, comma, nul, id, raw, prefix};
+  for (unsigned i = 0; i < sizeof all / sizeof *all; i++)
+    doc(all[i]);
+
+  expect(sel_hits(".max-md\\:flex-col { color: red }", variant));
+  expect(!sel_hits(".max-md\\:flex-col { color: red }", prefix));
+  expect(sel_hits(".h-\\[80vh\\] { color: red }", arbitrary));
+  expect(!sel_hits(".h-\\[80vh\\] { color: red }", variant));
+  expect(sel_hits(".bg-gray-700\\/50 { color: red }", slash));
+  expect(sel_hits(".aria-\\[current\\=page\\]\\:bg-white[aria-current=page] { color: red }", current));
+  expect(!sel_hits(".aria-\\[current\\=page\\]\\:bg-white[aria-current=page] { color: red }", not_current));
+  expect(sel_hits(".\\32 xl\\:p-4 { color: red }", hex)); /* the space ends the hex escape, not a combinator */
+  expect(!sel_hits(".\\32 xl\\:p-4 { color: red }", variant));
+  expect(sel_hits(".a\\,b { color: red }", comma)); /* an escaped comma doesn't split the list */
+  expect(!sel_hits(".a\\,b { color: red }", variant));
+  expect(sel_hits(".\\0 x { color: red }", nul)); /* NUL decodes to U+FFFD */
+  expect(sel_hits("#caf\\e9 { color: red }", id));
+  expect(sel_hits(".caf\\\xc3\xa9 { color: red }", raw)); /* an escaped raw UTF-8 character */
+  expect(sel_hits(".caf\xc3\xa9 { color: red }", raw));   /* a bare non-ASCII name */
+}
+
 int main(void)
 {
   test("complex :is selectors", test_complex_is_selectors);
@@ -473,6 +517,7 @@ int main(void)
   test("attribute selectors", test_attribute_selectors);
   test("scoped custom properties", test_scoped_custom_properties);
   test("::slotted and ::part", test_slotted_and_part);
+  test("escaped identifiers", test_escaped_identifiers);
 
   free_dom();
   return 0;

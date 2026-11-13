@@ -4,6 +4,7 @@
 static struct sel_list *parse_sel_list(const char *s, const char *e);
 static void pseudo_free(struct pseudo *pc);
 static void selector_finish(struct selector *sel);
+static char *ident_dup(const char *s, const char *e);
 
 /* True if byte c is in the NUL-terminated set. */
 static bool chr_in(const char *set, char c)
@@ -14,12 +15,62 @@ static bool chr_in(const char *set, char c)
   return false;
 }
 
-/* First byte of `stop` at bracket depth 0; (...) and [...] are skipped as a unit. */
+static int hex_val(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+#define ESC_NONE 0xffffffffu /* the escape decodes to nothing; the bytes after it carry the character */
+
+/* Past the CSS escape at s ('\'): up to six hex digits plus one whitespace, or the one escaped character. */
+static const char *esc_end(const char *s, const char *e, unsigned *cp)
+{
+  const char *p = s + 1;
+  if (p >= e || *p == '\n' || *p == '\r' || *p == '\f') {
+    if (cp)
+      *cp = '\\';
+    return p; /* a lone backslash stands for itself */
+  }
+  if (hex_val(*p) >= 0) {
+    unsigned v = 0;
+    for (int i = 0; i < 6 && p < e && hex_val(*p) >= 0; i++)
+      v = v * 16 + (unsigned)hex_val(*p++);
+    if (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\f'))
+      p++;
+    else if (p + 1 < e && p[0] == '\r' && p[1] == '\n')
+      p += 2;
+    else if (p < e && *p == '\r')
+      p++;
+    if (cp)
+      *cp = (v == 0 || v > 0x10ffff || (v >= 0xd800 && v <= 0xdfff)) ? 0xfffd : v;
+    return p;
+  }
+  if ((unsigned char)*p >= 0x80) {
+    if (cp)
+      *cp = ESC_NONE;
+    return p; /* an escaped non-ASCII character is just its own UTF-8 bytes */
+  }
+  if (cp)
+    *cp = (unsigned char)*p;
+  return p + 1;
+}
+
+/* First byte of `stop` at bracket depth 0; (...) and [...] are skipped as a unit, escapes as one character. */
 const char *scan_top(const char *s, const char *e, const char *stop)
 {
   int depth = 0;
   for (; s < e; s++) {
     char c = *s;
+    if (c == '\\') {
+      s = esc_end(s, e, 0) - 1;
+      continue;
+    }
     if (c == '(' || c == '[')
       depth++;
     else if (c == ')' || c == ']') {
@@ -33,7 +84,8 @@ const char *scan_top(const char *s, const char *e, const char *stop)
 
 bool is_sel_name(char c)
 {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+         (unsigned char)c >= 0x80;
 }
 
 /* Pseudo-classes: dynamic or unevaluable ones become PC_NEVER; empty :is()/:where() match nothing. */
@@ -108,7 +160,7 @@ static void cls_push(char ***v, int *n, const char *s, const char *e)
 {
   if (e <= s)
     return;
-  char *d = span_dup(s, e);
+  char *d = ident_dup(s, e);
   if (!d)
     return;
   char **nv = realloc(*v, (unsigned)(*n + 1) * sizeof *nv);
@@ -135,9 +187,36 @@ static void tag_copy(char tag[16], const char *s, const char *e)
 }
 static const char *name_end(const char *s, const char *e)
 {
-  while (s < e && is_sel_name(*s))
-    s++;
+  while (s < e) {
+    if (is_sel_name(*s))
+      s++;
+    else if (*s == '\\')
+      s = esc_end(s, e, 0);
+    else
+      break;
+  }
   return s;
+}
+
+/* Heap copy of the identifier [s,e) with its escapes decoded to UTF-8 (".md\:flex" names class "md:flex"). */
+static char *ident_dup(const char *s, const char *e)
+{
+  char *d = malloc((unsigned)(e - s) * 2 + 1); /* "\0" (2 bytes) decodes to U+FFFD (3 bytes) */
+  if (!d)
+    return 0;
+  int n = 0;
+  while (s < e) {
+    if (*s != '\\') {
+      d[n++] = *s++;
+      continue;
+    }
+    unsigned cp;
+    s = esc_end(s, e, &cp);
+    if (cp != ESC_NONE)
+      n += utf8_encode(cp, d + n);
+  }
+  d[n] = '\0';
+  return d;
 }
 
 static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss)
@@ -154,7 +233,7 @@ static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss
     } else if (*s == '#') {
       const char *ne = name_end(++s, e);
       free(ss->id);
-      ss->id = span_dup(s, ne);
+      ss->id = ident_dup(s, ne);
       s = ne;
     } else if (*s == '*') {
       s++;
@@ -418,7 +497,7 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
     } else if (*s == '#') {
       const char *ne = name_end(++s, e);
       free(st->id);
-      st->id = span_dup(s, ne);
+      st->id = ident_dup(s, ne);
       s = ne;
     } else if (*s == ':') {
       s++;
