@@ -7,7 +7,6 @@
 #include "backlight.h"
 #include "blk.h"
 #include "console.h"
-#include "crc32c.h"
 #include "entropy.h"
 #include "es1371.h"
 #include "ext.h"
@@ -20,6 +19,7 @@
 #include "heap.h"
 #include "hfs.h"
 #include "idt.h"
+#include "install.h"
 #include "irq.h"
 #include "irqflags.h"
 #include "iso9660.h"
@@ -77,97 +77,6 @@ static void shell_interrupt_locked(void)
   sched_kernel_leave();
   irq_restore(flags);
 }
-
-/* Install an embedded blob to owofs when absent or when its size differs from the built-in one. */
-/* What the installs last wrote, one "crc size path" line per file: a rebuilt blob of unchanged size (a one-line
- * fix often is) must still replace the copy on disk, and checksumming the embedded blob is far cheaper than
- * reading every installed file back. Loaded before the installs, rewritten after them. */
-#define INSTALL_MANIFEST "/var/lib/installed"
-static char *inst_old;
-static char *inst_new;
-static uint32_t inst_new_len, inst_new_cap;
-
-static void install_begin(void)
-{
-  int sz = fs_size(INSTALL_MANIFEST);
-  if (sz <= 0 || !(inst_old = kmalloc((uint32_t)sz + 1)))
-    return;
-  int n = fs_read(INSTALL_MANIFEST, inst_old, (uint32_t)sz);
-  inst_old[n > 0 ? n : 0] = '\0';
-}
-
-/* 1 if the boot-time manifest holds exactly this line */
-static int manifest_has(const char *line)
-{
-  for (const char *p = inst_old; p && (p = strstr(p, line)); p++)
-    if (p == inst_old || p[-1] == '\n')
-      return 1;
-  return 0;
-}
-
-static void manifest_add(const char *line)
-{
-  uint32_t n = (uint32_t)strlen(line);
-  if (inst_new_len + n + 1 > inst_new_cap) {
-    uint32_t cap = inst_new_cap ? inst_new_cap * 2 : 8192;
-    while (cap < inst_new_len + n + 1)
-      cap *= 2;
-    char *grown = kmalloc(cap);
-    if (!grown)
-      return;
-    if (inst_new)
-      memcpy(grown, inst_new, inst_new_len);
-    kfree(inst_new);
-    inst_new = grown;
-    inst_new_cap = cap;
-  }
-  memcpy(inst_new + inst_new_len, line, n + 1);
-  inst_new_len += n;
-}
-
-static void install_end(void)
-{
-  if (inst_new && !(inst_old && strcmp(inst_old, inst_new) == 0)) {
-    fs_delete(INSTALL_MANIFEST);
-    fs_create(INSTALL_MANIFEST, inst_new, inst_new_len);
-    fs_chmod(INSTALL_MANIFEST, 0644);
-  }
-  kfree(inst_old);
-  kfree(inst_new);
-  inst_old = inst_new = 0;
-  inst_new_len = inst_new_cap = 0;
-}
-
-static void install_blob(const char *path, const unsigned char *start, const unsigned char *end, uint32_t mode)
-{
-  uint32_t len = (uint32_t)(end - start);
-  char line[192];
-  ksnprintf(line, sizeof line, "%08x %u %s\n", crc32c_raw(0, start, len), len, path);
-  manifest_add(line);
-  if (fs_size(path) == (int)len && manifest_has(line))
-    return;        /* already up to date */
-  fs_delete(path); /* no-op if absent; drop stale copy */
-  fs_create(path, start, len);
-  fs_chmod(path, mode);
-}
-
-/* Fonts embedded from the fonts dir (generated kernel/fontstore.c). */
-extern const struct font_blob {
-  const char *name;
-  const unsigned char *start, *end;
-} fontstore[];
-extern const unsigned fontstore_count;
-
-/* Install an embedded blob given its disk path and objcopy symbol base; INSTALL_APP is the /bin form. */
-#define INSTALL_FILE(diskpath, symbase, mode)                                                                          \
-  do {                                                                                                                 \
-    extern const unsigned char symbase##_start[];                                                                      \
-    extern const unsigned char symbase##_end[];                                                                        \
-    install_blob(diskpath, symbase##_start, symbase##_end, mode);                                                      \
-  } while (0)
-#define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm, 0755)
-#define INSTALL_ICON(name, sym) INSTALL_FILE("/usr/share/icons/" name ".png", _binary_icons_##sym##_png, 0644)
-#define INSTALL_DESKTOP(nm) INSTALL_FILE("/usr/share/applications/" #nm ".desktop", _binary_desktop_##nm, 0644)
 
 /* Create a directory / file only if absent, with an explicit mode (the boot session runs as root). */
 static void mkdir_mode(const char *path, uint32_t mode)
@@ -457,64 +366,17 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   syscall_init();
 
-  /* Install the embedded programs onto the disk if absent. */
   {
     mkdir_mode("/bin", 0755);
     mkdir_mode("/home", 0755);
     mkdir_mode("/home/root", 0700);
     mkdir_mode("/home/root/Downloads", 0755);
-
     mkdir_mode("/var", 0755);
     mkdir_mode("/var/lib", 0755);
-    install_begin();
+    mkdir_mode("/etc", 0755);
+    install_payload();
 
     /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
-    mkdir_mode("/etc", 0755);
-    mkdir_mode("/etc/fonts", 0755);
-    for (unsigned i = 0; i < fontstore_count; i++) {
-      char path[96];
-      ksnprintf(path, sizeof path, "/etc/fonts/%s", fontstore[i].name);
-      install_blob(path, fontstore[i].start, fontstore[i].end, 0644);
-    }
-    mkdir_mode("/usr", 0755);
-    mkdir_mode("/usr/share", 0755);
-    mkdir_mode("/usr/share/applications", 0755);
-    mkdir_mode("/usr/share/icons", 0755);
-    INSTALL_ICON("utilities-terminal", utilities_terminal);
-    INSTALL_ICON("system-file-manager", system_file_manager);
-    INSTALL_ICON("utilities-file-archiver", utilities_file_archiver);
-    INSTALL_ICON("accessories-text-editor", accessories_text_editor);
-    INSTALL_ICON("web-browser", web_browser);
-    INSTALL_ICON("multimedia-player", multimedia_player);
-    INSTALL_ICON("preferences-system-time", preferences_system_time);
-    INSTALL_ICON("accessories-calculator", accessories_calculator);
-    INSTALL_ICON("preferences-system-notifications", preferences_system_notifications);
-    INSTALL_ICON("preferences-system", preferences_system);
-    INSTALL_ICON("help-about", help_about);
-    INSTALL_ICON("computer", computer);
-    INSTALL_ICON("application-default", application_default);
-    INSTALL_ICON("audio-volume-muted", audio_volume_muted);
-    INSTALL_ICON("audio-volume-low", audio_volume_low);
-    INSTALL_ICON("audio-volume-high", audio_volume_high);
-    INSTALL_ICON("battery-low", battery_low);
-    INSTALL_ICON("battery-medium", battery_medium);
-    INSTALL_ICON("battery-full", battery_full);
-    INSTALL_ICON("battery-charging", battery_charging);
-    INSTALL_ICON("network-ethernet", network_ethernet);
-    INSTALL_ICON("network-ethernet-disconnected", network_ethernet_disconnected);
-    INSTALL_DESKTOP(term);
-    INSTALL_DESKTOP(files);
-    INSTALL_DESKTOP(archive);
-    INSTALL_DESKTOP(editor);
-    INSTALL_DESKTOP(browser);
-    INSTALL_DESKTOP(pdfview);
-    INSTALL_DESKTOP(player);
-    INSTALL_DESKTOP(clock);
-    INSTALL_DESKTOP(calc);
-    INSTALL_DESKTOP(notifyd);
-    INSTALL_DESKTOP(settings);
-    INSTALL_DESKTOP(devhub);
-    INSTALL_DESKTOP(about);
     seed_file("/etc/passwd", "root::0:0:/home/root\n", 21, 0600);
     seed_file("/etc/group", "root:0:\n", 8, 0644);
     /* mdnsd advertisements, one "type port [txt...]" per line. */
@@ -524,60 +386,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     inittab_ensure("ntpd");
     inittab_ensure("mediad");
     users_init();
-    INSTALL_APP(edit);
-    INSTALL_APP(curl);
-    INSTALL_APP(editor);
-    INSTALL_APP(about);
-    INSTALL_APP(clock);
-    INSTALL_APP(calc);
-    INSTALL_APP(files);
-    INSTALL_APP(browser);
-    INSTALL_APP(imgview);
-    INSTALL_APP(pdfview);
-    INSTALL_APP(term);
-    INSTALL_APP(compositor);
-    INSTALL_APP(neofetch);
-    INSTALL_APP(lspci);
-    INSTALL_APP(uname);
-    INSTALL_APP(ps);
-    INSTALL_APP(ping);
-    INSTALL_APP(dig);
-    INSTALL_APP(stun);
-    INSTALL_APP(upnpc);
-    INSTALL_APP(torrent);
-    INSTALL_APP(player);
-    INSTALL_APP(settings);
-    INSTALL_APP(devhub);
-    INSTALL_APP(ssh);
-    INSTALL_APP(sshd);
-    INSTALL_APP(clipd);
-    INSTALL_APP(vmclipd);
-    INSTALL_APP(cliphist);
-    INSTALL_APP(notifyd);
-    INSTALL_APP(webp);
-    INSTALL_APP(json);
-    INSTALL_APP(base64);
-    INSTALL_APP(alac);
-    INSTALL_APP(aac);
-    INSTALL_APP(mpeg);
-    INSTALL_APP(h264);
-    INSTALL_APP(smbd);
-    INSTALL_APP(dhcpcd);
-    INSTALL_APP(ntpd);
-    INSTALL_APP(mdnsd);
-    INSTALL_APP(mediad);
-    INSTALL_APP(mediactl);
-    INSTALL_APP(cast);
-    INSTALL_APP(chmod);
-    INSTALL_APP(unrar);
-    INSTALL_APP(archive);
-    INSTALL_APP(chown);
-    INSTALL_APP(init);
-    INSTALL_APP(sh);
-    INSTALL_APP(sudo);
-    INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
-    INSTALL_APP(trayd);
-    install_end();
   }
   con_write("usermode: ready ('curl <url>').\n");
 

@@ -23,7 +23,8 @@ isodir/
 
 # Host test objects (tests/run-tests.sh)
 build/
-kernel/fontstore.c
+kernel/payload.c
+kernel/payload.list
 
 # JS tooling
 node_modules/

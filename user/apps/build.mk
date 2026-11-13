@@ -1,10 +1,9 @@
 # user/apps/build.mk: the user programs, one directory each (user/apps/<name>/),
-# embedded into the kernel as blobs.
+# and the payload of files the kernel installs onto the disk at boot.
 #
 # Every app links the base ULIB; GUI (windowed) apps also link gfx + the font lib
 # ($(GUILIB)). Per-app extras go in APP_LIBS_<name>. An app is every .c under its
-# directory, linked flat. Each ELF is wrapped into kernel/<name>_blob.o with the
-# symbol normalised to _binary_app_<name>_{start,end}.
+# directory, linked flat, and lands in /bin/<name> (or /bin/$(INSTALL_NAME_<name>)).
 
 # The browser includes its own headers by path from its root.
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
@@ -54,22 +53,17 @@ APP_LIBS_upnpc := $(UPNP)
 APP_LIBS_vmclipd := $(CLIPBOARD)
 APP_LIBS_webp := $(WEBP) $(PNGDEC)
 
-# $(call app_rule,name): link rule + kernel blob rule for one app.
+# $(call app_rule,name): link rule for one app.
 define app_rule
 user/apps/$(1)/$(1).elf: $(call app_objs,$(1)) $(APP_LIBS_$(1)) $(if $(filter $(1),$(GUI_APPS)),$$(GUILIB)) $$(ULIB) user/user.ld
 	$$(ULD) -m elf_i386 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
-kernel/$(1)_blob.o: user/apps/$(1)/$(1).elf
-	$$(call blob,$$<,app_$(1))
 endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
-# Start menu entries, embedded in the kernel and installed to /usr/share/applications at boot.
+INSTALL_NAME_notifysend := notify-send
+
+# Start menu entries, installed to /usr/share/applications.
 DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings devhub about
-define desktop_rule
-kernel/$(1)_desktop_blob.o: user/apps/$(1)/$(1).desktop
-	$$(call blob,$$<,desktop_$(1))
-endef
-$(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 
 # Combined function-symbol table (one text blob, sections keyed by app name) so
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
@@ -82,22 +76,28 @@ kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
 	$(call blob,kernel/appsyms.dat,appsyms)
 	@rm -f kernel/appsyms.dat
 
-# Every fonts/*.ttf and *.otf is installed to /etc/fonts at boot; gfx loads them at runtime
+# Every fonts/*.ttf and *.otf is installed to /etc/fonts; gfx loads them at runtime
 # instead of every app baking in a bitmap atlas. Drop one in fonts/ to ship it.
 FONT_FILES := $(sort $(wildcard fonts/*.ttf fonts/*.otf))
-kernel/fontstore.c: $(FONT_FILES) tools/genfontstore.sh
-	tools/genfontstore.sh $(FONT_FILES) > $@
 
-# App icons (icons/<Icon= name>.png, from tools/genicons.py), embedded in the kernel and installed to
-# /usr/share/icons at boot. The symbol base has dashes turned into underscores.
+# App icons (icons/<Icon= name>.png, from tools/genicons.py), installed to /usr/share/icons.
 ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver accessories-text-editor web-browser multimedia-player \
               preferences-system-time accessories-calculator preferences-system-notifications \
               preferences-system help-about computer application-default \
               audio-volume-muted audio-volume-low audio-volume-high \
               battery-low battery-medium battery-full battery-charging \
               network-ethernet network-ethernet-disconnected
-define icon_rule
-kernel/icon_$(subst -,_,$(1))_blob.o: icons/$(1).png
-	$$(call blob,$$<,icons_$(subst -,_,$(1))_png)
-endef
-$(foreach i,$(ICON_NAMES),$(eval $(call icon_rule,$(i))))
+
+# Everything the kernel embeds and installs at boot (kernel/install.c), as mode:disk-path:source.
+PAYLOAD := $(foreach a,$(APPS),0755:/bin/$(or $(INSTALL_NAME_$(a)),$(a)):user/apps/$(a)/$(a).elf) \
+           $(foreach a,$(DESKTOP_APPS),0644:/usr/share/applications/$(a).desktop:user/apps/$(a)/$(a).desktop) \
+           $(foreach i,$(ICON_NAMES),0644:/usr/share/icons/$(i).png:icons/$(i).png) \
+           $(foreach f,$(FONT_FILES),0644:/etc/fonts/$(notdir $(f)):$(f))
+PAYLOAD_SRCS := $(foreach e,$(PAYLOAD),$(word 3,$(subst :, ,$(e))))
+
+# The list is rewritten only when it changes, so dropping an entry still regenerates payload.c.
+kernel/payload.list: FORCE
+	@printf '%s %s %s\n' $(subst :, ,$(PAYLOAD)) > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+kernel/payload.c: kernel/payload.list $(PAYLOAD_SRCS) tools/genpayload.sh
+	tools/genpayload.sh $< > $@

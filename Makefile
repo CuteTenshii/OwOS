@@ -12,7 +12,7 @@
 # Include order matters: later fragments use variables the earlier ones define.
 #   toolchain.mk            compiler/linker flags + generic kernel compile rules
 #   user/lib/build.mk       libc + the per-library objects (UCFLAGS)
-#   user/apps/build.mk      user/apps/<name>/ programs + their kernel blobs
+#   user/apps/build.mk      user/apps/<name>/ programs + the payload the kernel installs
 #   kernel/build.mk         the kernel object list + the owos.bin link
 #   run.mk                  disk images + the QEMU run/debug/iso/usb targets
 # The ARM bring-up kernels replace all of these with kernel/arch/<arch>/build.mk.
@@ -34,7 +34,7 @@ need_tool = @command -v $(1) >/dev/null 2>&1 || { echo "error: $(1) not found" >
 .PHONY: check all test format format-check tidy install-hooks run debug iso run-iso run-iso-uefi usb clean distclean
 
 FORMAT_FILES := $(shell find drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
-	! -path 'kernel/font*.h' ! -path kernel/fontstore.c ! -path 'user/lib/gfx/font*.h' \
+	! -path 'kernel/font*.h' ! -path kernel/payload.c ! -path 'user/lib/gfx/font*.h' \
 	! -path 'user/lib/mp3/minimp3.h' ! -path 'user/lib/tz/zones.h')
 CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy
@@ -92,6 +92,7 @@ clean:
 	rm -f kernel/arch/arm/*.o kernel/arch/arm/*.d tests/arm/*.o tests/arm/*.d
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete
+	rm -f kernel/payload.c kernel/payload.list kernel/*_blob.o
 	rm -rf $(ISODIR)
 
 # Also remove the disk images (wipes stored files).
