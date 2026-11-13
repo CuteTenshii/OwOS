@@ -13,6 +13,7 @@
 #include "net.h"
 #include "paging.h"
 #include "pipe.h"
+#include "shm.h"
 #include "signal.h"
 #include "smp.h"
 #include "syscall.h"
@@ -1018,6 +1019,7 @@ void sched_exit(int status)
   if (!current->as || current->as_owner) {
     net_sock_close_owner(sched_current_process_id());
     syscall_fs_process_exiting(sched_current_process_id());
+    shm_process_exiting(sched_current_process_id(), sched_current_dir());
   }
   fds_close_all(current);
   if (current->as && current->as_owner) {

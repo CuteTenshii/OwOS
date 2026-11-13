@@ -63,6 +63,14 @@ void user_stack_reset_owner(uint32_t *dir);
 #define WIN_MAP_SLOT_BYTES 0x00800000u  /* 8 MiB per slot (>= 1920x1080x4)          */
 #define WIN_MAP_MAX 64u                 /* slots -> 0xE0000000..0x100000000 (4 GiB) */
 
+/* Shared memory (shm.c) maps only at the start of an 8 MiB slot inside [SHM_LOW_BASE, SHM_LOW_END) or
+ * [SHM_HIGH_BASE, 4 GiB); a slot spans whole page tables on both arches, so unmapping one never touches a
+ * neighbour, and the teardown of an address space frees those tables but never their frames. */
+#define SHM_SLOT_BYTES 0x00800000u
+#define SHM_LOW_BASE 0xC0000000u
+#define SHM_LOW_END COMPOSITOR_FB_VADDR
+#define SHM_HIGH_BASE 0xE0000000u
+
 /* Build a fresh address space from an ELF32 image. On success returns 0 and
  * fills *out_dir / *out_entry / *out_brk (the page-aligned image end, where the
  * heap begins); on a bad image returns -1. */

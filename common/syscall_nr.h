@@ -104,8 +104,17 @@
 #define SYS_INSTALL 98     /* ebx = INSTALL_LIST / _START / _STEP (common/diskinstall.h) */
 #define SYS_SETUID 99      /* ebx = uid for every thread of the process; 0/-1 */
 #define SYS_SETGID 100     /* ebx = gid for every thread of the process; 0/-1 */
+#define SYS_SHM 101        /* ebx = SHM_* op, ecx/edx = its arguments (kernel/shm.h) */
 #define SYS_PORT_PEER 102  /* ebx = channel fd, ecx = out {pid, uid, gid} of the other end; 0/-1 */
 #define SYS_WRITE_NB 103   /* as SYS_WRITE on a pipe or channel, but all-or-nothing: len / 0 no room yet / -1 */
+
+/* SYS_SHM ops */
+#define SHM_CREATE 0  /* ecx = bytes; -> handle / -1 */
+#define SHM_GRANT 1   /* ecx = handle, edx = pid allowed to map it */
+#define SHM_MAP 2     /* ecx = handle, edx = slot-aligned address in an shm region */
+#define SHM_UNMAP 3   /* ecx = address */
+#define SHM_RELEASE 4 /* ecx = handle: the owner drops it; mappings keep it alive */
+#define SHM_SIZE 5    /* ecx = handle; -> bytes / -1 */
 
 /* SYS_PORT_ACCEPT ecx flags */
 #define PORT_ACCEPT_NB 1 /* return -2 at once when no client is waiting */

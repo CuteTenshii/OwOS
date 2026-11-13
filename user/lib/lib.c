@@ -651,6 +651,18 @@ int port_peer(int fd, struct port_peer *out) { return syscall(SYS_PORT_PEER, fd,
 
 int write_nb(int fd, const void *buf, int len) { return syscall(SYS_WRITE_NB, fd, (int)buf, len); }
 
+int shm_create(unsigned bytes) { return syscall(SYS_SHM, SHM_CREATE, (int)bytes, 0); }
+
+int shm_grant(int handle, int pid) { return syscall(SYS_SHM, SHM_GRANT, handle, pid); }
+
+int shm_map(int handle, unsigned addr) { return syscall(SYS_SHM, SHM_MAP, handle, (int)addr); }
+
+int shm_unmap(unsigned addr) { return syscall(SYS_SHM, SHM_UNMAP, (int)addr, 0); }
+
+int shm_release(int handle) { return syscall(SYS_SHM, SHM_RELEASE, handle, 0); }
+
+int shm_size(int handle) { return syscall(SYS_SHM, SHM_SIZE, handle, 0); }
+
 /* malloc / free */
 /* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads */
 

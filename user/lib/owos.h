@@ -123,6 +123,15 @@ int printf(const char *fmt, ...);
 int snprintf(char *buf, unsigned size, const char *fmt, ...);
 int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
 
+/* Shared memory: the creator grants a handle to other pids; anyone allowed maps it at the start of an 8 MiB slot
+ * in [SHM_LOW_ADDR, SHM_LOW_ADDR + 32 slots) or [SHM_HIGH_ADDR, 4 GiB). Mapping over a slot replaces what was
+ * there. New objects are zero-filled; the frames go once the owner released it and nothing maps it. */
+#define SHM_SLOT_SIZE 0x00800000u
+#define SHM_LOW_ADDR 0xC0000000u
+#define SHM_LOW_SLOTS 32
+#define SHM_HIGH_ADDR 0xE0000000u
+#define SHM_HIGH_SLOTS 64
+
 /* windowing API */
 /* Client buffer is mapped at WIN_FB_ADDR (XRGB8888, pitch = width passed to win_create) */
 #define WIN_FB_ADDR 0xC0000000u
@@ -413,6 +422,14 @@ struct port_peer {
 };
 int port_peer(int fd, struct port_peer *out);   /* who is at the other end of a channel; 0/-1 */
 int write_nb(int fd, const void *buf, int len); /* all of len / 0 no room yet / -1; len <= 512 */
+
+/* Shared memory; the slot layout is at SHM_SLOT_SIZE */
+int shm_create(unsigned bytes);     /* handle / -1, at most SHM_SLOT_SIZE */
+int shm_grant(int handle, int pid); /* owner only; 0/-1 */
+int shm_map(int handle, unsigned addr);
+int shm_unmap(unsigned addr);
+int shm_release(int handle); /* owner only */
+int shm_size(int handle);    /* bytes / -1 */
 
 /* Signals; numbers/flags mirror kernel/signal.h, keep in sync */
 #define SIGHUP 1
