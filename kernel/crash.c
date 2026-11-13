@@ -252,12 +252,14 @@ void crash_record(const char *name, struct registers *r)
   /* Backtrace via saved return addresses; every read is probed so a corrupt frame pointer can't fault. */
   c->ntrace = 0;
   c->trace[c->ntrace++] = r->eip;
-  uint32_t bp = r->ebp;
-  while (c->ntrace < CRASH_TRACE && bp >= USER_BASE && bp + 8 <= USER_REGION_END && paging_user_mapped(bp) &&
-         paging_user_mapped(bp + 4)) {
-    uint32_t ret = *(volatile uint32_t *)(uintptr_t)(bp + 4);
-    c->trace[c->ntrace++] = ret;
-    uint32_t nbp = *(volatile uint32_t *)(uintptr_t)bp;
+  /* A frame is [saved bp][return address], each one user word (the kernel's word size). */
+  const uintptr_t word = sizeof(uintptr_t);
+  uintptr_t bp = r->ebp;
+  while (c->ntrace < CRASH_TRACE && bp >= USER_BASE && bp <= USER_REGION_END - 2 * word &&
+         paging_user_mapped((uint32_t)bp) && paging_user_mapped((uint32_t)(bp + word))) {
+    uintptr_t ret = *(volatile uintptr_t *)(bp + word);
+    c->trace[c->ntrace++] = (uint32_t)ret;
+    uintptr_t nbp = *(volatile uintptr_t *)bp;
     if (nbp <= bp)
       break; /* frames must grow walking up           */
     bp = nbp;

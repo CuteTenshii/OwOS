@@ -289,7 +289,14 @@ static const syscall_handler_t syscall_handlers[] = {
 
 void syscall_dispatch(struct registers *r)
 {
-  uint32_t number = r->eax;
+  uint32_t number = (uint32_t)r->eax;
+#ifdef __x86_64__
+  /* Arguments are 32-bit words on both arches (user addresses lie below 4 GiB). Handlers validate the low word
+   * and then dereference the register, so a high half must not survive to make those two differ. */
+  r->ebx = (uint32_t)r->ebx;
+  r->ecx = (uint32_t)r->ecx;
+  r->edx = (uint32_t)r->edx;
+#endif
   if (number >= sizeof syscall_handlers / sizeof *syscall_handlers || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
     return;

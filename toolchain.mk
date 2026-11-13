@@ -26,11 +26,10 @@ OBJCOPY := $(CROSS)objcopy
 # halfway through the link when the cross-toolchain isn't installed.
 $(call require_tool,$(CC),Install the target ELF toolchain or override CROSS)
 
-# User-space programs are always 32-bit ELF because the kernel embeds them as blobs.
-UCROSS ?= $(if $(MACOS),$(MACOS_CROSS_i386))
-UCC      := $(UCROSS)gcc
-ULD      := $(UCROSS)ld
-UOBJCOPY := $(UCROSS)objcopy
+# User space is built for the kernel's ARCH (32-bit ELF under i386, 64-bit under x86_64), so it shares the toolchain.
+UCC      := $(CC)
+ULD      := $(LD)
+UOBJCOPY := $(OBJCOPY)
 
 # grub-mkrescue builds the bootable ISO (make iso); grub-mkimage the boot images the Installer writes to a disk,
 # from the platform directories under GRUB_DIR.
@@ -51,6 +50,8 @@ ifeq ($(ARCH),x86_64)
   KBFD      := i386:x86-64
   QEMU      := qemu-system-x86_64
   KERNEL    := owos-x86_64.bin
+  UARCHFLAGS := -m64
+  UEMU      := elf_x86_64
 else
   ARCHFLAGS := -m32
   LINKER    := kernel/arch/x86/linker.ld
@@ -58,6 +59,8 @@ else
   KBFD      := i386
   QEMU      := qemu-system-i386
   KERNEL    := owos.bin
+  UARCHFLAGS := -m32
+  UEMU      := elf_i386
 endif
 
 # $(call blob,file,name): recipe wrapping `file` into the kernel object $@ as _binary_<name>_{start,end}.

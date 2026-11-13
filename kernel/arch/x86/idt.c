@@ -285,11 +285,13 @@ static void panic_screen(struct registers *r)
   fb_present();
 }
 
-/* Ring-3 exception to POSIX signal: #DE SIGFPE, #UD SIGILL, memory faults SIGSEGV. */
+/* Ring-3 exception to POSIX signal: #DE, #MF and #XM SIGFPE, #UD SIGILL, memory faults SIGSEGV. */
 static int fault_signal(uint32_t vec)
 {
   switch (vec) {
   case 0:
+  case 16:
+  case 19:
     return SIGFPE;
   case 6:
     return SIGILL;

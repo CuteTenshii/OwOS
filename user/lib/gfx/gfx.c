@@ -62,8 +62,9 @@ void gfx_set_clip(int x, int y, int w, int h)
 /* 32-bpp run fill (`rep stosl`) */
 static inline void fill32(unsigned *d, unsigned v, int n)
 {
-  int d0, d1;
-  __asm__ volatile("rep ; stosl" : "=&D"(d0), "=&c"(d1) : "a"(v), "0"(d), "1"(n) : "memory");
+  unsigned *d0;
+  unsigned long d1;
+  __asm__ volatile("rep ; stosl" : "=&D"(d0), "=&c"(d1) : "a"(v), "0"(d), "1"((unsigned long)n) : "memory");
 }
 
 struct gfx_rect {

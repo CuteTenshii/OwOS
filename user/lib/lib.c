@@ -5,18 +5,23 @@
 #include "owos.h"
 #include "syscall_nr.h"
 
-static inline int syscall(int num, int a, int b, int c)
+/* The kernel reads ebx/ecx/edx as 32-bit words on both arches: every user address lies below 4 GiB, so UW passes a
+ * pointer as its low word and UPTR widens a returned address without sign-extending one above 2 GiB. */
+#define UW(p) ((unsigned)(unsigned long)(p))
+#define UPTR(v) ((void *)(unsigned long)(unsigned)(v))
+
+static inline int syscall(int num, unsigned a, unsigned b, unsigned c)
 {
   int ret;
   __asm__ volatile("int $0x80" : "=a"(ret) : "a"(num), "b"(a), "c"(b), "d"(c) : "memory");
   return ret;
 }
 
-int write(int fd, const void *buf, int len) { return syscall(SYS_WRITE, fd, (int)buf, len); }
+int write(int fd, const void *buf, int len) { return syscall(SYS_WRITE, fd, UW(buf), len); }
 
-int read(int fd, void *buf, int len) { return syscall(SYS_READ, fd, (int)buf, len); }
+int read(int fd, void *buf, int len) { return syscall(SYS_READ, fd, UW(buf), len); }
 
-int pipe(int fds[2]) { return syscall(SYS_PIPE, (int)fds, 0, 0); }
+int pipe(int fds[2]) { return syscall(SYS_PIPE, UW(fds), 0, 0); }
 
 int close(int fd) { return syscall(SYS_CLOSE, fd, 0, 0); }
 
@@ -29,22 +34,22 @@ void exit(int code)
 
 int fork(void) { return syscall(SYS_FORK, 0, 0, 0); }
 
-int execp(const char *name) { return syscall(SYS_EXEC, (int)name, 0, 0); }
+int execp(const char *name) { return syscall(SYS_EXEC, UW(name), 0, 0); }
 
-int execp1(const char *name, const char *arg) { return syscall(SYS_EXEC, (int)name, (int)arg, 0); }
+int execp1(const char *name, const char *arg) { return syscall(SYS_EXEC, UW(name), UW(arg), 0); }
 
 int waitpid(int pid) { return syscall(SYS_WAITPID, pid, 0, 0); }
 
-int waitpid_nb(int pid, int *status) { return syscall(SYS_WAITPID, pid, (int)status, WNOHANG); }
+int waitpid_nb(int pid, int *status) { return syscall(SYS_WAITPID, pid, UW(status), WNOHANG); }
 
 unsigned uptime(void) { return msec() / 1000u; /* seconds since boot, derived from the ms counter */ }
 
 bool futex_wait(unsigned *addr, unsigned expected, unsigned ms)
 {
-  return syscall(SYS_FUTEX_WAIT, (int)addr, (int)expected, (int)ms) == 1;
+  return syscall(SYS_FUTEX_WAIT, UW(addr), (int)expected, (int)ms) == 1;
 }
 
-int futex_wake(unsigned *addr, int n) { return syscall(SYS_FUTEX_WAKE, (int)addr, n, 0); }
+int futex_wake(unsigned *addr, int n) { return syscall(SYS_FUTEX_WAKE, UW(addr), n, 0); }
 
 unsigned msec(void) { return (unsigned)syscall(SYS_MSEC, 0, 0, 0); }
 
@@ -58,41 +63,41 @@ long long now_ms(void)
   return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-int readfile(const char *name, char *buf, int max) { return syscall(SYS_READFILE, (int)name, (int)buf, max); }
+int readfile(const char *name, char *buf, int max) { return syscall(SYS_READFILE, UW(name), UW(buf), max); }
 
-int writefile(const char *name, const void *buf, int len) { return syscall(SYS_WRITEFILE, (int)name, (int)buf, len); }
+int writefile(const char *name, const void *buf, int len) { return syscall(SYS_WRITEFILE, UW(name), UW(buf), len); }
 
 int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
 {
-  unsigned a[4] = {(unsigned)name, off, (unsigned)buf, len};
-  return syscall(SYS_READFILE_AT, (int)a, 0, 0);
+  unsigned a[4] = {UW(name), off, UW(buf), len};
+  return syscall(SYS_READFILE_AT, UW(a), 0, 0);
 }
 
-int stream_begin(const char *name) { return syscall(SYS_STREAM_BEGIN, (int)name, 0, 0); }
+int stream_begin(const char *name) { return syscall(SYS_STREAM_BEGIN, UW(name), 0, 0); }
 
-int stream_write(const void *buf, int len) { return syscall(SYS_STREAM_WRITE, (int)buf, len, 0); }
+int stream_write(const void *buf, int len) { return syscall(SYS_STREAM_WRITE, UW(buf), len, 0); }
 
 int stream_end(void) { return syscall(SYS_STREAM_END, 0, 0, 0); }
 
-int net_connect(const char *host, int port, int tls) { return syscall(SYS_NET_CONNECT, (int)host, port, tls); }
+int net_connect(const char *host, int port, int tls) { return syscall(SYS_NET_CONNECT, UW(host), port, tls); }
 
 /* All net send/recv variants use two syscalls with a 6-word request {fd, buf, len, flags, ip|0 */
 int net_send(int h, const void *buf, int len)
 {
-  unsigned a[6] = {(unsigned)h, (unsigned)buf, (unsigned)len, 0, 0, 0};
-  return syscall(SYS_NET_SEND, (int)a, 0, 0);
+  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)len, 0, 0, 0};
+  return syscall(SYS_NET_SEND, UW(a), 0, 0);
 }
 
 int net_recv(int h, void *buf, int max)
 {
-  unsigned a[6] = {(unsigned)h, (unsigned)buf, (unsigned)max, 0, 0, 0};
-  return syscall(SYS_NET_RECV, (int)a, 0, 0);
+  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)max, 0, 0, 0};
+  return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
 int net_recv_nb(int h, void *buf, int max)
 {
-  unsigned a[6] = {(unsigned)h, (unsigned)buf, (unsigned)max, MSG_DONTWAIT, 0, 0};
-  return syscall(SYS_NET_RECV, (int)a, 0, 0);
+  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)max, MSG_DONTWAIT, 0, 0};
+  return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
 int net_close(int h) { return syscall(SYS_NET_CLOSE, h, 0, 0); }
@@ -110,18 +115,18 @@ int ifconfig(const unsigned char ip[4], const unsigned char mask[4], const unsig
     rest[4 + i] = gw[i];
     rest[8 + i] = dns[i];
   }
-  return syscall(SYS_IFCONFIG, (int)ip, (int)rest, 0);
+  return syscall(SYS_IFCONFIG, UW(ip), UW(rest), 0);
 }
 
 int setrtc(unsigned secs) { return syscall(SYS_SETRTC, (int)secs, 0, 0); }
 
-int gettime(struct timeval64 *tv) { return syscall(SYS_GETTIME, (int)tv, 0, 0); }
+int gettime(struct timeval64 *tv) { return syscall(SYS_GETTIME, UW(tv), 0, 0); }
 
-int settime(const struct timeval64 *tv) { return syscall(SYS_SETTIME, (int)tv, 0, 0); }
+int settime(const struct timeval64 *tv) { return syscall(SYS_SETTIME, UW(tv), 0, 0); }
 
 int adjtime(const struct timeval64 *delta, struct timeval64 *old)
 {
-  return syscall(SYS_ADJTIME, (int)delta, (int)old, 0);
+  return syscall(SYS_ADJTIME, UW(delta), UW(old), 0);
 }
 
 int net_listen(int port) { return syscall(SYS_NET_LISTEN, port, 0, 0); }
@@ -132,43 +137,43 @@ int net_bind(int port) { return syscall(SYS_NET_BIND, port, 0, 0); }
 
 int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[16], int *src_port)
 {
-  unsigned a[6] = {(unsigned)fd, (unsigned)buf, (unsigned)max, 0, (unsigned)src_ip, (unsigned)src_port};
-  return syscall(SYS_NET_RECV, (int)a, 0, 0);
+  unsigned a[6] = {(unsigned)fd, UW(buf), (unsigned)max, 0, UW(src_ip), UW(src_port)};
+  return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
 int net_sendto(int fd, const unsigned char ip[16], int port, const void *buf, int len)
 {
-  unsigned a[6] = {(unsigned)fd, (unsigned)buf, (unsigned)len, 0, (unsigned)ip, (unsigned)port};
-  return syscall(SYS_NET_SEND, (int)a, 0, 0);
+  unsigned a[6] = {(unsigned)fd, UW(buf), (unsigned)len, 0, UW(ip), (unsigned)port};
+  return syscall(SYS_NET_SEND, UW(a), 0, 0);
 }
 
 /* Compositor wrappers (root-only) */
-int fb_info(struct fbinfo *out) { return syscall(SYS_FB_INFO, (int)out, 0, 0); }
+int fb_info(struct fbinfo *out) { return syscall(SYS_FB_INFO, UW(out), 0, 0); }
 
 unsigned *fb_map(void)
 {
   int v = syscall(SYS_FB_MAP, 0, 0, 0);
-  return v == -1 ? (unsigned *)0 : (unsigned *)v;
+  return v == -1 ? (unsigned *)0 : UPTR(v);
 }
 
-int fb_present_rects(const struct fbrect *r, int n) { return syscall(SYS_FB_PRESENT, (int)r, n, 0); }
+int fb_present_rects(const struct fbrect *r, int n) { return syscall(SYS_FB_PRESENT, UW(r), n, 0); }
 
 int fb_cursor_set(const unsigned *argb, int w, int h, int hot_x, int hot_y, int scale)
 {
-  return syscall(SYS_FB_CURSOR, (int)argb, w | h << 8 | hot_x << 16 | hot_y << 24, scale);
+  return syscall(SYS_FB_CURSOR, UW(argb), w | h << 8 | hot_x << 16 | hot_y << 24, scale);
 }
 
-int input_poll(struct inputstate *out) { return syscall(SYS_INPUT_POLL, (int)out, 0, 0); }
+int input_poll(struct inputstate *out) { return syscall(SYS_INPUT_POLL, UW(out), 0, 0); }
 
 int input_set_bounds(int w, int h) { return syscall(SYS_INPUT_SET_BOUNDS, w, h, 0); }
 
-int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, (int)out, max, 0); }
+int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, UW(out), max, 0); }
 
-int symbolize(unsigned addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, (int)addr, (int)out, cap); }
+int symbolize(unsigned addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, (int)addr, UW(out), cap); }
 
-int thread_setname(const char *name) { return syscall(SYS_THREAD_NAME, THREAD_NAME_SET, (int)name, 0); }
+int thread_setname(const char *name) { return syscall(SYS_THREAD_NAME, THREAD_NAME_SET, UW(name), 0); }
 
-int thread_getname(char *out, int cap) { return syscall(SYS_THREAD_NAME, THREAD_NAME_GET, (int)out, cap); }
+int thread_getname(char *out, int cap) { return syscall(SYS_THREAD_NAME, THREAD_NAME_GET, UW(out), cap); }
 
 /* Packed (hour<<16)|(min<<8)|sec, UTC */
 unsigned now_hms(void)
@@ -178,53 +183,59 @@ unsigned now_hms(void)
   return (hour << 16) | (min << 8) | sec;
 }
 
-int readdir(const char *path, int idx, struct dirent_u *out) { return syscall(SYS_READDIR, (int)path, idx, (int)out); }
+int readdir(const char *path, int idx, struct dirent_u *out) { return syscall(SYS_READDIR, UW(path), idx, UW(out)); }
 
-int mkdir(const char *path) { return syscall(SYS_MKDIR, (int)path, 0, 0); }
-int rmdir(const char *path) { return syscall(SYS_RMDIR, (int)path, 0, 0); }
-int unlink(const char *path) { return syscall(SYS_DELETE, (int)path, 0, 0); }
-int rename(const char *old, const char *neu) { return syscall(SYS_RENAME, (int)old, (int)neu, 0); }
+int mkdir(const char *path) { return syscall(SYS_MKDIR, UW(path), 0, 0); }
+int rmdir(const char *path) { return syscall(SYS_RMDIR, UW(path), 0, 0); }
+int unlink(const char *path) { return syscall(SYS_DELETE, UW(path), 0, 0); }
+int rename(const char *old, const char *neu) { return syscall(SYS_RENAME, UW(old), UW(neu), 0); }
 
-int stat(const char *path, struct statinfo *out) { return syscall(SYS_STAT, (int)path, (int)out, 0); }
+int stat(const char *path, struct statinfo *out) { return syscall(SYS_STAT, UW(path), UW(out), 0); }
 
-int chmod(const char *path, unsigned mode) { return syscall(SYS_CHMOD, (int)path, (int)mode, 0); }
+int chmod(const char *path, unsigned mode) { return syscall(SYS_CHMOD, UW(path), (int)mode, 0); }
 
-int chown(const char *path, int uid, int gid) { return syscall(SYS_CHOWN, (int)path, uid, gid); }
+int chown(const char *path, int uid, int gid) { return syscall(SYS_CHOWN, UW(path), uid, gid); }
 
 unsigned umask(unsigned mask) { return (unsigned)syscall(SYS_UMASK, (int)mask, 0, 0); }
 
-int path_access(const char *path, int mode) { return syscall(SYS_ACCESS, (int)path, mode, 0); }
+int path_access(const char *path, int mode) { return syscall(SYS_ACCESS, UW(path), mode, 0); }
 
-int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATFS, (int)path, (int)out, 0); }
+int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATFS, UW(path), UW(out), 0); }
 
-int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, (int)path, (int)arg, 0); }
+int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, UW(path), UW(arg), 0); }
 
-/* SYS_SPAWN_CAP request; see syscall_exec_spawn_cap in the kernel */
+/* SYS_SPAWN_CAP request; see syscall_exec_spawn_cap in the kernel. Addresses are 32-bit words (see UW). */
 struct spawn_req {
-  const char *path;
-  char *const *argv;
+  unsigned path;
+  unsigned argv; /* -> argc words, each a string address */
   int argc;
-  int *rfd;
-  int *wfd;
+  unsigned rfd;
+  unsigned wfd;
   int uid;
   int gid;
-  const char *cwd;
+  unsigned cwd;
   unsigned flags;
   int stdio[3];
-  const char *env;
+  unsigned env;
   unsigned env_len;
 };
 
+#define SPAWN_MAXARGS 16 /* the kernel keeps no more */
+
 int spawn_ex(const struct spawn_opts *o)
 {
-  struct spawn_req req = {o->path,
-                          o->argv,
-                          o->argc,
-                          o->rfd,
-                          o->wfd,
+  unsigned argv[SPAWN_MAXARGS];
+  int argc = o->argc < SPAWN_MAXARGS ? o->argc : SPAWN_MAXARGS;
+  for (int i = 0; i < argc; i++)
+    argv[i] = UW(o->argv[i]);
+  struct spawn_req req = {UW(o->path),
+                          UW(argv),
+                          argc,
+                          UW(o->rfd),
+                          UW(o->wfd),
                           o->flags & SPAWN_CREDS ? o->uid : -1,
                           o->flags & SPAWN_CREDS ? o->gid : -1,
-                          o->cwd,
+                          UW(o->cwd),
                           o->flags & (SPAWN_PTY | SPAWN_STDIO),
                           {o->stdio[0], o->stdio[1], o->stdio[2]},
                           0,
@@ -235,11 +246,11 @@ int spawn_ex(const struct spawn_opts *o)
     unsigned n = 0;
     while (o->env[n] || o->env[n + 1])
       n++;
-    req.env = o->env;
+    req.env = UW(o->env);
     req.env_len = n ? n + 1 : 0;
     req.flags |= SPAWN_ENV;
   }
-  return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+  return syscall(SYS_SPAWN_CAP, UW(&req), 0, 0);
 }
 
 /* spawn_cap with a full argv; the kernel uses `path` for the image */
@@ -260,15 +271,10 @@ int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *
 
 static int env_call(unsigned cmd, const char *name, const char *value, char *buf, unsigned buf_len, unsigned index)
 {
-  struct env_req q = {cmd,
-                      (unsigned)name,
-                      name ? (unsigned)strlen(name) : 0,
-                      (unsigned)value,
-                      value ? (unsigned)strlen(value) : 0,
-                      (unsigned)buf,
-                      buf_len,
-                      index};
-  return syscall(SYS_ENV, (int)&q, 0, 0);
+  struct env_req q = {
+      cmd,     UW(name), name ? (unsigned)strlen(name) : 0, UW(value), value ? (unsigned)strlen(value) : 0, UW(buf),
+      buf_len, index};
+  return syscall(SYS_ENV, UW(&q), 0, 0);
 }
 
 /* The value stays valid until the next getenv call */
@@ -336,9 +342,9 @@ int tty_set_fg(int fd, int pid) { return syscall(SYS_TTY, fd, TTY_SETFG, pid); }
 int tty_fg(int fd) { return syscall(SYS_TTY, fd, TTY_GETFG, 0); }
 
 /* Non-blocking read: >0 bytes, 0 if it would block, -1 at EOF */
-int read_nb(int fd, void *buf, int len) { return syscall(SYS_READ_NB, fd, (int)buf, len); }
+int read_nb(int fd, void *buf, int len) { return syscall(SYS_READ_NB, fd, UW(buf), len); }
 
-int chdir(const char *path) { return syscall(SYS_CHDIR, (int)path, 0, 0); }
+int chdir(const char *path) { return syscall(SYS_CHDIR, UW(path), 0, 0); }
 
 int kill(int pid, int sig) { return syscall(SYS_KILL, pid, sig, 0); }
 
@@ -350,18 +356,18 @@ int getpid(void) { return syscall(SYS_GETPID, 0, 0, 0); }
 /* sigprocmask with set==NULL only queries the mask via *old */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
-  return syscall(SYS_SIGACTION, sig, (int)act, (int)old);
+  return syscall(SYS_SIGACTION, sig, UW(act), UW(old));
 }
 
 sighandler_t signal(int sig, sighandler_t handler)
 {
   struct sigaction act, old;
-  act.handler = (unsigned)handler;
+  act.handler = UW(handler);
   act.mask = 0;
   act.flags = 0;
   if (sigaction(sig, &act, &old) < 0)
     return SIG_ERR;
-  return (sighandler_t)old.handler;
+  return (sighandler_t)UPTR(old.handler);
 }
 
 unsigned sigprocmask(int how, const unsigned *set, unsigned *old)
@@ -374,32 +380,32 @@ unsigned sigprocmask(int how, const unsigned *set, unsigned *old)
 
 int raise(int sig) { return kill(getpid(), sig); }
 
-int volumes(int idx, struct volinfo *out) { return syscall(SYS_VOLUMES, idx, (int)out, 0); }
+int volumes(int idx, struct volinfo *out) { return syscall(SYS_VOLUMES, idx, UW(out), 0); }
 
-int umount(const char *point) { return syscall(SYS_UMOUNT, (int)point, 0, 0); }
+int umount(const char *point) { return syscall(SYS_UMOUNT, UW(point), 0, 0); }
 
-int mount(const char *dev, const char *point) { return syscall(SYS_MOUNT, (int)dev, (int)point, 0); }
-int install_disk(int index, struct install_disk *out) { return syscall(SYS_INSTALL, INSTALL_LIST, index, (int)out); }
-int install_start(const char *dev) { return syscall(SYS_INSTALL, INSTALL_START, (int)dev, 0); }
-int install_step(struct install_progress *out) { return syscall(SYS_INSTALL, INSTALL_STEP, (int)out, 0); }
+int mount(const char *dev, const char *point) { return syscall(SYS_MOUNT, UW(dev), UW(point), 0); }
+int install_disk(int index, struct install_disk *out) { return syscall(SYS_INSTALL, INSTALL_LIST, index, UW(out)); }
+int install_start(const char *dev) { return syscall(SYS_INSTALL, INSTALL_START, UW(dev), 0); }
+int install_step(struct install_progress *out) { return syscall(SYS_INSTALL, INSTALL_STEP, UW(out), 0); }
 
 int audio_open(void) { return syscall(SYS_AUDIO_OPEN, 0, 0, 0); }
 
-int audio_write(const void *pcm, int len) { return syscall(SYS_AUDIO_WRITE, (int)pcm, len, 0); }
+int audio_write(const void *pcm, int len) { return syscall(SYS_AUDIO_WRITE, UW(pcm), len, 0); }
 
 int audio_close(void) { return syscall(SYS_AUDIO_CLOSE, 0, 0, 0); }
 
 void msleep(unsigned ms) { syscall(SYS_SLEEP, (int)ms, 0, 0); }
 
 /* __thread storage. user.ld lays out the .tdata image and .tbss; each thread gets a block holding both,
- * then a thread pointer that stores its own address (%gs:0, as the i386 ABI wants). The kernel makes %gs
- * a segment based at that pointer, so a variable lives at a fixed negative offset from it. */
+ * then a thread pointer that stores its own address (%gs:0 on i386, %fs:0 on x86_64, as both ABIs want).
+ * The kernel bases that segment at the pointer, so a variable lives at a fixed negative offset from it. */
 extern char __tdata_start[], __tdata_end[], __tls_main[], __tls_memsz[], __tls_align[];
 
 static unsigned tls_data_size(void)
 {
-  unsigned align = (unsigned)__tls_align;
-  return ((unsigned)__tls_memsz + align - 1) & ~(align - 1);
+  unsigned align = UW(__tls_align);
+  return (UW(__tls_memsz) + align - 1) & ~(align - 1);
 }
 
 /* Fill the block at `block` (16-aligned, tls_data_size() + 16 bytes) and return its thread pointer. */
@@ -416,27 +422,40 @@ static void *tls_fill(char *block)
 /* Called by _start for the first thread, before main. */
 void tls_init(void)
 {
-  if ((unsigned)__tls_memsz)
-    syscall(SYS_SET_TLS, (int)tls_fill(__tls_main), 0, 0);
+  if (UW(__tls_memsz))
+    syscall(SYS_SET_TLS, UW(tls_fill(__tls_main)), 0, 0);
 }
 
-/* The new thread's TLS block is carved from the top of its stack; with an argument, the entry then sees an
- * ordinary cdecl frame (a null return address, then `arg`). */
+#ifdef __x86_64__
+void thread_start64(void); /* start_64.S: pops fn and arg, calls fn(arg), then exits the thread */
+#endif
+
+/* The new thread's TLS block is carved from the top of its stack. With an argument, the i386 entry then sees an
+ * ordinary cdecl frame (a null return address, then `arg`); x86_64 passes it in %rdi through thread_start64. */
 static int thread_spawn(void *fn, void *stack_top, int has_arg, void *arg)
 {
   void *tp = 0;
-  if ((unsigned)__tls_memsz) {
-    char *block = (char *)(((unsigned)stack_top - tls_data_size() - 16) & ~15u);
+  stack_top = (void *)((unsigned long)stack_top & ~15ul);
+  if (UW(__tls_memsz)) {
+    char *block = (char *)(((unsigned long)stack_top - tls_data_size() - 16) & ~15ul);
     tp = tls_fill(block);
     stack_top = block;
   }
+#ifdef __x86_64__
+  void **sp = (void **)stack_top - 2;
+  sp[0] = fn;
+  sp[1] = has_arg ? arg : 0;
+  stack_top = sp;
+  fn = (void *)thread_start64;
+#else
   if (has_arg) {
     void **sp = (void **)((char *)stack_top - 20); /* esp + 4 is 16-aligned at entry */
     sp[0] = 0;
     sp[1] = arg;
     stack_top = sp;
   }
-  return syscall(SYS_THREAD, (int)fn, (int)stack_top, (int)tp);
+#endif
+  return syscall(SYS_THREAD, UW(fn), UW(stack_top), UW(tp));
 }
 
 int thread_create(void (*fn)(void), void *stack_top) { return thread_spawn((void *)fn, stack_top, 0, 0); }
@@ -450,12 +469,12 @@ int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top)
 void *thread_stack_alloc(int bytes)
 {
   int pages = (bytes + 4095) / 4096;
-  return (void *)syscall(SYS_STACK_ALLOC, pages, 0, 0);
+  return UPTR(syscall(SYS_STACK_ALLOC, (unsigned)pages, 0, 0));
 }
 void thread_stack_free(void *top)
 {
   if (top)
-    syscall(SYS_STACK_FREE, (int)top, 0, 0);
+    syscall(SYS_STACK_FREE, UW(top), 0, 0);
 }
 
 /* identity / hostname */
@@ -582,7 +601,7 @@ int sethostname(const char *name) { return writefile("/etc/hostname", name, (int
 /* POSIX uname(2) */
 int uname(struct utsname *out)
 {
-  if (syscall(SYS_UNAME, (int)out, 0, 0) != 0)
+  if (syscall(SYS_UNAME, UW(out), 0, 0) != 0)
     return -1;
   gethostname(out->nodename, (int)sizeof out->nodename);
   return 0;
@@ -590,15 +609,15 @@ int uname(struct utsname *out)
 
 /* IPC: local ports */
 /* Named local port: as_server=1 listens (then port_accept), 0 connects */
-int port_open(const char *name, int as_server) { return syscall(SYS_PORT_OPEN, (int)name, as_server, 0); }
+int port_open(const char *name, int as_server) { return syscall(SYS_PORT_OPEN, UW(name), as_server, 0); }
 
 int port_accept(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, 0, 0); }
 
 int port_accept_nb(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, PORT_ACCEPT_NB, 0); }
 
-int port_peer(int fd, struct port_peer *out) { return syscall(SYS_PORT_PEER, fd, (int)out, 0); }
+int port_peer(int fd, struct port_peer *out) { return syscall(SYS_PORT_PEER, fd, UW(out), 0); }
 
-int write_nb(int fd, const void *buf, int len) { return syscall(SYS_WRITE_NB, fd, (int)buf, len); }
+int write_nb(int fd, const void *buf, int len) { return syscall(SYS_WRITE_NB, fd, UW(buf), len); }
 
 int shm_create(unsigned bytes) { return syscall(SYS_SHM, SHM_CREATE, (int)bytes, 0); }
 
@@ -615,9 +634,17 @@ int shm_size(int handle) { return syscall(SYS_SHM, SHM_SIZE, handle, 0); }
 /* malloc / free */
 /* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads */
 
-void *sbrk(int inc) { return (void *)syscall(SYS_SBRK, inc, 0, 0); }
+void *sbrk(int inc)
+{
+  int r = syscall(SYS_SBRK, (unsigned)inc, 0, 0);
+  return r == -1 ? (void *)-1 : UPTR(r);
+}
 
+#ifdef __x86_64__
+typedef long double Align; /* 16-byte blocks: the SysV ABI promises malloc'd memory suits SSE stores */
+#else
 typedef long long Align; /* 8-byte block + payload alignment */
+#endif
 union header {
   struct {
     union header *ptr;
@@ -767,21 +794,25 @@ void *realloc(void *ptr, unsigned size)
 }
 
 /* mem*: shared by every program and by libs like minimp3 and the HTTP/2 HPACK tables */
+/* The dummies are pointer-sized: rep uses all of rcx/rdi/rsi on x86_64, and the ecx write zero-extends rcx. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
 {
-  int d0, d1, d2;
+  __SIZE_TYPE__ d0;
+  void *d1;
+  const void *d2;
   __asm__ volatile("rep ; movsl\n\t"
                    "movl %4, %%ecx\n\t"
                    "andl $3, %%ecx\n\t"
                    "rep ; movsb"
                    : "=&c"(d0), "=&D"(d1), "=&S"(d2)
-                   : "0"((unsigned)n >> 2), "g"((unsigned)n), "1"(d), "2"(s)
+                   : "0"(n >> 2), "g"((unsigned)n), "1"(d), "2"(s)
                    : "memory");
   return d;
 }
 void *memset(void *d, int c, __SIZE_TYPE__ n)
 {
-  int d0, d1;
+  __SIZE_TYPE__ d0;
+  void *d1;
   unsigned cc = (unsigned char)c;
   unsigned pat = cc | (cc << 8) | (cc << 16) | (cc << 24);
   __asm__ volatile("rep ; stosl\n\t"
@@ -789,7 +820,7 @@ void *memset(void *d, int c, __SIZE_TYPE__ n)
                    "andl $3, %%ecx\n\t"
                    "rep ; stosb"
                    : "=&c"(d0), "=&D"(d1)
-                   : "a"(pat), "0"((unsigned)n >> 2), "g"((unsigned)n), "1"(d)
+                   : "a"(pat), "0"(n >> 2), "g"((unsigned)n), "1"(d)
                    : "memory");
   return d;
 }
@@ -1186,7 +1217,7 @@ static unsigned long long rng_tsc(void)
 }
 
 /* getrandom: CSPRNG bytes from the kernel entropy pool */
-int getrandom(void *buf, int len) { return syscall(SYS_GETRANDOM, (int)buf, len, 0); }
+int getrandom(void *buf, int len) { return syscall(SYS_GETRANDOM, UW(buf), len, 0); }
 
 void rng_bytes(void *out, int n)
 {

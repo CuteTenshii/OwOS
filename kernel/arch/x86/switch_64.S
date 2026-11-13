@@ -42,14 +42,30 @@ thread_start:
 
 /* A freshly created user task's crafted kernel stack holds an iretq frame
  * (ss/rsp/rflags/cs/rip). Drop to ring 3. Segments are flat in long mode; the
- * iretq frame carries SS, and CS selects the user code segment. */
+ * iretq frame carries SS, and CS selects the user code segment. %fs is left
+ * alone: loading it would reset the TLS base the scheduler just set, and the
+ * GPRs are cleared so no kernel value reaches user code. */
 .global enter_user_task
 .type enter_user_task, @function
 enter_user_task:
 	mov $0x23, %ax                 /* user data selector                       */
 	mov %ax, %ds
 	mov %ax, %es
-	mov %ax, %fs
+	xor %eax, %eax
+	xor %ebx, %ebx
+	xor %ecx, %ecx
+	xor %edx, %edx
+	xor %esi, %esi
+	xor %edi, %edi
+	xor %ebp, %ebp
+	xor %r8d, %r8d
+	xor %r9d, %r9d
+	xor %r10d, %r10d
+	xor %r11d, %r11d
+	xor %r12d, %r12d
+	xor %r13d, %r13d
+	xor %r14d, %r14d
+	xor %r15d, %r15d
 	iretq
 .size enter_user_task, . - enter_user_task
 
@@ -61,7 +77,7 @@ enter_user_task:
 .type fork_child_entry, @function
 fork_child_entry:
 	/* DS is per CPU, not per task: a task resumed on a CPU that ran the kernel would iretq to ring 3 with
-	 * DPL-0 DS, which the CPU nulls, and compatibility mode then faults on every DS access. */
+	 * DPL-0 DS, which the CPU nulls. */
 	pop  %rax                      /* ds saved at entry                        */
 	mov  %ax, %ds
 	mov  %ax, %es

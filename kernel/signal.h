@@ -80,11 +80,20 @@ struct k_siginfo {
   uint32_t err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
 };
 
-/* The interrupted user context, restored by sigreturn (a handler may read it, and rewrite it to resume elsewhere). */
+/* The interrupted user context, restored by sigreturn (a handler may read it, and rewrite it to resume elsewhere).
+ * x86_64 keeps the 32-bit names at full width and adds r8..r15, as struct registers does. */
+#ifdef __x86_64__
+struct k_sigctx {
+  uint64_t eip, eflags, esp;
+  uint64_t eax, ecx, edx, ebx, ebp, esi, edi;
+  uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+};
+#else
 struct k_sigctx {
   uint32_t eip, eflags, esp;
   uint32_t eax, ecx, edx, ebx, ebp, esi, edi;
 };
+#endif
 
 /* Bit for signal `s` (1..31). Signal 0 is not a real signal (kill(pid,0)
  * probes). */

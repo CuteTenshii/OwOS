@@ -58,7 +58,7 @@ APP_LIBS_webp := $(WEBP) $(PNGDEC)
 # $(call app_rule,name): link rule for one app.
 define app_rule
 user/apps/$(1)/$(1).elf: $(call app_objs,$(1)) $(APP_LIBS_$(1)) $(if $(filter $(1),$(GUI_APPS)),$$(GUILIB)) $$(ULIB) user/user.ld
-	$$(ULD) -m elf_i386 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
+	$$(ULD) -m $(UEMU) -z max-page-size=4096 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
 endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
@@ -74,7 +74,7 @@ SYM_APPS := browser files archive editor term calc imgview pdfview player settin
 kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
-	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
+	  $(CROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
 	$(call blob,kernel/appsyms.dat,appsyms)
 	@rm -f kernel/appsyms.dat
 

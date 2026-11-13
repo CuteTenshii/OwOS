@@ -14,6 +14,7 @@
 #include "fat.h"
 #include "fb.h"
 #include "firmware.h"
+#include "fpu.h"
 #include "fs.h"
 #include "gdt.h"
 #include "hda.h"
@@ -285,6 +286,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   gdt_init();
   idt_init();
   irq_init();
+  fpu_cpu_init();
 
   con_printf("mmdbg: path=%s mmapflag=%u entries=%u firmware=%s\n",
              magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1", (mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0,

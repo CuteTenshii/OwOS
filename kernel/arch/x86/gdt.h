@@ -20,8 +20,8 @@
 
 void gdt_init(void);
 
-/* Make the calling CPU's user TLS segment start at `base` and load it into %gs (0: the flat user data
- * segment). The scheduler calls this on every switch, as the segment is per CPU. */
+/* Point the calling CPU's user TLS register at `base`: a %gs segment on i386 (0: the flat user data segment), the
+ * %fs base on x86_64. The scheduler calls this on every switch, as the register is per CPU. */
 void gdt_set_tls(uint32_t base);
 
 /* Set the kernel stack the CPU loads on a ring3 -> ring0 trap (for the calling

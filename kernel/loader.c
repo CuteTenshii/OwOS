@@ -1,4 +1,4 @@
-/* loader.c: set up the user region, parse an ELF32 executable, and run it. */
+/* loader.c: set up the user region, parse an ELF executable (ELF32 on i386, ELF64 on x86_64), and run it. */
 
 #include "loader.h"
 #include "elf.h"
@@ -53,47 +53,65 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
   return 0;
 }
 
+/* User programs match the kernel's word size: the x86_64 kernel runs only 64-bit ones. */
+#ifdef __x86_64__
+typedef Elf64_Ehdr elf_ehdr;
+typedef Elf64_Phdr elf_phdr;
+#define ELF_CLASS ELFCLASS64
+#define ELF_MACHINE EM_X86_64
+#else
+typedef Elf32_Ehdr elf_ehdr;
+typedef Elf32_Phdr elf_phdr;
+#define ELF_CLASS ELFCLASS32
+#define ELF_MACHINE EM_386
+#endif
+
 /* A segment must stay below the stack and thread-stack region, whose pages load_elf and SYS_STACK_ALLOC map over
- * whatever is there. */
-static bool in_image_window(uint32_t addr, uint32_t len)
+ * whatever is there. Taken at 64 bits so no ELF64 field can wrap past the check. */
+static bool in_image_window(uint64_t addr, uint64_t len)
 {
-  return addr >= USER_BASE && addr + len <= USER_HEAP_MAX && addr + len >= addr;
+  return addr >= USER_BASE && len <= USER_HEAP_MAX && addr <= USER_HEAP_MAX - len;
 }
 
 int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out_entry, uint32_t *out_brk)
 {
   const uint8_t *file = image;
-  const Elf32_Ehdr *eh = image;
+  const elf_ehdr *eh = image;
   uint32_t image_end = USER_BASE; /* highest vaddr used by any segment */
 
-  if (size < sizeof(Elf32_Ehdr))
+  if (size < sizeof(elf_ehdr))
     return -1;
   if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' || eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F')
     return -1;
-  if (eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_machine != EM_386 || eh->e_type != ET_EXEC)
+  if (eh->e_ident[EI_CLASS] != ELF_CLASS || eh->e_machine != ELF_MACHINE || eh->e_type != ET_EXEC)
+    return -1;
+#ifdef __x86_64__
+  /* The entry is handed on as a 32-bit word; a higher one would be cut short rather than refused. */
+  if (eh->e_entry > 0xFFFFFFFFu)
+    return -1;
+#endif
+
+  /* Validate the untrusted phdr table (64-bit math avoids wrap) before indexing it. */
+  if (eh->e_phentsize < sizeof(elf_phdr) || eh->e_phoff > size ||
+      (uint64_t)eh->e_phnum * eh->e_phentsize > size - (uint64_t)eh->e_phoff)
     return -1;
 
   uint32_t *dir = paging_new_process_dir();
   if (!dir)
     return -1;
 
-  /* Validate the untrusted phdr table (64-bit math avoids wrap) before indexing it. */
-  if (eh->e_phentsize < sizeof(Elf32_Phdr) || (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > size) {
-    paging_free_process_dir(dir);
-    return -1;
-  }
-
   for (uint32_t i = 0; i < eh->e_phnum; i++) {
-    const Elf32_Phdr *ph = (const Elf32_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
+    const elf_phdr *ph = (const elf_phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
     if (ph->p_type != PT_LOAD)
       continue;
-    if (!in_image_window(ph->p_vaddr, ph->p_memsz) || (uint64_t)ph->p_offset + ph->p_filesz > size ||
-        load_segment(dir, ph->p_vaddr, file + ph->p_offset, ph->p_filesz, ph->p_memsz) != 0) {
+    if (!in_image_window(ph->p_vaddr, ph->p_memsz) || ph->p_filesz > size || ph->p_offset > size - ph->p_filesz ||
+        load_segment(dir, (uint32_t)ph->p_vaddr, file + ph->p_offset, (uint32_t)ph->p_filesz, (uint32_t)ph->p_memsz) !=
+            0) {
       paging_free_process_dir(dir);
       return -1;
     }
     if (ph->p_vaddr + ph->p_memsz > image_end)
-      image_end = ph->p_vaddr + ph->p_memsz;
+      image_end = (uint32_t)(ph->p_vaddr + ph->p_memsz);
   }
 
   for (uint32_t p = 0; p < USER_STACK_PAGES; p++) {
@@ -115,7 +133,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
   }
 
   *out_dir = dir;
-  *out_entry = eh->e_entry;
+  *out_entry = (uint32_t)eh->e_entry;
   *out_brk = (image_end + 0xFFFu) & ~0xFFFu;
   return 0;
 }
@@ -125,7 +143,8 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 {
-  /* The top stack page holds the args, written via the scratch map (IF off); pointers are user vaddrs. */
+  /* The top stack page holds the args, written via the scratch map (IF off); pointers are user vaddrs, each one
+   * user word (the kernel's word size) wide. */
   uint32_t page = ARG_TOP - 4096;
   uint32_t pa = paging_user_phys(dir, page);
   if (!pa)
@@ -135,11 +154,12 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 
   uint32_t fl = irq_save();
   uint8_t *fp = paging_scratch_map(0, pa);
-  uint32_t uargv[MAX_ARGS];
+  uintptr_t uargv[MAX_ARGS];
   uint32_t sp = ARG_TOP;
 
-  /* Keep strings above room for argv[] (argc+1 pointers) and argc, so the PUSHes never underflow. */
-  const uint32_t floor = page + (uint32_t)(MAX_ARGS + 2) * 4;
+  /* Keep strings above room for argv[] (argc+1 pointers), argc and the 16-byte alignment below (under 32 bytes),
+   * so the PUSHes never underflow. */
+  const uint32_t floor = page + (uint32_t)(MAX_ARGS + 2) * sizeof(uintptr_t) + 32;
 
   for (int i = 0; i < argc; i++) {
     uint32_t len = (uint32_t)strlen(argv[i]) + 1;
@@ -153,17 +173,19 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
       fp[sp - page + k] = (uint8_t)argv[i][k];
     uargv[i] = sp;
   }
-  sp &= ~3u;
+  /* argc lands 16-byte aligned: the x86_64 ABI's entry state, and harmless on i386. */
+  sp &= ~15u;
+  sp -= (16u - (uint32_t)(argc + 2) * sizeof(uintptr_t) % 16u) % 16u;
 
 #define PUSH(val)                                                                                                      \
   do {                                                                                                                 \
-    sp -= 4;                                                                                                           \
-    *(uint32_t *)(fp + (sp - page)) = (val);                                                                           \
+    sp -= sizeof(uintptr_t);                                                                                           \
+    *(uintptr_t *)(fp + (sp - page)) = (val);                                                                          \
   } while (0)
   PUSH(0);
   for (int i = argc - 1; i >= 0; i--)
     PUSH(uargv[i]);
-  PUSH((uint32_t)argc);
+  PUSH((uintptr_t)argc);
 #undef PUSH
   paging_scratch_unmap(0);
   irq_restore(fl);

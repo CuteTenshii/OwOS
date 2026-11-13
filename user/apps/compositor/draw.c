@@ -140,7 +140,8 @@ static void draw_window(const struct winrec *w, bool focused)
     client_rect(w, &fx, &fy, &fw, &fh);
     const struct winmap *fm = client_for(w->id);
     if (fm && fm->vaddr)
-      blit_client(fx, fy, (const unsigned *)fm->vaddr, fm->w < fw ? fm->w : fw, fm->h < fh ? fm->h : fh, fm->stride);
+      blit_client(fx, fy, (const unsigned *)(unsigned long)fm->vaddr, fm->w < fw ? fm->w : fw, fm->h < fh ? fm->h : fh,
+                  fm->stride);
     return;
   }
   gfx_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
@@ -185,7 +186,7 @@ static void draw_window(const struct winrec *w, bool focused)
   if (cm && cm->vaddr) {
     int bw = cm->w < cw ? cm->w : cw;
     int bh = cm->h < ch ? cm->h : ch;
-    blit_client(cx, cy, (const unsigned *)cm->vaddr, bw, bh, cm->stride);
+    blit_client(cx, cy, (const unsigned *)(unsigned long)cm->vaddr, bw, bh, cm->stride);
     if (bw < cw)
       gfx_fill_rect(cx + bw, cy, cw - bw, ch, 0x10141a);
     if (bh < ch)

@@ -1,4 +1,4 @@
-/* start.S — user program entry. Placed first in the binary by user.ld, so
+/* start_32.S: i386 user program entry. Placed first in the binary by user.ld, so
  * _start sits at the load address. Calls main(), then exit()s with its
  * return value. */
 
@@ -18,7 +18,7 @@ _start:
 hang:
 	jmp hang
 
-/* setjmp/longjmp — the C89 non-local jump. jmp_buf is 6 words:
+/* setjmp/longjmp: the C89 non-local jump. jmp_buf is 6 words:
  *   [0]=ebx [1]=esi [2]=edi [3]=ebp [4]=esp(after ret) [5]=return address.
  * Only the callee-saved regs + the resume point are saved; the C caller preserves
  * everything else. Used for crash recovery (a signal handler longjmps out of a

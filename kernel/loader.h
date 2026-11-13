@@ -1,4 +1,4 @@
-/* loader.h — load a flat user binary into the user region and run it. */
+/* loader.h: load a user ELF program into the user region and run it. */
 #ifndef OWOS_LOADER_H
 #define OWOS_LOADER_H
 
@@ -59,7 +59,7 @@ void user_stack_reset_owner(uint32_t *dir);
 #define SHM_LOW_END COMPOSITOR_FB_VADDR
 #define SHM_HIGH_BASE 0xE0000000u /* 64 slots up to the 4 GiB top */
 
-/* Build a fresh address space from an ELF32 image. On success returns 0 and
+/* Build a fresh address space from an ELF image of the kernel's word size. On success returns 0 and
  * fills *out_dir / *out_entry / *out_brk (the page-aligned image end, where the
  * heap begins); on a bad image returns -1. */
 int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out_entry, uint32_t *out_brk);

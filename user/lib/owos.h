@@ -439,11 +439,20 @@ typedef struct {
   unsigned si_trapno; /* CPU exception vector, SI_TRAP_NONE if no fault raised it */
   unsigned si_err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
 } siginfo_t;
-/* The interrupted registers; sigreturn resumes from them. */
+/* The interrupted registers; sigreturn resumes from them. x86_64 keeps the 32-bit names at full width (eip is
+ * rip, and so on) and adds r8..r15, like the kernel's register frame. */
+#ifdef __x86_64__
+struct sigcontext {
+  unsigned long eip, eflags, esp;
+  unsigned long eax, ecx, edx, ebx, ebp, esi, edi;
+  unsigned long r8, r9, r10, r11, r12, r13, r14, r15;
+};
+#else
 struct sigcontext {
   unsigned eip, eflags, esp;
   unsigned eax, ecx, edx, ebx, ebp, esi, edi;
 };
+#endif
 
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
@@ -462,8 +471,13 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old); /* 0
 unsigned sigprocmask(int how, const unsigned *set, unsigned *old);          /* new blocked mask */
 int raise(int sig);                                                         /* send `sig` to ourselves */
 
-/* setjmp/longjmp (start.S); longjmp makes setjmp return `val` (1 if 0) */
+/* setjmp/longjmp (start_32.S / start_64.S): the callee-saved registers, stack pointer and resume address;
+ * longjmp makes setjmp return `val` (1 if 0) */
+#ifdef __x86_64__
+typedef unsigned long jmp_buf[8];
+#else
 typedef unsigned jmp_buf[6];
+#endif
 int setjmp(jmp_buf env);
 void longjmp(jmp_buf env, int val);
 

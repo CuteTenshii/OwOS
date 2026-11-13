@@ -4,11 +4,13 @@
 #include "console.h"
 #include "env.h"
 #include "file.h"
+#include "fpu.h"
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
 #include "ipc.h"
 #include "irqflags.h"
+#include "kstring.h"
 #include "loader.h"
 #include "net.h"
 #include "paging.h"
@@ -47,8 +49,6 @@ typedef struct address_space {
   uint32_t brk_base;
 } address_space_t;
 
-#define FPU_IMAGE_BYTES 108 /* fnsave image */
-
 typedef struct task {
   uintptr_t esp;        /* saved kernel stack pointer (the context) */
   address_space_t *as;  /* shared by a process and its user threads */
@@ -79,15 +79,21 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
-  uint32_t tls_base;            /* user %gs segment base (0 = flat) */
-  struct env env;               /* process environment; threads use their leader's */
-  bool fpu_valid;               /* fpu[] holds a saved x87 image (else the task still has the init state) */
-  uint8_t fpu[FPU_IMAGE_BYTES]; /* x87 state saved while the task is switched out */
+  uint32_t tls_base; /* user TLS base: %gs on i386, %fs on x86_64 (0 = none) */
+  struct env env;    /* process environment; threads use their leader's */
+  bool fpu_valid;    /* fpu holds a saved image (else the task still has the init state) */
+  uint8_t fpu[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1]; /* FPU state while switched out; see fpu_area */
   struct task *next;
   int running_cpu;
   uint8_t kernel_lock_depth;
   uint8_t kernel_lock_reacquire;
 } task_t;
+
+/* kmalloc aligns only to 8 bytes, and fxsave needs 16. */
+static uint8_t *fpu_area(task_t *t)
+{
+  return (uint8_t *)(((uintptr_t)t->fpu + FPU_AREA_ALIGN - 1) & ~(uintptr_t)(FPU_AREA_ALIGN - 1));
+}
 
 /* Copy a path into a fixed buffer, NUL-terminating (truncates if too long). */
 static void cwd_set(char *dst, const char *src)
@@ -474,7 +480,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   *--sp = 0x23;     /* user SS */
   *--sp = user_esp; /* user RSP (points at argc) */
   *--sp = 0x202;    /* RFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS (32-bit compat, DPL3) */
+  *--sp = 0x1B;     /* user CS (64-bit, DPL3) */
   *--sp = entry;    /* user RIP */
   *--sp = (uint64_t)(uintptr_t)enter_user_task;
   for (int i = 0; i < 6; i++)
@@ -590,7 +596,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_bas
   *--sp = 0x23;     /* user SS */
   *--sp = user_esp; /* user RSP */
   *--sp = 0x202;    /* RFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS (32-bit compat, DPL3) */
+  *--sp = 0x1B;     /* user CS (64-bit, DPL3) */
   *--sp = entry;    /* user RIP */
   *--sp = (uint64_t)(uintptr_t)enter_user_task;
   for (int i = 0; i < 6; i++)
@@ -679,6 +685,13 @@ int sched_fork(struct registers *r)
   t->uid = current->uid;
   t->gid = current->gid;
   t->umask = current->umask;
+
+  /* The child resumes mid-program, so it keeps the parent's FPU modes. fnsave resets the FPU: reload it at once. */
+  uintptr_t fl = irq_save();
+  fpu_save(fpu_area(t));
+  fpu_restore(fpu_area(t));
+  irq_restore(fl);
+  t->fpu_valid = true;
 
   /* The child inherits the parent's open files (Unix semantics). */
   for (int i = 0; i < MAX_FD; i++) {
@@ -1193,6 +1206,20 @@ uint32_t sched_sigprocmask(int how, uint32_t set, int have_set)
   return old;
 }
 
+#ifdef __x86_64__
+/* Handler frame on the user stack. The handler takes sig, &info and &uc in rdi/rsi/rdx and returns through
+ * `pretcode` into `tramp` (SYS_SIGRETURN). The FPU image rides along: compiled code keeps live values in xmm
+ * registers, which the handler is free to clobber. */
+struct sigframe {
+  uint64_t pretcode;      /* -> tramp */
+  uint64_t saved_blocked; /* mask to restore on sigreturn */
+  struct k_sigctx uc;     /* interrupted context to resume */
+  struct k_siginfo info;
+  uint8_t tramp[8]; /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
+  uint8_t fpu[FPU_AREA_BYTES];
+};
+#define SIG_RED_ZONE 128 /* the SysV area below rsp that the interrupted code may still be using */
+#else
 /* Handler frame on the user stack: [pretcode][sig][&info][&uc], the arguments of an SA_SIGINFO handler (a
  * one-argument handler ignores the last two); pretcode points at `tramp` (SYS_SIGRETURN). */
 struct sigframe {
@@ -1205,33 +1232,58 @@ struct sigframe {
   struct k_siginfo info;
   uint8_t tramp[8]; /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
 };
+#define SIG_RED_ZONE 0
+#endif
 
 /* Build a signal frame on the user stack (current CR3); 0, or -1 if it doesn't fit. */
 static int sigframe_setup(task_t *t, struct registers *r, const struct k_siginfo *info)
 {
   int sig = info->signo;
-  uint32_t sp = (uint32_t)r->useresp;
-  uint32_t base = (sp - sizeof(struct sigframe)) & ~3u;
-  if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END || base > sp) /* underflow guard */
+  uint64_t sp = r->useresp;
+  if (sp > USER_REGION_END || sp < USER_BASE + SIG_RED_ZONE + sizeof(struct sigframe) + 16)
+    return -1;
+  uint64_t base = sp - SIG_RED_ZONE - sizeof(struct sigframe);
+#ifdef __x86_64__
+  base = (base & ~15ull) - 8; /* a function is entered with rsp + 8 16-byte aligned */
+#else
+  base &= ~3ull;
+#endif
+  if (base < USER_BASE)
     return -1;
 
   struct sigframe f;
-  f.pretcode = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
-  f.sig = (uint32_t)sig;
-  f.pinfo = base + (uint32_t)__builtin_offsetof(struct sigframe, info);
-  f.puc = base + (uint32_t)__builtin_offsetof(struct sigframe, uc);
-  f.info = *info;
+  memset(&f, 0, sizeof f); /* padding must not carry kernel stack bytes to the user */
+  f.pretcode = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
   f.saved_blocked = t->sig_blocked;
-  f.uc.eip = (uint32_t)r->eip;
-  f.uc.eflags = (uint32_t)r->eflags;
-  f.uc.esp = (uint32_t)r->useresp;
-  f.uc.eax = (uint32_t)r->eax;
-  f.uc.ecx = (uint32_t)r->ecx;
-  f.uc.edx = (uint32_t)r->edx;
-  f.uc.ebx = (uint32_t)r->ebx;
-  f.uc.ebp = (uint32_t)r->ebp;
-  f.uc.esi = (uint32_t)r->esi;
-  f.uc.edi = (uint32_t)r->edi;
+  f.info = *info;
+  f.uc.eip = r->eip;
+  f.uc.eflags = r->eflags;
+  f.uc.esp = r->useresp;
+  f.uc.eax = r->eax;
+  f.uc.ecx = r->ecx;
+  f.uc.edx = r->edx;
+  f.uc.ebx = r->ebx;
+  f.uc.ebp = r->ebp;
+  f.uc.esi = r->esi;
+  f.uc.edi = r->edi;
+#ifdef __x86_64__
+  f.uc.r8 = r->r8;
+  f.uc.r9 = r->r9;
+  f.uc.r10 = r->r10;
+  f.uc.r11 = r->r11;
+  f.uc.r12 = r->r12;
+  f.uc.r13 = r->r13;
+  f.uc.r14 = r->r14;
+  f.uc.r15 = r->r15;
+  uint8_t fxbuf[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1];
+  uint8_t *fx = (uint8_t *)(((uintptr_t)fxbuf + FPU_AREA_ALIGN - 1) & ~(uintptr_t)(FPU_AREA_ALIGN - 1));
+  fpu_save(fx); /* the task's own state: the kernel never touches the FPU */
+  memcpy(f.fpu, fx, sizeof f.fpu);
+#else
+  f.sig = (uint32_t)sig;
+  f.pinfo = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, info);
+  f.puc = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, uc);
+#endif
   f.tramp[0] = 0xB8; /* mov $imm32, %eax */
   f.tramp[1] = (uint8_t)(SYS_SIGRETURN);
   f.tramp[2] = (uint8_t)(SYS_SIGRETURN >> 8);
@@ -1241,11 +1293,17 @@ static int sigframe_setup(task_t *t, struct registers *r, const struct k_siginfo
   f.tramp[6] = 0x80;
   f.tramp[7] = 0x90; /* nop pad */
   /* The user's esp may point anywhere: an unmapped or read-only stack must fail, not fault in ring 0. */
-  if (copyout(base, &f, sizeof f) != 0)
+  if (copyout((uint32_t)base, &f, sizeof f) != 0)
     return -1;
 
-  r->useresp = base;
+  r->useresp = (uintptr_t)base;
   r->eip = t->sig_handler[sig];
+#ifdef __x86_64__
+  r->edi = (uint32_t)sig;
+  r->esi = base + __builtin_offsetof(struct sigframe, info);
+  r->edx = base + __builtin_offsetof(struct sigframe, uc);
+  fpu_load_init(); /* the handler starts from a clean FPU, with the default SSE modes */
+#endif
   return 0;
 }
 
@@ -1302,18 +1360,24 @@ int sched_fault_signal(struct registers *r, int sig, uint32_t addr)
   return 1;
 }
 
-/* SYS_SIGRETURN: frame base is useresp-4; restore the saved context and mask. */
+/* SYS_SIGRETURN: the handler's ret popped pretcode, so the frame starts one word below useresp; restore the saved
+ * context and mask. */
 int sched_sigreturn(struct registers *r)
 {
-  uint32_t base = (uint32_t)r->useresp - 4;
-  if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END)
+  uint64_t base = r->useresp - sizeof(uintptr_t);
+  if (r->useresp < USER_BASE + sizeof(uintptr_t) || base + sizeof(struct sigframe) > USER_REGION_END)
     return -1;
   struct sigframe f;
-  if (copyin(&f, base, sizeof f) != 0)
+  if (copyin(&f, (uint32_t)base, sizeof f) != 0)
     return -1;
+#ifdef __x86_64__
+  /* iretq to a non-canonical rip faults in ring 0, so a rewritten context must stay in the lower half. */
+  if ((f.uc.eip | f.uc.esp) >> 47)
+    return -1;
+#endif
 
   /* Strip SIGKILL/SIGSTOP so a crafted mask can't make the process unkillable. */
-  current->sig_blocked = f.saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+  current->sig_blocked = (uint32_t)f.saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
   r->eip = f.uc.eip;
   r->useresp = f.uc.esp;
   /* Sanitize user flags: keep arithmetic/DF/TF, force IF and bit1; never IOPL/NT. */
@@ -1325,6 +1389,21 @@ int sched_sigreturn(struct registers *r)
   r->ebp = f.uc.ebp;
   r->esi = f.uc.esi;
   r->edi = f.uc.edi;
+#ifdef __x86_64__
+  r->r8 = f.uc.r8;
+  r->r9 = f.uc.r9;
+  r->r10 = f.uc.r10;
+  r->r11 = f.uc.r11;
+  r->r12 = f.uc.r12;
+  r->r13 = f.uc.r13;
+  r->r14 = f.uc.r14;
+  r->r15 = f.uc.r15;
+  uint8_t fxbuf[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1];
+  uint8_t *fx = (uint8_t *)(((uintptr_t)fxbuf + FPU_AREA_ALIGN - 1) & ~(uintptr_t)(FPU_AREA_ALIGN - 1));
+  memcpy(fx, f.fpu, sizeof f.fpu);
+  fpu_sanitize(fx);
+  fpu_restore(fx);
+#endif
   return 0;
 }
 
@@ -1443,24 +1522,23 @@ int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t
   r->ds = 0x23;
   r->eax = r->ebx = r->ecx = r->edx = 0;
   r->esi = r->edi = r->ebp = 0;
+#ifdef __x86_64__
+  r->r8 = r->r9 = r->r10 = r->r11 = r->r12 = r->r13 = r->r14 = r->r15 = 0;
+#endif
+  fpu_load_init(); /* the new image starts from a clean FPU, as a fresh process does */
   return 0;
 }
 
-/* The x87 file is per task: user code rasterizes and decodes in floating point, and a preemption mid-computation
+/* The FPU state is per task: user code rasterizes and decodes in floating point, and a preemption mid-computation
  * would otherwise leak one task's registers into another's. */
-static uint8_t fpu_init_image[FPU_IMAGE_BYTES];
-static bool fpu_init_ready;
-
 static void fpu_switch(task_t *prev, task_t *next)
 {
-  __asm__ volatile("fnsave %0" : "=m"(prev->fpu)); /* leaves the FPU in its init state */
+  fpu_save(fpu_area(prev));
   prev->fpu_valid = true;
-  if (!fpu_init_ready) {
-    __asm__ volatile("fnsave %0" : "=m"(fpu_init_image));
-    fpu_init_ready = true;
-  }
-  const uint8_t *src = next->fpu_valid ? next->fpu : fpu_init_image;
-  __asm__ volatile("frstor (%0)" : : "r"(src) : "memory");
+  if (next->fpu_valid)
+    fpu_restore(fpu_area(next));
+  else
+    fpu_load_init();
 }
 
 void schedule(void)

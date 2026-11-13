@@ -3,6 +3,7 @@
 #include "smp.h"
 #include "console.h"
 #include "creg.h"
+#include "fpu.h"
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
@@ -272,6 +273,7 @@ void ap_main(uint32_t idx)
   gdt_load_ap();
   idt_load();
   tss_load_ap();
+  fpu_cpu_init();
   lapic_enable_local();
   sched_init_cpu((int)idx);
   lapic_timer_start();

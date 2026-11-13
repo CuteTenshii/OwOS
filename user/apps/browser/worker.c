@@ -42,9 +42,9 @@ static struct tab_crash g_crash;
 extern const unsigned char __text_start[], __text_end[];
 
 /* Whether stack word `w` is a return address: inside the code, right after a call instruction. */
-static bool after_call(unsigned w)
+static bool after_call(unsigned long w)
 {
-  if (w < (unsigned)__text_start + 7 || w > (unsigned)__text_end)
+  if (w < (unsigned long)__text_start + 7 || w > (unsigned long)__text_end)
     return false;
   const unsigned char *c = (const unsigned char *)w;
   return c[-5] == 0xE8 /* call rel32 */
@@ -62,12 +62,13 @@ static void worker_crash_handler(int sig, siginfo_t *info, void *ctx)
   g_crash.info = *info;
   g_crash.ctx = *sc;
   g_crash.ncallers = 0;
-  unsigned lo = (unsigned)worker_stack, hi = lo + sizeof worker_stack;
+  unsigned long lo = (unsigned long)worker_stack, hi = lo + sizeof worker_stack, word = sizeof(void *);
   if (sc->esp >= lo && sc->esp < hi) /* a wild esp would fault again in here: only scan our own stack */
-    for (unsigned p = sc->esp & ~3u; p + 4 <= hi && p - sc->esp < 32768 && g_crash.ncallers < CRASH_CALLERS; p += 4) {
-      unsigned w = *(const unsigned *)p;
+    for (unsigned long p = sc->esp & ~(word - 1);
+         p + word <= hi && p - sc->esp < 32768 && g_crash.ncallers < CRASH_CALLERS; p += word) {
+      unsigned long w = *(const unsigned long *)p;
       if (after_call(w))
-        g_crash.callers[g_crash.ncallers++] = w;
+        g_crash.callers[g_crash.ncallers++] = (unsigned)w;
     }
   /* Carry the signal out as the setjmp return value so the recovery point knows WHICH fault fired */
   longjmp(worker_recovery, sig);
@@ -76,7 +77,7 @@ static void worker_crash_handler(int sig, siginfo_t *info, void *ctx)
 static void worker_install_crash_handlers(void)
 {
   static const int sigs[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGABRT};
-  struct sigaction sa = {(unsigned)worker_crash_handler, 0, SA_SIGINFO};
+  struct sigaction sa = {(unsigned)(unsigned long)worker_crash_handler, 0, SA_SIGINFO};
   for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++)
     sigaction(sigs[i], &sa, 0);
 }

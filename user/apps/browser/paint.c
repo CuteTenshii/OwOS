@@ -831,7 +831,7 @@ void draw_dt_highlight(int x, int y, int w, int h, int clip_top, int clip_bot, i
 static const char *crash_reason(int sig, const siginfo_t *in)
 {
   if (sig == SIGSEGV && in->si_trapno == 14) {
-    unsigned lo = (unsigned)worker_stack;
+    unsigned lo = (unsigned)(unsigned long)worker_stack;
     if (in->si_addr < lo && lo - in->si_addr <= 65536)
       return "It ran out of stack space, usually from recursion that went too deep.";
     if (in->si_addr < 0x1000)

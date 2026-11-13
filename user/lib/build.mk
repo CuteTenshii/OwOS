@@ -1,17 +1,25 @@
 # user/lib/build.mk - user/lib, the user-space libraries.
 #
-# -mno-sse/-mmx + x87 math: like the kernel, user code must avoid SSE - the
-# context switch saves no FPU/SSE state, and the float->int conversions gcc would
-# otherwise emit as cvttss2si (#UD on a no-SSE CPU like QEMU's qemu32) must use
-# x87 instead. The user lib is one directory per actual library - curl/ torrent/
-# crypto/ gfx/ zlib/ png/ mp3/ font/ - each linked independently into the programs
-# that use it, and each added to the include path so the flat `#include "http.h"`
-# convention keeps resolving (same trick as the kernel's DRVDIRS). libc
-# (start/lib.c/owos.h) is the base every program includes, so it stays at the
-# user/lib root.
+# The user lib is one directory per actual library - curl/ torrent/ crypto/ gfx/
+# zlib/ png/ mp3/ font/ - each linked independently into the programs that use it,
+# and each added to the include path so the flat `#include "http.h"` convention
+# keeps resolving (same trick as the kernel's DRVDIRS). libc (start/lib.c/owos.h)
+# is the base every program includes, so it stays at the user/lib root.
+#
+# i386: -mno-sse/-mmx + x87 math. The 32-bit kernel saves only the x87 file on a
+# context switch, and QEMU's qemu32 CPU has no SSE (cvttss2si would #UD).
+# x86_64: the ABI passes floats in SSE registers, and the 64-bit kernel enables SSE
+# and saves the full FXSAVE image per task.
 ULIBDIRS := $(patsubst user/lib/%/,%,$(wildcard user/lib/*/))
-UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
-           -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
+ifeq ($(ARCH),x86_64)
+  UBITS     := 64
+  UARCHOPTS :=
+else
+  UBITS     := 32
+  UARCHOPTS := -mno-sse -mno-mmx -mfpmath=387
+endif
+UCFLAGS := $(UARCHFLAGS) -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
+           $(UARCHOPTS) $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
 
 # Debug build (make JSDEBUG=1 ...): the JS engine logs every thrown exception with
@@ -26,7 +34,7 @@ endif
 # graphics weight. gfx loads its fonts at runtime from /etc/fonts (see kernel
 # install + user/lib/gfx), so no app bakes in a bitmap atlas.
 FONT     = user/lib/font/font.o user/lib/font/fontstore.o   # TrueType/OpenType(glyf) parser + AA glyph rasterizer
-ULIB     = user/lib/start.o user/lib/lib.o user/lib/opt.o user/lib/mutex.o user/lib/win/win.o
+ULIB     = user/lib/start_$(UBITS).o user/lib/lib.o user/lib/opt.o user/lib/mutex.o user/lib/win/win.o
 GUILIB   = user/lib/gfx/gfx.o user/lib/gfx/style.o user/lib/gfx/focus.o user/lib/gfx/a11y.o user/lib/gfx/selection.o user/lib/gfx/textfield.o user/lib/gfx/sidebar.o user/lib/gfx/select.o user/lib/gfx/tabbar.o user/lib/gfx/scrollview.o user/lib/gfx/toggle.o $(FONT)
 FILEPICK  = user/lib/gfx/filelist.o user/lib/gfx/filepicker.o $(GUILIB)   # modal file/folder picker (uses gfx widgets)
 DIALOG   = user/lib/dialog/dialog.o $(GUILIB)   # reusable modal message-box + property-sheet dialogs (uses gfx)
@@ -92,7 +100,7 @@ MEDIA    = user/lib/media/media.o user/lib/media/tags.o $(MP3) $(ALAC) $(AAC) $(
 # front end over $(H264) + $(MP4) that decodes a local .264/.mp4 to timed RGB
 # frames. Linked only by video consumers so audio-only programs skip the decoder.
 VIDEO    = user/lib/media/video.o $(H264) $(MP4)
-LIBGCC  := $(shell $(UCC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
+LIBGCC  := $(shell $(UCC) $(UARCHFLAGS) -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO   = user/lib/crypto/crypto.o user/lib/crypto/ed25519.o   # SHA-1/256/512/HMAC/PRF/HKDF/AES-GCM/X25519 + Ed25519 (torrent, ssh, curl)
 # tls: user-space TLS 1.3 client with a TLS 1.2 fallback, over an owned SK_TCP
 # socket. Ported from kernel/tls.c; certificates verified with $(PKI) (warn and
@@ -178,8 +186,8 @@ JS       = user/lib/js/lexer.o user/lib/js/parser.o user/lib/js/ast.o \
 # symbol decode.c externs); encode is standalone. Links with $(LIBGCC).
 BROTLIDICT  = user/lib/brotli/dict_blob.o
 BROTLI   = user/lib/brotli/decode.o user/lib/brotli/encode.o $(BROTLIDICT)
-$(BROTLIDICT): user/lib/brotli/dictionary.bin
-	$(UOBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
+$(BROTLIDICT): user/lib/brotli/dictionary.bin $(ARCH_STAMP)
+	$(UOBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
 # woff: WOFF1 (zlib) + WOFF2 (brotli + glyf transform) container -> SFNT. Lives in
 # user/lib/font and is wired into font_load via a weak ref, so font_load decodes
 # web fonts transparently; only programs that link $(WOFF) drag in brotli/inflate.
@@ -190,7 +198,7 @@ ZSTD     = user/lib/zstd/zstd_common.o user/lib/zstd/fse.o user/lib/zstd/huf.o u
 ARCHIVE  = user/lib/archive/archive.o user/lib/archive/zip.o $(BROTLI) $(CRC32) $(INFLATE) $(ZSTD)
 SHLIB  = user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
-user/lib/start.o: user/lib/start.S $(ARCH_STAMP)
+user/lib/start_$(UBITS).o: user/lib/start_$(UBITS).S $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
 
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.

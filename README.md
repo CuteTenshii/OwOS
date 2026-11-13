@@ -34,7 +34,7 @@ You need the target ELF toolchain `i686-elf-gcc` and `i686-elf-binutils`, plus
 `xorriso`, and `mtools`; the seeded FAT test disks need `mkfs.fat` (dosfstools).
 
 The default build uses the `i686-elf-` toolchain. The 64-bit build uses
-`x86_64-elf-` for the kernel and still uses `i686-elf-` for embedded user programs.
+`x86_64-elf-` for both the kernel and the embedded user programs.
 With [Homebrew](https://brew.sh), install the target toolchains and runtime tools:
 
   ```sh
@@ -63,8 +63,9 @@ The same source tree also builds a 64-bit (long-mode) kernel: `make ARCH=x86_64`
 produces `owos-x86_64.bin`, an ELF64 image that boots into long mode (the boot
 stub sets up PAE paging + LME and far-jumps to 64-bit code). The default build is
 unchanged 32-bit. On macOS this needs the matching cross-toolchain
-(`brew install x86_64-elf-gcc x86_64-elf-binutils`); the user programs stay 32-bit
-either way (the kernel embeds them as blobs), so `i686-elf-` is still required too.
+(`brew install x86_64-elf-gcc x86_64-elf-binutils`). The user programs follow `ARCH`:
+the 64-bit kernel runs 64-bit ELF programs with SSE floating point, and the syscall ABI
+stays the same 32-bit words on both, since every user address lies below 4 GiB.
 Switching `ARCH` rebuilds the objects automatically (a `.arch.*` stamp guards it).
 
 Note QEMU's built-in `-kernel` multiboot loader only loads 32-bit ELF, so
@@ -155,8 +156,8 @@ private address space). The full lifecycle works:
 Processes carry a **cwd**, so `curl -o out.txt` lands in the current directory.
 Each has a file-descriptor table (0/1/2 = console); `pipe` creates a kernel ring
 buffer, fds survive `fork`/`exec`, and the shell wires `a | b` pipelines
-kernel-side. User programs are freestanding ELF32 linked at the user window and
-embedded into the kernel image; the loader parses the program headers into a
+kernel-side. User programs are freestanding ELF (ELF32 on i386, ELF64 on x86_64)
+linked at the user window and embedded into the kernel image; the loader parses the program headers into a
 fresh address space.
 
 ### Storage & filesystems
@@ -321,6 +322,7 @@ kernel/arch/x86/gdt.c gdt_flush_*.S GDT + lgdt/segment reload
 kernel/arch/x86/idt.c isr*.S        CPU exception IDT + dispatcher (panic screen + COM1)
 kernel/arch/x86/irq.c irq_*.S       PIC remap + hardware IRQ dispatch
 kernel/arch/x86/switch_*.S          context switch and new-thread entry
+kernel/arch/x86/fpu.c               per-task FPU state (x87 on i386, x87 + SSE on x86_64)
 kernel/arch/x86/smp.c smp_ap_*.S    MADT topology and application-processor bring-up
 kernel/arch/x86/paging_*.c          identity map, frame pool, per-process address spaces
 kernel/arch/x86/timer.c             PIT (250 Hz), tick counter + sleep (IRQ0)
@@ -338,7 +340,7 @@ kernel/heap.c      kmalloc/kfree (first-fit free list)
 kernel/kstring.c   freestanding memory primitives
 kernel/sched.c     scheduler: kernel threads + user processes, fork, reaping
 kernel/syscall.c   int 0x80 dispatch (write..net..win)
-kernel/loader.c    ELF32 loader: load segments into a fresh address space
+kernel/loader.c    ELF loader: load segments into a fresh address space
 kernel/pipe.c      kernel pipe ring buffers
 kernel/file.h      per-process fd table
 

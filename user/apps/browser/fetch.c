@@ -474,7 +474,7 @@ static void ext_css_clear(void)
 {
   struct css_link *c = B->ext_css;
   /* The head must be NULL or a heap node; a lower value is a stray write, so drop the list. */
-  if ((unsigned)c && (unsigned)c < 0x40000000u) {
+  if (c && (unsigned long)c < 0x40000000u) {
     B->ext_css = 0;
     return;
   }

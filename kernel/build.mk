@@ -16,14 +16,16 @@ ISO    := owos.iso
 ISODIR := isodir
 
 # Objects are emitted in place (kernel/foo.o), shared by both arches. The stamp stores
-# the active compiler configuration, so switching ARCH or OPT_LEVEL rebuilds objects.
+# the active compiler configuration, so switching ARCH or OPT_LEVEL rebuilds objects. The user
+# word size is part of it because x86_64 builds once linked 32-bit user programs.
 .PHONY: FORCE
 FORCE:
 
+ARCH_CONFIG = $(ARCH):O$(OPT_LEVEL):user$(UBITS)
 $(ARCH_STAMP): FORCE
-	@if [ ! -f $@ ] || [ "$$(cat $@)" != "$(ARCH):O$(OPT_LEVEL)" ]; then \
+	@if [ ! -f $@ ] || [ "$$(cat $@)" != "$(ARCH_CONFIG)" ]; then \
 		rm -f .arch.*; \
-		printf '%s\n' '$(ARCH):O$(OPT_LEVEL)' > $@; \
+		printf '%s\n' '$(ARCH_CONFIG)' > $@; \
 		sleep 1; \
 		touch $@; \
 	fi

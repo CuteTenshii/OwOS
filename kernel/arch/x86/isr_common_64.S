@@ -35,7 +35,7 @@ isr_common_stub:                       /* on entry: top of stack = int_no       
 	call isr_handler
 
 	/* DS is per CPU, not per task: a task resumed on a CPU that ran the kernel would iretq to ring 3 with
-	 * DPL-0 DS, which the CPU nulls, and compatibility mode then faults on every DS access. */
+	 * DPL-0 DS, which the CPU nulls. */
 	pop  %rax                      /* ds saved at entry                        */
 	mov  %ax, %ds
 	mov  %ax, %es
