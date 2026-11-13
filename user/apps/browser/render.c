@@ -155,6 +155,8 @@ static void paint_page_core(int py, int pw, int ct, int cb, unsigned bg, bool fi
     /* On-screen now */
     if (im->lazy && !im->fetched && show_images)
       im->want = 1;
+    if (im->inl)
+      continue; /* painted in its line by draw_slice_core */
     if (im->ok && show_images)
       draw_inline_image(im, py, ct, cb, paw);
     else

@@ -74,6 +74,7 @@ struct layout_out {
   int n_geo, cap_geo;
   int *img_pos, *img_row, *img_rows;
   int *img_fs; /* for an image inside a flex/grid item, its line slice in fs (which knows its column), else -1 */
+  int *img_fitw; /* an inline image: the line width it was fitted to */
   int n_img, cap_img;
   struct lmedia *med;
   int n_med, cap_med;
@@ -175,9 +176,23 @@ void set_block(struct bctx *c, int off);
 int glyph_px(int off);
 int body_cp_adv(struct bctx *c, unsigned cp, int px, int set);
 int glyph_set(int off);
-/* Advance of the glyph at text offset `off`: its font size plus its letter-spacing. */
+extern int g_inline_fit;
+bool text_may_have_img(int off, int len);
+int inline_img_at(unsigned cp, int off);
+void inline_img_box(const struct bctx *c, int q, int *dw, int *dh, int *top);
+int inline_img_extent(const struct bctx *c, int off, int len, int base, int line_h, int *below);
+int line_ascent(int off, int len, int maxpx);
+/* Advance of the glyph at text offset `off`: its font size plus its letter-spacing, or an inline image's width. */
 static inline int glyph_adv(struct bctx *c, unsigned cp, int off)
 {
+  if (cp >= INLINE_IMG_CP0) {
+    int q = inline_img_at(cp, off);
+    if (q >= 0) {
+      int dw, dh, top;
+      inline_img_box(c, q, &dw, &dh, &top);
+      return B->pg->imgs[q].ml + dw + B->pg->imgs[q].mr;
+    }
+  }
   return body_cp_adv(c, cp, glyph_px(off), glyph_set(off)) + B->pg->ls[off];
 }
 int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px, int set,
@@ -210,6 +225,7 @@ void draw_image(int px, int py, int pw, int ph, unsigned bg);
 void imgc_clear(void);
 void image_anim_tick(void); /* advance a playing full-page GIF / animated WebP */
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw);
+void draw_image_at(struct inl_img *im, int bx, int by, int bdw, int bdh, int ct, int cb);
 void draw_alt_box(struct inl_img *im, int py, int ct, int cb);
 
 /* paint.c */

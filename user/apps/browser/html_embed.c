@@ -231,6 +231,11 @@ static void img_box_style(struct inl_img *im, const struct css_style *cs)
   im->fbright = cs->flt_bright >= 0 ? cs->flt_bright : 1000;
   im->fgray = cs->flt_gray >= 0 ? cs->flt_gray : 0;
   im->finvert = cs->flt_invert >= 0 ? cs->flt_invert : 0;
+  im->inl = 0; /* the slot is reused across walks: only handle_img makes an image inline */
+  im->halign = 0;
+  im->va = 0;
+  im->ml = im->mr = 0;
+  im->fitw = 0;
 }
 
 /* Inline <svg>…</svg> */
@@ -297,7 +302,7 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
 }
 
 /* Append an inline <img> to B->pg->imgs on its own line (box from the computed CSS width/height) */
-void handle_img(struct dom_node *el, const struct css_style *cs)
+void handle_img(struct dom_node *el, const struct css_style *cs, int place)
 {
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
     return;
@@ -333,10 +338,11 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
     return;
   }
 
-  if (W_run_nl < 1 && W_n > 0)
+  int idx = B->pg->n_imgs;
+  bool inl = place < 0 && idx < (int)INLINE_IMG_MAX;
+  if (!inl && W_run_nl < 1 && W_n > 0)
     W_n = text_put(W_n, '\n', 0);
 
-  int idx = B->pg->n_imgs;
   struct inl_img *im = &B->pg->imgs[idx];
   strlcpy(im->href, imgurl, (int)sizeof im->href);
   if (!img_carry_take(&g_carry, im, im->href, idx, false, B->pg->imgs))
@@ -355,14 +361,36 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   im->lazy = (ld && starts_ci(ld, "lazy")) ? 1 : 0;
 
   img_box_style(im, cs);
+  im->inl = inl;
+  im->halign = (signed char)(place > 0 ? place : 0);
+  if (inl) {
+    im->ml = (short)(cs->margin[3] > 0 ? (cs->margin[3] > 999 ? 999 : cs->margin[3]) : 0);
+    im->mr = (short)(cs->margin[1] > 0 ? (cs->margin[1] > 999 ? 999 : cs->margin[1]) : 0);
+  }
+  int fp = W_fontpx ? W_fontpx : HTML_BASE_FONT;
+  im->va = (short)(cs->va_kind == CSS_VA_MIDDLE  ? INLINE_VA_MIDDLE
+                   : cs->va_kind == CSS_VA_SUB   ? fp / 5
+                   : cs->va_kind == CSS_VA_SUPER ? -fp / 3
+                   : cs->va_kind == CSS_VA_LEN   ? -cs->va_len
+                                                 : 0);
 
+  if (inl && W_pend_sp) { /* the collapsed space before it, as emit_text would write before a glyph */
+    if (W_n > 0 && W_run_nl == 0)
+      W_n = text_put(W_n, ' ', 0);
+    W_pend_sp = false;
+  }
   im->text_pos = W_n;
   im->rows = 0;
   im->start_row = -1;
   im->lx = -1;
   B->pg->n_imgs++;
-  W_n = text_put(W_n, '\n', 0);
-  W_run_nl = 1;
+  if (inl) {
+    W_n = utf8_emit(W_n, INLINE_IMG_CP0 + (unsigned)idx, sty_byte());
+    W_run_nl = 0;
+  } else {
+    W_n = text_put(W_n, '\n', 0);
+    W_run_nl = 1;
+  }
 }
 
 /* <canvas>: its bitmap is committed into the image pool like an inline <img>; canvas_tick keeps it current. */

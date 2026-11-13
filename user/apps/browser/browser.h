@@ -136,7 +136,16 @@ struct inl_img {
   short radius;               /* border-radius px (9999 = pill), 0 = square */
   short bw;                   /* uniform border width px around the image */
   unsigned bcol;              /* its colour, 0xRRGGBB */
+  signed char inl;            /* 1 = display:inline: a glyph in its line (INLINE_IMG_CP0 + index at text_pos) */
+  signed char halign;         /* a block image on its own line: 0 left, 1 centred, 2 right */
+  short va;                   /* inline: vertical-align offset px (+ down), or INLINE_VA_MIDDLE */
+  short ml, mr;               /* inline: horizontal margins px */
+  int fitw;                   /* inline: the line width it was fitted to at the last layout (published) */
 };
+/* An inline image is stored in the text as this private-use code point plus its index in imgs[] (4 UTF-8 bytes). */
+#define INLINE_IMG_CP0 0xF0000u
+#define INLINE_IMG_MAX 0xFFFDu
+#define INLINE_VA_MIDDLE (-32768)
 
 /* 32 random hex digits, the shape Chrome gives target and frame ids */
 void make_unique_id(char out[33]);

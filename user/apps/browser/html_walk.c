@@ -273,6 +273,41 @@ static int g_sel_cur = -1; /* ::selection colour in effect at this depth of the 
 /* g_flex_item: the elements entered next are direct children of a flex or grid container; g_is_item: the
  * element being entered is one (read before its children are walked), so it is blockified. */
 static bool g_flex_item, g_is_item;
+/* g_flex_halign: how the column flexbox whose children are entered next aligns them across (enum css_align), -1
+ * if it isn't one; g_item_halign: the same for the element being entered. */
+static signed char g_flex_halign = -1, g_item_halign = -1;
+/* An inline-flex box's items stay in its line: g_iflex_* is how it centres its items vertically and spaces them,
+ * for the elements entered next; g_item_iflex_* the same for the element being entered. */
+static bool g_iflex_mid, g_item_iflex_mid;
+static short g_iflex_gap, g_item_iflex_gap;
+
+/* Whether another flex item (an element, or non-blank text) follows `el` in its parent. */
+static bool has_next_item(const struct dom_node *el)
+{
+  for (const struct dom_node *n = el->next; n; n = n->next) {
+    if (n->type == DOM_ELEMENT)
+      return true;
+    if (n->type == DOM_TEXT && n->text)
+      for (const char *p = n->text; *p; p++)
+        if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+          return true;
+  }
+  return false;
+}
+
+/* How an <img> sits: inline in its line (-1), or alone on its line aligned left (0), centred (1) or right (2). */
+static int img_placement(const struct css_style *cs)
+{
+  bool own_line = g_is_item || cs->disp == CSS_DISP_BLOCK || cs->pos == CSS_POS_ABS || cs->pos == CSS_POS_FIXED;
+  if (!own_line)
+    return -1;
+  if (cs->margin[3] == -2) /* auto margins absorb the free space before any alignment does */
+    return cs->margin[1] == -2 ? 1 : 2;
+  if (!g_is_item || g_item_halign < 0)
+    return 0;
+  signed char a = cs->align_self >= 0 && cs->align_self != CSS_ALIGN_AUTO ? cs->align_self : g_item_halign;
+  return a == CSS_ALIGN_CENTER ? 1 : a == CSS_ALIGN_END ? 2 : 0;
+}
 
 /* Tags whose UA stylesheet gives them vertical margins. */
 static bool has_ua_margin(const char *name)
@@ -291,8 +326,17 @@ static void walk_element(struct dom_node *el)
     return;
   g_walk_depth++;
   bool outer_item = g_flex_item;
+  signed char outer_halign = g_flex_halign;
+  bool outer_iflex_mid = g_iflex_mid;
+  short outer_iflex_gap = g_iflex_gap;
   g_is_item = g_flex_item;
+  g_item_halign = g_flex_halign;
+  g_item_iflex_mid = g_iflex_mid;
+  g_item_iflex_gap = g_iflex_gap;
   g_flex_item = false;
+  g_flex_halign = -1;
+  g_iflex_mid = false;
+  g_iflex_gap = 0;
   int si = span_begin(el);
   signed char props[3];
   int start = W_n, sel, outer_sel = g_sel_cur;
@@ -303,6 +347,9 @@ static void walk_element(struct dom_node *el)
     sel = -1; /* unchanged from the enclosing element: its region already covers this one */
   walk_element_inner(el);
   g_flex_item = outer_item;
+  g_flex_halign = outer_halign;
+  g_iflex_mid = outer_iflex_mid;
+  g_iflex_gap = outer_iflex_gap;
   g_sel_cur = outer_sel;
   if ((tagged || sel >= 0) && W_n > start && browser_ensure_regs(B->pg->nregs + 1)) {
     B->pg->regs[B->pg->nregs] = (struct pregion){start, W_n, props[0], props[1], props[2], sel};
@@ -345,7 +392,11 @@ static void walk_element_inner(struct dom_node *el)
     return; /* table column metadata, no box */
 
   if (streq(name, "img")) {
-    handle_img(el, &cs);
+    if (g_item_iflex_mid && cs.va_kind < 0)
+      cs.va_kind = CSS_VA_MIDDLE;
+    if (g_item_iflex_gap > 0 && cs.margin[1] < 0 && has_next_item(el))
+      cs.margin[1] = g_item_iflex_gap;
+    handle_img(el, &cs, img_placement(&cs));
     return;
   }
   if (streq(name, "canvas")) {
@@ -486,7 +537,9 @@ static void walk_element_inner(struct dom_node *el)
     int fp = W_fontpx ? W_fontpx : HTML_BASE_FONT;
     sty_cur.va = (signed char)(name[2] == 'b' ? fp / 3 : -fp / 2);
   }
-  if (cs.va_kind >= 0) {
+  /* On an inline-flex/grid box vertical-align places the box in its line, not each glyph inside it. */
+  bool inline_box = cs.disp == CSS_DISP_INLINE && (cs.flex == 1 || cs.grid == 1);
+  if (cs.va_kind >= 0 && !inline_box) {
     int fp = W_fontpx ? W_fontpx : HTML_BASE_FONT;
     sty_cur.va = (signed char)(cs.va_kind == CSS_VA_SUB      ? fp / 5
                                : cs.va_kind == CSS_VA_SUPER  ? -fp / 3
@@ -561,6 +614,14 @@ static void walk_element_inner(struct dom_node *el)
     blk = 1; /* flex and grid items are block-level whatever their display (inline-flex buttons, spans) */
   /* a display:contents element's children are its parent's items */
   g_flex_item = cs.disp == CSS_DISP_CONTENTS ? is_item : blk && (cs.flex == 1 || cs.grid == 1);
+  if (cs.disp == CSS_DISP_CONTENTS)
+    g_flex_halign = g_item_halign;
+  else if (g_flex_item && cs.flex == 1 && cs.flex_dir == 1)
+    g_flex_halign = cs.align_items < 0 ? CSS_ALIGN_STRETCH : cs.align_items;
+  if (!blk && cs.flex == 1) { /* inline-flex */
+    g_iflex_mid = cs.align_items == CSS_ALIGN_CENTER;
+    g_iflex_gap = cs.gap_col > 0 ? cs.gap_col : 0;
+  }
   if (cs.disp == CSS_DISP_CONTENTS)
     cs.bg = -1; /* no box of its own, so no background */
   if (cs.pos == CSS_POS_FIXED || cs.pos == CSS_POS_ABS)

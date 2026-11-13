@@ -506,22 +506,31 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   /* Draw with the exact geometry the row was reserved with (line_x/line_w), not the full pane */
   const struct ltab *t = &g_fr->lt;
   int row = im->start_row;
-  bool recorded = (row >= 0 && row < t->n);
-  int x0 = recorded ? (im->lx >= 0 ? im->lx : t->x[row]) : 4;
-  int rw = recorded ? (im->lx >= 0 ? im->lw : t->w[row]) : (paw < 1 ? 1 : paw);
-  int dw = 0, dh = 0;
-  img_disp_size(im, rw, &dw, &dh);
-  int bw = im->bw > 0 ? im->bw : 0, bdw = dw, bdh = dh; /* border box; the picture sits bw inside it */
-  dw -= 2 * bw;
-  dh -= 2 * bw;
+  if (row < 0 || row >= t->n)
+    return;
+  int x0 = im->lx >= 0 ? im->lx : t->x[row];
+  int rw = im->lx >= 0 ? im->lw : t->w[row];
+  if (rw < 1)
+    rw = paw < 1 ? 1 : paw;
+  int bdw = 0, bdh = 0;
+  img_disp_size(im, rw, &bdw, &bdh);
+  if (rw > bdw)
+    x0 += im->halign == 1 ? (rw - bdw) / 2 : im->halign == 2 ? rw - bdw : 0;
+  draw_image_at(im, x0, py + t->y[row] - B->pg->scroll, bdw, bdh, ct, cb);
+}
+
+/* Draw image `im` with its border box (bdw x bdh) at screen (bx,by), clipped to the rows [ct,cb). */
+void draw_image_at(struct inl_img *im, int bx, int by, int bdw, int bdh, int ct, int cb)
+{
+  if (im->hidden)
+    return;
+  int bw = im->bw > 0 ? im->bw : 0; /* the picture sits bw inside the border box */
+  int dw = bdw - 2 * bw, dh = bdh - 2 * bw;
   if (dw < 1)
     dw = 1;
   if (dh < 1)
     dh = 1;
-  if (!recorded)
-    return;
-  int y0 = py + t->y[row] - B->pg->scroll + bw;
-  x0 += bw;
+  int x0 = bx + bw, y0 = by + bw;
   /* Rounded or bordered: keep what lies under the border box, so the corners can show it again. */
   unsigned *under = 0;
   int fr0 = 0, fr1 = 0, fbx = x0 - bw, fby = y0 - bw;

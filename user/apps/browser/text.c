@@ -594,6 +594,80 @@ int run_ascent(int px, int set)
   return a;
 }
 
+/* A line's baseline: the tallest ascent at the line's font size among the fonts its runs use. */
+int line_ascent(int off, int len, int maxpx)
+{
+  int best = run_ascent(maxpx, glyph_set(off)), seen = glyph_set(off);
+  for (int p = off; p < off + len; p += utf8_seqlen((unsigned char)B->pg->text[p])) {
+    int set = glyph_set(p);
+    if (set == seen)
+      continue;
+    seen = set;
+    int a = run_ascent(maxpx, set);
+    if (a > best)
+      best = a;
+  }
+  return best;
+}
+
+/* While the worker wraps a line, inline images fit this width (0 = unbounded: their max-content size). */
+int g_inline_fit;
+
+/* Whether text [off,off+len) may hold an inline image: its placeholder's UTF-8 lead byte is 0xF3. */
+bool text_may_have_img(int off, int len)
+{
+  const unsigned char *t = (const unsigned char *)B->pg->text;
+  for (int i = off; i < off + len; i++)
+    if (t[i] == 0xF3)
+      return true;
+  return false;
+}
+
+/* The inline image a placeholder code point at text offset `off` stands for, or -1 (ordinary Plane 15 text). */
+int inline_img_at(unsigned cp, int off)
+{
+  if (cp < INLINE_IMG_CP0 || cp >= INLINE_IMG_CP0 + INLINE_IMG_MAX)
+    return -1;
+  int q = (int)(cp - INLINE_IMG_CP0);
+  const struct page *pg = B->pg;
+  return q < pg->n_imgs && pg->imgs[q].inl && pg->imgs[q].text_pos == off ? q : -1;
+}
+
+/* Border-box size of inline image `q` and its top relative to the baseline (negative = above it). */
+void inline_img_box(const struct bctx *c, int q, int *dw, int *dh, int *top)
+{
+  const struct inl_img *im = &B->pg->imgs[q];
+  int fit = c->worker ? g_inline_fit : im->fitw;
+  img_disp_size(im, fit > 0 ? fit : 1 << 20, dw, dh);
+  if (im->va == INLINE_VA_MIDDLE)
+    *top = -glyph_px(im->text_pos) / 4 - *dh / 2; /* its middle on the baseline plus half an x-height */
+  else
+    *top = -*dh + im->va;
+}
+
+/* The px inline images on [off,off+len) stick out above a baseline `base` px below the line top (returned), and
+ * below a line `line_h` px tall (*below). */
+int inline_img_extent(const struct bctx *c, int off, int len, int base, int line_h, int *below)
+{
+  int above = 0, under = 0;
+  for (int p = off; p < off + len;) {
+    unsigned cp;
+    int gp = p;
+    p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
+    int q = inline_img_at(cp, gp);
+    if (q < 0)
+      continue;
+    int dw, dh, top;
+    inline_img_box(c, q, &dw, &dh, &top);
+    if (base + top < -above)
+      above = -(base + top);
+    if (base + top + dh - line_h > under)
+      under = base + top + dh - line_h;
+  }
+  *below = under;
+  return above;
+}
+
 /* Display height of a text line from its largest font px and largest CSS line-height */
 int line_height(int maxpx, int lhmax)
 {

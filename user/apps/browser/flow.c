@@ -164,6 +164,24 @@ static bool slice_has_item(int t0, int t1)
   return false;
 }
 
+/* Record the row (or band slice) of the line add_line is about to make for the inline images in [t0,t1). */
+static void note_inline_imgs(int t0, int t1, int fit)
+{
+  struct layout_out *o = g_bk;
+  for (int p = t0; p < t1;) {
+    unsigned cp;
+    int gp = p;
+    p += utf8_decode(&B->pg->text[p], &B->pg->text[t1], &cp);
+    int q = inline_img_at(cp, gp);
+    if (q < 0 || q >= o->n_img)
+      continue;
+    o->img_rows[q] = 1;
+    o->img_row[q] = o->lt.n;
+    o->img_fs[q] = g_ov_active ? o->n_fs : -1;
+    o->img_fitw[q] = fit;
+  }
+}
+
 /* Wrap glyph slice [t0,t1) at origin `base_x` / width `w` px into display lines. */
 static void flow_slice(int t0, int t1, int base_x, int w)
 {
@@ -213,6 +231,8 @@ static void flow_slice(int t0, int t1, int base_x, int w)
       }
     } else {
       int ls = i;
+      int outer_fit = g_inline_fit;
+      g_inline_fit = avail;
       while (ls < j) {
         int brk;
         if (pg->attr[ls] & ST_NOWRAP) {
@@ -235,11 +255,18 @@ static void flow_slice(int t0, int t1, int base_x, int w)
         }
         int maxpx, lhmax;
         ru_line_scan(pg->text, pg->fsz, pg->bp, pg->lh, ls, brk, (int)BODY_PX, &maxpx, &lhmax);
-        add_line(ls, brk - ls, base_x, w, line_height(maxpx, lhmax), maxpx);
+        int lh = line_height(maxpx, lhmax);
+        if (text_may_have_img(ls, brk - ls)) {
+          int below, above = inline_img_extent(c, ls, brk - ls, line_ascent(ls, brk - ls, maxpx), lh, &below);
+          note_inline_imgs(ls, brk, avail);
+          lh += above + below;
+        }
+        add_line(ls, brk - ls, base_x, w, lh, maxpx);
         ls = brk;
         while (ls < j && pg->text[ls] == ' ')
           ls++;
       }
+      g_inline_fit = outer_fit;
     }
     i = j + 1;
   }
@@ -383,7 +410,12 @@ static int g_force_w = -1; /* the next flow_box gets this border-box width: an i
 /* Document y where the next line will go: the page table's end, or an item's pen inside a band. */
 static int flow_y(void) { return g_ov_active ? g_ov_y0 + g_ov_n * BAND_PX : lt_doc_px(&g_bk->lt); }
 
-static bool is_anchor(int i) { return img_at_pos(i) >= 0 || (g_has_media && media_at_text_pos(i)); }
+/* An image or media element on a line of its own (an inline image is measured as part of its text). */
+static bool is_anchor(int i)
+{
+  int q = img_at_pos(i);
+  return (q >= 0 && !B->pg->imgs[q].inl) || (g_has_media && media_at_text_pos(i));
+}
 
 /* Anonymous items in [t0,t1): every image or media element alone, and each run of visible text between them. */
 static int anon_items(int t0, int t1, struct bitem *out)
@@ -451,7 +483,7 @@ static int range_maxw(int t0, int t1)
   int w = slice_maxcontent(t0, t1);
   for (int i = t0; i < t1; i++) {
     int q = img_at_pos(i);
-    if (q < 0)
+    if (q < 0 || B->pg->imgs[q].inl)
       continue;
     int dw = 0, dh = 0;
     img_disp_size(&B->pg->imgs[q], 1 << 20, &dw, &dh);
@@ -1293,8 +1325,10 @@ static void layout_apply(const struct layout_out *o)
     if (o->img_rows[q] >= 0)
       pg->imgs[q].rows = o->img_rows[q];
     pg->imgs[q].lx = -1;
+    pg->imgs[q].fitw = o->img_fitw[q];
     int s = o->img_fs[q];
-    if (s >= 0 && s < o->n_fs && o->fs[s].off == pg->imgs[q].text_pos) { /* in a flex/grid band */
+    /* in a flex/grid band: an anchored image's slice starts at it, an inline one's at its line */
+    if (s >= 0 && s < o->n_fs && (o->fs[s].off == pg->imgs[q].text_pos || pg->imgs[q].inl)) {
       pg->imgs[q].start_row = o->fs[s].row;
       pg->imgs[q].rows = (o->fs[s].h + BAND_PX - 1) / BAND_PX;
       pg->imgs[q].lx = o->fs[s].x;
@@ -1419,7 +1453,7 @@ void rewrap(int paw)
   int ni = B->pg->n_imgs;
   if (ni > o->cap_img) {
     int nc = browser_grow_cap(o->cap_img, 64, ni);
-    int *m = realloc(o->img_pos, (unsigned long)nc * 4 * sizeof *m);
+    int *m = realloc(o->img_pos, (unsigned long)nc * 5 * sizeof *m);
     if (m) {
       o->img_pos = m;
       o->cap_img = nc;
@@ -1429,11 +1463,13 @@ void rewrap(int paw)
     o->img_row = o->img_pos + o->cap_img;
     o->img_rows = o->img_pos + 2 * o->cap_img;
     o->img_fs = o->img_pos + 3 * o->cap_img;
+    o->img_fitw = o->img_pos + 4 * o->cap_img;
     for (int q = 0; q < ni; q++) {
       o->img_pos[q] = B->pg->imgs[q].text_pos;
       o->img_row[q] = -1;
       o->img_rows[q] = -1;
       o->img_fs[q] = -1;
+      o->img_fitw[q] = 0;
     }
     o->n_img = ni;
   }

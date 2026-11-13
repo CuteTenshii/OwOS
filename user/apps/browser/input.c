@@ -209,7 +209,7 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
   if (*off < 0 && !ov_hit) {
     for (int i = 0; i < B->pg->n_imgs; i++) {
       struct inl_img *im = &B->pg->imgs[i];
-      if (im->start_row < 0)
+      if (im->start_row < 0 || im->inl) /* an inline image is hit through its line's glyphs above */
         continue;
       int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
       if (row >= im->start_row && row < r1) {
@@ -763,9 +763,16 @@ void copy_selection(void)
       a = 0;
     if (b > B->pg->text_len)
       b = B->pg->text_len;
-    n = b - a;
-    if (n > 0 && (buf = malloc((unsigned)n + 1))) {
-      memcpy(buf, B->pg->text + a, (unsigned)n);
+    if (b > a && (buf = malloc((unsigned)(b - a) + 1))) {
+      for (int p = a; p < b;) { /* an inline image's placeholder is not text */
+        unsigned cp;
+        int nb = utf8_decode(&B->pg->text[p], &B->pg->text[b], &cp);
+        if (inline_img_at(cp, p) < 0) {
+          memcpy(buf + n, B->pg->text + p, (unsigned)nb);
+          n += nb;
+        }
+        p += nb;
+      }
       buf[n] = '\0';
     }
   }

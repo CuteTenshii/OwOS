@@ -127,7 +127,8 @@ void title_walk_publish(void);
 int open_link(struct dom_node *el);
 void close_link(void);
 void handle_svg(struct dom_node *el, const struct css_style *cs);
-void handle_img(struct dom_node *el, const struct css_style *cs);
+/* place: -1 inline in its line, else alone on its line aligned left (0), centred (1) or right (2) */
+void handle_img(struct dom_node *el, const struct css_style *cs, int place);
 void handle_canvas(struct dom_node *el, const struct css_style *cs);
 void handle_media(struct dom_node *el);
 void handle_favicon(struct dom_node *el);

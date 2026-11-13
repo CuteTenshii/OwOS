@@ -2,20 +2,14 @@
 
 /* --------------------------------------------------------------- drawing */
 
-/* A line's baseline: the tallest ascent at the line's font size among the fonts its runs use. */
-static int line_ascent(int off, int len, int maxpx)
+/* The inline image whose placeholder starts at text offset `p` (before `end`), or -1. */
+static int img_glyph_at(int p, int end)
 {
-  int best = run_ascent(maxpx, glyph_set(off)), seen = glyph_set(off);
-  for (int p = off; p < off + len; p += utf8_seqlen((unsigned char)B->pg->text[p])) {
-    int set = glyph_set(p);
-    if (set == seen)
-      continue;
-    seen = set;
-    int a = run_ascent(maxpx, set);
-    if (a > best)
-      best = a;
-  }
-  return best;
+  if ((unsigned char)B->pg->text[p] != 0xF3)
+    return -1;
+  unsigned cp;
+  utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
+  return inline_img_at(cp, p);
 }
 
 /* Draw one wrapped text run [off,off+len) at (x,y), clipped vertically to [ct,cb) */
@@ -33,6 +27,11 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
   int col_right = x + paw;                 /* the column's right edge, before indent and alignment */
   x += g_ui.bindent * INDENT_PX;           /* blockquote / list indent  */
   int base = line_ascent(off, len, maxpx); /* baseline shared by the line's runs */
+  bool imgs = text_may_have_img(off, len);
+  if (imgs) { /* the layout grew the line by what its inline images stick out above the text */
+    int below;
+    base += inline_img_extent(&g_ui, off, len, base, line_h, &below);
+  }
   if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
     int lw = 0, p = off, end = off + len;
     unsigned cp;
@@ -96,6 +95,17 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
 
   int i = 0;
   while (i < len) {
+    int q;
+    if (imgs && (q = img_glyph_at(off + i, off + len)) >= 0) {
+      struct inl_img *im = &B->pg->imgs[q];
+      int dw, dh, top;
+      inline_img_box(&g_ui, q, &dw, &dh, &top);
+      if (im->ok && show_images && !(B->pg->attr[off + i] & ST_HIDDEN))
+        draw_image_at(im, x + im->ml, y + base + top, dw, dh, ct, cb);
+      x += im->ml + dw + im->mr;
+      i += utf8_seqlen((unsigned char)B->pg->text[off + i]);
+      continue;
+    }
     unsigned char a = B->pg->attr[off + i];
     unsigned fg = B->pg->fg[off + i];
     unsigned bgc = B->pg->bg[off + i];
@@ -106,7 +116,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     /* Accumulate codepoints sharing one (attr,fg,bg,size,font,spacing,shift) so any change starts a new run */
     while (i < len && B->pg->attr[off + i] == a && B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc &&
            glyph_px(off + i) == rpx && glyph_set(off + i) == rset && B->pg->ls[off + i] == rls &&
-           B->pg->va[off + i] == rva) {
+           B->pg->va[off + i] == rva && !(imgs && img_glyph_at(off + i, off + len) >= 0)) {
       int nb = utf8_seqlen((unsigned char)B->pg->text[off + i]);
       if (i + nb > len)
         nb = 1;
