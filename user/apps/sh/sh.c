@@ -6,7 +6,7 @@
 static void bi_help(int, char **)
 {
   tputs_c("OwOS shell.  Ctrl+C cancels the line / aborts a command.\n", FG_DIR);
-  tputs("files    ls cat cp mv rm mkdir rmdir stat chmod chown umask pwd cd grep\n");
+  tputs("files    ls cat cp mv rm mkdir rmdir stat file chmod chown umask pwd cd grep\n");
   tputs("archive  zip unzip gzip gunzip\n");
   tputs("system   uptime hostname whoami id cpuinfo meminfo date ps journal "
         "which\n");
