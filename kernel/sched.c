@@ -537,7 +537,13 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_bas
   if (!t)
     return -1;
   t->id = next_id++;
-  t->name = "thread";
+  /* A thread runs the process's program, so it carries its name (crash traces symbolize against it): copied, as
+   * the creator's storage may go before the thread does. */
+  int k = 0;
+  for (const char *n = current->name; n && n[k] && k < (int)sizeof t->namebuf - 1; k++)
+    t->namebuf[k] = n[k];
+  t->namebuf[k] = '\0';
+  t->name = t->namebuf;
   t->runs = 0;
   t->as = current->as;
   t->as_owner = false;
