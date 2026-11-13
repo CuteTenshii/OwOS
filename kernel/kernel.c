@@ -116,13 +116,6 @@ static void seed_file(const char *path, const char *data, uint32_t len, uint32_t
   fs_chmod(path, mode);
 }
 
-/* CPU-bound thread that never yields (preemption test). */
-static void spinner(void)
-{
-  for (;;)
-    __asm__ volatile("");
-}
-
 /* Load a /bin program and run it as a detached root process. */
 static void spawn_bin_detached(const char *path, char *arg0)
 {
@@ -409,9 +402,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   sched_init();
   net_start();
-  sched_create_thread("spin-a", spinner);
-  sched_create_thread("spin-b", spinner);
-  con_write("scheduler: 2 worker threads spawned.\n");
 
   /* PS/2 mouse: seed pointer bounds from the framebuffer until the compositor sets them. */
   if (fb_active())
