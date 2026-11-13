@@ -10,6 +10,7 @@
  *   /proc/uptime    seconds              /proc/display   framebuffer + EDID
  *   /proc/date      wall clock           /proc/storage   one line per disk
  *   /proc/tasks     scheduler task count /proc/owofs     file/byte usage
+ *   /proc/ps        one line per task
  *                                        /proc/pci       one line per PCI
  * device
  *
@@ -119,6 +120,30 @@ static void gen_tasks(struct pb *b)
 {
   pu(b, (uint32_t)sched_count());
   pc(b, '\n');
+}
+
+/* One tab-separated line per task: tid pid ppid uid state runs name */
+static void gen_ps(struct pb *b)
+{
+  int cap = sched_count() + 16; /* slack for tasks spawned between the count and the snapshot */
+  struct sched_task_info *ti = kmalloc((uint32_t)cap * sizeof *ti);
+  if (!ti)
+    return;
+  int n = sched_snapshot(ti, cap);
+  for (int i = 0; i < n; i++) {
+    const uint32_t nums[] = {ti[i].tid, ti[i].pid, ti[i].ppid, ti[i].uid};
+    for (unsigned k = 0; k < sizeof nums / sizeof *nums; k++) {
+      pu(b, nums[k]);
+      pc(b, '\t');
+    }
+    pc(b, ti[i].state);
+    pc(b, '\t');
+    pu(b, ti[i].runs);
+    pc(b, '\t');
+    ps(b, ti[i].name);
+    pc(b, '\n');
+  }
+  kfree(ti);
 }
 
 static void gen_date(struct pb *b)
@@ -257,7 +282,7 @@ static void gen_usb(struct pb *b)
 
 /* The entry names, in listing order. Single source of truth for read + list. */
 static const char *const entries[] = {
-    "cpuinfo", "meminfo", "uptime", "tasks", "date", "owofs", "storage", "pci", "journal", "usb", "user",
+    "cpuinfo", "meminfo", "uptime", "tasks", "ps", "date", "owofs", "storage", "pci", "journal", "usb", "user",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
 
@@ -341,6 +366,8 @@ int procfs_read(const char *sub, char *buf, int max)
     gen_uptime(&b);
   else if (streq(sub, "tasks"))
     gen_tasks(&b);
+  else if (streq(sub, "ps"))
+    gen_ps(&b);
   else if (streq(sub, "date"))
     gen_date(&b);
   else if (streq(sub, "owofs"))

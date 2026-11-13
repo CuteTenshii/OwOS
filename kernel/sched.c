@@ -1434,6 +1434,57 @@ void schedule(void)
 
 int sched_count(void) { return count; }
 
+static void info_copy(char *dst, int cap, const char *src)
+{
+  int i = 0;
+  for (; src && src[i] && i < cap - 1; i++)
+    dst[i] = src[i];
+  dst[i] = '\0';
+}
+
+static char task_state_char(int state)
+{
+  switch (state) {
+  case TASK_RUNNABLE:
+    return 'R';
+  case TASK_WAITING:
+    return 'S';
+  case TASK_ZOMBIE:
+    return 'Z';
+  case TASK_EMBRYO:
+    return 'E';
+  default:
+    return '?';
+  }
+}
+
+int sched_snapshot(struct sched_task_info *out, int max)
+{
+  int n = 0;
+  uintptr_t flags = irq_save();
+  sched_lock();
+  const task_t *t = &main_task;
+  do {
+    if (n >= max)
+      break;
+    if (t->state != TASK_FREE) {
+      const task_t *leader = t->process ? t->process : t;
+      struct sched_task_info *o = &out[n++];
+      o->tid = t->id;
+      o->pid = leader->id;
+      o->ppid = leader->parent;
+      o->uid = t->uid;
+      o->runs = t->runs;
+      o->state = task_state_char(t->state);
+      info_copy(o->name, sizeof o->name, t->name ? t->name : "task");
+    }
+    t = t->next;
+  } while (t != &main_task);
+  sched_unlock();
+  irq_restore(flags);
+  return n;
+}
+
 void sched_dump(void)
 {
   con_write("id  name        runs\n");

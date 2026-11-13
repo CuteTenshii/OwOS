@@ -81,4 +81,18 @@ void sched_set_creds(int pid, uint32_t uid, uint32_t gid); /* set a child's uid/
 void sched_dump(void);
 int sched_count(void);
 
+/* One task as /proc/ps reports it; pid is the process leader's id, so pid != tid marks a user thread. */
+struct sched_task_info {
+  uint32_t tid;
+  uint32_t pid;
+  uint32_t ppid;
+  uint32_t uid;
+  uint32_t runs;
+  char state; /* R runnable, S waiting, Z zombie, E held by its spawner */
+  char name[16];
+};
+
+/* Copy up to `max` tasks into `out` in run-queue order; returns how many were copied. */
+int sched_snapshot(struct sched_task_info *out, int max);
+
 #endif /* OWOS_SCHED_H */
