@@ -10,6 +10,7 @@
 #include "kstring.h"
 #include "nvme.h"
 #include "paging.h"
+#include "part.h"
 #include "pmm.h"
 #include "scsi.h"
 #include "sd.h"
@@ -19,6 +20,8 @@
 
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
 static enum backend backend;
+/* The OwOS root partition on the backing disk; win_count 0 means the whole disk. */
+static uint32_t win_start, win_count;
 
 /* RAM disk for live boots, allocated above the identity map on first use. */
 static volatile uint8_t *ram_disk;
@@ -73,18 +76,33 @@ static void cache_invalidate(uint32_t lba, uint32_t count)
   }
 }
 
+/* Disks that can hold the OwOS root, in the order they are searched. */
+static const struct {
+  enum backend id;
+  int (*present)(void);
+  part_read_fn read;
+} root_disks[] = {
+    {BK_IDE, ata_present, ata_read_sector},
+    {BK_AHCI, ahci_present, ahci_read_sector},
+    {BK_NVME, nvme_present, nvme_read_sector},
+};
+#define NROOT (int)(sizeof root_disks / sizeof root_disks[0])
+
 void blk_init(void)
 {
   cache_clear();
-  if (ata_present()) {
-    backend = BK_IDE;
+  if (ata_present())
     ata_dma_init();
-  } else if (ahci_present())
-    backend = BK_AHCI;
-  else if (nvme_present())
-    backend = BK_NVME;
-  else
-    backend = BK_NONE;
+
+  /* An installed system lives in an OwOS root partition. Otherwise the first disk backs owofs whole, as older
+   * installs did; fs_init runs live from RAM if it holds no owofs. */
+  backend = BK_NONE;
+  for (int i = 0; i < NROOT && backend == BK_NONE; i++)
+    if (root_disks[i].present() && part_find(root_disks[i].read, PART_TYPE_OWOS_ROOT, &win_start, &win_count) == 0)
+      backend = root_disks[i].id;
+  for (int i = 0; i < NROOT && backend == BK_NONE; i++)
+    if (root_disks[i].present())
+      backend = root_disks[i].id;
 
   con_write("blk: owofs backing device = ");
   con_write(blk_backend());
@@ -92,6 +110,8 @@ void blk_init(void)
     con_write(" (");
     con_write(blk_model());
     con_write(")");
+    if (win_count)
+      con_printf(", OwOS partition at sector %u, %u MiB", win_start, win_count / 2048);
   }
   con_putc('\n');
 }
@@ -132,6 +152,7 @@ int blk_use_ram(uint32_t sectors)
   }
   cache_clear();
   backend = BK_RAM;
+  win_start = win_count = 0;
   return 0;
 }
 
@@ -232,6 +253,7 @@ int blk_read_sector(uint32_t lba, void *buf)
     spin_unlock_irqrestore(&blk_lock, flags);
     return -1;
   }
+  lba += win_start;
   int rc = blk_read_sector_locked(lba, buf);
   spin_unlock_irqrestore(&blk_lock, flags);
   return rc;
@@ -249,6 +271,7 @@ int blk_read(uint32_t lba, void *buf, uint32_t count)
     spin_unlock_irqrestore(&blk_lock, flags);
     return -1;
   }
+  lba += win_start;
   /* Keep requests within the one-page DMA buffers used by AHCI and NVMe. */
   if (backend == BK_IDE) {
     rc = ata_read(lba, buf, count);
@@ -323,6 +346,7 @@ int blk_write_sector(uint32_t lba, const void *buf)
     spin_unlock_irqrestore(&blk_lock, flags);
     return -1;
   }
+  lba += win_start;
   int rc = blk_write_sector_locked(lba, buf);
   spin_unlock_irqrestore(&blk_lock, flags);
   return rc;
@@ -333,7 +357,6 @@ int blk_write(uint32_t lba, const void *buf, uint32_t count)
   uintptr_t flags;
   int rc = 0;
   uint32_t requested = count;
-  uint32_t start_lba = lba;
   const uint8_t *start_buf = buf;
   if (count == 0)
     return 0;
@@ -342,6 +365,8 @@ int blk_write(uint32_t lba, const void *buf, uint32_t count)
     spin_unlock_irqrestore(&blk_lock, flags);
     return -1;
   }
+  lba += win_start;
+  uint32_t start_lba = lba;
   cache_invalidate(lba, count);
   if (backend == BK_IDE) {
     rc = ata_write(lba, buf, count);
@@ -382,7 +407,7 @@ fail:
   return -1;
 }
 
-uint32_t blk_sectors(void)
+static uint32_t device_sectors(void)
 {
   switch (backend) {
   case BK_IDE:
@@ -397,6 +422,8 @@ uint32_t blk_sectors(void)
     return 0;
   }
 }
+
+uint32_t blk_sectors(void) { return win_count ? win_count : device_sectors(); }
 
 const char *blk_model(void)
 {
