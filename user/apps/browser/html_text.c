@@ -240,8 +240,8 @@ bool cp_drop(unsigned cp)
     return true;
   if (cp == 0xAD)
     return true; /* soft hyphen     */
-  if (cp >= 0x200B && cp <= 0x200F)
-    return true; /* zero-width / dir */
+  if (cp >= 0x200B && cp <= 0x200F && cp != 0x200D)
+    return true; /* zero-width / dir; the joiner stays to glue emoji sequences (it draws as nothing) */
   if (cp == 0xFEFF)
     return true; /* BOM / ZWNBSP    */
   return false;

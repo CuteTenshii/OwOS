@@ -385,6 +385,11 @@ static bool render_color(const struct font *f, int gi, int px, struct ru_gent *n
 }
 
 /* Bitmap + advance of one glyph of `face` at `px` (g_ui only). */
+static bool body_mono(const struct bctx *c);
+
+/* Glyph-cache keys with this bit carry a ligature's glyph index instead of a code point. */
+#define LIG_CP 0x80000000u
+
 static const struct ru_gent *gcache_get(struct bctx *c, int face, unsigned cp, int px)
 {
   unsigned key = glyph_key(face, px);
@@ -394,7 +399,7 @@ static const struct ru_gent *gcache_get(struct bctx *c, int face, unsigned cp, i
   struct ru_gent n = {.cp = cp, .px = key};
   const struct font *f = face_font(face);
   if (f) {
-    int gi = font_glyph_index(f, (int)cp);
+    int gi = cp & LIG_CP ? (int)(cp & ~LIG_CP) : font_glyph_index(f, (int)cp);
     if (font_has_color(f) && render_color(f, gi, px, &n))
       font_glyph_hmetrics(f, gi, (float)px, &n.adv, 0);
     else
@@ -418,6 +423,175 @@ static int adv_measure(int face, unsigned cp, int px)
     return gfx_ui_cw_cp_px(cp, px);
   int adv = 0;
   font_glyph_hmetrics(f, font_glyph_index(f, (int)cp), (float)px, &adv, 0);
+  return adv;
+}
+
+/* Emoji clusters: a regional-indicator pair (a flag), or an emoji with the variation selector, skin tone, tag
+ * characters, keycap mark or zero-width-joined emoji that follow it. The emoji font draws a whole cluster as one
+ * GSUB ligature glyph; without one, its code points draw one by one as before. */
+static bool is_ri(unsigned cp) { return cp >= 0x1F1E6 && cp <= 0x1F1FF; }
+static bool emoji_joiner(unsigned cp)
+{
+  return cp == 0x200D || cp == 0xFE0F || cp == 0x20E3 || (cp >= 0x1F3FB && cp <= 0x1F3FF) ||
+         (cp >= 0xE0020 && cp <= 0xE007F);
+}
+
+static int prev_cp_start(const char *t, int lo, int p)
+{
+  do
+    p--;
+  while (p > lo && ((unsigned char)t[p] & 0xC0) == 0x80);
+  return p;
+}
+
+static unsigned cp_at(const char *t, int p, int hi, int *nb)
+{
+  unsigned cp;
+  *nb = utf8_decode(&t[p], &t[hi], &cp);
+  return cp;
+}
+
+#define CLUSTER_MAX 16 /* code points: the longest RGI emoji sequences are well under this */
+
+/* The cluster [*cs,*ce) of text t[lo,hi) holding the code point at `off`; false if it is a lone code point. */
+static bool emoji_cluster(const char *t, int lo, int hi, int off, int *cs, int *ce)
+{
+  int nb;
+  unsigned cp = cp_at(t, off, hi, &nb);
+  if (is_ri(cp)) { /* indicators pair up from the start of their run */
+    int k = 0, p = off;
+    while (p > lo && k < 64) {
+      int q = prev_cp_start(t, lo, p), qn;
+      if (!is_ri(cp_at(t, q, hi, &qn)))
+        break;
+      p = q;
+      k++;
+    }
+    int start = k % 2 ? prev_cp_start(t, lo, off) : off, sn, en;
+    cp_at(t, start, hi, &sn);
+    if (start + sn >= hi || !is_ri(cp_at(t, start + sn, hi, &en)))
+      return false;
+    *cs = start;
+    *ce = start + sn + en;
+    return true;
+  }
+  int s = off;
+  for (int guard = 0; guard < CLUSTER_MAX; guard++) { /* back to the cluster's base emoji */
+    unsigned c = cp_at(t, s, hi, &nb);
+    if (s > lo && emoji_joiner(c)) {
+      s = prev_cp_start(t, lo, s);
+      continue;
+    }
+    if (s > lo) {
+      int q = prev_cp_start(t, lo, s), qn;
+      if (cp_at(t, q, hi, &qn) == 0x200D) {
+        s = q;
+        continue;
+      }
+    }
+    break;
+  }
+  if (emoji_joiner(cp_at(t, s, hi, &nb)))
+    return false; /* a stray joiner with nothing to join */
+  int e = s + nb, count = 1;
+  while (e < hi && count < CLUSTER_MAX) { /* forward over the modifiers and joined emoji */
+    unsigned c = cp_at(t, e, hi, &nb);
+    if (c == 0x200D) {
+      int nn;
+      if (e + nb >= hi)
+        break;
+      cp_at(t, e + nb, hi, &nn);
+      e += nb + nn;
+      count += 2;
+    } else if (emoji_joiner(c)) {
+      e += nb;
+      count++;
+    } else {
+      break;
+    }
+  }
+  if (count < 2 || off < s || off >= e)
+    return false;
+  *cs = s;
+  *ce = e;
+  return true;
+}
+
+/* FNV-1a over the cluster's bytes, kept clear of real code points and of LIG_CP. */
+static unsigned cluster_key(const char *t, int cs, int ce)
+{
+  unsigned h = 2166136261u;
+  for (int i = cs; i < ce; i++)
+    h = (h ^ (unsigned char)t[i]) * 16777619u;
+  return 0x40000000u | (h & 0x3FFFFFFFu);
+}
+
+/* Font f's ligature for the whole cluster t[cs,ce), or -1. Fonts list sequences with or without VS16. */
+static int font_cluster_lig(const struct font *f, const char *t, int cs, int ce)
+{
+  if (!f || ce <= cs)
+    return -1;
+  int gids[CLUSTER_MAX], n = 0, bare[CLUSTER_MAX], nbare = 0, used = 0, nb;
+  for (int p = cs; p < ce && n < CLUSTER_MAX; p += nb) {
+    unsigned cp = cp_at(t, p, ce, &nb);
+    gids[n++] = font_glyph_index(f, (int)cp);
+    if (cp != 0xFE0F)
+      bare[nbare++] = gids[n - 1];
+  }
+  int lig = font_ligature(f, gids, n, &used);
+  if (used == n)
+    return lig;
+  lig = nbare > 1 ? font_ligature(f, bare, nbare, &used) : -1;
+  return used == nbare ? lig : -1;
+}
+
+/* The ligature glyph drawing cluster t[cs,ce) in font set `set`, and its face; -1 if no font has one. */
+static int cluster_glyph(struct bctx *c, const char *t, int cs, int ce, int set, int *face)
+{
+  unsigned key = cluster_key(t, cs, ce);
+  struct ru_gent *e = ru_gtab_find(&c->pk, key, (unsigned)set);
+  if (e && e->h == ce - cs) {
+    *face = e->w;
+    return e->adv;
+  }
+  int nb, flags;
+  *face = pick_face(c, set, cp_at(t, cs, ce, &nb), &flags);
+  int lig = font_cluster_lig(face_font(*face), t, cs, ce);
+  if (lig < 0 && *face != -1 - LF_EMOJI) { /* a keycap's digit picks the text font; its sequence is the emoji font's */
+    lig = font_cluster_lig(local_font(LF_EMOJI), t, cs, ce);
+    if (lig >= 0)
+      *face = -1 - LF_EMOJI;
+  }
+  if (c->pk.n >= PICK_MAX)
+    ru_gtab_clear(&c->pk);
+  struct ru_gent ne = {.cp = key, .px = (unsigned)set, .adv = lig, .w = *face, .h = ce - cs};
+  ru_gtab_put(&c->pk, &ne);
+  return lig;
+}
+
+/* Advance of the code point at `off` in text t[lo,hi) when it belongs to an emoji cluster the font ligates: the
+ * ligature's for the cluster's first code point, 0 for the rest. EMOJI_SOLO when it draws on its own. */
+int emoji_cluster_adv(struct bctx *c, const char *t, int lo, int hi, int off, int px, int set)
+{
+  if (body_mono(c))
+    return EMOJI_SOLO;
+  int cs, ce;
+  if (!emoji_cluster(t, lo, hi, off, &cs, &ce))
+    return EMOJI_SOLO;
+  bool lock = c->worker && !c->held;
+  if (lock)
+    browser_buf_lock();
+  gcache_sync(c);
+  int face, lig = cluster_glyph(c, t, cs, ce, set, &face), adv = EMOJI_SOLO;
+  if (lig >= 0) {
+    adv = 0;
+    if (off == cs) {
+      const struct font *f = face_font(face);
+      font_glyph_hmetrics(f, lig, (float)(px ? px : (int)BODY_PX), &adv, 0);
+    }
+  }
+  if (lock)
+    browser_buf_unlock();
   return adv;
 }
 
@@ -538,8 +712,21 @@ int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, 
   int by = y + baseline; /* screen baseline shared by runs */
   int eff = px ? px : (int)BODY_PX;
   gcache_sync(&g_ui);
+  const char *s0 = s;
   while (s < end) {
+    int at = (int)(s - s0);
     s += utf8_decode(s, end, &cp);
+    int cs, ce, lface;
+    if (emoji_maybe(cp) && emoji_cluster(s0, 0, len, at, &cs, &ce) && cs == at) {
+      int lig = cluster_glyph(&g_ui, s0, cs, ce, set, &lface);
+      if (lig >= 0) { /* the whole cluster as one glyph */
+        const struct ru_gent *g = gcache_get(&g_ui, lface, LIG_CP | (unsigned)lig, eff);
+        blit_glyph(x, by, g, fg, ct, cb, 0);
+        x += g->adv;
+        s = s0 + ce;
+        continue;
+      }
+    }
     if (zero_width(cp))
       continue;
     int flags;

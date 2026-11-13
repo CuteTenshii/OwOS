@@ -182,6 +182,14 @@ int inline_img_at(unsigned cp, int off);
 void inline_img_box(const struct bctx *c, int q, int *dw, int *dh, int *top);
 int inline_img_extent(const struct bctx *c, int off, int len, int base, int line_h, int *below);
 int line_ascent(int off, int len, int maxpx);
+#define EMOJI_SOLO (-1) /* emoji_cluster_adv: the code point is not part of a ligated cluster */
+int emoji_cluster_adv(struct bctx *c, const char *t, int lo, int hi, int off, int px, int set);
+/* Cheap filter for code points that can start or continue an emoji cluster (keycaps start with # * 0-9). */
+static inline bool emoji_maybe(unsigned cp)
+{
+  return cp >= 0x1F000 || (cp >= 0x2000 && cp <= 0x3299) || cp == 0xFE0F || (cp >= '0' && cp <= '9') || cp == '#' ||
+         cp == '*' || cp == 0xA9 || cp == 0xAE;
+}
 /* Advance of the glyph at text offset `off`: its font size plus its letter-spacing, or an inline image's width. */
 static inline int glyph_adv(struct bctx *c, unsigned cp, int off)
 {
@@ -192,6 +200,11 @@ static inline int glyph_adv(struct bctx *c, unsigned cp, int off)
       inline_img_box(c, q, &dw, &dh, &top);
       return B->pg->imgs[q].ml + dw + B->pg->imgs[q].mr;
     }
+  }
+  if (emoji_maybe(cp)) {
+    int a = emoji_cluster_adv(c, B->pg->text, 0, B->pg->text_len, off, glyph_px(off), glyph_set(off));
+    if (a != EMOJI_SOLO)
+      return a ? a + B->pg->ls[off] : 0;
   }
   return body_cp_adv(c, cp, glyph_px(off), glyph_set(off)) + B->pg->ls[off];
 }
