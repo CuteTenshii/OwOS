@@ -214,6 +214,45 @@ static void cjk_fallback(void)
   free(tb);
 }
 
+static int read_host_file(void *path, unsigned off, void *buf, unsigned len)
+{
+  FILE *fp = fopen(path, "rb");
+  if (!fp)
+    return -1;
+  int got = fseek(fp, (long)off, SEEK_SET) == 0 ? (int)fread(buf, 1, len, fp) : -1;
+  fclose(fp);
+  return got;
+}
+
+/* The font store sorts faces into roles by probing their files: each shipped face lands in the role it serves. */
+static void probe_roles(void)
+{
+  static const struct {
+    const char *path, *family;
+    int weight, italic, mono, color, cjk;
+  } want[] = {
+      {"fonts/LiberationSans-Regular.ttf", "Liberation Sans", 400, 0, 0, 0, 0},
+      {"fonts/LiberationMono-Regular.ttf", "Liberation Mono", 400, 0, 1, 0, 0},
+      {"fonts/NotoSans-Regular.ttf", "Noto Sans", 400, 0, 0, 0, 0},
+      {"fonts/NotoSans-BoldItalic.ttf", "Noto Sans", 700, 1, 0, 0, 0},
+      {"fonts/NotoColorEmoji.ttf", "Noto Color Emoji", 400, 0, 1, 1, 0}, /* fixed pitch, but colour decides */
+      {"fonts/NotoSansCJKsc-Regular.otf", "Noto Sans CJK SC", 400, 0, 0, 0, 1},
+  };
+  for (unsigned i = 0; i < sizeof want / sizeof want[0]; i++) {
+    struct font_info fi;
+    expect(font_probe(read_host_file, (void *)want[i].path, &fi));
+    expect_string(fi.family, want[i].family);
+    expect_eq(fi.weight, want[i].weight);
+    expect_eq(fi.italic, want[i].italic);
+    expect_eq(fi.mono, want[i].mono);
+    expect_eq(fi.color, want[i].color);
+    expect_eq(fi.cjk, want[i].cjk);
+  }
+  struct font_info fi;
+  expect(!font_probe(read_host_file, (void *)"fonts/NotoSans-OFL.txt", &fi));
+  expect(!font_probe(read_host_file, (void *)"fonts/missing.ttf", &fi));
+}
+
 static void put16(unsigned char *p, unsigned v)
 {
   p[0] = (unsigned char)(v >> 8);
@@ -346,5 +385,6 @@ int main(void)
   test("no_color_in_outline_font", no_color_in_outline_font);
   test("noto_sans_faces", noto_sans_faces);
   test("cjk_fallback", cjk_fallback);
+  test("probe_roles", probe_roles);
   return 0;
 }

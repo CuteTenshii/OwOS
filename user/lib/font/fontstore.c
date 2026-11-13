@@ -6,9 +6,16 @@
 #define CONF "/etc/fonts.conf"
 #define NAME_MAX_U 64
 
+#define FACES 48
+
 static const char *const key[FONT_ROLES] = {"sans=", "mono=", "emoji=", "cjk="};
-static const char *const builtin[FONT_ROLES] = {"LiberationSans-Regular.ttf", "LiberationMono-Regular.ttf",
-                                                "NotoColorEmoji.ttf", "NotoSansCJKsc-Regular.otf"};
+
+/* The installed faces, sorted by file name; nfaces < 0 until the first scan */
+static struct face {
+  char name[NAME_MAX_U];
+  struct font_info info;
+} faces[FACES];
+static int nfaces = -1;
 
 /* Web-font containers; present only in programs that link user/lib/font/woff.c */
 extern int woff_is_woff(const unsigned char *, int) __attribute__((weak));
@@ -91,23 +98,53 @@ int fontstore_install(const char *src, char *name)
     snprintf(dst, sizeof dst, DIR "/%s", name);
     mkdir(DIR);
     rc = writefile(dst, buf, len);
+    nfaces = -1;
   }
   free(buf);
   return rc;
 }
 
-int fontstore_list(int i, char *name)
+static int read_file(void *path, unsigned off, void *buf, unsigned len) { return readfile_at(path, off, buf, len); }
+
+static void scan_faces(void)
 {
   struct dirent_u de;
-  for (int idx = 0, seen = 0; readdir(DIR, idx, &de) == 1; idx++) {
-    if (de.is_dir || !is_font_name(de.name) || !strcmp(de.name, builtin[FONT_EMOJI]) ||
-        !strcmp(de.name, builtin[FONT_CJK]))
+  char path[96];
+  nfaces = 0;
+  for (int idx = 0; nfaces < FACES && readdir(DIR, idx, &de) == 1; idx++) {
+    struct font_info info;
+    snprintf(path, sizeof path, DIR "/%s", de.name);
+    if (de.is_dir || !is_font_name(de.name) || !font_probe(read_file, path, &info))
       continue;
-    if (seen++ == i) {
-      strcpy(name, de.name);
+    int at = nfaces++;
+    for (; at > 0 && strcmp(faces[at - 1].name, de.name) > 0; at--)
+      faces[at] = faces[at - 1];
+    strcpy(faces[at].name, de.name);
+    faces[at].info = info;
+  }
+}
+
+static int face_role(const struct font_info *fi)
+{
+  return fi->color ? FONT_EMOJI : fi->cjk ? FONT_CJK : fi->mono ? FONT_MONO : FONT_SANS;
+}
+
+static int is_text_face(const struct face *f)
+{
+  int role = face_role(&f->info);
+  return role == FONT_SANS || role == FONT_MONO;
+}
+
+int fontstore_list(int i, char *name)
+{
+  /* Listing from the start rescans, so a font another program installed shows up */
+  if (i == 0 || nfaces < 0)
+    scan_faces();
+  for (int f = 0, seen = 0; f < nfaces; f++)
+    if (is_text_face(&faces[f]) && seen++ == i) {
+      strcpy(name, faces[f].name);
       return 0;
     }
-  }
   return -1;
 }
 
@@ -134,6 +171,46 @@ static int conf_get(int role, char *name)
   return 0;
 }
 
+static int ieq(const char *a, const char *b)
+{
+  for (; *a && *b; a++, b++)
+    if (((*a | 32) != (*b | 32)))
+      return 0;
+  return !*a && !*b;
+}
+
+/* How far a face is from the asked weight and slant; lower is closer */
+static int face_cost(const struct font_info *fi, int weight, int italic)
+{
+  int d = fi->weight - weight;
+  /* A slant mismatch outweighs any weight distance; at equal distance the heavier face wins for bold */
+  return (d < 0 ? -d : d) * 2 + (d < 0) * (weight >= 500) + (d > 0) * (weight < 500) +
+         ((fi->italic != 0) != (italic != 0)) * 10000;
+}
+
+/* The default face for `role`: of the faces suited to it, the family with the most installed faces (the first by
+ * file name on a tie), so bold and italic text get real faces; its upright regular face. -1 if none suits. */
+static int default_face(int role)
+{
+  int best = -1, best_count = 0;
+  for (int i = 0; i < nfaces; i++) {
+    if (face_role(&faces[i].info) != role)
+      continue;
+    int count = 0;
+    for (int j = 0; j < nfaces; j++)
+      count += face_role(&faces[j].info) == role && ieq(faces[j].info.family, faces[i].info.family);
+    if (count > best_count) {
+      best = i;
+      best_count = count;
+    }
+  }
+  for (int i = 0; best >= 0 && i < nfaces; i++)
+    if (face_role(&faces[i].info) == role && ieq(faces[i].info.family, faces[best].info.family) &&
+        face_cost(&faces[i].info, 400, 0) < face_cost(&faces[best].info, 400, 0))
+      best = i;
+  return best;
+}
+
 void fontstore_current(int role, char *name)
 {
   char path[96];
@@ -143,7 +220,16 @@ void fontstore_current(int role, char *name)
     if (stat(path, &st) == 0 && !st.is_dir)
       return;
   }
-  strcpy(name, builtin[role]);
+  if (nfaces < 0)
+    scan_faces();
+  int f = default_face(role);
+  /* Sans and mono stand in for each other, so text still draws with only one of them installed */
+  if (f < 0 && (role == FONT_SANS || role == FONT_MONO))
+    f = default_face(role == FONT_SANS ? FONT_MONO : FONT_SANS);
+  if (f >= 0)
+    strcpy(name, faces[f].name);
+  else
+    name[0] = '\0';
 }
 
 void fontstore_path(int role, char *path, int n)
@@ -169,50 +255,13 @@ int fontstore_choose(int role, const char *name)
   return writefile(CONF, out, o);
 }
 
-static int ieq(const char *a, const char *b)
-{
-  for (; *a && *b; a++, b++)
-    if (((*a | 32) != (*b | 32)))
-      return 0;
-  return !*a && !*b;
-}
-
-#define FAMILIES 32
-static struct {
-  char family[64], name[NAME_MAX_U];
-  int weight, italic;
-} fam_cache[FAMILIES];
-static int fam_n = -1;
-
-static void scan_families(void)
-{
-  char name[NAME_MAX_U], p[96];
-  fam_n = 0;
-  for (int i = 0; fam_n < FAMILIES && fontstore_list(i, name) == 0; i++) {
-    snprintf(p, sizeof p, DIR "/%s", name);
-    int len;
-    unsigned char *buf = slurp(p, &len);
-    if (!buf)
-      continue;
-    struct font *f = font_load(buf, len);
-    if (f && font_family(f, fam_cache[fam_n].family, sizeof fam_cache[0].family)) {
-      strcpy(fam_cache[fam_n].name, name);
-      font_style(f, &fam_cache[fam_n].weight, &fam_cache[fam_n].italic);
-      fam_n++;
-    }
-    if (f)
-      font_free(f);
-    free(buf);
-  }
-}
-
 int fontstore_find(const char *family, char *path, int n)
 {
-  if (fam_n < 0)
-    scan_families();
-  for (int i = 0; i < fam_n; i++)
-    if (ieq(fam_cache[i].family, family)) {
-      snprintf(path, n, DIR "/%s", fam_cache[i].name);
+  if (nfaces < 0)
+    scan_faces();
+  for (int i = 0; i < nfaces; i++)
+    if (is_text_face(&faces[i]) && faces[i].info.family[0] && ieq(faces[i].info.family, family)) {
+      snprintf(path, n, DIR "/%s", faces[i].name);
       return 1;
     }
   return 0;
@@ -220,16 +269,13 @@ int fontstore_find(const char *family, char *path, int n)
 
 int fontstore_match(const char *family, int weight, int italic, char *path, int n, int *got_weight, int *got_italic)
 {
-  if (fam_n < 0)
-    scan_families();
+  if (nfaces < 0)
+    scan_faces();
   int best = -1, best_cost = 0;
-  for (int i = 0; i < fam_n; i++) {
-    if (!ieq(fam_cache[i].family, family))
+  for (int i = 0; i < nfaces; i++) {
+    if (!is_text_face(&faces[i]) || !faces[i].info.family[0] || !ieq(faces[i].info.family, family))
       continue;
-    int d = fam_cache[i].weight - weight;
-    /* A slant mismatch outweighs any weight distance; at equal distance the heavier face wins for bold */
-    int cost = (d < 0 ? -d : d) * 2 + (d < 0) * (weight >= 500) + (d > 0) * (weight < 500) +
-               ((fam_cache[i].italic != 0) != (italic != 0)) * 10000;
+    int cost = face_cost(&faces[i].info, weight, italic);
     if (best < 0 || cost < best_cost) {
       best = i;
       best_cost = cost;
@@ -237,10 +283,10 @@ int fontstore_match(const char *family, int weight, int italic, char *path, int 
   }
   if (best < 0)
     return 0;
-  snprintf(path, n, DIR "/%s", fam_cache[best].name);
+  snprintf(path, n, DIR "/%s", faces[best].name);
   if (got_weight)
-    *got_weight = fam_cache[best].weight;
+    *got_weight = faces[best].info.weight;
   if (got_italic)
-    *got_italic = fam_cache[best].italic;
+    *got_italic = faces[best].info.italic;
   return 1;
 }

@@ -3,6 +3,7 @@
 #include "browser.h"
 #include "dom.h"
 #include "font.h"
+#include "fontstore.h"
 
 #define MAX_SIDE 16384
 #define MAX_RECS 256
@@ -31,8 +32,11 @@ static void attach_fonts(struct c2d *c)
 {
   if (!g_fonts_tried) {
     g_fonts_tried = true;
-    g_sans = load_font("/etc/fonts/LiberationSans-Regular.ttf");
-    g_mono = load_font("/etc/fonts/LiberationMono-Regular.ttf");
+    char path[96];
+    fontstore_path(FONT_SANS, path, sizeof path);
+    g_sans = load_font(path);
+    fontstore_path(FONT_MONO, path, sizeof path);
+    g_mono = load_font(path);
   }
   c->sans = g_sans;
   c->mono = g_mono;

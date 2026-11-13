@@ -28,6 +28,21 @@ int font_family(const struct font *f, char *out, int n);
  * oblique. Either out pointer may be 0. */
 void font_style(const struct font *f, int *weight, int *italic);
 
+/* What a font file is, read from its table directory and a few small tables without loading it whole. */
+struct font_info {
+  char family[64];    /* as font_family */
+  int weight, italic; /* as font_style */
+  int mono;           /* fixed pitch */
+  int color;          /* carries CBDT colour bitmaps, as emoji fonts do */
+  int cjk;            /* OS/2 claims Han, kana or Hangul coverage */
+};
+
+/* Reads `len` bytes at offset `off` of the file into `buf`; returns the count read, or < 0. */
+typedef int (*font_read_fn)(void *ctx, unsigned off, void *buf, unsigned len);
+
+/* Fill `out` for the SFNT file that `read` reads. Returns 1, or 0 if it is not an SFNT with a head table. */
+int font_probe(font_read_fn read, void *ctx, struct font_info *out);
+
 /* Scaled vertical metrics at pixel size `px` (the em square maps to `px`
  * pixels). `descent` is negative (below the baseline); any of the out pointers
  * may be 0. */

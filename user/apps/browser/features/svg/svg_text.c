@@ -1,6 +1,7 @@
 /* svg_text.c: <text> and <tspan> laid out with the shared TrueType rasterizer. */
 #include "features/svg/svg_int.h"
 #include "font.h"
+#include "fontstore.h"
 
 static struct font *g_fonts[2]; /* sans, mono */
 static bool g_fonts_tried;
@@ -19,7 +20,7 @@ static struct font *load_font(const char *path)
   return f;
 }
 
-/* Fonts used for text; NULL keeps the installed Liberation faces. */
+/* Fonts used for text; NULL keeps the installed sans and mono faces. */
 void svg_set_fonts(struct font *sans, struct font *mono)
 {
   g_fonts[0] = sans;
@@ -31,8 +32,11 @@ static const struct font *pick_font(bool mono)
 {
   if (!g_fonts_tried) {
     g_fonts_tried = true;
-    g_fonts[0] = load_font("/etc/fonts/LiberationSans-Regular.ttf");
-    g_fonts[1] = load_font("/etc/fonts/LiberationMono-Regular.ttf");
+    char path[96];
+    fontstore_path(FONT_SANS, path, sizeof path);
+    g_fonts[0] = load_font(path);
+    fontstore_path(FONT_MONO, path, sizeof path);
+    g_fonts[1] = load_font(path);
   }
   return g_fonts[mono] ? g_fonts[mono] : g_fonts[!mono];
 }

@@ -3,7 +3,8 @@
 #define OWOS_FONTSTORE_H
 
 /* FONT_EMOJI and FONT_CJK are fallbacks for codepoints the text fonts lack: colour emoji, and Han, kana and Hangul.
- * fontstore_list leaves their built-in faces out, as they are not chosen as text faces. */
+ * Each installed face serves one role, read from the file: colour bitmaps make it emoji, OS/2 CJK coverage CJK, fixed
+ * pitch mono, anything else sans. */
 enum { FONT_SANS, FONT_MONO, FONT_EMOJI, FONT_CJK, FONT_ROLES };
 
 /* Validate the .ttf/.otf/.woff/.woff2 file at `src` and copy it into /etc/fonts (web fonts are
@@ -11,10 +12,13 @@ enum { FONT_SANS, FONT_MONO, FONT_EMOJI, FONT_CJK, FONT_ROLES };
  * file name. Returns 0, or -1 if unreadable, not a usable font, or the write failed. */
 int fontstore_install(const char *src, char *name);
 
-/* Installed font file names: the i-th entry into `name` (>= 64 bytes); -1 past the end. */
+/* File names of the installed sans and mono faces, by name: the i-th into `name` (>= 64 bytes); -1 past the end.
+ * i == 0 rereads /etc/fonts. */
 int fontstore_list(int i, char *name);
 
-/* Path of the font used for `role`: the choice in /etc/fonts.conf if installed, else the built-in. */
+/* Path of the font used for `role`: the choice in /etc/fonts.conf if installed, else the upright regular face of the
+ * installed family with the most faces in that role. Sans and mono stand in for each other; with no font for the
+ * role the path is the /etc/fonts directory itself, which no font loader accepts. */
 void fontstore_path(int role, char *path, int n);
 
 /* File name of the font used for `role` (>= 64 bytes). */

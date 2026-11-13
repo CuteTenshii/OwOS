@@ -1263,15 +1263,16 @@ unsigned char *font_render_glyph(const struct font *f, int gi, float px, int *w,
 }
 
 /* ------------------------------------------------ weight and slant -------- */
-void font_style(const struct font *f, int *weight, int *italic)
+/* Weight and slant from an OS/2 table (first `os2_len` bytes), else from head.macStyle. Either table may be 0. */
+static void style_from(const unsigned char *os2, int os2_len, const unsigned char *head, int head_len, int *weight,
+                       int *italic)
 {
-  unsigned os2 = find_table(f->d, f->len, "OS/2");
   int w = 400, it = 0;
-  if (os2 && off_ok(os2, 64, f->len)) {
-    w = (int)rd16(f->d + os2 + 4);
-    it = (rd16(f->d + os2 + 62) & 0x201) != 0; /* ITALIC or OBLIQUE */
-  } else if (f->head) {
-    unsigned mac = rd16(f->d + f->head + 44);
+  if (os2 && os2_len >= 64) {
+    w = (int)rd16(os2 + 4);
+    it = (rd16(os2 + 62) & 0x201) != 0; /* ITALIC or OBLIQUE */
+  } else if (head && head_len >= 46) {
+    unsigned mac = rd16(head + 44);
     w = mac & 1 ? 700 : 400;
     it = (mac & 2) != 0;
   }
@@ -1286,44 +1287,127 @@ void font_style(const struct font *f, int *weight, int *italic)
     *italic = it;
 }
 
-/* ------------------------------------------------ family name -------------- */
-int font_family(const struct font *f, char *out, int n)
+void font_style(const struct font *f, int *weight, int *italic)
 {
-  unsigned nt = find_table(f->d, f->len, "name");
+  unsigned os2 = find_table(f->d, f->len, "OS/2");
+  int os2_len = os2 && off_ok(os2, 0, f->len) ? f->len - (int)os2 : 0;
+  style_from(os2_len ? f->d + os2 : 0, os2_len, f->head ? f->d + f->head : 0, f->head ? f->len - (int)f->head : 0,
+             weight, italic);
+}
+
+/* ------------------------------------------------ family name -------------- */
+/* Family name from a name table whose first `len` bytes are at `nt`; see font_family. */
+static int family_from(const unsigned char *nt, int len, char *out, int n)
+{
   if (n < 1)
     return 0;
   out[0] = '\0';
-  if (!nt || !off_ok(nt, 6, f->len))
+  if (!off_ok(0, 6, len))
     return 0;
-  int count = (int)rd16(f->d + nt + 2);
-  unsigned strs = nt + rd16(f->d + nt + 4);
+  int count = (int)rd16(nt + 2);
+  unsigned strs = rd16(nt + 4);
   int best = 0, bestscore = 0;
   for (int i = 0; i < count; i++) {
-    unsigned r = nt + 6 + (unsigned)i * 12;
-    if (!off_ok(r, 12, f->len))
+    unsigned r = 6 + (unsigned)i * 12;
+    if (!off_ok(r, 12, len))
       break;
-    unsigned plat = rd16(f->d + r), id = rd16(f->d + r + 6);
+    unsigned plat = rd16(nt + r), id = rd16(nt + r + 6);
     int score = (id == 16 ? 2 : id == 1 ? 1 : 0) * 2 + (plat == 3 ? 1 : 0);
     if (id != 1 && id != 16)
       continue;
-    if ((plat != 3 && plat != 1) || score <= bestscore ||
-        !off_ok(strs + rd16(f->d + r + 10), rd16(f->d + r + 8), f->len))
+    if ((plat != 3 && plat != 1) || score <= bestscore || !off_ok(strs + rd16(nt + r + 10), rd16(nt + r + 8), len))
       continue;
     best = i + 1;
     bestscore = score;
   }
   if (!best)
     return 0;
-  unsigned r = nt + 6 + (unsigned)(best - 1) * 12;
-  const unsigned char *s = f->d + strs + rd16(f->d + r + 10);
-  unsigned len = rd16(f->d + r + 8), step = rd16(f->d + r) == 3 ? 2 : 1;
+  unsigned r = 6 + (unsigned)(best - 1) * 12;
+  const unsigned char *s = nt + strs + rd16(nt + r + 10);
+  unsigned slen = rd16(nt + r + 8), step = rd16(nt + r) == 3 ? 2 : 1;
   int o = 0;
-  for (unsigned i = 0; i + step <= len && o < n - 1; i += step) {
+  for (unsigned i = 0; i + step <= slen && o < n - 1; i += step) {
     unsigned c = step == 2 ? rd16(s + i) : s[i];
     out[o++] = c < 0x80 ? (char)c : '?';
   }
   out[o] = '\0';
   return o;
+}
+
+int font_family(const struct font *f, char *out, int n)
+{
+  unsigned nt = find_table(f->d, f->len, "name");
+  if (n >= 1)
+    out[0] = '\0';
+  if (!nt || !off_ok(nt, 0, f->len))
+    return 0;
+  return family_from(f->d + nt, f->len - (int)nt, out, n);
+}
+
+/* ------------------------------------------------ probing a font file ------ */
+#define PROBE_TABLES 64
+#define PROBE_NAME_MAX 65536
+
+static int probe_read(font_read_fn read, void *ctx, unsigned off, void *buf, unsigned len)
+{
+  return read(ctx, off, buf, len) == (int)len;
+}
+
+/* Offset of table `tag` in a directory of `n` entries, with its length in *len; 0 if absent */
+static unsigned dir_find(const unsigned char *dir, int n, const char *tag, unsigned *len)
+{
+  for (int i = 0; i < n; i++) {
+    const unsigned char *e = dir + i * 16;
+    if (e[0] == (unsigned char)tag[0] && e[1] == (unsigned char)tag[1] && e[2] == (unsigned char)tag[2] &&
+        e[3] == (unsigned char)tag[3]) {
+      *len = rd32(e + 12);
+      return rd32(e + 8);
+    }
+  }
+  *len = 0;
+  return 0;
+}
+
+int font_probe(font_read_fn read, void *ctx, struct font_info *out)
+{
+  unsigned char hdr[12], dir[PROBE_TABLES * 16], head[54], os2[64], post[16];
+  *out = (struct font_info){0};
+  if (!probe_read(read, ctx, 0, hdr, sizeof hdr))
+    return 0;
+  unsigned ver = rd32(hdr);
+  if (ver != 0x00010000 && ver != 0x74727565 /*true*/ && ver != 0x74797031 /*typ1*/ && ver != 0x4f54544f /*OTTO*/)
+    return 0;
+  int n = (int)rd16(hdr + 4);
+  if (n > PROBE_TABLES)
+    n = PROBE_TABLES;
+  if (!probe_read(read, ctx, 12, dir, (unsigned)n * 16))
+    return 0;
+  unsigned head_len, os2_len, post_len, name_len, cblc_len, cbdt_len;
+  unsigned head_off = dir_find(dir, n, "head", &head_len), os2_off = dir_find(dir, n, "OS/2", &os2_len),
+           post_off = dir_find(dir, n, "post", &post_len), name_off = dir_find(dir, n, "name", &name_len);
+  if (!head_off || head_len < sizeof head || !probe_read(read, ctx, head_off, head, sizeof head))
+    return 0;
+  if (os2_len > sizeof os2)
+    os2_len = sizeof os2;
+  if (!os2_off || !probe_read(read, ctx, os2_off, os2, os2_len))
+    os2_len = 0;
+  style_from(os2_len ? os2 : 0, (int)os2_len, head, sizeof head, &out->weight, &out->italic);
+  out->color = dir_find(dir, n, "CBLC", &cblc_len) && dir_find(dir, n, "CBDT", &cbdt_len);
+  /* post.isFixedPitch, else a Latin-text PANOSE whose proportion is monospaced */
+  out->mono = (post_off && post_len >= sizeof post && probe_read(read, ctx, post_off, post, sizeof post) &&
+               rd32(post + 12) != 0) ||
+              (os2_len >= 36 && os2[32] == 2 && os2[35] == 9);
+  /* ulUnicodeRange bits 49 (Hiragana), 56 (Hangul syllables) and 59 (CJK Unified Ideographs) */
+  if (os2_len >= 50)
+    out->cjk = (rd32(os2 + 46) & (1u << 17 | 1u << 24 | 1u << 27)) != 0;
+  if (name_off && name_len) {
+    unsigned want = name_len < PROBE_NAME_MAX ? name_len : PROBE_NAME_MAX;
+    unsigned char *nt = malloc(want);
+    if (nt && probe_read(read, ctx, name_off, nt, want))
+      family_from(nt, (int)want, out->family, sizeof out->family);
+    free(nt);
+  }
+  return 1;
 }
 
 /* ------------------------------------------------ colour bitmaps (CBLC/CBDT) */
