@@ -100,6 +100,37 @@ static void color_emoji(void)
   free(b);
 }
 
+/* GSUB ligatures: regional indicators F+R become one flag glyph and a ZWJ family one glyph; plain text has none. */
+static void emoji_ligatures(void)
+{
+  int len = 0;
+  unsigned char *b = slurp("fonts/NotoColorEmoji.ttf", &len);
+  expect(b != NULL);
+  if (!b)
+    return;
+  struct font *f = font_load(b, len);
+  expect(f != NULL);
+  if (f) {
+    int fr[2] = {font_glyph_index(f, 0x1F1EB), font_glyph_index(f, 0x1F1F7)}, used = 0;
+    expect(fr[0] > 0 && fr[1] > 0);
+    int flag = font_ligature(f, fr, 2, &used);
+    expect(flag > 0 && flag != fr[0] && flag != fr[1]);
+    expect_eq(used, 2);
+    expect(font_glyph_png(f, flag, 20, &(struct font_png){0}) == 1);
+
+    int fam[5] = {font_glyph_index(f, 0x1F468), font_glyph_index(f, 0x200D), font_glyph_index(f, 0x1F469),
+                  font_glyph_index(f, 0x200D), font_glyph_index(f, 0x1F467)};
+    expect(font_ligature(f, fam, 5, &used) > 0);
+    expect_eq(used, 5);
+
+    int lone[1] = {fr[0]};
+    expect(font_ligature(f, lone, 1, &used) < 0); /* one indicator alone is not a flag */
+    expect_eq(used, 0);
+    font_free(f);
+  }
+  free(b);
+}
+
 /* An outline font has no colour glyphs. */
 static void no_color_in_outline_font(void)
 {
@@ -245,6 +276,7 @@ int main(void)
   test("glyph_index_by_encoding", glyph_index_by_encoding);
   test("cff_bad_charstrings_offset", cff_bad_charstrings_offset);
   test("color_emoji", color_emoji);
+  test("emoji_ligatures", emoji_ligatures);
   test("no_color_in_outline_font", no_color_in_outline_font);
   return 0;
 }

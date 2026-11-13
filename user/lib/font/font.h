@@ -67,4 +67,10 @@ int font_has_color(const struct font *f);
  * Returns 1, or 0 if the font has none for it (then the glyph is an outline, or absent). */
 int font_glyph_png(const struct font *f, int gi, float px, struct font_png *out);
 
+/* The ligature glyph that GSUB substitutes for glyphs gids[0..n) starting at gids[0], from any type-4 lookup
+ * (directly or through an extension), the longest match winning. Returns the glyph and sets *used to how many of
+ * gids it covers, or returns -1. Script and feature selection are not modelled: the caller asks only where a
+ * ligature is mandatory (emoji sequences). */
+int font_ligature(const struct font *f, const int *gids, int n, int *used);
+
 #endif /* OWOS_FONT_H */

@@ -34,6 +34,7 @@ struct font {
   int cmap_fmt;        /* chosen cmap subtable        */
   unsigned cff;        /* CFF table offset; 0 = TrueType outlines */
   unsigned cblc, cbdt; /* colour bitmap tables; both 0 unless the font has CBDT glyphs */
+  unsigned gsub;       /* GSUB table offset; 0 = absent */
   unsigned charstrings, gsubrs, lsubrs, fdselect;
   unsigned *fd_subrs; /* per-Font-DICT local subrs of a CID-keyed CFF */
   int n_fd;
@@ -153,6 +154,9 @@ struct font *font_load(const unsigned char *data, int len)
   f->cff = ver == 0x4f54544f ? find_table(data, len, "CFF ") : 0;
   f->cblc = find_table(data, len, "CBLC");
   f->cbdt = find_table(data, len, "CBDT");
+  f->gsub = find_table(data, len, "GSUB");
+  if (!off_ok(f->gsub, 10, len))
+    f->gsub = 0;
   if (!off_ok(f->cblc, 8, len) || !off_ok(f->cbdt, 4, len))
     f->cblc = f->cbdt = 0;
   int outlines = f->cff || (f->loca && f->glyf);
@@ -1443,3 +1447,110 @@ int font_glyph_png(const struct font *f, int gi, float px, struct font_png *out)
 }
 
 int font_has_color(const struct font *f) { return f && f->cblc; }
+
+/* Coverage index of glyph `gi` in the Coverage table at `cov`, or -1. */
+static int coverage_index(const struct font *f, unsigned cov, int gi)
+{
+  const unsigned char *d = f->d;
+  if (!off_ok(cov, 4, f->len))
+    return -1;
+  unsigned fmt = rd16(d + cov), n = rd16(d + cov + 2);
+  if (fmt == 1) {
+    if (!off_ok(cov + 4, (int)n * 2, f->len))
+      return -1;
+    int lo = 0, hi = (int)n - 1;
+    while (lo <= hi) { /* glyphArray is sorted */
+      int mid = (lo + hi) / 2, g = (int)rd16(d + cov + 4 + mid * 2);
+      if (g == gi)
+        return mid;
+      if (g < gi)
+        lo = mid + 1;
+      else
+        hi = mid - 1;
+    }
+  } else if (fmt == 2) {
+    if (!off_ok(cov + 4, (int)n * 6, f->len))
+      return -1;
+    for (unsigned i = 0; i < n; i++) {
+      const unsigned char *r = d + cov + 4 + i * 6;
+      int start = (int)rd16(r), end = (int)rd16(r + 2);
+      if (gi >= start && gi <= end)
+        return (int)rd16(r + 4) + gi - start;
+    }
+  }
+  return -1;
+}
+
+/* The longest ligature in LigatureSubst subtable `st` (format 1) for gids[0..n); see font_ligature. */
+static int ligature_in(const struct font *f, unsigned st, const int *gids, int n, int *used)
+{
+  const unsigned char *d = f->d;
+  if (!off_ok(st, 6, f->len) || rd16(d + st) != 1)
+    return -1;
+  int ci = coverage_index(f, st + rd16(d + st + 2), gids[0]);
+  unsigned nsets = rd16(d + st + 4);
+  if (ci < 0 || (unsigned)ci >= nsets || !off_ok(st + 6, (int)nsets * 2, f->len))
+    return -1;
+  unsigned set = st + rd16(d + st + 6 + ci * 2);
+  if (!off_ok(set, 2, f->len))
+    return -1;
+  unsigned nlig = rd16(d + set);
+  if (!off_ok(set + 2, (int)nlig * 2, f->len))
+    return -1;
+  int best = -1, best_n = 0;
+  for (unsigned i = 0; i < nlig; i++) {
+    unsigned lig = set + rd16(d + set + 2 + i * 2);
+    if (!off_ok(lig, 4, f->len))
+      continue;
+    int comps = (int)rd16(d + lig + 2);
+    if (comps < 1 || comps > n || comps <= best_n || !off_ok(lig + 4, (comps - 1) * 2, f->len))
+      continue;
+    int k = 1;
+    while (k < comps && (int)rd16(d + lig + 4 + (k - 1) * 2) == gids[k])
+      k++;
+    if (k == comps) {
+      best = (int)rd16(d + lig);
+      best_n = comps;
+    }
+  }
+  *used = best_n;
+  return best;
+}
+
+int font_ligature(const struct font *f, const int *gids, int n, int *used)
+{
+  *used = 0;
+  if (!f || !f->gsub || n < 1)
+    return -1;
+  const unsigned char *d = f->d;
+  unsigned ll = f->gsub + rd16(d + f->gsub + 8); /* LookupList */
+  if (!off_ok(ll, 2, f->len))
+    return -1;
+  unsigned nlook = rd16(d + ll);
+  if (!off_ok(ll + 2, (int)nlook * 2, f->len))
+    return -1;
+  int best = -1, best_n = 0;
+  for (unsigned i = 0; i < nlook; i++) {
+    unsigned lk = ll + rd16(d + ll + 2 + i * 2);
+    if (!off_ok(lk, 6, f->len))
+      continue;
+    unsigned type = rd16(d + lk), nsub = rd16(d + lk + 4);
+    if ((type != 4 && type != 7) || !off_ok(lk + 6, (int)nsub * 2, f->len))
+      continue;
+    for (unsigned s = 0; s < nsub; s++) {
+      unsigned st = lk + rd16(d + lk + 6 + s * 2);
+      if (type == 7) { /* ExtensionSubst: format, the real type, a 32-bit offset from this subtable */
+        if (!off_ok(st, 8, f->len) || rd16(d + st) != 1 || rd16(d + st + 2) != 4)
+          continue;
+        st += rd32(d + st + 4);
+      }
+      int u = 0, g = ligature_in(f, st, gids, n, &u);
+      if (g >= 0 && u > best_n) {
+        best = g;
+        best_n = u;
+      }
+    }
+  }
+  *used = best_n;
+  return best;
+}
