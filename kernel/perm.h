@@ -59,6 +59,12 @@ static inline bool perm_may_chown(uint32_t fuid, uint32_t uid, uint32_t gid, uin
   return uid == fuid && new_uid == fuid && new_gid == gid;
 }
 
+/* setuid/setgid: root may take any id; with no saved id to return to, anyone else may only keep their own. */
+static inline bool perm_may_setid(uint32_t uid, uint32_t cur_id, uint32_t new_id)
+{
+  return uid == 0 || new_id == cur_id;
+}
+
 /* "drwxr-xr-x" style string; out needs 11 bytes. */
 static inline void perm_mode_str(uint32_t mode, bool is_dir, char *out)
 {

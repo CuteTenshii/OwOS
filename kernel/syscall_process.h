@@ -10,6 +10,8 @@ void syscall_process_futex_wait(struct registers *r);
 void syscall_process_futex_wake(struct registers *r);
 void syscall_process_msec(struct registers *r);
 void syscall_process_getuid(struct registers *r);
+void syscall_process_setuid(struct registers *r);
+void syscall_process_setgid(struct registers *r);
 void syscall_process_thread(struct registers *r);
 void syscall_process_set_tls(struct registers *r);
 void syscall_process_sleep(struct registers *r);

@@ -102,6 +102,8 @@
 #define THREAD_NAME_GET 1
 #define THREAD_NAME_MAX 32 /* label bytes including the NUL; longer names are truncated */
 #define SYS_INSTALL 98     /* ebx = INSTALL_LIST / _START / _STEP (common/diskinstall.h) */
+#define SYS_SETUID 99      /* ebx = uid for every thread of the process; 0/-1 */
+#define SYS_SETGID 100     /* ebx = gid for every thread of the process; 0/-1 */
 
 /* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */
 #define ENV_GET 0   /* copy the value of name into buf (if buf_len > 0); returns its length, -1 if unset */

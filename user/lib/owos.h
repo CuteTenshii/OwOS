@@ -387,7 +387,9 @@ int power(int action); /* 0 = shut down, 1 = reboot, 2 = suspend (returns on res
 
 /* Identity: numeric uid from the kernel; name/home resolved from /etc/passwd */
 int getuid(void);
-int getgid(void);                                           /* primary gid of this process, -1 if unknown */
+int getgid(void);    /* primary gid of this process, -1 if unknown */
+int setuid(int uid); /* every thread of the process; root may pick any uid, others only their own; 0/-1 */
+int setgid(int gid); /* same rule, judged by the uid: call before setuid when dropping root */
 int user_ident(char *name, int nmax, char *home, int hmax); /* 1 if found */
 int gethostname(char *buf, int max);                        /* /etc/hostname (default "owos") */
 int sethostname(const char *name);                          /* persist /etc/hostname; 0/-1 */

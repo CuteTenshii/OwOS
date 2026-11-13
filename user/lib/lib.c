@@ -512,6 +512,8 @@ void thread_stack_free(void *top)
 /* identity / hostname */
 /* Per-process credentials */
 int getuid(void) { return syscall(SYS_GETUID, 0, 0, 0); }
+int setuid(int uid) { return uid < 0 ? -1 : syscall(SYS_SETUID, uid, 0, 0); }
+int setgid(int gid) { return gid < 0 ? -1 : syscall(SYS_SETGID, gid, 0, 0); }
 
 /* Copy the ':'-separated field #idx (0-based) of the line [s,end) into out */
 static void passwd_field(const char *s, const char *end, int idx, char *out, int max)

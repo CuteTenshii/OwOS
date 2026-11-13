@@ -2,6 +2,7 @@
 #include "idt.h"
 #include "loader.h"
 #include "paging.h"
+#include "perm.h"
 #include "power.h"
 #include "sched.h"
 #include "syscall_nr.h"
@@ -52,6 +53,26 @@ void syscall_process_futex_wake(struct registers *r)
 }
 
 void syscall_process_getuid(struct registers *r) { r->eax = sched_uid(); }
+
+void syscall_process_setuid(struct registers *r)
+{
+  if (!perm_may_setid(sched_uid(), sched_uid(), r->ebx)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  sched_set_process_uid(r->ebx);
+  r->eax = 0;
+}
+
+void syscall_process_setgid(struct registers *r)
+{
+  if (!perm_may_setid(sched_uid(), sched_gid(), r->ebx)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  sched_set_process_gid(r->ebx);
+  r->eax = 0;
+}
 
 void syscall_process_thread(struct registers *r)
 {

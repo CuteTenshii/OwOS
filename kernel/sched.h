@@ -81,6 +81,8 @@ void sched_set_creds_self(uint32_t uid, uint32_t gid);
 uint32_t sched_umask(void);                                /* file creation mask, inherited across spawn/fork */
 uint32_t sched_set_umask(uint32_t mask);                   /* returns the previous mask */
 void sched_set_creds(int pid, uint32_t uid, uint32_t gid); /* set a child's uid/gid */
+void sched_set_process_uid(uint32_t uid);                  /* every thread of the caller's process */
+void sched_set_process_gid(uint32_t gid);
 void sched_dump(void);
 int sched_count(void);
 

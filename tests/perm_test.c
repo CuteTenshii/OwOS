@@ -145,6 +145,17 @@ static void check_chmod_symbolic_x(void)
   expect(parsed("a+X", 0600, 0, 1) == 0711);
 }
 
+static void check_setid(void)
+{
+  expect(perm_may_setid(0, 0, 1000));
+  expect(perm_may_setid(0, 50, 0));
+  expect(perm_may_setid(1000, 1000, 1000));
+  expect(!perm_may_setid(1000, 1000, 0));
+  expect(!perm_may_setid(1000, 1000, 1001));
+  expect(perm_may_setid(1000, 100, 100));
+  expect(!perm_may_setid(1000, 100, 0));
+}
+
 static void check_chmod_symbolic_bad(void)
 {
   expect(parsed("u+z", 0644, 0, 0) == 0xFFFFu);
@@ -165,6 +176,7 @@ int main(void)
   test("sticky directories restrict removal to the entry owner, directory owner or root", check_sticky);
   test("umask math", check_umask);
   test("chmod and chown authority", check_chmod_chown);
+  test("setuid and setgid authority", check_setid);
   test("mode string", check_mode_str);
   test("chmod octal", check_chmod_octal);
   test("chmod symbolic", check_chmod_symbolic);

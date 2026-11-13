@@ -896,6 +896,29 @@ void sched_set_creds(int pid, uint32_t uid, uint32_t gid)
   }
 }
 
+/* Credentials are per process, so a change made by one thread must reach its siblings too. */
+static void set_process_creds(bool set_uid, uint32_t id)
+{
+  uintptr_t flags = irq_save();
+  sched_lock();
+  const task_t *leader = current->process ? current->process : current;
+  task_t *t = &main_task;
+  do {
+    if (t->state != TASK_FREE && (t == leader || t->process == leader)) {
+      if (set_uid)
+        t->uid = id;
+      else
+        t->gid = id;
+    }
+    t = t->next;
+  } while (t != &main_task);
+  sched_unlock();
+  irq_restore(flags);
+}
+
+void sched_set_process_uid(uint32_t uid) { set_process_creds(true, uid); }
+void sched_set_process_gid(uint32_t gid) { set_process_creds(false, gid); }
+
 void sched_yield(void) { schedule(); /* give up the CPU; we stay RUNNABLE */ }
 
 /* Block off the run queue (TASK_WAITING) until tick `wake`; the timer IRQ promotes via sched_wake_due(). */
