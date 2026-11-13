@@ -501,7 +501,7 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
   if (fx && fx->clip_kind > CSS_CLIP_NONE) { /* the shape clips the solid background only */
     if (b->bg == BG_NONE)
       return;
-    int alpha = b->opacity < 0 ? 255 : b->opacity * 255 / 100;
+    int alpha = (b->opacity < 0 ? 255 : b->opacity * 255 / 100) * b->bg_a / 255;
     int sy = py + ge->y - top_doc;
     for (int row = 0; row < ge->h; row++) {
       int xs[2 * CSS_CLIP_PTS];
@@ -523,7 +523,8 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
   if (!has_bg && !has_bd && !has_img && !has_ol && b->sh_color == BG_NONE)
     return;
   int alpha = b->opacity < 0 ? 255 : b->opacity * 255 / 100;
-  int sy = py + ge->y - top_doc; /* box top, screen y */
+  int bga = alpha * b->bg_a / 255; /* the background colour's own alpha on top of opacity */
+  int sy = py + ge->y - top_doc;   /* box top, screen y */
   int r = b->radius;
   if (b->sh_color != BG_NONE) /* drop shadow (clips itself to the band) */
     draw_box_shadow(b, ge, sy, r, ct, cb);
@@ -547,9 +548,9 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
       int inr = r - bw;
       if (inr < 0)
         inr = 0;
-      fill_round_rect(ge->x + il, sy + it, ge->w - il - ir, ge->h - it - ib, inr, b->bg, alpha, ct, cb);
+      fill_round_rect(ge->x + il, sy + it, ge->w - il - ir, ge->h - it - ib, inr, b->bg, bga, ct, cb);
     } else {
-      fill_round_rect(ge->x, sy, ge->w, ge->h, r, b->bg, alpha, ct, cb);
+      fill_round_rect(ge->x, sy, ge->w, ge->h, r, b->bg, bga, ct, cb);
     }
   } else if (bh > 0) {
     /* background-clip: the area the background covers, inside the border (and padding for content-box) */
@@ -560,8 +561,8 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
     int gx = ge->x + cl, gw = ge->w - cl - cr, gy = sy + ctp, gh = ge->h - ctp - cbt;
     int gby = gy < ct ? ct : gy, gbh = (gy + gh > cb ? cb : gy + gh) - gby;
     if (has_bg && gw > 0 && gbh > 0) {
-      if (alpha < 255 || b->bg_clip)
-        fill_round_rect(gx, gby, gw, gbh, 0, b->bg, alpha, ct, cb);
+      if (bga < 255 || b->bg_clip)
+        fill_round_rect(gx, gby, gw, gbh, 0, b->bg, bga, ct, cb);
       else
         fill_clip(gx, gby, gw, gbh, b->bg, ct, cb);
     }

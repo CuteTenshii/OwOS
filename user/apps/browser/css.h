@@ -154,6 +154,7 @@ struct css_bg_image {
 struct css_style {
   int color;
   int bg;
+  unsigned char bg_a; /* background-color alpha 0..255, with bg */
   signed char bold;
   short weight; /* font-weight 1..1000, CSS_W_BOLDER/LIGHTER, -1 unset */
   signed char under;

@@ -552,6 +552,30 @@ static void test_box_shorthand_calc(void)
   css_free(sh);
 }
 
+/* 20. A translucent background keeps its alpha through the cascade, so the box paints it translucent. */
+static void test_background_alpha(void)
+{
+  struct dom_node *a = el("a"), *b = el("b"), *i = el("i");
+  doc(a);
+  doc(b);
+  doc(i);
+  struct css_style st;
+  css_sheet *sh =
+      sheet("a { background-color: #36415380 } b { background: rgba(0, 0, 0, .25) } i { background: #123 }");
+  css_style_reset(&st);
+  css_apply_sheet(sh, a, &st);
+  expect_eq(st.bg, 0x364153);
+  expect_eq(st.bg_a, 0x80);
+  css_style_reset(&st);
+  css_apply_sheet(sh, b, &st);
+  expect_eq(st.bg, 0);
+  expect(st.bg_a >= 63 && st.bg_a <= 64);
+  css_style_reset(&st);
+  css_apply_sheet(sh, i, &st);
+  expect_eq(st.bg_a, 255);
+  css_free(sh);
+}
+
 int main(void)
 {
   test("complex :is selectors", test_complex_is_selectors);
@@ -572,6 +596,7 @@ int main(void)
   test("escaped identifiers", test_escaped_identifiers);
   test("inherit keywords", test_inherit_keywords);
   test("box shorthand calc", test_box_shorthand_calc);
+  test("background alpha", test_background_alpha);
 
   free_dom();
   return 0;

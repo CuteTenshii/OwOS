@@ -43,8 +43,10 @@ static void fold(struct css_style *out, const struct css_style *d)
 {
   if (d->color >= 0 || d->color == CSS_COLOR_INHERIT)
     out->color = d->color;
-  if (d->bg >= 0 || d->bg == CSS_BG_CLEAR)
+  if (d->bg >= 0 || d->bg == CSS_BG_CLEAR) {
     out->bg = d->bg;
+    out->bg_a = d->bg_a;
+  }
   if (d->bold >= 0)
     out->bold = d->bold;
   if (d->weight != -1)
@@ -927,6 +929,7 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
   bool dialog = streq(el->tag, "dialog");
   if (dialog || dom_get_attr(el, "popover")) { /* UA box for a dialog / popover */
     out->bg = 0xffffff;
+    out->bg_a = 255;
     out->color = 0;
     out->margin[1] = out->margin[3] = -2;
     for (int i = 0; i < 4; i++) {
@@ -949,8 +952,10 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
   const char *bg = dom_get_attr(el, "bgcolor");
   if (bg) {
     int rgb = parse_color(bg);
-    if (rgb >= 0)
+    if (rgb >= 0) {
       out->bg = rgb;
+      out->bg_a = 255;
+    }
   }
   const char *w = dom_get_attr(el, "width");
   if (w) {

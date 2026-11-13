@@ -457,9 +457,10 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
       out->color = parse_color(val);
   } else if (span_is(p, pe, "background-color")) {
     int a, c = color_parse_a(val, &a);
-    if (c >= 0)
+    if (c >= 0) {
       out->bg = a ? c : CSS_BG_CLEAR;
-    else if (starts_ci(val, "transparent"))
+      out->bg_a = (unsigned char)(a > 255 ? 255 : a < 0 ? 0 : a);
+    } else if (starts_ci(val, "transparent"))
       out->bg = CSS_BG_CLEAR;
   } else if (span_is(p, pe, "background"))
     parse_bg_shorthand(val, out);
