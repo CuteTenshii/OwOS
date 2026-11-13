@@ -6,6 +6,7 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "io.h"
 #include "irqflags.h"
 #include "paging.h"
 #include "power.h"
@@ -189,12 +190,16 @@ static void udelay(uint32_t us)
     __asm__ volatile("pause");
 }
 
+/* Interrupts stay off across the ICR pair: a task switched in between could send its own IPI and leave its target in
+ * ICRHI, so an INIT meant for a booting AP would reset a running CPU, along with any kernel lock it held. */
 static void send_ipi(uint8_t apic_id, uint32_t icr_low)
 {
+  uintptr_t fl = irq_save();
   lapic_wr(LAPIC_ICRHI, (uint32_t)apic_id << 24);
   lapic_wr(LAPIC_ICRLO, icr_low);
-  for (int i = 0; i < 1000 && (lapic_rd(LAPIC_ICRLO) & (1 << 12)); i++)
-    udelay(10); /* spin on the delivery-status bit */
+  for (int i = 0; i < 1000000 && (lapic_rd(LAPIC_ICRLO) & (1 << 12)); i++)
+    __asm__ volatile("pause"); /* delivery status; udelay needs the PIT, which can't tick with IF=0 */
+  irq_restore(fl);
 }
 
 /* Each core soft-enables (and hardware-enables) its own Local APIC. */
@@ -206,10 +211,37 @@ static void lapic_enable_local(void)
 
 /* Measure the LAPIC timer against the PIT once on the BSP (about 10 ms) to derive the per-tick reload. The PIT
  * needs IRQs on to count, so time the real interval: a preemption inside udelay would otherwise inflate the result. */
+/* LAPIC timer counts in one 10 ms PIT channel 2 one-shot, polled with interrupts off; 0 if channel 2 never fires.
+ * The PIT-tick clock can't be the reference: the BSP may spend part of the window with IF=0 waiting for the kernel
+ * lock, the lost ticks shrink the measured time, and the APs then preempted once every few seconds. */
+static uint32_t lapic_counts_per_10ms(void)
+{
+  enum { PIT_HZ = 1193182, WINDOW = PIT_HZ / 100 };
+  uintptr_t fl = irq_save();
+  uint8_t p61 = inb(0x61);
+  outb(0x61, (uint8_t)((p61 & ~0x02u) | 0x01u)); /* gate channel 2 on, speaker off */
+  outb(0x43, 0xB0);                              /* channel 2, lobyte/hibyte, mode 0 */
+  outb(0x42, WINDOW & 0xFF);
+  outb(0x42, (WINDOW >> 8) & 0xFF);
+  lapic_wr(LAPIC_TIMER_INIT, 0xFFFFFFFF);
+  uint32_t guard = 0;
+  while (!(inb(0x61) & 0x20) && ++guard < 50000000u)
+    ;
+  uint32_t elapsed = 0xFFFFFFFFu - lapic_rd(LAPIC_TIMER_CUR);
+  outb(0x61, p61);
+  irq_restore(fl);
+  return guard < 50000000u ? elapsed : 0;
+}
+
 static uint32_t lapic_timer_calibrate(void)
 {
   lapic_wr(LAPIC_TIMER_DIV, 0x3); /* divide by 16 */
   lapic_wr(LAPIC_LVT_TIMER, LVT_MASKED);
+  uint32_t per_10ms = lapic_counts_per_10ms();
+  if (per_10ms) {
+    lapic_wr(LAPIC_TIMER_INIT, 0); /* stop */
+    return (uint32_t)((uint64_t)per_10ms * 100u / TIMER_HZ);
+  }
   uintptr_t fl = irq_save();
   lapic_wr(LAPIC_TIMER_INIT, 0xFFFFFFFF);
   uint64_t t0 = timer_us64();
