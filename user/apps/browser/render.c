@@ -495,6 +495,9 @@ bool render_incremental(unsigned seq_delta, int id)
   pane_metrics(&py, &phh, &rows);
   int pw = BW - PAGE_SCROLL_W;
   bool scrolled = B->pg->scroll != g_painted.scroll;
+  for (int k = 0; scrolled && k < g_fr->n_ov; k++)
+    if (!g_fr->ov[k].doc)
+      return false; /* a viewport-fixed box stays put while the page moves under it: shifting pixels would drag it */
   struct ru_scroll_plan plan = {0};
   if (scrolled &&
       (g_dmg.band || hover_url[0] || media_active() || !ru_scroll_plan(g_painted.scroll, B->pg->scroll, phh, &plan)))
