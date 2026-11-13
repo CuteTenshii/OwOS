@@ -249,8 +249,7 @@ static int identify(uint16_t *words)
     return -1;
   if (wait_drq())
     return -1;
-  for (int i = 0; i < 256; i++)
-    words[i] = inw(ATA_DATA);
+  insw(ATA_DATA, words, 256);
   return 0;
 }
 
@@ -289,13 +288,15 @@ void ata_dma_init(void)
   con_printf("ata: bus-master DMA writes at io 0x%x\n", (uint32_t)bm_base);
 }
 
+/* blk bounds-checks every transfer against this, so it must not cost an IDENTIFY each time; the fixed primary
+ * master cannot change size while running. */
 uint32_t ata_sectors(void)
 {
+  static uint32_t capacity;
   uint16_t words[256];
-  if (identify(words))
-    return 0;
-  /* Words 60-61: total addressable sectors in LBA28 mode. */
-  return (uint32_t)words[60] | ((uint32_t)words[61] << 16);
+  if (!capacity && identify(words) == 0)
+    capacity = (uint32_t)words[60] | ((uint32_t)words[61] << 16); /* words 60-61: LBA28 sector count */
+  return capacity;
 }
 
 /* ATA IDENTIFY strings are stored big-endian within each 16-bit word: the high
