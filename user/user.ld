@@ -17,6 +17,8 @@ SECTIONS
 	. = 0x40000000;
 
 	.text : { *(.text.start) *(.text*) } :text
+	__text_start = ADDR(.text); /* bounds for crash handlers telling return addresses from data */
+	__text_end = ADDR(.text) + SIZEOF(.text);
 	.rodata : { *(.rodata*) } :text
 	. = ALIGN(CONSTANT (MAXPAGESIZE));
 	.data : { *(.data*) } :data

@@ -37,19 +37,64 @@ static int tab_of_page(const struct page *p)
   return active_tab; /* unreachable: B->pg is always a live tab's page */
 }
 
-static void worker_crash_handler(int sig)
+/* Filled by the handler, which may neither allocate nor lock: the heap may be what broke. */
+static struct tab_crash g_crash;
+extern const unsigned char __text_start[], __text_end[];
+
+/* Whether stack word `w` is a return address: inside the code, right after a call instruction. */
+static bool after_call(unsigned w)
 {
+  if (w < (unsigned)__text_start + 7 || w > (unsigned)__text_end)
+    return false;
+  const unsigned char *c = (const unsigned char *)w;
+  return c[-5] == 0xE8 /* call rel32 */
+         || (c[-2] == 0xFF && ((c[-1] & 0xF8) == 0xD0 ||
+                               ((c[-1] & 0xF8) == 0x10 && c[-1] != 0x14 && c[-1] != 0x15))) /* call *%reg, *(%reg) */
+         || (c[-3] == 0xFF && ((c[-2] & 0xF8) == 0x50 || c[-2] == 0x14))                    /* call *d8(%reg), *(sib) */
+         || (c[-4] == 0xFF && c[-3] == 0x54)                                                /* call *d8(sib) */
+         || (c[-6] == 0xFF && ((c[-5] & 0xF8) == 0x90 || c[-5] == 0x15))                    /* call *d32(%reg), *abs */
+         || (c[-7] == 0xFF && c[-6] == 0x94);                                               /* call *d32(sib) */
+}
+
+static void worker_crash_handler(int sig, siginfo_t *info, void *ctx)
+{
+  const struct sigcontext *sc = ctx;
+  g_crash.info = *info;
+  g_crash.ctx = *sc;
+  g_crash.ncallers = 0;
+  unsigned lo = (unsigned)worker_stack, hi = lo + sizeof worker_stack;
+  if (sc->esp >= lo && sc->esp < hi) /* a wild esp would fault again in here: only scan our own stack */
+    for (unsigned p = sc->esp & ~3u; p + 4 <= hi && p - sc->esp < 32768 && g_crash.ncallers < CRASH_CALLERS; p += 4) {
+      unsigned w = *(const unsigned *)p;
+      if (after_call(w))
+        g_crash.callers[g_crash.ncallers++] = w;
+    }
   /* Carry the signal out as the setjmp return value so the recovery point knows WHICH fault fired */
   longjmp(worker_recovery, sig);
 }
 
 static void worker_install_crash_handlers(void)
 {
-  signal(SIGSEGV, worker_crash_handler);
-  signal(SIGILL, worker_crash_handler);
-  signal(SIGFPE, worker_crash_handler);
-  signal(SIGBUS, worker_crash_handler);
-  signal(SIGABRT, worker_crash_handler);
+  static const int sigs[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGABRT};
+  struct sigaction sa = {(unsigned)worker_crash_handler, 0, SA_SIGINFO};
+  for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++)
+    sigaction(sigs[i], &sa, 0);
+}
+
+/* The crash report on the serial console, every caller included. */
+static void crash_log(int sig, const struct tab_crash *c, const char *url)
+{
+  char line[160], at[128], thread[THREAD_NAME_MAX] = "";
+  crash_describe(sig, c, line, sizeof line);
+  crash_where(c->ctx.eip, at, sizeof at);
+  thread_getname(thread, sizeof thread); /* we log from the thread that faulted */
+  printf("browser [%s]: tab crashed on %s\n  %s\n  at %s\n", thread[0] ? thread : "?", url, line, at);
+  printf("  eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n", c->ctx.eax, c->ctx.ebx,
+         c->ctx.ecx, c->ctx.edx, c->ctx.esi, c->ctx.edi, c->ctx.ebp, c->ctx.esp);
+  for (int i = 0; i < c->ncallers; i++) {
+    crash_where(c->callers[i], at, sizeof at);
+    printf("  called from %s\n", at);
+  }
 }
 
 /* After a longjmp out of a fault */
@@ -245,6 +290,8 @@ void worker_fn(void)
     worker_after_crash();
     tabs[worker_tab]->crashed = 1;
     tabs[worker_tab]->crash_sig = crash_sig;
+    tabs[worker_tab]->crash = g_crash;
+    crash_log(crash_sig, &g_crash, B->pg->cur_url[0] ? B->pg->cur_url : B->req_url);
     B->loading = 0;
     B->abort_load = 0;
     B->scripts_pending = 0;
@@ -308,6 +355,8 @@ void worker_fn(void)
       tabs[worker_tab]->crashed = 0; /* reloading/navigating clears the crash page */
       B->loading = 1;
       B->seq++;
+      if (streq_ci(B->req_url, "about:crash")) /* like chrome://crash: exercise the crash page and report */
+        *(volatile int *)0 = 0;
       do_fetch();
       /* An HTML page's scripts run on the NEXT pass (html_run_page_scripts), once this laid-out page */
       if (!B->scripts_pending) {

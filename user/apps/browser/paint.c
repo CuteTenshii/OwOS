@@ -827,22 +827,86 @@ void draw_dt_highlight(int x, int y, int w, int h, int clip_top, int clip_bot, i
   }
 }
 
-/* Human-readable cause for the "tab crashed" page, from the fault signal. */
-static const char *crash_reason(int sig)
+/* The plain-language cause for the "tab crashed" page, from what the fault handler saw. */
+static const char *crash_reason(int sig, const siginfo_t *in)
 {
+  if (sig == SIGSEGV && in->si_trapno == 14) {
+    unsigned lo = (unsigned)worker_stack;
+    if (in->si_addr < lo && lo - in->si_addr <= 65536)
+      return "It ran out of stack space, usually from recursion that went too deep.";
+    if (in->si_addr < 0x1000)
+      return "It followed a null pointer.";
+    const char *op = in->si_err & 16 ? "jumped to" : in->si_err & 2 ? "wrote to" : "read";
+    static char why[96];
+    snprintf(why, sizeof why, "It %s memory %s.", op,
+             in->si_code == SEGV_MAPERR ? "that isn't mapped (a bad or stale pointer)" : "it may not touch");
+    return why;
+  }
   switch (sig) {
   case SIGSEGV:
   case SIGBUS:
-    return "It ran out of memory or accessed invalid memory.";
+    return "It broke a memory protection rule.";
   case SIGILL:
-    return "It executed an illegal instruction.";
+    return "It ran an invalid instruction.";
   case SIGFPE:
-    return "It hit an arithmetic error.";
+    return "It divided by zero.";
   case SIGABRT:
-    return "It aborted unexpectedly.";
+    return "It stopped itself after an internal check failed.";
   default:
     return "Something went wrong while displaying this page.";
   }
+}
+
+static const char *sig_name(int sig)
+{
+  switch (sig) {
+  case SIGSEGV:
+    return "SIGSEGV";
+  case SIGBUS:
+    return "SIGBUS";
+  case SIGILL:
+    return "SIGILL";
+  case SIGFPE:
+    return "SIGFPE";
+  case SIGABRT:
+    return "SIGABRT";
+  default:
+    return "signal";
+  }
+}
+
+void crash_describe(int sig, const struct tab_crash *c, char *out, int cap)
+{
+  const siginfo_t *in = &c->info;
+  if (sig == SIGSEGV && in->si_trapno == 14) {
+    const char *op = in->si_err & 16 ? "jump to" : in->si_err & 2 ? "write to" : "read of";
+    const char *what = in->si_code == SEGV_MAPERR ? "unmapped" : "protected";
+    snprintf(out, (unsigned)cap, "%s: %s %s address 0x%08x%s", sig_name(sig), op, what, in->si_addr,
+             in->si_addr < 0x1000 ? " (null pointer)" : "");
+  } else if (sig == SIGSEGV && in->si_trapno == 13) {
+    snprintf(out, (unsigned)cap, "%s: general protection fault", sig_name(sig));
+  } else if (sig == SIGSEGV && in->si_trapno == 12) {
+    snprintf(out, (unsigned)cap, "%s: stack fault", sig_name(sig));
+  } else if (sig == SIGILL) {
+    snprintf(out, (unsigned)cap, "%s: illegal instruction at 0x%08x", sig_name(sig), in->si_addr);
+  } else if (sig == SIGFPE) {
+    snprintf(out, (unsigned)cap, "%s: integer division by zero", sig_name(sig));
+  } else if (sig == SIGABRT) {
+    snprintf(out, (unsigned)cap, "%s: abort() was called", sig_name(sig));
+  } else if (in->si_trapno != SI_TRAP_NONE) {
+    snprintf(out, (unsigned)cap, "%s: CPU exception %u, error code 0x%x", sig_name(sig), in->si_trapno, in->si_err);
+  } else {
+    snprintf(out, (unsigned)cap, "%s", sig_name(sig));
+  }
+}
+
+void crash_where(unsigned addr, char *out, int cap)
+{
+  char sym[96];
+  if (symbolize(addr, sym, sizeof sym) == 0)
+    snprintf(out, (unsigned)cap, "%s (0x%08x)", sym, addr);
+  else
+    snprintf(out, (unsigned)cap, "0x%08x", addr);
 }
 
 /* Reload button on the crash page, remembered so handle_click can hit-test */
@@ -853,7 +917,7 @@ void draw_crash_page(int py, int pw, int phh)
 {
   gfx_fill_rect(0, py, pw, phh, 0xf2f3f5); /* neutral canvas, not the dead page's */
 
-  const char *reason = crash_reason(tabs[active_tab]->crash_sig);
+  const char *reason = crash_reason(tabs[active_tab]->crash_sig, &tabs[active_tab]->crash.info);
   const char *head = "This tab has crashed";
   int cx = pw / 2;
   int cy = py + phh / 2;
@@ -868,9 +932,24 @@ void draw_crash_page(int py, int pw, int phh)
   int rw = gfx_ui_width(reason);
   gfx_ui_text(cx - rw / 2, cy + 12, reason, 0x707880);
 
+  /* The technical detail, for a bug report: what faulted, where, and from where it was called */
+  const struct tab_crash *c = &tabs[active_tab]->crash;
+  char what[160], at[128], line[160];
+  crash_describe(tabs[active_tab]->crash_sig, c, what, sizeof what);
+  crash_where(c->ctx.eip, at, sizeof at);
+  snprintf(line, sizeof line, "at %s", at);
+  int dy = cy + 40;
+  gfx_ui_text(cx - gfx_ui_width(what) / 2, dy, what, 0x8a9099);
+  gfx_ui_text(cx - gfx_ui_width(line) / 2, dy + UIFONT_H, line, 0x8a9099);
+  if (c->ncallers > 0) {
+    crash_where(c->callers[0], at, sizeof at);
+    snprintf(line, sizeof line, "called from %s", at);
+    gfx_ui_text(cx - gfx_ui_width(line) / 2, dy + 2 * UIFONT_H, line, 0x8a9099);
+  }
+
   int bw = 96, bh = 30;
   crash_reload_rect.x = cx - bw / 2;
-  crash_reload_rect.y = cy + 44;
+  crash_reload_rect.y = dy + 3 * UIFONT_H + 12;
   crash_reload_rect.w = bw;
   crash_reload_rect.h = bh;
   button_draw(crash_reload_rect.x, crash_reload_rect.y, bw, bh, "Reload", BTN_NORMAL);

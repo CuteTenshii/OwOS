@@ -85,6 +85,20 @@ struct layout_out {
 /* --- tabs ------------------------------------------------------------------ */
 /* Each tab keeps its URL, label and scroll offset, plus */
 #define HIST_MAX 32 /* per-tab back/forward history depth */
+/* A worker fault as its handler saw it: the kernel's siginfo and registers, and the code addresses found on the
+ * stack (frame pointers are omitted, so these are the probable callers, nearest first). */
+#define CRASH_CALLERS 6
+struct tab_crash {
+  siginfo_t info;
+  struct sigcontext ctx;
+  unsigned callers[CRASH_CALLERS];
+  int ncallers;
+};
+/* One line naming the fault ("SIGSEGV: read of unmapped address 0x00000004 (null pointer)") */
+void crash_describe(int sig, const struct tab_crash *c, char *out, int cap);
+/* "func+0x1c (0x4001a2b3)", or the bare address when the kernel has no symbol for it */
+void crash_where(unsigned addr, char *out, int cap);
+
 struct tab {
   char url[URL_MAX]; /* address-bar / navigation target               */
   char label[40];    /* tab-strip label (page title or host)          */
@@ -103,6 +117,7 @@ struct tab {
   /* Set when this tab's page faulted (JS-runtime/GC OOM, a use-after-free, deep recursion overrun) */
   bool crashed;
   int crash_sig;
+  struct tab_crash crash; /* what the fault handler saw, shown on the crash page */
 };
 #define LINE_H UIFONT_H
 #define BODY_PX 15.0f
