@@ -17,6 +17,7 @@ void syscall_process_kill(struct registers *r);
 void syscall_process_power(struct registers *r);
 void syscall_process_sbrk(struct registers *r);
 void syscall_process_getpid(struct registers *r);
+void syscall_process_thread_name(struct registers *r);
 void syscall_process_sigprocmask(struct registers *r);
 void syscall_process_stack_alloc(struct registers *r);
 void syscall_process_stack_free(struct registers *r);

@@ -217,6 +217,10 @@ int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, 
 
 int symbolize(unsigned addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, (int)addr, (int)out, cap); }
 
+int thread_setname(const char *name) { return syscall(SYS_THREAD_NAME, THREAD_NAME_SET, (int)name, 0); }
+
+int thread_getname(char *out, int cap) { return syscall(SYS_THREAD_NAME, THREAD_NAME_GET, (int)out, cap); }
+
 /* Packed (hour<<16)|(min<<8)|sec, UTC */
 unsigned now_hms(void)
 {

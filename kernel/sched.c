@@ -64,13 +64,14 @@ typedef struct task {
   uint32_t futex_key; /* user address a futex waiter sleeps on (0 = none) */
   uint32_t wake_tick; /* if WAITING for a timed sleep: tick to wake at (0 = not a timed sleep, e.g. a waitpid waiter) */
   int exit_status;    /* set on exit, read by waitpid */
-  uint32_t sig_pending;       /* bitset of posted-but-undelivered signals */
-  uint32_t sig_blocked;       /* bitset currently masked from delivery */
-  uint32_t sig_handler[NSIG]; /* disposition per signal (SIG_DFL/IGN/addr) */
-  uint32_t sig_mask[NSIG];    /* extra signals blocked while a handler runs */
-  uint32_t sig_flags[NSIG];   /* per-signal SA_* flags */
-  const char *name;
-  char namebuf[16]; /* owns `name` for spawned programs (argv[0]) */
+  uint32_t sig_pending;        /* bitset of posted-but-undelivered signals */
+  uint32_t sig_blocked;        /* bitset currently masked from delivery */
+  uint32_t sig_handler[NSIG];  /* disposition per signal (SIG_DFL/IGN/addr) */
+  uint32_t sig_mask[NSIG];     /* extra signals blocked while a handler runs */
+  uint32_t sig_flags[NSIG];    /* per-signal SA_* flags */
+  const char *name;            /* the program: crash traces symbolize against it */
+  char namebuf[16];            /* owns `name` for spawned programs (argv[0]) */
+  char tname[THREAD_NAME_MAX]; /* the thread's own label (SYS_THREAD_NAME), "" when it has none */
   uint32_t runs;
   struct fd fds[MAX_FD];  /* open file descriptors */
   char cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
@@ -544,6 +545,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_bas
     t->namebuf[k] = n[k];
   t->namebuf[k] = '\0';
   t->name = t->namebuf;
+  t->tname[0] = '\0';
   t->runs = 0;
   t->as = current->as;
   t->as_owner = false;
@@ -816,6 +818,15 @@ uint32_t sched_current_process_id(void) { return current->process ? current->pro
 
 /* The current task's name (for the crash reporter). */
 const char *sched_current_name(void) { return current->name ? current->name : "task"; }
+const char *sched_current_thread_name(void) { return current->tname; }
+
+void sched_set_thread_name(const char *name)
+{
+  int i = 0;
+  for (; name && name[i] && i < (int)sizeof current->tname - 1; i++)
+    current->tname[i] = name[i];
+  current->tname[i] = '\0';
+}
 
 /* Point a not-yet-running process's fd at a pipe end (shell `a | b`). */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id)
@@ -1514,7 +1525,10 @@ void sched_dump(void)
   con_write("id  name        runs\n");
   task_t *t = &main_task;
   do {
-    con_printf("%u   %s\t%u\n", t->id, t->name, t->runs);
+    if (t->tname[0])
+      con_printf("%u   %s [%s]\t%u\n", t->id, t->name, t->tname, t->runs);
+    else
+      con_printf("%u   %s\t%u\n", t->id, t->name, t->runs);
     t = t->next;
   } while (t != &main_task);
 }

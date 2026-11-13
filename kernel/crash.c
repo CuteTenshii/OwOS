@@ -154,6 +154,12 @@ static void crash_dump_serial(const struct crash_info *c)
   char hx[12], cb[128];
   serial_write("\n=== CRASH: ");
   serial_write(c->name[0] ? c->name : "?");
+  const char *thread = sched_current_thread_name(); /* dumped from the faulting task, so this is its thread */
+  if (thread[0]) {
+    serial_write(" [");
+    serial_write(thread);
+    serial_write("]");
+  }
   serial_write(" - ");
   serial_write(vec_name(c->vector));
   serial_write(" ===\n");

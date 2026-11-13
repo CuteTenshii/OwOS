@@ -97,6 +97,10 @@
 #define SYS_WIN_FULLSCREEN 95 /* ebx = window id, ecx = on */
 #define SYS_SET_TLS 94        /* ebx = thread pointer: the base of the %gs segment (0 = none) */
 #define SYS_SYMBOLIZE 96      /* ebx = address in the caller's program, ecx = out, edx = cap: "func+0xNN", 0/-1 */
+#define SYS_THREAD_NAME 97    /* ebx = THREAD_NAME_SET (ecx = name, NULL clears) or _GET (ecx = out, edx = cap) */
+#define THREAD_NAME_SET 0
+#define THREAD_NAME_GET 1
+#define THREAD_NAME_MAX 32 /* label bytes including the NUL; longer names are truncated */
 
 /* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */
 #define ENV_GET 0   /* copy the value of name into buf (if buf_len > 0); returns its length, -1 if unset */

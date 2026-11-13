@@ -4,6 +4,7 @@
 #include "paging.h"
 #include "power.h"
 #include "sched.h"
+#include "syscall_nr.h"
 #include "timer.h"
 #include "uaccess.h"
 #include "users.h"
@@ -109,6 +110,35 @@ void syscall_process_power(struct registers *r)
 void syscall_process_sbrk(struct registers *r) { r->eax = sched_sbrk((int)r->ebx); }
 
 void syscall_process_getpid(struct registers *r) { r->eax = sched_current_id(); }
+
+void syscall_process_thread_name(struct registers *r)
+{
+  char name[THREAD_NAME_MAX * 2]; /* longer than a label holds, so a long name is truncated rather than refused */
+  if (r->ebx == THREAD_NAME_SET) {
+    if (!r->ecx) {
+      sched_set_thread_name("");
+    } else if (copyin_str(r->ecx, name, sizeof name) < 0) {
+      r->eax = (uint32_t)-1; /* unreadable, or no terminator within 64 bytes */
+      return;
+    } else {
+      sched_set_thread_name(name);
+    }
+    r->eax = 0;
+    return;
+  }
+  if (r->ebx == THREAD_NAME_GET && r->edx > 0) {
+    const char *t = sched_current_thread_name();
+    uint32_t cap = r->edx < THREAD_NAME_MAX ? r->edx : THREAD_NAME_MAX, n = 0;
+    for (; t[n] && n < cap - 1; n++)
+      name[n] = t[n];
+    name[n] = '\0';
+    if (user_out_range(r->ecx, n + 1) && copyout(r->ecx, name, n + 1) == 0) {
+      r->eax = 0;
+      return;
+    }
+  }
+  r->eax = (uint32_t)-1;
+}
 
 void syscall_process_sigprocmask(struct registers *r)
 {

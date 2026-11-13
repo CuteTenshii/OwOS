@@ -60,7 +60,9 @@ struct fd *sched_fds(void);        /* the current task's file descriptor table *
 uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) */
 uint32_t sched_current_id(void);   /* current task's pid */
 uint32_t sched_current_process_id(void);
-const char *sched_current_name(void); /* current task's name (crash reporter) */
+const char *sched_current_name(void);         /* current task's program name (crash reporter, symbols) */
+const char *sched_current_thread_name(void);  /* its thread label, "" if unnamed */
+void sched_set_thread_name(const char *name); /* label the current thread (truncated to THREAD_NAME_MAX - 1) */
 struct env;
 struct env *sched_env(void);                                        /* the running process's environment */
 void sched_set_env_block(int pid, const char *block, uint32_t len); /* give a new child exactly this environment */

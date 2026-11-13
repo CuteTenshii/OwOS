@@ -266,6 +266,10 @@ struct crash_rec {
 int crash_poll(struct crash_rec *out, int max); /* count / -1 */
 /* Name an address in this program as "func+0xNN" from the kernel's copy of its symbols; 0, or -1 if unknown */
 int symbolize(unsigned addr, char *out, int cap);
+/* Label the calling thread (up to THREAD_NAME_MAX - 1 chars; NULL clears it) for task listings and crash reports */
+int thread_setname(const char *name);
+/* The calling thread's label into out[cap] ("" if unnamed); 0/-1 */
+int thread_getname(char *out, int cap);
 
 /* Wall-clock time, packed as (hour<<16)|(min<<8)|sec */
 unsigned now_hms(void);
