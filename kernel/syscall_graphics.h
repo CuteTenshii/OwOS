@@ -16,5 +16,6 @@ void syscall_graphics_win_geom(struct registers *r);
 void syscall_graphics_win_deliver(struct registers *r);
 void syscall_graphics_win_key_space(struct registers *r);
 void syscall_graphics_crash_poll(struct registers *r);
+void syscall_graphics_symbolize(struct registers *r);
 
 #endif

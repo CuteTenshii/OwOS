@@ -215,6 +215,8 @@ int win_key_space(int id) { return syscall(SYS_WIN_KEY_SPACE, id, 0, 0); }
 
 int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, (int)out, max, 0); }
 
+int symbolize(unsigned addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, (int)addr, (int)out, cap); }
+
 /* Packed (hour<<16)|(min<<8)|sec, UTC */
 unsigned now_hms(void)
 {

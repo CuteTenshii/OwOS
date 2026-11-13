@@ -264,6 +264,8 @@ struct crash_rec {
   int ntrace;
 };
 int crash_poll(struct crash_rec *out, int max); /* count / -1 */
+/* Name an address in this program as "func+0xNN" from the kernel's copy of its symbols; 0, or -1 if unknown */
+int symbolize(unsigned addr, char *out, int cap);
 
 /* Wall-clock time, packed as (hour<<16)|(min<<8)|sec */
 unsigned now_hms(void);

@@ -295,6 +295,7 @@ static const syscall_handler_t syscall_handlers[] = {
     [SYS_FB_CURSOR] = syscall_graphics_fb_cursor,
     [SYS_SET_TLS] = syscall_process_set_tls,
     [SYS_WIN_FULLSCREEN] = syscall_window_fullscreen,
+    [SYS_SYMBOLIZE] = syscall_graphics_symbolize,
 };
 
 void syscall_dispatch(struct registers *r)

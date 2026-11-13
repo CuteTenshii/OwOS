@@ -6,6 +6,7 @@
 #include "idt.h"
 #include "loader.h"
 #include "paging.h"
+#include "sched.h"
 #include "serial.h"
 #include <stdint.h>
 
@@ -203,6 +204,11 @@ static void crash_dump_serial(const struct crash_info *c)
     }
     serial_write(i == 0 ? "  <- fault\n" : "\n");
   }
+}
+
+int crash_symbolize_self(uint32_t addr, char *out, int cap)
+{
+  return cap >= 16 && crash_symbolize(sched_current_name(), addr, out, cap);
 }
 
 void crash_record(const char *name, struct registers *r)

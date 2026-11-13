@@ -36,4 +36,7 @@ struct crash_rec {
  * this to render "<app> has crashed" windows without a kernel window. */
 int crash_poll(struct crash_rec *out, int max);
 
+/* Name `addr` in the current task's own program as "func+0xNN" (its symbols are no secret to it); 1 on success. */
+int crash_symbolize_self(uint32_t addr, char *out, int cap);
+
 #endif /* OWOS_CRASH_H */

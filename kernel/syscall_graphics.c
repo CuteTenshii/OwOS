@@ -230,6 +230,18 @@ void syscall_graphics_win_key_space(struct registers *r)
   r->eax = (uint32_t)uwin_key_space((int)r->ebx);
 }
 
+void syscall_graphics_symbolize(struct registers *r)
+{
+  char sym[96];
+  int cap = (int)r->edx > (int)sizeof sym ? (int)sizeof sym : (int)r->edx;
+  if (cap <= 0 || !user_out_range(r->ecx, (uint32_t)cap) || !crash_symbolize_self((uint32_t)r->ebx, sym, cap) ||
+      copyout(r->ecx, sym, (uint32_t)cap) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  r->eax = 0;
+}
+
 void syscall_graphics_crash_poll(struct registers *r)
 {
   int max = (int)r->ecx;
