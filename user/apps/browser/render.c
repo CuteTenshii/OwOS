@@ -56,8 +56,9 @@ static void draw_page_scrollbar(int pw, int py, int phh, int scroll, int total, 
     scrollbar_draw_ex(pw, py, PAGE_SCROLL_W, phh, scroll, total, visible, &B->pg->sb_st);
 }
 
-/* Paint the position:fixed / top-layer boxes over the page, bottom to top */
-static void paint_overlays(int py, int pw, int ct, int cb)
+/* Paint the position:fixed / top-layer boxes bottom to top: those with a negative z-index under the page's
+ * content (`below`), the rest over it */
+static void paint_overlays(int py, int pw, int ct, int cb, bool below)
 {
   const struct layout_out *o = g_fr;
   int n, order[OVL_MAX], pane_y, phh, rows;
@@ -70,6 +71,9 @@ static void paint_overlays(int py, int pw, int ct, int cb)
   overlay_order(o, order);
   for (int q = 0; q < o->n_ov; q++) {
     const struct lovl *ov = &o->ov[order[q]];
+    int z = bx[ov->box].z_index;
+    if ((z != CSS_Z_AUTO && z < 0) != below)
+      continue;
     int h, top = overlay_place(ov, phh, &h);
     if (ov->modal) {
       const struct lext *x = bx[ov->box].ext;
@@ -104,8 +108,10 @@ static void paint_page_core(int py, int pw, int ct, int cb, unsigned bg, bool fi
   int paw = pw - 8; /* content width, px */
   int sc = B->pg->scroll, vt = sc + (ct - py), vb = sc + (cb - py), over = g_fr->over;
   gfx_set_clip(0, ct, pw, cb - ct);
-  if (fill)
+  if (fill) {
     gfx_fill_rect(0, ct, pw, cb - ct, bg);
+    paint_overlays(py, pw, ct, cb, true);
+  }
 
   paint_boxes(py, pw, ct, cb); /* block backgrounds behind the text */
   if (B->loading && t->n == 0) {
@@ -258,7 +264,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   paint_rotated(py, pw, ct, cb, bg);
   g_gate.n = 0;
   gfx_set_clip(0, ct, pw, cb - ct);
-  paint_overlays(py, pw, ct, cb);
+  paint_overlays(py, pw, ct, cb, false);
   gfx_clip_none();
 }
 
