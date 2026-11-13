@@ -67,7 +67,7 @@ struct bctx g_wk = {.worker = true};
 static struct ru_gent g_gscratch; /* stand-in glyph when the cache can't grow */
 
 /* Fonts from /etc/fonts shared by every page: the fixed roles, then installed families pages name. */
-enum { LF_UI, LF_MONO, LF_EMOJI, LF_FIXED, LF_MAX = 16 };
+enum { LF_UI, LF_MONO, LF_EMOJI, LF_CJK, LF_FIXED, LF_MAX = 16 };
 static struct {
   char family[CSS_FAM_MAX];
   struct font *font;
@@ -101,33 +101,36 @@ static struct font *load_font_file(const char *path, unsigned char **data)
   return f;
 }
 
+/* The font store role behind fixed local slot k */
+static int local_role(int k) { return k == LF_MONO ? FONT_MONO : k == LF_EMOJI ? FONT_EMOJI : FONT_CJK; }
+
 static struct font *local_font(int k)
 {
   if (k == LF_UI)
     return gfx_ui_font();
-  if (!g_local[k].tried && (k == LF_MONO || k == LF_EMOJI)) {
+  if (!g_local[k].tried && (k == LF_MONO || k == LF_EMOJI || k == LF_CJK)) {
     char path[96];
     g_local[k].tried = true;
-    fontstore_path(k == LF_MONO ? FONT_MONO : FONT_EMOJI, path, sizeof path);
+    fontstore_path(local_role(k), path, sizeof path);
     g_local[k].font = load_font_file(path, &g_local[k].data);
   }
   return g_local[k].font;
 }
 
-/* Read the emoji font ahead of the first paint that needs it; the slow read runs outside the buffer lock. */
-void fonts_preload_emoji(void)
+/* Read a fallback font ahead of the first paint that needs it; the slow read runs outside the buffer lock. */
+static void preload(int k)
 {
-  if (g_local[LF_EMOJI].tried)
+  if (g_local[k].tried)
     return;
   char path[96];
   unsigned char *data;
-  fontstore_path(FONT_EMOJI, path, sizeof path);
+  fontstore_path(local_role(k), path, sizeof path);
   struct font *f = load_font_file(path, &data);
   browser_buf_lock();
-  if (!g_local[LF_EMOJI].tried) {
-    g_local[LF_EMOJI].tried = true;
-    g_local[LF_EMOJI].font = f;
-    g_local[LF_EMOJI].data = data;
+  if (!g_local[k].tried) {
+    g_local[k].tried = true;
+    g_local[k].font = f;
+    g_local[k].data = data;
     f = 0;
   }
   browser_buf_unlock();
@@ -136,6 +139,9 @@ void fonts_preload_emoji(void)
     free(data);
   }
 }
+
+void fonts_preload_emoji(void) { preload(LF_EMOJI); }
+void fonts_preload_cjk(void) { preload(LF_CJK); }
 
 /* The local slot of an installed family named `name`, loading it on first use; -1 if none is installed. */
 static int local_named(const char *name)
@@ -208,7 +214,7 @@ static int weight_cost(int want, int lo, int hi)
 
 /* The face for `cp` in font set `set`: the first family in the stack that has the glyph (for @font-face
  * families, the face whose unicode-range covers it and whose weight and style fit best), then the UI font,
- * then the emoji font. */
+ * then the emoji font, then the CJK font. */
 static int pick_face_uncached(int set, unsigned cp, int *flags)
 {
   const struct font_set *fs = set > 0 && set < B->pg->n_fsets ? &B->pg->fsets[set] : 0;
@@ -259,10 +265,15 @@ static int pick_face_uncached(int set, unsigned cp, int *flags)
       return FACE_LOCAL(k);
     }
   }
-  if (font_has(local_font(LF_UI), cp) || !font_has(local_font(LF_EMOJI), cp))
-    return FACE_LOCAL(LF_UI); /* the UI font draws tofu for what nothing has */
-  *flags = PK_BOLD | PK_ITALIC;
-  return FACE_LOCAL(LF_EMOJI);
+  if (font_has(local_font(LF_UI), cp))
+    return FACE_LOCAL(LF_UI);
+  if (font_has(local_font(LF_EMOJI), cp)) {
+    *flags = PK_BOLD | PK_ITALIC;
+    return FACE_LOCAL(LF_EMOJI);
+  }
+  if (font_has(local_font(LF_CJK), cp))
+    return FACE_LOCAL(LF_CJK);
+  return FACE_LOCAL(LF_UI); /* the UI font draws tofu for what nothing has */
 }
 
 /* Drop the caches when the page (or its faces) changed under this context. */

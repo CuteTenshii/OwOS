@@ -178,6 +178,42 @@ static void noto_sans_faces(void)
   }
 }
 
+/* The CJK fallback is a CID-keyed CFF font: it covers Han, kana and Hangul, which the Liberation text faces lack,
+ * and draws them as outlines. */
+static void cjk_fallback(void)
+{
+  static const unsigned cps[] = {0x6F22 /* 漢 */, 0x3042 /* あ */, 0x30AB /* カ */, 0xD55C /* 한 */, 0xFF01 /* ！ */};
+  int len = 0, tlen = 0;
+  unsigned char *b = slurp("fonts/NotoSansCJKsc-Regular.otf", &len);
+  unsigned char *tb = slurp("fonts/LiberationSans-Regular.ttf", &tlen);
+  expect(b != NULL && tb != NULL);
+  struct font *f = b ? font_load(b, len) : 0, *text = tb ? font_load(tb, tlen) : 0;
+  expect(f != NULL && text != NULL);
+  if (f && text) {
+    char fam[64];
+    font_family(f, fam, sizeof fam);
+    expect_string(fam, "Noto Sans CJK SC");
+    expect(!font_has_color(f));
+    for (unsigned i = 0; i < sizeof cps / sizeof cps[0]; i++) {
+      expect_eq(font_glyph_index(text, (int)cps[i]), 0);
+      int gi = font_glyph_index(f, (int)cps[i]);
+      expect(gi > 0);
+      int w, h, ox, oy, adv, ink = 0;
+      unsigned char *bm = font_render_glyph(f, gi, 16, &w, &h, &ox, &oy, &adv);
+      expect(bm != NULL && w > 0 && h > 8 && oy < 0);
+      expect(adv >= 14 && adv <= 17); /* full-width: one em */
+      for (int p = 0; bm && p < w * h; p++)
+        ink += bm[p] > 128;
+      expect(ink > 6);
+      free(bm);
+    }
+  }
+  font_free(f);
+  font_free(text);
+  free(b);
+  free(tb);
+}
+
 static void put16(unsigned char *p, unsigned v)
 {
   p[0] = (unsigned char)(v >> 8);
@@ -309,5 +345,6 @@ int main(void)
   test("emoji_ligatures", emoji_ligatures);
   test("no_color_in_outline_font", no_color_in_outline_font);
   test("noto_sans_faces", noto_sans_faces);
+  test("cjk_fallback", cjk_fallback);
   return 0;
 }

@@ -6,9 +6,9 @@
 #define CONF "/etc/fonts.conf"
 #define NAME_MAX_U 64
 
-static const char *const key[FONT_ROLES] = {"sans=", "mono=", "emoji="};
+static const char *const key[FONT_ROLES] = {"sans=", "mono=", "emoji=", "cjk="};
 static const char *const builtin[FONT_ROLES] = {"LiberationSans-Regular.ttf", "LiberationMono-Regular.ttf",
-                                                "NotoColorEmoji.ttf"};
+                                                "NotoColorEmoji.ttf", "NotoSansCJKsc-Regular.otf"};
 
 /* Web-font containers; present only in programs that link user/lib/font/woff.c */
 extern int woff_is_woff(const unsigned char *, int) __attribute__((weak));
@@ -100,7 +100,8 @@ int fontstore_list(int i, char *name)
 {
   struct dirent_u de;
   for (int idx = 0, seen = 0; readdir(DIR, idx, &de) == 0; idx++) {
-    if (de.is_dir || !is_font_name(de.name) || !strcmp(de.name, builtin[FONT_EMOJI]))
+    if (de.is_dir || !is_font_name(de.name) || !strcmp(de.name, builtin[FONT_EMOJI]) ||
+        !strcmp(de.name, builtin[FONT_CJK]))
       continue;
     if (seen++ == i) {
       strcpy(name, de.name);
@@ -112,7 +113,7 @@ int fontstore_list(int i, char *name)
 
 static int conf_get(int role, char *name)
 {
-  char buf[256];
+  char buf[FONT_ROLES * (NAME_MAX_U + 8) + 1];
   int n = readfile(CONF, buf, sizeof buf - 1);
   if (n <= 0)
     return 0;

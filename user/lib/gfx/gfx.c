@@ -183,8 +183,10 @@ struct gcache_e {
   int valid;
 };
 
-/* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss */
-static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *cache, int n, unsigned cp)
+/* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss. A codepoint `font` lacks is drawn from
+ * `fallback(cp)` when that is non-null and has it. */
+static struct gcache_e *cache_glyph(struct font *font, struct font *(*fallback)(unsigned), int px,
+                                    struct gcache_e *cache, int n, unsigned cp)
 {
   struct gcache_e *g = &cache[cp % n];
   if (g->valid && g->cp == cp)
@@ -194,6 +196,12 @@ static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *
     g->bm = 0;
   }
   int gi = font_glyph_index(font, (int)cp);
+  struct font *fb = gi == 0 && fallback ? fallback(cp) : 0;
+  int fgi = fb ? font_glyph_index(fb, (int)cp) : 0;
+  if (fgi > 0) {
+    font = fb;
+    gi = fgi;
+  }
   g->bm = font_render_glyph(font, gi, (float)px, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
   g->cp = cp;
   g->valid = 1;
@@ -201,7 +209,7 @@ static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *
 }
 
 /* Font files loaded so far, shared by every size drawn from them; a file that failed to load keeps font = 0 */
-#define FONT_FILES 8
+#define FONT_FILES 12
 struct font_file {
   char path[96];
   struct font *font;
@@ -388,9 +396,23 @@ static int font_view(const struct gfx_font *spec, struct face_view *v)
   return 1;
 }
 
+/* The CJK face, for codepoints the text faces lack; read the first time one is drawn, as it is large */
+static struct font *fallback_font(unsigned cp)
+{
+  static int file = -2;
+  if (cp < 0x80)
+    return 0;
+  if (file == -2) {
+    char path[96];
+    fontstore_path(FONT_CJK, path, sizeof path);
+    file = file_open(path);
+  }
+  return file >= 0 ? g_files[file].font : 0;
+}
+
 static struct gcache_e *view_glyph(const struct face_view *v, unsigned cp)
 {
-  return cache_glyph(v->font, v->px, v->cache, v->n, cp);
+  return cache_glyph(v->font, fallback_font, v->px, v->cache, v->n, cp);
 }
 
 /* Blit a cached glyph with its top-left at (x + ox, baseline + oy). `bold` widens each row by that many px, taking the
@@ -451,7 +473,7 @@ void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
     gfx_fill_rect(x, y, GFX_FONT_W, GFX_FONT_H, bg);
   if (!mono_ready())
     return;
-  struct gcache_e *g = cache_glyph(g_files[g_mono.file].font, MONO_PX, g_mono.cache, FACE_CACHE, ch);
+  struct gcache_e *g = cache_glyph(g_files[g_mono.file].font, 0, MONO_PX, g_mono.cache, FACE_CACHE, ch);
   face_blit(x, y + g_mono.baseline, g, fg, 0, 0);
 }
 

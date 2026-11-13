@@ -257,6 +257,22 @@ static bool cover_needs_fallback(const struct cp_cover *c)
   return false;
 }
 
+/* Text in the CJK blocks that the UI font can't draw: CJK symbols and punctuation through the unified
+ * ideographs, Hangul syllables, compatibility ideographs, and full-width forms. */
+static bool cover_needs_cjk(const struct cp_cover *c)
+{
+  static const unsigned ranges[][2] = {{0x2e80, 0x9fff}, {0xac00, 0xd7af}, {0xf900, 0xfaff}, {0xff00, 0xffef}};
+  struct font *ui = gfx_ui_font();
+  for (unsigned r = 0; r < sizeof ranges / sizeof ranges[0]; r++)
+    for (unsigned i = ranges[r][0] / 32; i <= ranges[r][1] / 32; i++)
+      for (unsigned w = c->bmp[i]; w; w &= w - 1) {
+        unsigned cp = i * 32 + (unsigned)__builtin_ctz(w);
+        if (cp >= ranges[r][0] && cp <= ranges[r][1] && (!ui || font_glyph_index(ui, (int)cp) <= 0))
+          return true;
+      }
+  return false;
+}
+
 static unsigned g_font_gen; /* source of page font generations; never reused */
 
 /* Load the @font-face faces the page's text can use: those whose unicode-range covers some of it. Each
@@ -268,6 +284,8 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
     cover_text(root, cov);
   if (cov && cover_needs_fallback(cov))
     fonts_preload_emoji();
+  if (cov && cover_needs_cjk(cov))
+    fonts_preload_cjk();
 
   int nfaces = css_fontface_count(g_sheet);
   char **urls = nfaces ? calloc((unsigned)nfaces, sizeof *urls) : 0;
