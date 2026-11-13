@@ -22,6 +22,7 @@ struct lext {
   short tr_x, tr_y, tr_xp, tr_yp;                /* translate: px, and percent of the border box */
   short flt_bright;                              /* filter brightness, permille (1000 identity) */
   signed char flt_gray, flt_invert, flt_opacity; /* filter percent */
+  short bdf_blur;                                /* backdrop-filter blur radius px, 0 none */
   signed char clip_kind, clip_n;
   short clip_v[CSS_CLIP_PTS * 2];
   signed char clip_unit[CSS_CLIP_PTS * 2];

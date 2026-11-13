@@ -87,7 +87,7 @@ static struct ledge edge4(const short v[4])
 static struct lext *ext_new(const struct css_style *cs)
 {
   bool tr = cs->has_tr == 1, mat = cs->tr_mat == 1, flt = cs->flt_bright >= 0, clip = cs->clip_kind > CSS_CLIP_NONE;
-  if (cs->n_areas <= 0 && !cs->area[0] && !tr && !flt && !clip && !cs->backdrop_set)
+  if (cs->n_areas <= 0 && !cs->area[0] && !tr && !flt && !clip && !cs->backdrop_set && cs->bdf_blur <= 0)
     return 0;
   struct lext *x = calloc(1, sizeof *x);
   if (!x)
@@ -125,6 +125,7 @@ static struct lext *ext_new(const struct css_style *cs)
     x->flt_invert = cs->flt_invert;
     x->flt_opacity = cs->flt_opacity;
   }
+  x->bdf_blur = cs->bdf_blur > 0 ? cs->bdf_blur : 0;
   if (clip) {
     x->clip_kind = cs->clip_kind;
     x->clip_n = cs->clip_n;

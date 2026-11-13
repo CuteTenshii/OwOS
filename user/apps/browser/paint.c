@@ -405,6 +405,75 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
       }
   }
 }
+/* One box-blur pass of radius r over n pixels spaced `step` apart, from src into dst (edges clamp). */
+static void blur_line(const unsigned *src, unsigned *dst, int n, int step, int r)
+{
+  unsigned sr = 0, sg = 0, sb = 0, w = (unsigned)(2 * r + 1);
+  for (int k = -r; k <= r; k++) {
+    unsigned p = src[(k < 0 ? 0 : k >= n ? n - 1 : k) * step];
+    sr += (p >> 16) & 0xff;
+    sg += (p >> 8) & 0xff;
+    sb += p & 0xff;
+  }
+  for (int i = 0; i < n; i++) {
+    dst[i * step] = (sr / w) << 16 | (sg / w) << 8 | sb / w;
+    unsigned out = src[(i - r < 0 ? 0 : i - r) * step], in = src[(i + r + 1 >= n ? n - 1 : i + r + 1) * step];
+    sr += ((in >> 16) & 0xff) - ((out >> 16) & 0xff);
+    sg += ((in >> 8) & 0xff) - ((out >> 8) & 0xff);
+    sb += (in & 0xff) - (out & 0xff);
+  }
+}
+
+/* backdrop-filter: blur(): blur what is already painted under the rounded box [x,y,w,h] (radius r), within the
+ * band [ct,cb). Three box passes each way approximate the Gaussian of standard deviation `blur`. */
+static void backdrop_blur(int x, int y, int w, int h, int r, int blur, int ct, int cb)
+{
+  int pad = blur * 2; /* read a margin so the box's edge isn't darkened by what lies outside the band */
+  int x0 = x - pad < 0 ? 0 : x - pad, x1 = x + w + pad > BW ? BW : x + w + pad;
+  int y0 = y - pad < ct ? ct : y - pad, y1 = y + h + pad > cb ? cb : y + h + pad;
+  if (y0 < 0)
+    y0 = 0;
+  if (y1 > BH)
+    y1 = BH;
+  int rw = x1 - x0, rh = y1 - y0;
+  if (rw <= 0 || rh <= 0)
+    return;
+  unsigned *a = malloc((unsigned long)rw * (unsigned long)rh * 4),
+           *t = malloc((unsigned long)rw * (unsigned long)rh * 4);
+  if (!a || !t) {
+    free(a);
+    free(t);
+    return;
+  }
+  unsigned *fb = browser_surface();
+  for (int row = 0; row < rh; row++)
+    memcpy(a + (long)row * rw, fb + (long)(y0 + row) * BW + x0, (unsigned long)rw * 4);
+  int br = blur / 2 > 0 ? blur / 2 : 1; /* three passes of radius sigma/2 give roughly sigma */
+  for (int pass = 0; pass < 3; pass++) {
+    for (int row = 0; row < rh; row++)
+      blur_line(a + (long)row * rw, t + (long)row * rw, rw, 1, br);
+    for (int col = 0; col < rw; col++)
+      blur_line(t + col, a + col, rh, rw, br);
+  }
+  if (r > w / 2)
+    r = w / 2;
+  if (r > h / 2)
+    r = h / 2;
+  for (int yy = 0; yy < h; yy++) {
+    int sy = y + yy;
+    if (sy < y0 || sy >= y1)
+      continue;
+    int cut = 0, d = yy < r ? r - yy : yy >= h - r ? yy - (h - 1 - r) : -1;
+    if (d >= 0 && d <= r)
+      cut = r - isqrt_i(r * r - d * d);
+    int xa = x + cut < x0 ? x0 : x + cut, xb = x + w - cut > x1 ? x1 : x + w - cut;
+    if (xb > xa)
+      memcpy(fb + (long)sy * BW + xa, a + (long)(sy - y0) * rw + (xa - x0), (unsigned long)(xb - xa) * 4);
+  }
+  free(a);
+  free(t);
+}
+
 /* A box's drop shadow */
 static void draw_box_shadow(const struct lbox *b, const struct lgeom *ge, int sy, int r, int ct, int cb)
 {
@@ -520,7 +589,8 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
   bool has_bg = b->bg != BG_NONE;
   bool has_bd = b->border_color != BG_NONE && (b->border.t || b->border.r || b->border.b || b->border.l);
   bool has_ol = b->outline_w > 0 && b->outline_color != BG_NONE;
-  if (!has_bg && !has_bd && !has_img && !has_ol && b->sh_color == BG_NONE)
+  int bdf = b->ext ? b->ext->bdf_blur : 0;
+  if (!has_bg && !has_bd && !has_img && !has_ol && b->sh_color == BG_NONE && bdf <= 0)
     return;
   int alpha = b->opacity < 0 ? 255 : b->opacity * 255 / 100;
   int bga = alpha * b->bg_a / 255; /* the background colour's own alpha on top of opacity */
@@ -528,6 +598,8 @@ static void paint_one_box(const struct lbox *src, const struct lgeom *ge, int py
   int r = b->radius;
   if (b->sh_color != BG_NONE) /* drop shadow (clips itself to the band) */
     draw_box_shadow(b, ge, sy, r, ct, cb);
+  if (bdf > 0)
+    backdrop_blur(ge->x, sy, ge->w, ge->h, r, bdf, ct, cb);
   int by = sy, bh = ge->h;
   if (by < ct) {
     bh -= ct - by;

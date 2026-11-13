@@ -234,6 +234,7 @@ struct css_style {
   signed char flt_gray;           /* filter grayscale 0..100 percent, -1 unset */
   signed char flt_invert;         /* filter invert 0..100 percent, -1 unset */
   signed char flt_opacity;        /* filter opacity 0..100 percent, -1 unset */
+  short bdf_blur;                 /* backdrop-filter blur radius px (0 none), -1 unset */
   signed char clip_kind;          /* enum css_clip, -1 unset */
   short clip_v[CSS_CLIP_PTS * 2]; /* inset: t r b l round | circle: r cx cy | ellipse: rx ry cx cy | polygon x y pairs;
                                      percent*10 or px */

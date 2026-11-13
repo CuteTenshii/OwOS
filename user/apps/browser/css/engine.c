@@ -265,6 +265,8 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->flt_invert = d->flt_invert;
   if (d->flt_opacity >= 0)
     out->flt_opacity = d->flt_opacity;
+  if (d->bdf_blur >= 0)
+    out->bdf_blur = d->bdf_blur;
   if (d->clip_kind >= 0) {
     out->clip_kind = d->clip_kind;
     out->clip_n = d->clip_n;

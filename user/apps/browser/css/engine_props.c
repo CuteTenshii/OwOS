@@ -61,6 +61,7 @@ void css_style_reset(struct css_style *s)
   s->tr_org = -1;
   s->flt_bright = -1;
   s->flt_gray = s->flt_invert = s->flt_opacity = -1;
+  s->bdf_blur = -1;
   s->clip_kind = -1;
   s->clip_n = 0;
   s->overflow = -1;

@@ -301,10 +301,10 @@ static void check_media_features(void)
 static void check_supports(void)
 {
   expect_eq(sheet_color("#a{color:#010101} @supports (display:grid){#a{color:#020202}}"), 0x020202);
-  expect_eq(sheet_color("#a{color:#010101} @supports (backdrop-filter:blur(2px)){#a{color:#020202}}"), 0x010101);
-  expect_eq(sheet_color("#a{color:#010101} @supports not (backdrop-filter:blur(2px)){#a{color:#020202}}"), 0x020202);
-  expect_eq(sheet_color(
-                "#a{color:#010101} @supports (display:grid) and (not (backdrop-filter:blur(2px))) {#a{color:#020202}}"),
+  expect_eq(sheet_color("#a{color:#010101} @supports (backdrop-filter:blur(2px)){#a{color:#020202}}"), 0x020202);
+  expect_eq(sheet_color("#a{color:#010101} @supports (offset-path:none){#a{color:#020202}}"), 0x010101);
+  expect_eq(sheet_color("#a{color:#010101} @supports not (offset-path:none){#a{color:#020202}}"), 0x020202);
+  expect_eq(sheet_color("#a{color:#010101} @supports (display:grid) and (not (offset-path:none)) {#a{color:#020202}}"),
             0x020202);
   expect_eq(sheet_color("#a{color:#010101} @supports (nope:1) or (aspect-ratio:1){#a{color:#020202}}"), 0x020202);
   expect_eq(sheet_color("#a{color:#010101} @supports selector(:hover){#a{color:#020202}}"), 0x020202);

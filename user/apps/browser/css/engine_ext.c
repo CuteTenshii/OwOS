@@ -336,6 +336,27 @@ static void parse_filter(const char *v, struct css_style *o)
   }
 }
 
+/* backdrop-filter: the blur() radius in px (0 for none); other functions aren't painted. */
+static void parse_backdrop_filter(const char *v, struct css_style *o)
+{
+  o->bdf_blur = 0;
+  for (const char *s = v; *s;) {
+    s = skip_ws(s);
+    char name[16];
+    int nl = fn_name(s, name, sizeof name);
+    if (!nl)
+      break;
+    const char *as = s + nl + 1, *ae = fn_args_end(as);
+    char arg[40];
+    next_arg(as, ae, arg, sizeof arg);
+    if (!strcmp(name, "blur")) {
+      int px = *arg ? one_len(arg, 0) : 0;
+      o->bdf_blur = (short)(px < 0 ? 0 : px > 64 ? 64 : px);
+    }
+    s = *ae ? ae + 1 : ae;
+  }
+}
+
 /* ---- clip-path ---- */
 
 static void clip_push(struct css_style *o, const char *arg)
@@ -876,6 +897,8 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
     parse_transform(buf, out, false);
   } else if (span_is(p, pe, "filter") || span_is(p, pe, "-webkit-filter")) {
     parse_filter(val, out);
+  } else if (span_is(p, pe, "backdrop-filter") || span_is(p, pe, "-webkit-backdrop-filter")) {
+    parse_backdrop_filter(val, out);
   } else if (span_is(p, pe, "clip-path") || span_is(p, pe, "-webkit-clip-path")) {
     parse_clip_path(val, out);
   } else
