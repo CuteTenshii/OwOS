@@ -107,6 +107,7 @@ TORLIB   = user/lib/torrent/bencode.o user/lib/torrent/torrent.o $(CRYPTO)   # l
 SQLITE   = user/lib/sqlite/sqlite.o   # real SQLite3 file-format DB (browser cookie jar)
 CLIPBOARD  = user/lib/clipboard/clipboard.o  # clipd client (multi-item clipboard)
 MIME     = user/lib/mime/mime.o       # filename/content -> MIME type helper
+MAGIC    = user/lib/mime/magic.o      # file(1) content identification
 # base64: RFC 4648 encode/decode. Allocation-free, pure computation, libc-only.
 BASE64   = user/lib/base64/base64.o
 # json: standalone RFC 8259 value tree (parse + builder + encode). Pure
