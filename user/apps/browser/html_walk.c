@@ -46,7 +46,42 @@ static void emit_pseudo(struct dom_node *el, int which)
   text[n] = '\0';
   struct sty sv = sty_cur;
   apply_css(pcs, &sv);
+  /* A positioned, block-level or painted pseudo-element is a box of its own (a fixed full-page backdrop, a
+   * decorative overlay), not just inline text. */
+  bool out = pcs->pos == CSS_POS_ABS || pcs->pos == CSS_POS_FIXED;
+  bool boxed = out || pcs->disp == CSS_DISP_BLOCK || pcs->bg >= 0 || pcs->bgi.kind > CSS_BGK_NONE ||
+               pcs->sh_color >= 0 || pcs->border_w[0] > 0;
+  if (!boxed) {
+    emit_text(text);
+    sty_cur = sv;
+    return;
+  }
+  struct css_style *bs = malloc(sizeof *bs); /* the walk's frames are tight: keep this copy off the stack */
+  if (!bs) {
+    emit_text(text);
+    sty_cur = sv;
+    return;
+  }
+  *bs = *pcs;
+  if (bs->bgi.kind == CSS_BGK_URL) {
+    if (g_frame_depth == 0)
+      bg_note_url(bs->bgi.url);
+    bs->bgi.img_idx = bg_image_index(bs->bgi.url, g_base_url);
+  }
+  if (bs->border_color < 0)
+    bs->border_color = (int)sty_cur.fg;
+  bs->visibility = sty_cur.hidden ? 0 : 1;
+  unsigned sv_bg = W_bg;
+  W_bg = BG_NONE; /* the box paints its own background */
+  if (!out)
+    line_end();
+  layout_box_open(0, bs, W_n);
   emit_text(text);
+  layout_box_close(W_n);
+  if (!out)
+    line_end();
+  W_bg = sv_bg;
+  free(bs);
   sty_cur = sv;
 }
 
