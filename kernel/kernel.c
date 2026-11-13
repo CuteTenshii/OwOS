@@ -361,7 +361,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   atapi_init();
 
   blk_init();
-  fs_init();
+  /* Live owofs adds per-file cluster rounding and its directory on top of the payload itself. */
+  fs_init(install_payload_bytes() / 512u * 9u / 8u + 8u * 2048u);
   /* Removable volumes are not auto-mounted (mount command or Files app). */
 
   syscall_init();

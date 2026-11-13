@@ -20,7 +20,9 @@
 
 #include <stdint.h>
 
-void fs_init(void); /* mount the disk; format it if unformatted          */
+/* Mount owofs from the backing disk, or run live from a RAM disk when it has none; live_sectors is the least the
+ * live system's files need. */
+void fs_init(uint32_t live_sectors);
 void fs_format(void);
 
 /* owofs is now hierarchical: the 64 directory slots form a tree via a parent

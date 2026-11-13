@@ -1005,7 +1005,10 @@ static int migrate_v8(void)
   return rc;
 }
 
-void fs_init(void)
+/* Room a live system gets beyond what its files need, for downloads and settings, when RAM allows. */
+#define LIVE_HEADROOM_SECTORS (64u * 2048u)
+
+void fs_init(uint32_t live_sectors)
 {
   fs_mount_pseudo();
 
@@ -1030,20 +1033,14 @@ void fs_init(void)
     mounted = true;
     return;
   }
-  if (have && blk_is_ide()) {
-    con_write("fs: unformatted IDE disk -- creating owofs.\n");
+  /* A disk without owofs may hold another system's data, so it is never formatted here: the system runs live
+   * from RAM, and only the Installer writes a disk. */
+  if (blk_use_ram(live_sectors + LIVE_HEADROOM_SECTORS) == 0 || blk_use_ram(live_sectors) == 0) {
+    con_printf("fs: no OwOS disk -- running live from RAM (%u MiB, not persistent).\n", blk_sectors() / 2048);
     fs_format();
     return;
   }
-
-  /* No usable persistent disk (none, or an AHCI/NVMe OS drive that must not be auto-formatted): fall back
-   * to a volatile RAM filesystem; the real disk is only ever read. */
-  if (blk_use_ram() == 0) {
-    con_write("fs: no owofs disk -- using RAM (tmpfs; not persistent).\n");
-    fs_format();
-    return;
-  }
-  con_write("fs: no disk and RAM fs unavailable.\n");
+  con_write("fs: no OwOS disk and not enough RAM to run live.\n");
   mounted = false;
 }
 

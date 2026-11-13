@@ -13,8 +13,9 @@ void blk_init(void);
 bool blk_present(void);
 const char *blk_backend(void); /* "IDE" / "AHCI" / "NVMe" / "tmpfs"/"none"*/
 
-/* Switch to a volatile RAM disk (tmpfs) when there is no usable owofs disk. 0, or -1 on allocation failure. */
-int blk_use_ram(void);
+/* Switch to a volatile RAM disk of `sectors` 512-byte sectors (live boot). 0, or -1 if that much contiguous RAM
+ * is not free; the size is fixed by the first successful call. */
+int blk_use_ram(uint32_t sectors);
 
 /* A present removable block device, for the /dev listing and the Files app Devices list. */
 struct blk_devinfo {
@@ -29,9 +30,6 @@ int blk_dev_list(struct blk_devinfo *out, int max);
 
 /* Resolve a /dev name to its sector callbacks and CD flag. 0, or -1 if absent; *w is NULL if read-only. */
 int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso);
-
-/* True only for the IDE disk: fs_init() auto-formats a blank IDE disk, never AHCI/NVMe (the user's OS drive). */
-bool blk_is_ide(void);
 
 int blk_read_sector(uint32_t lba, void *buf);
 /* Read `count` contiguous sectors at once. */

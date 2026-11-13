@@ -20,8 +20,7 @@
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
 static enum backend backend;
 
-/* RAM disk (tmpfs) sized to owofs's 16 MiB sector space, allocated above the identity map on first use. */
-#define RAMDISK_SECTORS 32768u
+/* RAM disk for live boots, allocated above the identity map on first use. */
 static volatile uint8_t *ram_disk;
 static uint32_t ram_sectors;
 
@@ -115,19 +114,19 @@ const char *blk_backend(void)
   }
 }
 
-bool blk_is_ide(void) { return backend == BK_IDE; }
-
-int blk_use_ram(void)
+int blk_use_ram(uint32_t sectors)
 {
   if (!ram_disk) {
-    uint32_t bytes = RAMDISK_SECTORS * 512u;
-    uint32_t phys = pmm_alloc_contig(bytes);
+    uint32_t bytes = sectors * 512u;
+    phys_t phys = pmm_alloc_contig(bytes);
     if (!phys)
       return -1;
-    if (paging_identity_map(phys, bytes) != 0)
+    if (paging_identity_map((uint32_t)phys, bytes) != 0) {
+      pmm_free_contig(phys, bytes);
       return -1;
+    }
     ram_disk = (volatile uint8_t *)(uintptr_t)phys;
-    ram_sectors = RAMDISK_SECTORS;
+    ram_sectors = sectors;
     for (uint32_t i = 0; i < bytes; i++)
       ram_disk[i] = 0;
   }

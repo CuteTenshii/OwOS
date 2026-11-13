@@ -13,6 +13,14 @@
 #define PKGDB_FILE "/var/lib/installed"
 #define DIR_MODE 0755
 
+uint32_t install_payload_bytes(void)
+{
+  uint32_t total = 0;
+  for (unsigned i = 0; i < payload_count; i++)
+    total += (uint32_t)(payload[i].end - payload[i].start);
+  return total;
+}
+
 /* The whole file in a fresh buffer, its length in *len; NULL if absent or unreadable. */
 static uint8_t *read_file(const char *path, uint32_t *len)
 {
