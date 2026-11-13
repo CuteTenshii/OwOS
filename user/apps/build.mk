@@ -8,7 +8,7 @@
 # The browser includes its own headers by path from its root.
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
 
-GUI_APPS := about archive browser calc cliphist clock compositor devhub editor files imgview notifyd pdfview player settings term
+GUI_APPS := about archive browser calc cliphist clock compositor devhub editor files imgview installer notifyd pdfview player settings term
 APPS := $(patsubst user/apps/%/,%,$(wildcard user/apps/*/))
 app_objs = $(patsubst %.c,%.o,$(sort $(shell find user/apps/$(1) -name '*.c')))
 
@@ -30,6 +30,7 @@ APP_LIBS_editor := $(CLIPBOARD) $(MIME) $(DIALOG) $(FILEPICK)
 APP_LIBS_files := $(DIALOG) $(FILEPICK) $(WOFF)
 APP_LIBS_h264 := $(H264) $(MP4)
 APP_LIBS_imgview := $(PNGDEC) $(IMGANIM)
+APP_LIBS_installer := $(DIALOG)
 APP_LIBS_json := $(JSON)
 APP_LIBS_mediactl := $(MEDIACTL)
 APP_LIBS_mediad := user/lib/mediactl/session.o
@@ -63,12 +64,12 @@ $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 INSTALL_NAME_notifysend := notify-send
 
 # Start menu entries, installed to /usr/share/applications.
-DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings devhub about
+DESKTOP_APPS := term files archive editor browser pdfview player clock calc notifyd settings devhub installer about
 
 # Combined function-symbol table (one text blob, sections keyed by app name) so
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
-SYM_APPS := browser files archive editor term calc imgview pdfview player settings devhub notifyd about clock cliphist
+SYM_APPS := browser files archive editor term calc imgview pdfview player settings devhub notifyd about clock cliphist installer
 kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \

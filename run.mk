@@ -62,11 +62,10 @@ $(call blank_image,$(1))
 	$(call seeded,$($(3)) && mcopy -s -i $@ "$$t"/* ::)
 endef
 
-# A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
-# sizes itself to the disk's capacity (capped at 64 MiB in fs.c). The NVMe, SCSI
-# and UFS disks stay blank.
+# The IDE disk starts blank, so OwOS boots live until the Installer app installs onto it; 512 MiB leaves room for
+# the installed layout (it needs about 258 MiB). The NVMe, SCSI and UFS disks stay blank.
 $(DISK):
-	$(call blank_image,64)
+	$(call blank_image,512)
 $(NVMEDISK) $(SCSIDISK) $(UFSDISK):
 	$(call blank_image,16)
 

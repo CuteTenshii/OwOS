@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Installer
+GenericName=Install OwOS
+Comment=Install OwOS onto a disk
+Exec=installer
+Icon=computer
+Terminal=false
+Categories=System;
+X-OwOS-Order=98
