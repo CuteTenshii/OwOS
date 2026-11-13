@@ -26,4 +26,9 @@ int fontstore_choose(int role, const char *name);
 /* Path of an installed font whose family is `family` (case-insensitive); 0 if none, else 1. */
 int fontstore_find(const char *family, char *path, int n);
 
+/* Path of the installed face of `family` (case-insensitive) nearest to `weight` (100..900) and `italic`, preferring
+ * the right slant over the right weight. got_weight/got_italic (either may be 0) report the face found. Returns 1, or
+ * 0 if no face of that family is installed. */
+int fontstore_match(const char *family, int weight, int italic, char *path, int n, int *got_weight, int *got_italic);
+
 #endif

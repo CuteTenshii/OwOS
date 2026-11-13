@@ -1262,6 +1262,30 @@ unsigned char *font_render_glyph(const struct font *f, int gi, float px, int *w,
   return out;
 }
 
+/* ------------------------------------------------ weight and slant -------- */
+void font_style(const struct font *f, int *weight, int *italic)
+{
+  unsigned os2 = find_table(f->d, f->len, "OS/2");
+  int w = 400, it = 0;
+  if (os2 && off_ok(os2, 64, f->len)) {
+    w = (int)rd16(f->d + os2 + 4);
+    it = (rd16(f->d + os2 + 62) & 0x201) != 0; /* ITALIC or OBLIQUE */
+  } else if (f->head) {
+    unsigned mac = rd16(f->d + f->head + 44);
+    w = mac & 1 ? 700 : 400;
+    it = (mac & 2) != 0;
+  }
+  /* Some old fonts store 1..9 rather than 100..900 */
+  if (w >= 1 && w <= 9)
+    w *= 100;
+  if (w < 1 || w > 1000)
+    w = 400;
+  if (weight)
+    *weight = w;
+  if (italic)
+    *italic = it;
+}
+
 /* ------------------------------------------------ family name -------------- */
 int font_family(const struct font *f, char *out, int n)
 {

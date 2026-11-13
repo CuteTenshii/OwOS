@@ -176,9 +176,10 @@ static int ieq(const char *a, const char *b)
   return !*a && !*b;
 }
 
-#define FAMILIES 16
+#define FAMILIES 32
 static struct {
   char family[64], name[NAME_MAX_U];
+  int weight, italic;
 } fam_cache[FAMILIES];
 static int fam_n = -1;
 
@@ -195,6 +196,7 @@ static void scan_families(void)
     struct font *f = font_load(buf, len);
     if (f && font_family(f, fam_cache[fam_n].family, sizeof fam_cache[0].family)) {
       strcpy(fam_cache[fam_n].name, name);
+      font_style(f, &fam_cache[fam_n].weight, &fam_cache[fam_n].italic);
       fam_n++;
     }
     if (f)
@@ -213,4 +215,31 @@ int fontstore_find(const char *family, char *path, int n)
       return 1;
     }
   return 0;
+}
+
+int fontstore_match(const char *family, int weight, int italic, char *path, int n, int *got_weight, int *got_italic)
+{
+  if (fam_n < 0)
+    scan_families();
+  int best = -1, best_cost = 0;
+  for (int i = 0; i < fam_n; i++) {
+    if (!ieq(fam_cache[i].family, family))
+      continue;
+    int d = fam_cache[i].weight - weight;
+    /* A slant mismatch outweighs any weight distance; at equal distance the heavier face wins for bold */
+    int cost = (d < 0 ? -d : d) * 2 + (d < 0) * (weight >= 500) + (d > 0) * (weight < 500) +
+               ((fam_cache[i].italic != 0) != (italic != 0)) * 10000;
+    if (best < 0 || cost < best_cost) {
+      best = i;
+      best_cost = cost;
+    }
+  }
+  if (best < 0)
+    return 0;
+  snprintf(path, n, DIR "/%s", fam_cache[best].name);
+  if (got_weight)
+    *got_weight = fam_cache[best].weight;
+  if (got_italic)
+    *got_italic = fam_cache[best].italic;
+  return 1;
 }

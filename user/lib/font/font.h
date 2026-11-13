@@ -24,6 +24,10 @@ void font_free(struct font *f);
  * other characters). Returns its length, 0 if the font has none. */
 int font_family(const struct font *f, char *out, int n);
 
+/* The face's weight (100..900, from OS/2 usWeightClass, else head.macStyle) and whether it is italic or
+ * oblique. Either out pointer may be 0. */
+void font_style(const struct font *f, int *weight, int *italic);
+
 /* Scaled vertical metrics at pixel size `px` (the em square maps to `px`
  * pixels). `descent` is negative (below the baseline); any of the out pointers
  * may be 0. */
