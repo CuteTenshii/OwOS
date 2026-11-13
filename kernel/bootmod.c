@@ -36,8 +36,9 @@ void bootmod_relocate(void)
     uint32_t len = mods[i].len;
     bool kept;
     if (mods[i].start < pmm_low_end()) {
+      /* A module can start below the low identity map and run past its end. */
       phys_t to = pmm_alloc_contig(len);
-      kept = to && paging_identity_map((uint32_t)to, len) == 0;
+      kept = to && paging_identity_map(mods[i].start, len) == 0 && paging_identity_map((uint32_t)to, len) == 0;
       if (kept) {
         memcpy((void *)(uintptr_t)to, (const void *)(uintptr_t)mods[i].start, len);
         mods[i].start = (uint32_t)to;
