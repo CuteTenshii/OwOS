@@ -45,7 +45,7 @@ static void emit_pseudo(struct dom_node *el, int which)
   }
   text[n] = '\0';
   struct sty sv = sty_cur;
-  apply_css(pcs);
+  apply_css(pcs, &sv);
   emit_text(text);
   sty_cur = sv;
 }
@@ -430,7 +430,7 @@ static void walk_element_inner(struct dom_node *el)
   int linked = streq(name, "a") ? open_link(el) : 0;
 
   apply_ua_style(name);
-  apply_css(&cs);
+  apply_css(&cs, &saved);
   if (cs.bg >= 0)
     W_bg = (unsigned)cs.bg;
 

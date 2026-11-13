@@ -500,6 +500,36 @@ static void test_escaped_identifiers(void)
   expect(sel_hits(".caf\xc3\xa9 { color: red }", raw));   /* a bare non-ASCII name */
 }
 
+/* 17. color/text-decoration inherit must survive the cascade so the walk can override a link's UA blue/underline. */
+static void test_inherit_keywords(void)
+{
+  struct dom_node *a = el("a"), *p = el("p"), *q = el("q");
+  doc(a);
+  doc(p);
+  doc(q);
+  struct css_style st;
+
+  css_sheet *sh = sheet("a { color: red; text-decoration: underline } a { color: inherit; text-decoration: inherit }");
+  css_style_reset(&st);
+  css_apply_sheet(sh, a, &st);
+  expect_eq(st.color, CSS_COLOR_INHERIT);
+  expect_eq(st.under, CSS_DECO_INHERIT);
+  expect_eq(st.strike, CSS_DECO_INHERIT);
+  css_free(sh);
+
+  sh = sheet("p { color: currentColor; text-decoration: line-through } q { color: initial; text-decoration: unset }");
+  css_style_reset(&st);
+  css_apply_sheet(sh, p, &st);
+  expect_eq(st.color, CSS_COLOR_INHERIT);
+  expect_eq(st.strike, 1);
+  css_style_reset(&st);
+  css_apply_sheet(sh, q, &st);
+  expect_eq(st.color, 0x000000);
+  expect_eq(st.under, 0);
+  expect_eq(st.strike, 0);
+  css_free(sh);
+}
+
 int main(void)
 {
   test("complex :is selectors", test_complex_is_selectors);
@@ -518,6 +548,7 @@ int main(void)
   test("scoped custom properties", test_scoped_custom_properties);
   test("::slotted and ::part", test_slotted_and_part);
   test("escaped identifiers", test_escaped_identifiers);
+  test("inherit keywords", test_inherit_keywords);
 
   free_dom();
   return 0;

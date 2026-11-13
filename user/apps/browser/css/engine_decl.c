@@ -448,9 +448,14 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   svg_decl_add(p, pe, val, out);
   if (parse_ext_decl(p, pe, val, out))
     return;
-  if (span_is(p, pe, "color"))
-    out->color = parse_color(val);
-  else if (span_is(p, pe, "background-color")) {
+  if (span_is(p, pe, "color")) {
+    if (starts_ci(val, "inherit") || starts_ci(val, "unset") || starts_ci(val, "currentcolor"))
+      out->color = CSS_COLOR_INHERIT;
+    else if (starts_ci(val, "initial"))
+      out->color = 0x000000;
+    else
+      out->color = parse_color(val);
+  } else if (span_is(p, pe, "background-color")) {
     int a, c = color_parse_a(val, &a);
     if (c >= 0)
       out->bg = a ? c : CSS_BG_CLEAR;
@@ -497,7 +502,11 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     out->bold = (signed char)parse_weight(val);
     out->weight = (short)parse_weight_num(val);
   } else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line")) {
-    if (has_ci(val, "underline"))
+    if (starts_ci(val, "inherit"))
+      out->under = out->strike = CSS_DECO_INHERIT;
+    else if (starts_ci(val, "initial") || starts_ci(val, "unset"))
+      out->under = out->strike = 0;
+    else if (has_ci(val, "underline"))
       out->under = 1;
     else if (has_ci(val, "none"))
       out->under = 0;

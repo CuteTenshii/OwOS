@@ -41,7 +41,7 @@ bool css_state_in_use(void) { return g_state_used; }
 /* cascade */
 static void fold(struct css_style *out, const struct css_style *d)
 {
-  if (d->color >= 0)
+  if (d->color >= 0 || d->color == CSS_COLOR_INHERIT)
     out->color = d->color;
   if (d->bg >= 0 || d->bg == CSS_BG_CLEAR)
     out->bg = d->bg;
@@ -51,6 +51,8 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->weight = d->weight;
   if (d->under >= 0)
     out->under = d->under;
+  if (d->strike >= 0)
+    out->strike = d->strike;
   if (d->disp)
     out->disp = d->disp;
   if (d->center >= 0)

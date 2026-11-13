@@ -451,11 +451,13 @@ void apply_ua_style(const char *name)
   }
 }
 
-/* Layer a computed CSS style over the UA defaults already in sty_cur. */
-void apply_css(const struct css_style *cs)
+/* Layer a computed CSS style over the UA defaults already in sty_cur; `parent` resolves inherit. */
+void apply_css(const struct css_style *cs, const struct sty *parent)
 {
   if (cs->color >= 0)
     sty_cur.fg = (unsigned)cs->color;
+  else if (cs->color == CSS_COLOR_INHERIT)
+    sty_cur.fg = parent->fg;
   if (cs->bold >= 0)
     sty_cur.bold = cs->bold ? 1 : 0;
   if (cs->weight > 0 || cs->weight == CSS_W_BOLDER || cs->weight == CSS_W_LIGHTER) {
@@ -474,9 +476,13 @@ void apply_css(const struct css_style *cs)
   }
   if (cs->fam[0])
     sty_cur.fam = fam_intern(cs->fam);
-  if (cs->under >= 0)
+  if (cs->under == CSS_DECO_INHERIT)
+    sty_cur.under = parent->under;
+  else if (cs->under >= 0)
     sty_cur.under = cs->under ? 1 : 0;
-  if (cs->strike >= 0)
+  if (cs->strike == CSS_DECO_INHERIT)
+    sty_cur.strike = parent->strike;
+  else if (cs->strike >= 0)
     sty_cur.strike = cs->strike ? 1 : 0;
   if (cs->italic >= 0)
     sty_cur.italic = cs->italic ? 1 : 0;

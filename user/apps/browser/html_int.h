@@ -109,7 +109,7 @@ int cp1252_high(unsigned char b);
 int read_char(const char **pp, const char *end);
 unsigned char sty_byte(void);
 void apply_ua_style(const char *name);
-void apply_css(const struct css_style *cs);
+void apply_css(const struct css_style *cs, const struct sty *parent);
 bool is_block_tag(const char *name);
 int decode_entity(const char *p, const char *end, int *adv);
 void decode_entities(char *s);
