@@ -20,7 +20,7 @@
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
  *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one
  * dir/device) /sys/power/battery/{capacity,status}                      (ro,
- * real HW) /sys/firmware/type                  BIOS / UEFI           (ro)
+ * real HW) /sys/firmware/type            BIOS / UEFI / Device tree   (ro)
  *
  * The tree is small, and the dynamic parts (which NIC/block devices exist, is a
  * battery present) depend on hardware, so it's resolved by an explicit

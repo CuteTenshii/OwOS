@@ -5,6 +5,7 @@
 #include "clk.h"
 #include "console.h"
 #include "entropy.h"
+#include "firmware.h"
 #include "fpu.h"
 #include "fs.h"
 #include "gpio.h"
@@ -195,6 +196,7 @@ void arch_main(void)
   con_printf("RAM free %u KiB\n", pmm_free_kib());
 
   cpu_record(0);
+  firmware_set(FIRMWARE_DEVICETREE); /* QEMU, U-Boot and the phone loaders all hand over a device tree */
   fpu_cpu_init();
   entropy_init();
   gic_init();
