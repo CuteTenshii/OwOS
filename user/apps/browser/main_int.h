@@ -91,13 +91,13 @@ struct layout_out {
 struct tab_crash {
   siginfo_t info;
   struct sigcontext ctx;
-  unsigned callers[CRASH_CALLERS];
+  sys_word callers[CRASH_CALLERS];
   int ncallers;
 };
 /* One line naming the fault ("SIGSEGV: read of unmapped address 0x00000004 (null pointer)") */
 void crash_describe(int sig, const struct tab_crash *c, char *out, int cap);
 /* "func+0x1c (0x4001a2b3)", or the bare address when the kernel has no symbol for it */
-void crash_where(unsigned addr, char *out, int cap);
+void crash_where(sys_word addr, char *out, int cap);
 
 struct tab {
   char url[URL_MAX]; /* address-bar / navigation target               */

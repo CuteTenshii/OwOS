@@ -7,7 +7,6 @@
 #   make             # 32-bit owos.bin
 #   make ARCH=x86_64  # 64-bit owos-x86_64.bin
 ARCH ?= i386
-ARCH_STAMP := .arch.current
 ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)'; use i386 or x86_64)
 endif
@@ -51,7 +50,7 @@ ifeq ($(ARCH),x86_64)
   QEMU      := qemu-system-x86_64
   KERNEL    := owos-x86_64.bin
   UARCHFLAGS := -m64
-  UEMU      := elf_x86_64
+  ULDFLAGS  := -m elf_x86_64
 else
   ARCHFLAGS := -m32
   LINKER    := kernel/arch/x86/linker.ld
@@ -60,17 +59,9 @@ else
   QEMU      := qemu-system-i386
   KERNEL    := owos.bin
   UARCHFLAGS := -m32
-  UEMU      := elf_i386
+  ULDFLAGS  := -m elf_i386
 endif
 
-# $(call blob,file,name): recipe wrapping `file` into the kernel object $@ as _binary_<name>_{start,end}.
-# objcopy names the symbols after the input path, with every '/', '.' and '-' turned into '_'.
-blob_sym = _binary_$(subst -,_,$(subst .,_,$(subst /,_,$(1))))
-define blob
-$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
-	  --redefine-sym $(call blob_sym,$(1))_start=_binary_$(2)_start \
-	  --redefine-sym $(call blob_sym,$(1))_end=_binary_$(2)_end $(1) $@
-endef
 
 # Freestanding: no host libc/headers, no PIE/stack-protector/red-zone. -mno-sse/
 # -mno-mmx: the kernel never enables SSE, so GCC must not auto-vectorize into xmm/mmx

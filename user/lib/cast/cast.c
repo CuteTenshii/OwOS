@@ -37,11 +37,7 @@
 
 /* ---- small spinlock (mirrors user malloc / media.c) -----------------------
  */
-static inline int xchg32(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
+static inline int xchg32(volatile int *p, int v) { return __sync_lock_test_and_set(p, v); }
 
 /* ---- session --------------------------------------------------------------
  */
@@ -77,11 +73,7 @@ static void lock_w(cast_session *s)
   while (xchg32(&s->wlock, 1))
     msleep(0);
 }
-static void unlock_w(cast_session *s)
-{
-  __asm__ volatile("" ::: "memory");
-  s->wlock = 0;
-}
+static void unlock_w(cast_session *s) { __atomic_store_n(&s->wlock, 0, __ATOMIC_RELEASE); }
 
 /* ---- bounded string copy --------------------------------------------------
  */
@@ -321,8 +313,7 @@ static void handle_receiver_status(cast_session *s, json_value *root)
       cpstr(s->app_session_id, sizeof s->app_session_id, sid);
     if (tid && tid[0]) {
       cpstr(s->transport_id, sizeof s->transport_id, tid);
-      __asm__ volatile("" ::: "memory");
-      s->have_transport = 1;
+      __atomic_store_n(&s->have_transport, 1, __ATOMIC_RELEASE);
     }
   }
 }
@@ -340,8 +331,7 @@ static void handle_media_status(cast_session *s, json_value *root)
     json_value *msid = json_object_get(item, "mediaSessionId");
     if (msid && json_typeof(msid) == JSON_NUMBER) {
       s->media_session_id = (int)json_as_number(msid, 0);
-      __asm__ volatile("" ::: "memory");
-      s->have_media = 1;
+      __atomic_store_n(&s->have_media, 1, __ATOMIC_RELEASE);
     }
   }
   s->state = player_state_of(json_as_string(json_object_get(item, "playerState")));
@@ -392,8 +382,7 @@ static volatile int g_spawn_taken;
 static cast_session *grab_session(void)
 {
   cast_session *s = g_spawning;
-  __asm__ volatile("" ::: "memory");
-  g_spawn_taken = 1;
+  __atomic_store_n(&g_spawn_taken, 1, __ATOMIC_RELEASE); /* after the read above: the spawner reuses g_spawning */
   return s;
 }
 
@@ -435,18 +424,16 @@ static int start_thread(cast_session *s, void (*fn)(void), int *tid_out, void **
   while (xchg32(&g_spawn_lock, 1))
     msleep(0);
   g_spawning = s;
-  g_spawn_taken = 0;
-  __asm__ volatile("" ::: "memory");
+  __atomic_store_n(&g_spawn_taken, 0, __ATOMIC_RELEASE);
   tid = thread_create(fn, st);
   if (tid < 0) {
     g_spawn_lock = 0;
     thread_stack_free(st);
     return -1;
   }
-  while (!g_spawn_taken)
+  while (!__atomic_load_n(&g_spawn_taken, __ATOMIC_ACQUIRE))
     msleep(0); /* wait until the thread copied s */
-  __asm__ volatile("" ::: "memory");
-  g_spawn_lock = 0;
+  __atomic_store_n(&g_spawn_lock, 0, __ATOMIC_RELEASE);
   *tid_out = tid;
   *stack_out = st;
   return 0;
@@ -610,7 +597,7 @@ int cast_scan_get(int i, struct cast_device *out)
 
 static int wait_flag(volatile int *flag, int deadline_ms)
 {
-  while (!*flag) {
+  while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE)) { /* the data it guards was written before it was set */
     if ((int)(deadline_ms - (int)now_ms()) <= 0)
       return 0;
     msleep(20);
@@ -727,7 +714,7 @@ int cast_load(cast_session *s, const char *url, const char *content_type, const 
 static int media_cmd(cast_session *s, const char *type, json_value *extra)
 {
   json_value *o;
-  if (!s || s->conn != CAST_CONNECTED || !s->have_media) {
+  if (!s || s->conn != CAST_CONNECTED || !__atomic_load_n(&s->have_media, __ATOMIC_ACQUIRE)) {
     if (extra)
       json_free(extra);
     return -1;

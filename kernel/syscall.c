@@ -16,11 +16,9 @@
 #include "file.h"
 #include "firmware.h"
 #include "fs.h"
-#include "gdt.h"
 #include "hda.h"
 #include "heap.h"
 #include "hfs.h"
-#include "idt.h"
 #include "ipc.h"
 #include "iso9660.h"
 #include "keyboard.h"
@@ -36,6 +34,7 @@
 #include "pmm.h"
 #include "power.h"
 #include "procfs.h"
+#include "regs.h"
 #include "rtc.h"
 #include "sb16.h"
 #include "sched.h"
@@ -163,9 +162,6 @@ int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
   return fs_read_at(abs, off, buf, len);
 }
 
-/* A user pointer must lie entirely within the user region, else refuse the call. */
-extern void isr128(void); /* the int 0x80 stub (isr.S) */
-
 /* Unix seconds (UTC) to civil date/time (Hinnant's civil-from-days), for SYS_SETRTC. */
 void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
 {
@@ -187,12 +183,6 @@ void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
   t->day = (uint8_t)d;
   t->month = (uint8_t)m;
   t->year = (uint16_t)(y + (m <= 2u ? 1u : 0u));
-}
-
-void syscall_init(void)
-{
-  /* 0xEE = present, DPL 3, 32-bit interrupt gate -- ring 3 may invoke it. */
-  idt_set_gate(0x80, (uintptr_t)isr128, GDT_KERNEL_CODE, 0xEE);
 }
 
 typedef void (*syscall_handler_t)(struct registers *r);
@@ -289,16 +279,16 @@ static const syscall_handler_t syscall_handlers[] = {
 
 void syscall_dispatch(struct registers *r)
 {
-  uint32_t number = (uint32_t)r->eax;
+  uint32_t number = (uint32_t)SC_NUM(r);
 #ifdef __x86_64__
-  /* Arguments are 32-bit words on both arches (user addresses lie below 4 GiB). Handlers validate the low word
-   * and then dereference the register, so a high half must not survive to make those two differ. */
-  r->ebx = (uint32_t)r->ebx;
-  r->ecx = (uint32_t)r->ecx;
-  r->edx = (uint32_t)r->edx;
+  /* Arguments are 32-bit words on x86 (common/uabi.h). Handlers validate the low word and then dereference the
+   * register, so a high half must not survive to make those two differ. */
+  SC_ARG0(r) = (uint32_t)SC_ARG0(r);
+  SC_ARG1(r) = (uint32_t)SC_ARG1(r);
+  SC_ARG2(r) = (uint32_t)SC_ARG2(r);
 #endif
   if (number >= sizeof syscall_handlers / sizeof *syscall_handlers || !syscall_handlers[number]) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   syscall_handlers[number](r);

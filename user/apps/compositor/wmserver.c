@@ -45,7 +45,7 @@ static struct wclient clients[WMS_CLIENTS];
 static struct wwin wins[WM_LIST_MAX];
 static int listen_fd = -1;
 
-static unsigned map_addr(int id) { return SHM_HIGH_ADDR + (unsigned)id * SHM_SLOT_SIZE; }
+static sys_word map_addr(int id) { return SHM_HIGH_ADDR + (sys_word)id * SHM_SLOT_SIZE; }
 
 static unsigned *map_of(int id) { return (unsigned *)(uintptr_t)map_addr(id); }
 

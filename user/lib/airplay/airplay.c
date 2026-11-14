@@ -53,7 +53,10 @@ static int supports_video(const char *txt)
   if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
     p += 2;
   for (; *p && *p != ','; p++) {
-    int d = *p >= '0' && *p <= '9' ? *p - '0' : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10 : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
+    int d = *p >= '0' && *p <= '9'   ? *p - '0'
+            : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10
+            : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10
+                                     : -1;
     if (d < 0)
       break;
     v = v * 16 + (unsigned)d;
@@ -172,7 +175,7 @@ struct airplay_session {
   volatile int conn;
   volatile int state;
   volatile int cur_ms, dur_ms;
-  volatile int loaded;  /* a /play was accepted */
+  volatile int loaded; /* a /play was accepted */
   volatile int seen_playing;
   int tid;
   void *stack;
@@ -183,11 +186,7 @@ static void lock_s(airplay_session *s)
   while (xchg32(&s->lock, 1))
     msleep(0);
 }
-static void unlock_s(airplay_session *s)
-{
-  __asm__ volatile("" ::: "memory");
-  s->lock = 0;
-}
+static void unlock_s(airplay_session *s) { __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE); }
 
 static int write_all(netconn *nc, const char *p, int n)
 {

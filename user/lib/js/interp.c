@@ -3074,6 +3074,27 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
 #define GEN_STACK_BYTES (sizeof(void *) > 4 ? 512 * 1024 : 128 * 1024)
 #define GEN_STACK_HEADROOM 32768 /* kept clear below the JS stack limit for natives and the throw path */
 
+#if defined(__aarch64__)
+/* GCC has no naked functions on AArch64, so the switch is plain assembly; the callee-saved x19..x30 and d8..d15 go
+ * in a 160-byte frame on the old stack. */
+void js_coro_switch(void **save, void *to);
+__asm__(".text\n"
+        ".globl js_coro_switch\n"
+        ".hidden js_coro_switch\n"
+        ".type js_coro_switch, %function\n"
+        "js_coro_switch:\n\t"
+        "sub sp, sp, #160\n\t"
+        "stp x19, x20, [sp, #0]\n\tstp x21, x22, [sp, #16]\n\tstp x23, x24, [sp, #32]\n\t"
+        "stp x25, x26, [sp, #48]\n\tstp x27, x28, [sp, #64]\n\tstp x29, x30, [sp, #80]\n\t"
+        "stp d8, d9, [sp, #96]\n\tstp d10, d11, [sp, #112]\n\tstp d12, d13, [sp, #128]\n\tstp d14, d15, [sp, #144]\n\t"
+        "mov x9, sp\n\tstr x9, [x0]\n\tmov sp, x1\n\t"
+        "ldp x19, x20, [sp, #0]\n\tldp x21, x22, [sp, #16]\n\tldp x23, x24, [sp, #32]\n\t"
+        "ldp x25, x26, [sp, #48]\n\tldp x27, x28, [sp, #64]\n\tldp x29, x30, [sp, #80]\n\t"
+        "ldp d8, d9, [sp, #96]\n\tldp d10, d11, [sp, #112]\n\tldp d12, d13, [sp, #128]\n\tldp d14, d15, [sp, #144]\n\t"
+        "add sp, sp, #160\n\tret\n"
+        ".size js_coro_switch, . - js_coro_switch\n");
+#define coro_switch js_coro_switch
+#else
 __attribute__((naked, noinline)) static void coro_switch(void **save, void *to)
 {
 #if defined(__x86_64__)
@@ -3085,21 +3106,11 @@ __attribute__((naked, noinline)) static void coro_switch(void **save, void *to)
           "pushl %ebp\n\tpushl %ebx\n\tpushl %esi\n\tpushl %edi\n\t"
           "movl %esp, (%eax)\n\tmovl %ecx, %esp\n\t"
           "popl %edi\n\tpopl %esi\n\tpopl %ebx\n\tpopl %ebp\n\tret");
-#elif defined(__aarch64__)
-  __asm__(
-      "sub sp, sp, #160\n\t"
-      "stp x19, x20, [sp, #0]\n\tstp x21, x22, [sp, #16]\n\tstp x23, x24, [sp, #32]\n\t"
-      "stp x25, x26, [sp, #48]\n\tstp x27, x28, [sp, #64]\n\tstp x29, x30, [sp, #80]\n\t"
-      "stp d8, d9, [sp, #96]\n\tstp d10, d11, [sp, #112]\n\tstp d12, d13, [sp, #128]\n\tstp d14, d15, [sp, #144]\n\t"
-      "mov x9, sp\n\tstr x9, [x0]\n\tmov sp, x1\n\t"
-      "ldp x19, x20, [sp, #0]\n\tldp x21, x22, [sp, #16]\n\tldp x23, x24, [sp, #32]\n\t"
-      "ldp x25, x26, [sp, #48]\n\tldp x27, x28, [sp, #64]\n\tldp x29, x30, [sp, #80]\n\t"
-      "ldp d8, d9, [sp, #96]\n\tldp d10, d11, [sp, #112]\n\tldp d12, d13, [sp, #128]\n\tldp d14, d15, [sp, #144]\n\t"
-      "add sp, sp, #160\n\tret");
 #else
 #error "generators need a coro_switch for this architecture"
 #endif
 }
+#endif
 
 /* Lay out a fresh stack so the first coro_switch into it "returns" into entry. */
 static void *coro_prepare(char *stack, void (*entry)(void))

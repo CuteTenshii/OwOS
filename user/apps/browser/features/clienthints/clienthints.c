@@ -6,9 +6,14 @@
 
 void browser_viewport_px(int *w, int *h); /* browser.h; kept out so host tests need no UI headers */
 
-#ifdef __x86_64__
+#if defined(__aarch64__)
+#define CH_ARCH "arm"
+#define CH_BITNESS "64"
+#elif defined(__x86_64__)
+#define CH_ARCH "x86"
 #define CH_BITNESS "64"
 #else
+#define CH_ARCH "x86"
 #define CH_BITNESS "32"
 #endif
 
@@ -17,7 +22,7 @@ const struct ch_ua_data ch_ua = {
     .full_brands = {{"OwOS-Browser", "1.0.0.0"}, {"Not.A/Brand", "99.0.0.0"}},
     .platform = "OwOS",
     .platform_version = "1.0.0",
-    .architecture = "x86",
+    .architecture = CH_ARCH,
     .bitness = CH_BITNESS,
     .model = "",
     .form_factor = "Desktop",

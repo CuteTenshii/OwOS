@@ -3,9 +3,11 @@
 #define OWOS_USER_H
 
 #include "ascii.h"
+#include "crashrec.h"
 #include "diskinstall.h"
 #include "syscall_nr.h"
 #include "timeval64.h"
+#include "uabi.h"
 #include <stdarg.h>
 
 /* The null pointer constant */
@@ -118,19 +120,15 @@ void puts(const char *s);         /* write a NUL-terminated string */
 void print_uint(unsigned v);      /* write a decimal number */
 int readline(char *buf, int max); /* echoed line input, returns len */
 
-/* Supports %s %c %d %i %u %x %X %p %% with '0' flag and width; no floats or length modifiers */
+/* Supports %s %c %d %i %u %x %X %p %% with '0' flag and width; no floats or length modifiers. %p prints the whole
+ * pointer, at least 8 hex digits. */
 int printf(const char *fmt, ...);
 int snprintf(char *buf, unsigned size, const char *fmt, ...);
 int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
 
 /* Shared memory: the creator grants a handle to other pids; anyone allowed maps it at the start of an 8 MiB slot
- * in [SHM_LOW_ADDR, SHM_LOW_ADDR + 32 slots) or [SHM_HIGH_ADDR, 4 GiB). Mapping over a slot replaces what was
- * there. New objects are zero-filled; the frames go once the owner released it and nothing maps it. */
-#define SHM_SLOT_SIZE 0x00800000u
-#define SHM_LOW_ADDR 0xC0000000u
-#define SHM_LOW_SLOTS 32
-#define SHM_HIGH_ADDR 0xE0000000u
-#define SHM_HIGH_SLOTS 64
+ * (SHM_SLOT_SIZE, SHM_LOW_ADDR, SHM_HIGH_ADDR: common/uabi.h). Mapping over a slot replaces what was there. New objects
+ * are zero-filled; the frames go once the owner released it and nothing maps it. */
 
 /* windowing API: a client of the compositor's "wm" port (user/lib/win/win.c, wmproto.h). Use a window from the
  * thread that created it: events arrive on that thread's connection. */
@@ -200,7 +198,6 @@ unsigned *win_fb_of(int id);
 int win_cursor(int id, int shape);
 
 /* Compositor API (root-only, -1 if not uid 0) */
-#define COMPOSITOR_FB_ADDR 0xD0000000u
 
 struct fbinfo {
   int w, h, pitch, bpp;
@@ -226,18 +223,10 @@ struct inputstate {
 int input_poll(struct inputstate *out); /* 0/-1 */
 int input_set_bounds(int w, int h);     /* clamp box after a mode change; 0/-1 */
 
-/* Pending crash reports; crash_poll consumes up to `max` (root) */
-#define CRASH_TRACE_MAX 12
-struct crash_rec {
-  char name[24];
-  unsigned vector, err, eip, cr2;
-  unsigned eax, ebx, ecx, edx, esi, edi, ebp, esp;
-  unsigned trace[CRASH_TRACE_MAX];
-  int ntrace;
-};
+/* Pending crash reports (common/crashrec.h); crash_poll consumes up to `max` (root) */
 int crash_poll(struct crash_rec *out, int max); /* count / -1 */
 /* Name an address in this program as "func+0xNN" from the kernel's copy of its symbols; 0, or -1 if unknown */
-int symbolize(unsigned addr, char *out, int cap);
+int symbolize(sys_word addr, char *out, int cap);
 /* Label the calling thread (up to THREAD_NAME_MAX - 1 chars; NULL clears it) for task listings and crash reports */
 int thread_setname(const char *name);
 /* The calling thread's label into out[cap] ("" if unnamed); 0/-1 */
@@ -388,8 +377,8 @@ int write_nb(int fd, const void *buf, int len); /* all of len / 0 no room yet / 
 /* Shared memory; the slot layout is at SHM_SLOT_SIZE */
 int shm_create(unsigned bytes);     /* handle / -1, at most SHM_SLOT_SIZE */
 int shm_grant(int handle, int pid); /* owner only; 0/-1 */
-int shm_map(int handle, unsigned addr);
-int shm_unmap(unsigned addr);
+int shm_map(int handle, sys_word addr);
+int shm_unmap(sys_word addr);
 int shm_release(int handle); /* owner only */
 int shm_size(int handle);    /* bytes / -1 */
 
@@ -432,26 +421,43 @@ typedef void (*sighandler_t)(int);
 #define ILL_ILLOPC 1
 #define FPE_INTDIV 1
 #define SI_TRAP_NONE 0xFFFFFFFFu
+/* si_trapno is the CPU's own exception number: the vector on x86, the ESR exception class on AArch64. A page fault
+ * (SEGV_MAPERR / SEGV_ACCERR, si_addr the address) carries the x86-style si_err bits on both. */
+#if defined(__aarch64__)
+#define SI_PAGE_FAULT(in) ((in)->si_trapno == 0x20 || (in)->si_trapno == 0x24) /* instruction or data abort */
+#else
+#define SI_PAGE_FAULT(in) ((in)->si_trapno == 14)
+#endif
 typedef struct {
   int si_signo;
   int si_code;        /* SI_USER, or the SEGV_/ILL_/FPE_ cause of a CPU fault */
-  unsigned si_addr;   /* faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
+  sys_word si_addr;   /* faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
   unsigned si_trapno; /* CPU exception vector, SI_TRAP_NONE if no fault raised it */
   unsigned si_err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
 } siginfo_t;
 /* The interrupted registers; sigreturn resumes from them. x86_64 keeps the 32-bit names at full width (eip is
  * rip, and so on) and adds r8..r15, like the kernel's register frame. */
-#ifdef __x86_64__
+#if defined(__aarch64__)
+struct sigcontext {
+  unsigned long x[31], sp, pc, pstate; /* the EL0 general registers, stack pointer, return address and flags */
+};
+#define SIGCONTEXT_SP(sc) ((sc)->sp)
+#define SIGCONTEXT_PC(sc) ((sc)->pc)
+#elif defined(__x86_64__)
 struct sigcontext {
   unsigned long eip, eflags, esp;
   unsigned long eax, ecx, edx, ebx, ebp, esi, edi;
   unsigned long r8, r9, r10, r11, r12, r13, r14, r15;
 };
+#define SIGCONTEXT_SP(sc) ((sc)->esp)
+#define SIGCONTEXT_PC(sc) ((sc)->eip)
 #else
 struct sigcontext {
   unsigned eip, eflags, esp;
   unsigned eax, ecx, edx, ebx, ebp, esi, edi;
 };
+#define SIGCONTEXT_SP(sc) ((sc)->esp)
+#define SIGCONTEXT_PC(sc) ((sc)->eip)
 #endif
 
 #define SIG_BLOCK 0
@@ -461,7 +467,7 @@ struct sigcontext {
 #define sigmask(n) (1u << (n))
 
 struct sigaction {
-  unsigned handler; /* a sighandler_t, or SIG_DFL / SIG_IGN */
+  sys_word handler; /* a sighandler_t, or SIG_DFL / SIG_IGN */
   unsigned mask;    /* extra signals blocked while the handler runs */
   unsigned flags;   /* SA_* */
 };
@@ -471,9 +477,11 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old); /* 0
 unsigned sigprocmask(int how, const unsigned *set, unsigned *old);          /* new blocked mask */
 int raise(int sig);                                                         /* send `sig` to ourselves */
 
-/* setjmp/longjmp (start_32.S / start_64.S): the callee-saved registers, stack pointer and resume address;
- * longjmp makes setjmp return `val` (1 if 0) */
-#ifdef __x86_64__
+/* setjmp/longjmp (user/lib/start_*.S): the callee-saved registers, stack pointer and resume address; longjmp makes
+ * setjmp return `val` (1 if 0) */
+#if defined(__aarch64__)
+typedef unsigned long jmp_buf[21]; /* x19..x30, sp, d8..d15 */
+#elif defined(__x86_64__)
 typedef unsigned long jmp_buf[8];
 #else
 typedef unsigned jmp_buf[6];

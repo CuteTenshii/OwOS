@@ -1,5 +1,5 @@
 #include "syscall_signal.h"
-#include "idt.h"
+#include "regs.h"
 #include "sched.h"
 #include "signal.h"
 #include "uaccess.h"
@@ -9,26 +9,26 @@ void syscall_signal_action(struct registers *r)
 {
   struct k_sigaction action, old;
   const struct k_sigaction *input = 0;
-  if (r->ecx) {
-    if (!user_range(r->ecx, sizeof action) || copyin(&action, r->ecx, sizeof action) != 0) {
-      r->eax = (uint32_t)-1;
+  if (SC_ARG1(r)) {
+    if (!user_range(SC_ARG1(r), sizeof action) || copyin(&action, SC_ARG1(r), sizeof action) != 0) {
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     input = &action;
   }
-  if (r->edx && !user_out_range(r->edx, sizeof old)) {
-    r->eax = (uint32_t)-1;
+  if (SC_ARG2(r) && !user_out_range(SC_ARG2(r), sizeof old)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  int rc = sched_sigaction((int)r->ebx, input, r->edx ? &old : 0);
-  if (rc == 0 && r->edx && copyout(r->edx, &old, sizeof old) != 0)
+  int rc = sched_sigaction((int)SC_ARG0(r), input, SC_ARG2(r) ? &old : 0);
+  if (rc == 0 && SC_ARG2(r) && copyout(SC_ARG2(r), &old, sizeof old) != 0)
     rc = -1;
-  r->eax = (uint32_t)rc;
+  SC_RET(r) = (uint32_t)rc;
 }
 
 void syscall_signal_procmask(struct registers *r)
 {
-  r->eax = sched_sigprocmask((int)r->ebx, (uint32_t)r->ecx, (int)r->edx);
+  SC_RET(r) = sched_sigprocmask((int)SC_ARG0(r), (uint32_t)SC_ARG1(r), (int)SC_ARG2(r));
 }
 
 void syscall_signal_return(struct registers *r)

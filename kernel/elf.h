@@ -1,4 +1,4 @@
-/* elf.h: the bits of ELF we need to load a static executable (ELF32 on i386, ELF64 on x86_64). */
+/* elf.h: the bits of ELF we need to load a static executable (ELF32 on i386, ELF64 on x86_64 and AArch64). */
 #ifndef OWOS_ELF_H
 #define OWOS_ELF_H
 
@@ -67,6 +67,7 @@ typedef struct {
 #define ET_EXEC 2
 #define EM_386 3
 #define EM_X86_64 62
+#define EM_AARCH64 183
 #define PT_LOAD 1
 
 #endif /* OWOS_ELF_H */

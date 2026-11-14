@@ -116,7 +116,7 @@ static bool tick_passed(uint32_t t) { return (int32_t)(timer_ticks() - t) >= 0; 
 /* Claim a free slot as `newstate`; need_rxbuf (IRQ path) only takes slots with a buffer. NULL if none. */
 static struct tcp_conn *tcb_alloc(int newstate, int need_rxbuf)
 {
-  uint32_t f = irq_save();
+  uintptr_t f = irq_save();
   struct tcp_conn *c = NULL;
   for (int i = 0; i < TCP_MAX_CONNS; i++) {
     if (conns[i].state != ST_CLOSED)
@@ -614,7 +614,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport)
         c->state = ST_CLOSED;
         return NULL;
       }
-      __asm__ volatile("sti\n\thlt");
+      cpu_wait_enabled();
     }
   }
   if (c->state == ST_ESTAB)
@@ -651,7 +651,7 @@ int tcp_write(tcp_conn_t *c, const void *data, uint32_t len)
     }
     if (sched_intr_pending())
       return done ? (int)done : TCP_EINTR;
-    __asm__ volatile("sti\n\thlt");
+    cpu_wait_enabled();
   }
   return (int)done;
 }
@@ -711,7 +711,7 @@ int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
       *closed = 1;
       return 0;
     }
-    __asm__ volatile("sti\n\thlt");
+    cpu_wait_enabled();
   }
 }
 
@@ -748,7 +748,7 @@ int tcp_listen(uint16_t port)
     }
   }
 
-  uint32_t f = irq_save();
+  uintptr_t f = irq_save();
   int slot = -1;
   for (int i = 0; i < TCP_MAX_LISTEN; i++) {
     if (listeners[i].active && listeners[i].port == port) { /* in use: sharing would split accepts */
@@ -788,7 +788,7 @@ static void tcp_reap_halfopen(void)
   for (int i = 0; i < TCP_MAX_CONNS; i++) {
     struct tcp_conn *c = &conns[i];
     if (c->state == ST_SYN_RCVD && now - c->opened > TCP_SYN_RCVD_TIMEOUT) {
-      uint32_t f = irq_save();
+      uintptr_t f = irq_save();
       if (c->state == ST_SYN_RCVD)
         c->state = ST_CLOSED;
       irq_restore(f);
@@ -840,7 +840,7 @@ tcp_conn_t *tcp_accept(uint16_t port)
       bool open = c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT;
       if (!open || c->lport != port || c->accepted || !c->passive)
         continue; /* an outgoing connection can share the port number but is never a listener's */
-      uint32_t f = irq_save();
+      uintptr_t f = irq_save();
       if ((c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT) && !c->accepted) {
         c->accepted = true;
         irq_restore(f);
@@ -851,6 +851,6 @@ tcp_conn_t *tcp_accept(uint16_t port)
     tcp_reap_halfopen();
     if (sched_intr_pending())
       return NULL;
-    __asm__ volatile("sti\n\thlt");
+    cpu_wait_enabled();
   }
 }

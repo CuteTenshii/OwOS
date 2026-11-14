@@ -9,6 +9,7 @@
 #include "fs.h"
 #include "gzip.h"
 #include "heap.h"
+#include "irqflags.h"
 #include "kstring.h"
 #include "loader.h"
 #include "log.h"
@@ -458,7 +459,7 @@ static bool nbr_resolve(const uint8_t ip[16], uint8_t out[6])
       if (sched_intr_pending()) /* Ctrl+C: give up resolving */
         return false;
       /* sti before hlt: syscall context has IF=0, a bare hlt would never wake. */
-      __asm__ volatile("sti\n\thlt");
+      cpu_wait_enabled();
     }
   }
   return false;
@@ -1300,7 +1301,7 @@ static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
   for (;;) {
     if (s->dg_head != s->dg_tail) {
-      __asm__ volatile("cli");
+      irq_disable();
       uint32_t idx = s->dg_head;
       uint32_t n = s->dg_len[idx];
       if (n > max)
@@ -1312,14 +1313,14 @@ static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t
       if (out_port)
         *out_port = s->dg_src_port[idx];
       s->dg_head = (idx + 1) % SOCK_DGRING;
-      __asm__ volatile("sti");
+      irq_enable();
       return (int)n;
     }
     if (sched_intr_pending())
       return -4;
     if (tick_passed(deadline))
       return 0;
-    __asm__ volatile("sti\n\thlt");
+    cpu_wait_enabled();
   }
 }
 
@@ -1342,7 +1343,7 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
   for (;;) {
     if (s->rf_head != s->rf_tail) {
-      __asm__ volatile("cli");
+      irq_disable();
       uint32_t idx = s->rf_head;
       uint32_t n = s->rf_len[idx];
       if (n > max)
@@ -1350,7 +1351,7 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
       for (uint32_t i = 0; i < n; i++)
         ((uint8_t *)buf)[i] = s->rf[idx][i];
       s->rf_head = (idx + 1) % RAW_RING;
-      __asm__ volatile("sti");
+      irq_enable();
       return (int)n;
     }
     if (!block)
@@ -1359,7 +1360,7 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
       return -4;
     if (tick_passed(deadline))
       return 0;
-    __asm__ volatile("sti\n\thlt");
+    cpu_wait_enabled();
   }
 }
 

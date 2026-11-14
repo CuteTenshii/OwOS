@@ -1,6 +1,8 @@
 #ifndef OWOS_SYSCALL_NR_H
 #define OWOS_SYSCALL_NR_H
 
+#include "uabi.h"
+
 #define SYS_WRITE 1
 #define SYS_EXIT 2
 #define SYS_READ 3
@@ -111,10 +113,29 @@
 
 struct env_req {
   unsigned cmd;
-  unsigned name, name_len;
-  unsigned value, value_len;
-  unsigned buf, buf_len;
+  sys_word name;
+  unsigned name_len;
+  sys_word value;
+  unsigned value_len;
+  sys_word buf;
+  unsigned buf_len;
   unsigned index;
+};
+
+/* SYS_SPAWN_CAP request (ebx points at it). uid/gid < 0 and cwd 0 inherit the caller's. */
+struct spawn_req {
+  sys_word path;
+  sys_word argv; /* -> argc words, each the address of a string */
+  int argc;
+  sys_word rfd; /* -> int */
+  sys_word wfd; /* -> int */
+  int uid;
+  int gid;
+  sys_word cwd;
+  unsigned flags;
+  int stdio[3];
+  sys_word env;
+  unsigned env_len;
 };
 
 /* SYS_SPAWN_CAP request flags */

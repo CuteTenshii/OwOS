@@ -2,6 +2,8 @@
 #ifndef OWOS_WMSERVER_H
 #define OWOS_WMSERVER_H
 
+#include "uabi.h"
+
 #define WM_TITLE_H 22
 #define WM_BORDER 2
 #define WM_BAR_H 28
@@ -30,7 +32,7 @@ struct winrec {
 #define UWIN_F_MODAL 0x20      /* transient child that blocks its parent family */
 #define UWIN_F_FULLSCREEN 0x40 /* covers the screen, no chrome */
 struct winmap {
-  unsigned vaddr;
+  sys_word vaddr;
   int w, h, stride;
 };
 struct winevent {

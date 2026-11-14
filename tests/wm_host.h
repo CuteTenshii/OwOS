@@ -3,6 +3,8 @@
 #ifndef OWOS_TEST_WM_HOST_H
 #define OWOS_TEST_WM_HOST_H
 
+#include "uabi.h"
+
 #define read wmt_read
 #define write wmt_write
 #define close wmt_close
@@ -29,11 +31,6 @@
 #define WEV_DRAG 8
 #define WEV_MOVE 9
 #define WIN_CURSOR_PROGRESS 14
-#define SHM_SLOT_SIZE 0x00800000u
-#define SHM_LOW_ADDR 0xC0000000u
-#define SHM_LOW_SLOTS 32
-#define SHM_HIGH_ADDR 0xE0000000u
-#define SHM_HIGH_SLOTS 64
 
 struct win_event {
   unsigned type;
@@ -55,8 +52,8 @@ int port_accept_nb(int listen_fd);
 int port_peer(int fd, struct port_peer *out);
 int shm_create(unsigned bytes);
 int shm_grant(int handle, int pid);
-int shm_map(int handle, unsigned addr);
-int shm_unmap(unsigned addr);
+int shm_map(int handle, sys_word addr);
+int shm_unmap(sys_word addr);
 int shm_release(int handle);
 
 int win_create(int w, int h, const char *title);

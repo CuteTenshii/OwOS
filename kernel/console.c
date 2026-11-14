@@ -1,4 +1,4 @@
-/* console.c — the kernel console layer (see console.h for the full picture).
+/* console.c: the kernel console layer (see console.h for the full picture).
  *
  * con_putc() is the one funnel every console write passes through. It fans each
  * byte out to: the serial port, the boot journal (log.c), the framebuffer boot
@@ -9,11 +9,10 @@
  * physical 0xB8000, each cell a character + attribute byte, written directly
  * (no BIOS). In graphics mode it becomes a shadow the compositor renders; the
  * VGA width/memory/CRTC constants here are that backend's hardware, kept
- * internal to this file. */
+ * internal to this file. Other arches have no text-mode display: there the grid
+ * is only the shadow, and the serial port carries what is printed. */
 
 #include "console.h"
-#include "fb.h"
-#include "io.h"
 #include "kstring.h"
 #include "log.h"
 #include "serial.h"
@@ -21,11 +20,41 @@
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
-#define VGA_MEMORY ((volatile uint16_t *)0xB8000)
 
+#if defined(__i386__) || defined(__x86_64__)
+#include "fb.h"
+#include "io.h"
+
+#define VGA_MEMORY ((volatile uint16_t *)0xB8000)
 /* CRTC index/data ports; registers 14/15 hold the hardware cursor location. */
 #define VGA_CRTC_INDEX 0x3D4
 #define VGA_CRTC_DATA 0x3D5
+
+static void vga_store(int idx, uint16_t entry) { VGA_MEMORY[idx] = entry; }
+
+static void vga_cursor(uint16_t pos)
+{
+  outb(VGA_CRTC_INDEX, 0x0F);
+  outb(VGA_CRTC_DATA, (uint8_t)(pos & 0xFF));
+  outb(VGA_CRTC_INDEX, 0x0E);
+  outb(VGA_CRTC_DATA, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+static void boot_fb_putc(char c)
+{
+  if (fb_active())
+    fb_con_putc(c);
+}
+#else
+/* The UART mirrors to the boot framebuffer itself (serial_putc), so there is nothing more to draw here. */
+static void vga_store(int idx, uint16_t entry)
+{
+  (void)idx;
+  (void)entry;
+}
+static void vga_cursor(uint16_t pos) { (void)pos; }
+static void boot_fb_putc(char c) { (void)c; }
+#endif
 
 static uint16_t cursor_row;
 static uint16_t cursor_col;
@@ -47,7 +76,7 @@ static void cell_write(int idx, uint16_t entry)
 {
   shadow[idx] = entry;
   if (!gfx)
-    VGA_MEMORY[idx] = entry;
+    vga_store(idx, entry);
   dirty++;
 }
 
@@ -113,15 +142,7 @@ static uint16_t con_entry(char c) { return (uint16_t)(uint8_t)c | ((uint16_t)col
 
 /* Move the blinking hardware cursor to the current row/col so it tracks the
  * text. Without this the cursor stays frozen where the BIOS left it. */
-static void con_update_cursor(void)
-{
-  uint16_t pos = cursor_row * VGA_WIDTH + cursor_col;
-
-  outb(VGA_CRTC_INDEX, 0x0F);
-  outb(VGA_CRTC_DATA, (uint8_t)(pos & 0xFF));
-  outb(VGA_CRTC_INDEX, 0x0E);
-  outb(VGA_CRTC_DATA, (uint8_t)((pos >> 8) & 0xFF));
-}
+static void con_update_cursor(void) { vga_cursor(cursor_row * VGA_WIDTH + cursor_col); }
 
 void con_set_color(enum con_color fg, enum con_color bg)
 {
@@ -158,7 +179,7 @@ static void con_scroll(void)
 
   if (!gfx)
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
-      VGA_MEMORY[i] = shadow[i];
+      vga_store(i, shadow[i]);
 
   scroll_count++;
   dirty++;
@@ -232,8 +253,8 @@ void con_putc(char c)
    * compositor isn't up yet, so mirror the log onto a framebuffer console. Only
    * before the WM takes the framebuffer (!gfx); after that vga draws the shadow
    * grid the compositor renders. */
-  if (log_verbose() && !gfx && fb_active())
-    fb_con_putc(c);
+  if (log_verbose() && !gfx)
+    boot_fb_putc(c);
 
   if (c == '\n') {
     cursor_col = 0;

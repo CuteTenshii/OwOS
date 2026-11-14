@@ -285,7 +285,7 @@ static struct fmap *map_at(unsigned at)
   return 0;
 }
 
-int wmt_shm_map(int h, unsigned at)
+int wmt_shm_map(int h, sys_word at)
 {
   struct fobj *o = obj_of(h);
   if (!o || at % SHM_SLOT_SIZE)
@@ -312,7 +312,7 @@ int wmt_shm_map(int h, unsigned at)
   return 0;
 }
 
-int wmt_shm_unmap(unsigned at)
+int wmt_shm_unmap(sys_word at)
 {
   struct fmap *m = map_at(at);
   if (!m)

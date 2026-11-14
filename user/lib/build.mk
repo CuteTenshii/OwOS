@@ -10,13 +10,25 @@
 # context switch, and QEMU's qemu32 CPU has no SSE (cvttss2si would #UD).
 # x86_64: the ABI passes floats in SSE registers, and the 64-bit kernel enables SSE
 # and saves the full FXSAVE image per task.
+# aarch64: plain ARMv8-A for every supported core, with char signed as on x86 (the code
+# was written there) and atomics inline rather than libgcc's outline helpers. The libm
+# primitives come from math_soft.c, as there is no x87.
 ULIBDIRS := $(patsubst user/lib/%/,%,$(wildcard user/lib/*/))
-ifeq ($(ARCH),x86_64)
+ifeq ($(ARCH),aarch64)
   UBITS     := 64
+  UCRT      := start_aarch64
+  UARCHOPTS := -march=armv8-a -fsigned-char -mno-outline-atomics
+  MATHPRIM  := math_soft
+else ifeq ($(ARCH),x86_64)
+  UBITS     := 64
+  UCRT      := start_64
   UARCHOPTS :=
+  MATHPRIM  := math_x87
 else
   UBITS     := 32
+  UCRT      := start_32
   UARCHOPTS := -mno-sse -mno-mmx -mfpmath=387
+  MATHPRIM  := math_x87
 endif
 UCFLAGS := $(UARCHFLAGS) -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            $(UARCHOPTS) $(VERSION_DEF) -MMD -MP \
@@ -34,7 +46,7 @@ endif
 # graphics weight. gfx loads its fonts at runtime from /etc/fonts (see kernel
 # install + user/lib/gfx), so no app bakes in a bitmap atlas.
 FONT     = user/lib/font/font.o user/lib/font/fontstore.o   # TrueType/OpenType(glyf) parser + AA glyph rasterizer
-ULIB     = user/lib/start_$(UBITS).o user/lib/lib.o user/lib/opt.o user/lib/mutex.o user/lib/win/win.o
+ULIB     = user/lib/$(UCRT).o user/lib/lib.o user/lib/opt.o user/lib/mutex.o user/lib/win/win.o
 GUILIB   = user/lib/gfx/gfx.o user/lib/gfx/style.o user/lib/gfx/focus.o user/lib/gfx/a11y.o user/lib/gfx/selection.o user/lib/gfx/textfield.o user/lib/gfx/sidebar.o user/lib/gfx/select.o user/lib/gfx/tabbar.o user/lib/gfx/scrollview.o user/lib/gfx/toggle.o $(FONT)
 FILEPICK  = user/lib/gfx/filelist.o user/lib/gfx/filepicker.o $(GUILIB)   # modal file/folder picker (uses gfx widgets)
 DIALOG   = user/lib/dialog/dialog.o $(GUILIB)   # reusable modal message-box + property-sheet dialogs (uses gfx)
@@ -167,9 +179,9 @@ NTP      = user/lib/ntp/ntp.o
 # tz: built-in IANA zone table (POSIX rules), UTC<->local conversion, /etc/timezone. Pure computation.
 TZ       = user/lib/tz/tz.o
 
-# math: freestanding x87 libm + shortest-round-trip number<->string (Dragon4).
+# math: freestanding libm (x87 or portable primitives, see MATHPRIM) + shortest-round-trip number<->string (Dragon4).
 # Pure computation, no syscalls; links with $(LIBGCC) for 64-bit integer divides.
-MATH     = user/lib/math/math.o user/lib/math/fmt.o
+MATH     = user/lib/math/math.o user/lib/math/$(MATHPRIM).o user/lib/math/fmt.o
 # gc: precise mark-sweep collector over the malloc heap (roots + tracer supplied
 # by the client). For language runtimes that need managed memory.
 GC       = user/lib/gc/gc.o
@@ -198,8 +210,13 @@ ZSTD     = user/lib/zstd/zstd_common.o user/lib/zstd/fse.o user/lib/zstd/huf.o u
 ARCHIVE  = user/lib/archive/archive.o user/lib/archive/zip.o $(BROTLI) $(CRC32) $(INFLATE) $(ZSTD)
 SHLIB  = user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
-user/lib/start_$(UBITS).o: user/lib/start_$(UBITS).S $(ARCH_STAMP)
+user/lib/$(UCRT).o: user/lib/$(UCRT).S $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
+
+# The portable libm is checked against the host libm with contraction off (tests/math_soft_test.c), so the target
+# must not fuse multiply-adds either; libc's mem* are loops that must not be rewritten into calls to themselves.
+user/lib/math/math_soft.o: UCFLAGS += -ffp-contract=off
+user/lib/lib.o: UCFLAGS += -fno-tree-loop-distribute-patterns
 
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.
 user/%.o: user/%.c $(ARCH_STAMP)

@@ -1,65 +1,42 @@
 /* crash.c: crash reporter (see crash.h).
- * A user fault never panics: crash_record() captures registers and a backtrace, dumps to COM1 and the
+ * A user fault never panics: crash_record() captures registers and a backtrace, dumps to the serial console and the
  * process is killed. The compositor drains reports via crash_poll (SYS_CRASH_POLL). */
 #include "crash.h"
-#include "creg.h"
-#include "idt.h"
 #include "loader.h"
 #include "paging.h"
 #include "sched.h"
 #include "serial.h"
+#include "task_arch.h"
 #include <stdint.h>
 
 #define MAXCRASH 4
-#define CRASH_TRACE CRASH_TRACE_MAX
 
-struct crash_info {
-  int state; /* 0 free, 1 pending (needs window), 2 shown   */
-  char name[24];
-  uint32_t vector, err, eip, cr2;
-  uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;
-  uint32_t trace[CRASH_TRACE];
-  int ntrace;
-};
+static struct crash_rec reports[MAXCRASH];
+static int report_state[MAXCRASH]; /* 0 free, 1 pending (the compositor has not taken it yet) */
 
-static struct crash_info reports[MAXCRASH];
-
-/* Format `v` as 8-digit hex into out (no "0x"); returns out for chaining. */
-static const char *hex8(uint32_t v, char *out)
+/* `v` in hex, at least 8 digits and all of a wider one (no "0x"); returns out for chaining. */
+static const char *hexw(uint64_t v, char *out)
 {
   static const char d[] = "0123456789abcdef";
-  for (int i = 0; i < 8; i++)
-    out[i] = d[(v >> ((7 - i) * 4)) & 0xF];
-  out[8] = '\0';
+  int n = 8;
+  while (n < 16 && (v >> (n * 4)))
+    n++;
+  for (int i = 0; i < n; i++)
+    out[i] = d[(v >> ((n - 1 - i) * 4)) & 0xF];
+  out[n] = '\0';
   return out;
 }
 
-static const char *vec_name(uint32_t v)
-{
-  return v == 14   ? "page fault"
-         : v == 13 ? "general protection fault"
-         : v == 6  ? "invalid opcode"
-         : v == 0  ? "divide error"
-         : v == 1  ? "debug"
-         : v == 3  ? "breakpoint"
-         : v == 8  ? "double fault"
-         : v == 12 ? "stack fault"
-                   : "exception";
-}
-
 /* Plain-English page-fault cause from the error code and faulting address. */
-static const char *pf_cause(uint32_t vec, uint32_t err, uint32_t cr2, char *buf)
+static const char *pf_cause(uint32_t err, uaddr_t addr, char *buf)
 {
   int i = 0;
   const char *parts[4];
-  buf[0] = '\0';
-  if (vec != 14)
-    return buf;
   parts[0] = (err & 4) ? "user-mode " : "kernel ";
   parts[1] = (err & 16) ? "instruction fetch from " : (err & 2) ? "write to " : "read of ";
   parts[2] = (err & 1) ? "a protected page" : "unmapped memory";
-  parts[3] = cr2 < 0x1000 ? " (NULL dereference)"
-             : (cr2 >= USER_BASE && cr2 < USER_REGION_END)
+  parts[3] = addr < 0x1000 ? " (NULL dereference)"
+             : (addr >= USER_BASE && addr < USER_REGION_END)
                  ? " (bad heap/stack pointer - likely corruption or use-after-free)"
                  : "";
   for (int p = 0; p < 4; p++)
@@ -74,11 +51,11 @@ extern const char _binary_appsyms_start[], _binary_appsyms_end[];
 
 /* Resolve `addr` to "func+0xNN" within `app`'s symbol section (largest symbol
  * address <= addr). Returns 1 and fills out on success, 0 if unknown. */
-static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
+static bool crash_symbolize(const char *app, uaddr_t addr, char *out, int cap)
 {
   const char *p = _binary_appsyms_start, *end = _binary_appsyms_end;
   int in = 0;
-  uint32_t best = 0;
+  uaddr_t best = 0;
   const char *bn = 0;
   int bl = 0;
   out[0] = '\0';
@@ -97,7 +74,7 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
         break;
       in = match;
     } else if (in) { /* "<hexaddr> name" */
-      uint32_t a = 0;
+      uaddr_t a = 0;
       while (p < end && *p != ' ' && *p != '\n') {
         int c = *p, d = (c >= '0' && c <= '9')   ? c - '0'
                         : (c >= 'a' && c <= 'f') ? c - 'a' + 10
@@ -105,7 +82,7 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
                                                  : -1;
         if (d < 0)
           break;
-        a = a * 16 + (uint32_t)d;
+        a = a * 16 + (uaddr_t)d;
         p++;
       }
       if (p < end && *p == ' ') {
@@ -127,17 +104,17 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
   if (!bn)
     return false;
   int o = 0;
-  for (int i = 0; i < bl && o < cap - 12; i++)
+  for (int i = 0; i < bl && o < cap - 20; i++)
     out[o++] = bn[i];
-  uint32_t off = addr - best;
+  uint64_t off = addr - best;
   out[o++] = '+';
   out[o++] = '0';
   out[o++] = 'x';
   {
     static const char hd[] = "0123456789abcdef";
     bool st = false;
-    for (int sh = 28; sh >= 0; sh -= 4) {
-      int nb = (off >> sh) & 0xF;
+    for (int sh = 60; sh >= 0; sh -= 4) {
+      int nb = (int)((off >> sh) & 0xF);
       if (nb || st || sh == 0) {
         out[o++] = hd[nb];
         st = true;
@@ -148,10 +125,12 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
   return true;
 }
 
-/* Emit the full report to COM1 as text (serial_* is heapless and lockless, safe from the faulting task). */
-static void crash_dump_serial(const struct crash_info *c)
+/* Emit the full report to the serial console as text (serial_* is heapless and lockless, safe from the faulting
+ * task). */
+static void crash_dump_serial(const struct crash_rec *c)
 {
-  char hx[12], cb[128];
+  static const char *const reg_names[CRASH_REGS] = CRASH_REG_NAMES;
+  char hx[20], cb[128];
   serial_write("\n=== CRASH: ");
   serial_write(c->name[0] ? c->name : "?");
   const char *thread = sched_current_thread_name(); /* dumped from the faulting task, so this is its thread */
@@ -161,41 +140,30 @@ static void crash_dump_serial(const struct crash_info *c)
     serial_write("]");
   }
   serial_write(" - ");
-  serial_write(vec_name(c->vector));
+  serial_write(c->page_fault ? "page fault" : arch_trap_name(c->vector));
   serial_write(" ===\n");
-  if (c->vector == 14) {
+  if (c->page_fault) {
     serial_write("cause: ");
-    serial_write(pf_cause(c->vector, c->err, c->cr2, cb));
+    serial_write(pf_cause(c->err, c->addr, cb));
     serial_write("\n");
   }
-  serial_write("eip=");
-  serial_write(hex8(c->eip, hx));
-  if (c->vector == 14) {
-    serial_write(" cr2=");
-    serial_write(hex8(c->cr2, hx));
+  serial_write("pc=");
+  serial_write(hexw(c->pc, hx));
+  if (c->page_fault) {
+    serial_write(" addr=");
+    serial_write(hexw(c->addr, hx));
   }
   serial_write(" err=");
-  serial_write(hex8(c->err, hx));
-  serial_write("\n");
-  serial_write("eax=");
-  serial_write(hex8(c->eax, hx));
-  serial_write(" ebx=");
-  serial_write(hex8(c->ebx, hx));
-  serial_write(" ecx=");
-  serial_write(hex8(c->ecx, hx));
-  serial_write(" edx=");
-  serial_write(hex8(c->edx, hx));
-  serial_write("\n");
-  serial_write("esi=");
-  serial_write(hex8(c->esi, hx));
-  serial_write(" edi=");
-  serial_write(hex8(c->edi, hx));
-  serial_write(" ebp=");
-  serial_write(hex8(c->ebp, hx));
-  serial_write(" esp=");
-  serial_write(hex8(c->esp, hx));
-  serial_write("\n");
-  serial_write("trace (addr2line -e user/apps/");
+  serial_write(hexw(c->err, hx));
+  serial_write(" sp=");
+  serial_write(hexw(c->sp, hx));
+  for (int i = 0; i < CRASH_REGS; i++) {
+    serial_write(i % 4 ? " " : "\n");
+    serial_write(reg_names[i]);
+    serial_write("=");
+    serial_write(hexw(c->regs[i], hx));
+  }
+  serial_write("\ntrace (addr2line -e user/apps/");
   serial_write(c->name[0] ? c->name : "app");
   serial_write("/");
   serial_write(c->name[0] ? c->name : "app");
@@ -203,7 +171,7 @@ static void crash_dump_serial(const struct crash_info *c)
   for (int i = 0; i < c->ntrace; i++) {
     char sym[96];
     serial_write("  ");
-    serial_write(hex8(c->trace[i], hx));
+    serial_write(hexw(c->trace[i], hx));
     if (crash_symbolize(c->name, c->trace[i], sym, sizeof sym)) {
       serial_write("  ");
       serial_write(sym);
@@ -212,89 +180,56 @@ static void crash_dump_serial(const struct crash_info *c)
   }
 }
 
-int crash_symbolize_self(uint32_t addr, char *out, int cap)
+int crash_symbolize_self(uaddr_t addr, char *out, int cap)
 {
-  return cap >= 16 && crash_symbolize(sched_current_name(), addr, out, cap);
+  return cap >= 24 && crash_symbolize(sched_current_name(), addr, out, cap);
 }
 
 void crash_record(const char *name, struct registers *r)
 {
   int slot = -1;
   for (int i = 0; i < MAXCRASH; i++)
-    if (!reports[i].state) {
+    if (!report_state[i]) {
       slot = i;
       break;
     }
   if (slot < 0)
     return;
-  struct crash_info *c = &reports[slot];
+  struct crash_rec *c = &reports[slot];
+  *c = (struct crash_rec){0};
 
   int i = 0;
   for (; name && name[i] && i < (int)sizeof c->name - 1; i++)
     c->name[i] = name[i];
   c->name[i] = '\0';
 
-  c->vector = r->int_no;
-  c->err = r->err_code;
-  c->eip = r->eip;
-  c->cr2 = 0;
-  if (r->int_no == 14)
-    c->cr2 = (uint32_t)read_cr2();
-  c->eax = r->eax;
-  c->ebx = r->ebx;
-  c->ecx = r->ecx;
-  c->edx = r->edx;
-  c->esi = r->esi;
-  c->edi = r->edi;
-  c->ebp = r->ebp;
-  c->esp = (uint32_t)r->useresp; /* r->esp is pusha's kernel-stack value, not the faulting user's */
-
-  /* Backtrace via saved return addresses; every read is probed so a corrupt frame pointer can't fault. */
+  /* Backtrace via the frame records ([saved fp][return address], a user word each); every read is probed so a
+   * corrupt frame pointer can't fault. */
+  uaddr_t fp = arch_crash_capture(c, r);
   c->ntrace = 0;
-  c->trace[c->ntrace++] = r->eip;
-  /* A frame is [saved bp][return address], each one user word (the kernel's word size). */
-  const uintptr_t word = sizeof(uintptr_t);
-  uintptr_t bp = r->ebp;
-  while (c->ntrace < CRASH_TRACE && bp >= USER_BASE && bp <= USER_REGION_END - 2 * word &&
-         paging_user_mapped((uint32_t)bp) && paging_user_mapped((uint32_t)(bp + word))) {
-    uintptr_t ret = *(volatile uintptr_t *)(bp + word);
-    c->trace[c->ntrace++] = (uint32_t)ret;
-    uintptr_t nbp = *(volatile uintptr_t *)bp;
-    if (nbp <= bp)
-      break; /* frames must grow walking up           */
-    bp = nbp;
+  c->trace[c->ntrace++] = c->pc;
+  const uaddr_t word = sizeof(uintptr_t);
+  while (c->ntrace < CRASH_TRACE_MAX && fp >= USER_BASE && fp <= USER_REGION_END - 2 * word && paging_user_mapped(fp) &&
+         paging_user_mapped(fp + word)) {
+    c->trace[c->ntrace++] = *(volatile uintptr_t *)(uintptr_t)(fp + word);
+    uaddr_t next = *(volatile uintptr_t *)(uintptr_t)fp;
+    if (next <= fp)
+      break; /* frames must grow walking up */
+    fp = next;
   }
-  c->state = 1;
+  report_state[slot] = 1;
   crash_dump_serial(c);
 }
 
-/* SYS_CRASH_POLL: hand pending reports to the compositor, consuming each (state 1 to free). */
+/* SYS_CRASH_POLL: hand pending reports to the compositor, consuming each. */
 int crash_poll(struct crash_rec *out, int max)
 {
   int n = 0;
   for (int i = 0; i < MAXCRASH && n < max; i++) {
-    if (reports[i].state != 1)
+    if (report_state[i] != 1)
       continue;
-    const struct crash_info *c = &reports[i];
-    struct crash_rec *o = &out[n++];
-    for (int k = 0; k < (int)sizeof o->name; k++)
-      o->name[k] = c->name[k];
-    o->vector = c->vector;
-    o->err = c->err;
-    o->eip = c->eip;
-    o->cr2 = c->cr2;
-    o->eax = c->eax;
-    o->ebx = c->ebx;
-    o->ecx = c->ecx;
-    o->edx = c->edx;
-    o->esi = c->esi;
-    o->edi = c->edi;
-    o->ebp = c->ebp;
-    o->esp = c->esp;
-    o->ntrace = c->ntrace;
-    for (int k = 0; k < CRASH_TRACE_MAX; k++)
-      o->trace[k] = c->trace[k];
-    reports[i].state = 0;
+    out[n++] = reports[i];
+    report_state[i] = 0;
   }
   return n;
 }

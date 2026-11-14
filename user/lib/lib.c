@@ -5,16 +5,25 @@
 #include "owos.h"
 #include "syscall_nr.h"
 
-/* The kernel reads ebx/ecx/edx as 32-bit words on both arches: every user address lies below 4 GiB, so UW passes a
- * pointer as its low word and UPTR widens a returned address without sign-extending one above 2 GiB. */
-#define UW(p) ((unsigned)(unsigned long)(p))
-#define UPTR(v) ((void *)(unsigned long)(unsigned)(v))
+/* Syscall arguments and request fields are sys_word (common/uabi.h): a pointer travels as UW, and UPTR widens a
+ * returned address without sign-extending one above 2 GiB on x86. */
+#define UW(p) ((sys_word)(unsigned long)(p))
+#define UPTR(v) ((void *)(unsigned long)(sys_word)(v))
 
-static inline int syscall(int num, unsigned a, unsigned b, unsigned c)
+static inline long syscall(int num, sys_word a, sys_word b, sys_word c)
 {
-  int ret;
+#ifdef __aarch64__
+  register long x8 __asm__("x8") = num;
+  register sys_word x0 __asm__("x0") = a;
+  register sys_word x1 __asm__("x1") = b;
+  register sys_word x2 __asm__("x2") = c;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+  return (long)x0;
+#else
+  int ret; /* a 32-bit result: the x86_64 kernel zero-extends it into rax */
   __asm__ volatile("int $0x80" : "=a"(ret) : "a"(num), "b"(a), "c"(b), "d"(c) : "memory");
   return ret;
+#endif
 }
 
 int write(int fd, const void *buf, int len) { return syscall(SYS_WRITE, fd, UW(buf), len); }
@@ -69,7 +78,7 @@ int writefile(const char *name, const void *buf, int len) { return syscall(SYS_W
 
 int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
 {
-  unsigned a[4] = {UW(name), off, UW(buf), len};
+  sys_word a[4] = {UW(name), off, UW(buf), len};
   return syscall(SYS_READFILE_AT, UW(a), 0, 0);
 }
 
@@ -84,19 +93,19 @@ int net_connect(const char *host, int port, int tls) { return syscall(SYS_NET_CO
 /* All net send/recv variants use two syscalls with a 6-word request {fd, buf, len, flags, ip|0 */
 int net_send(int h, const void *buf, int len)
 {
-  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)len, 0, 0, 0};
+  sys_word a[6] = {(unsigned)h, UW(buf), (unsigned)len, 0, 0, 0};
   return syscall(SYS_NET_SEND, UW(a), 0, 0);
 }
 
 int net_recv(int h, void *buf, int max)
 {
-  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)max, 0, 0, 0};
+  sys_word a[6] = {(unsigned)h, UW(buf), (unsigned)max, 0, 0, 0};
   return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
 int net_recv_nb(int h, void *buf, int max)
 {
-  unsigned a[6] = {(unsigned)h, UW(buf), (unsigned)max, MSG_DONTWAIT, 0, 0};
+  sys_word a[6] = {(unsigned)h, UW(buf), (unsigned)max, MSG_DONTWAIT, 0, 0};
   return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
@@ -137,13 +146,13 @@ int net_bind(int port) { return syscall(SYS_NET_BIND, port, 0, 0); }
 
 int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[16], int *src_port)
 {
-  unsigned a[6] = {(unsigned)fd, UW(buf), (unsigned)max, 0, UW(src_ip), UW(src_port)};
+  sys_word a[6] = {(unsigned)fd, UW(buf), (unsigned)max, 0, UW(src_ip), UW(src_port)};
   return syscall(SYS_NET_RECV, UW(a), 0, 0);
 }
 
 int net_sendto(int fd, const unsigned char ip[16], int port, const void *buf, int len)
 {
-  unsigned a[6] = {(unsigned)fd, UW(buf), (unsigned)len, 0, UW(ip), (unsigned)port};
+  sys_word a[6] = {(unsigned)fd, UW(buf), (unsigned)len, 0, UW(ip), (unsigned)port};
   return syscall(SYS_NET_SEND, UW(a), 0, 0);
 }
 
@@ -152,7 +161,7 @@ int fb_info(struct fbinfo *out) { return syscall(SYS_FB_INFO, UW(out), 0, 0); }
 
 unsigned *fb_map(void)
 {
-  int v = syscall(SYS_FB_MAP, 0, 0, 0);
+  long v = syscall(SYS_FB_MAP, 0, 0, 0);
   return v == -1 ? (unsigned *)0 : UPTR(v);
 }
 
@@ -169,7 +178,7 @@ int input_set_bounds(int w, int h) { return syscall(SYS_INPUT_SET_BOUNDS, w, h, 
 
 int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, UW(out), max, 0); }
 
-int symbolize(unsigned addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, (int)addr, UW(out), cap); }
+int symbolize(sys_word addr, char *out, int cap) { return syscall(SYS_SYMBOLIZE, addr, UW(out), cap); }
 
 int thread_setname(const char *name) { return syscall(SYS_THREAD_NAME, THREAD_NAME_SET, UW(name), 0); }
 
@@ -204,27 +213,11 @@ int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATF
 
 int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, UW(path), UW(arg), 0); }
 
-/* SYS_SPAWN_CAP request; see syscall_exec_spawn_cap in the kernel. Addresses are 32-bit words (see UW). */
-struct spawn_req {
-  unsigned path;
-  unsigned argv; /* -> argc words, each a string address */
-  int argc;
-  unsigned rfd;
-  unsigned wfd;
-  int uid;
-  int gid;
-  unsigned cwd;
-  unsigned flags;
-  int stdio[3];
-  unsigned env;
-  unsigned env_len;
-};
-
 #define SPAWN_MAXARGS 16 /* the kernel keeps no more */
 
 int spawn_ex(const struct spawn_opts *o)
 {
-  unsigned argv[SPAWN_MAXARGS];
+  sys_word argv[SPAWN_MAXARGS];
   int argc = o->argc < SPAWN_MAXARGS ? o->argc : SPAWN_MAXARGS;
   for (int i = 0; i < argc; i++)
     argv[i] = UW(o->argv[i]);
@@ -397,15 +390,41 @@ int audio_close(void) { return syscall(SYS_AUDIO_CLOSE, 0, 0, 0); }
 
 void msleep(unsigned ms) { syscall(SYS_SLEEP, (int)ms, 0, 0); }
 
-/* __thread storage. user.ld lays out the .tdata image and .tbss; each thread gets a block holding both,
- * then a thread pointer that stores its own address (%gs:0 on i386, %fs:0 on x86_64, as both ABIs want).
- * The kernel bases that segment at the pointer, so a variable lives at a fixed negative offset from it. */
-extern char __tdata_start[], __tdata_end[], __tls_main[], __tls_memsz[], __tls_align[];
+/* __thread storage. user.ld lays out the .tdata image and .tbss, and each thread gets a block holding both.
+ * i386 and x86_64 use TLS variant II: the thread pointer follows the block and stores its own address (%gs:0 and
+ * %fs:0), so a variable lives at a fixed negative offset from it. AArch64 uses variant I: TPIDR_EL0 addresses a
+ * 16-byte control block, and the variables follow it at the first offset aligned for them. */
+extern char __tdata_start[], __tdata_end[], __tls_main[];
+extern const unsigned long long __tls_layout[2]; /* user.ld: the variables' total size, then their alignment */
 
+static unsigned tls_memsz(void) { return (unsigned)__tls_layout[0]; }
+static unsigned tls_align(void) { return (unsigned)__tls_layout[1]; }
+
+#ifdef __aarch64__
+static unsigned tls_offset(void)
+{
+  unsigned align = tls_align();
+  return (16 + align - 1) & ~(align - 1);
+}
+
+/* Bytes a block needs: the control block, padding, then the variables. */
+static unsigned tls_block_size(void) { return tls_offset() + tls_memsz(); }
+
+/* Fill the block at `block` (aligned for the variables, tls_block_size() bytes) and return its thread pointer. */
+static void *tls_fill(char *block)
+{
+  unsigned image = (unsigned)(__tdata_end - __tdata_start);
+  char *data = block + tls_offset();
+  memset(block, 0, tls_offset());
+  memcpy(data, __tdata_start, image);
+  memset(data + image, 0, tls_memsz() - image);
+  return block;
+}
+#else
 static unsigned tls_data_size(void)
 {
-  unsigned align = UW(__tls_align);
-  return (UW(__tls_memsz) + align - 1) & ~(align - 1);
+  unsigned align = tls_align();
+  return (tls_memsz() + align - 1) & ~(align - 1);
 }
 
 /* Fill the block at `block` (16-aligned, tls_data_size() + 16 bytes) and return its thread pointer. */
@@ -418,35 +437,42 @@ static void *tls_fill(char *block)
   *tp = tp;
   return tp;
 }
+#endif
 
 /* Called by _start for the first thread, before main. */
 void tls_init(void)
 {
-  if (UW(__tls_memsz))
+  if (tls_memsz())
     syscall(SYS_SET_TLS, UW(tls_fill(__tls_main)), 0, 0);
 }
 
-#ifdef __x86_64__
-void thread_start64(void); /* start_64.S: pops fn and arg, calls fn(arg), then exits the thread */
+#if defined(__x86_64__) || defined(__aarch64__)
+void thread_entry(void); /* start_*.S: pops fn and arg, calls fn(arg), then exits the thread */
 #endif
 
 /* The new thread's TLS block is carved from the top of its stack. With an argument, the i386 entry then sees an
- * ordinary cdecl frame (a null return address, then `arg`); x86_64 passes it in %rdi through thread_start64. */
+ * ordinary cdecl frame (a null return address, then `arg`); the 64-bit arches pass it in a register through
+ * thread_entry. */
 static int thread_spawn(void *fn, void *stack_top, int has_arg, void *arg)
 {
   void *tp = 0;
   stack_top = (void *)((unsigned long)stack_top & ~15ul);
-  if (UW(__tls_memsz)) {
+  if (tls_memsz()) {
+#ifdef __aarch64__
+    unsigned long align = tls_align() > 16 ? tls_align() : 16;
+    char *block = (char *)(((unsigned long)stack_top - tls_block_size()) & ~(align - 1));
+#else
     char *block = (char *)(((unsigned long)stack_top - tls_data_size() - 16) & ~15ul);
+#endif
     tp = tls_fill(block);
     stack_top = block;
   }
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__aarch64__)
   void **sp = (void **)stack_top - 2;
   sp[0] = fn;
   sp[1] = has_arg ? arg : 0;
   stack_top = sp;
-  fn = (void *)thread_start64;
+  fn = (void *)thread_entry;
 #else
   if (has_arg) {
     void **sp = (void **)((char *)stack_top - 20); /* esp + 4 is 16-aligned at entry */
@@ -623,9 +649,9 @@ int shm_create(unsigned bytes) { return syscall(SYS_SHM, SHM_CREATE, (int)bytes,
 
 int shm_grant(int handle, int pid) { return syscall(SYS_SHM, SHM_GRANT, handle, pid); }
 
-int shm_map(int handle, unsigned addr) { return syscall(SYS_SHM, SHM_MAP, handle, (int)addr); }
+int shm_map(int handle, sys_word addr) { return syscall(SYS_SHM, SHM_MAP, handle, addr); }
 
-int shm_unmap(unsigned addr) { return syscall(SYS_SHM, SHM_UNMAP, (int)addr, 0); }
+int shm_unmap(sys_word addr) { return syscall(SYS_SHM, SHM_UNMAP, addr, 0); }
 
 int shm_release(int handle) { return syscall(SYS_SHM, SHM_RELEASE, handle, 0); }
 
@@ -636,12 +662,12 @@ int shm_size(int handle) { return syscall(SYS_SHM, SHM_SIZE, handle, 0); }
 
 void *sbrk(int inc)
 {
-  int r = syscall(SYS_SBRK, (unsigned)inc, 0, 0);
+  long r = syscall(SYS_SBRK, (sys_word)inc, 0, 0);
   return r == -1 ? (void *)-1 : UPTR(r);
 }
 
-#ifdef __x86_64__
-typedef long double Align; /* 16-byte blocks: the SysV ABI promises malloc'd memory suits SSE stores */
+#if defined(__x86_64__) || defined(__aarch64__)
+typedef long double Align; /* 16-byte blocks: both 64-bit ABIs promise malloc'd memory suits vector stores */
 #else
 typedef long long Align; /* 8-byte block + payload alignment */
 #endif
@@ -794,6 +820,7 @@ void *realloc(void *ptr, unsigned size)
 }
 
 /* mem*: shared by every program and by libs like minimp3 and the HTTP/2 HPACK tables */
+#if defined(__i386__) || defined(__x86_64__)
 /* The dummies are pointer-sized: rep uses all of rcx/rdi/rsi on x86_64, and the ecx write zero-extends rcx. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
 {
@@ -824,6 +851,36 @@ void *memset(void *d, int c, __SIZE_TYPE__ n)
                    : "memory");
   return d;
 }
+#else
+typedef unsigned long __attribute__((may_alias)) mem_word;
+
+/* Word at a time once both ends are aligned; lib.o is built without loop-to-memcpy rewriting, so these stay loops. */
+void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
+{
+  unsigned char *dp = d;
+  const unsigned char *sp = s;
+  if ((((unsigned long)dp | (unsigned long)sp) & (sizeof(mem_word) - 1)) == 0)
+    for (; n >= sizeof(mem_word); n -= sizeof(mem_word), dp += sizeof(mem_word), sp += sizeof(mem_word))
+      *(mem_word *)dp = *(const mem_word *)sp;
+  while (n--)
+    *dp++ = *sp++;
+  return d;
+}
+
+void *memset(void *d, int c, __SIZE_TYPE__ n)
+{
+  unsigned char *dp = d, b = (unsigned char)c;
+  for (; n && ((unsigned long)dp & (sizeof(mem_word) - 1)); n--)
+    *dp++ = b;
+  mem_word pattern = (mem_word)b * (~(mem_word)0 / 0xFF);
+  for (; n >= sizeof(mem_word); n -= sizeof(mem_word), dp += sizeof(mem_word))
+    *(mem_word *)dp = pattern;
+  while (n--)
+    *dp++ = b;
+  return d;
+}
+#endif
+
 void *memmove(void *d, const void *s, __SIZE_TYPE__ n)
 {
   unsigned char *a = d;
@@ -995,8 +1052,8 @@ void print_uint(unsigned v)
 /* printf family */
 
 /* A minimal freestanding printf, shared by snprintf and printf */
-static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned v, unsigned base, int upper, int width, int zero,
-                      int neg)
+static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned long v, unsigned base, int upper, int width,
+                      int zero, int neg)
 {
   const char *digs = upper ? "0123456789ABCDEF" : "0123456789abcdef";
   char tmp[32];
@@ -1082,7 +1139,8 @@ static void vfmt(void (*sink)(char, void *), void *ctx, const char *fmt, va_list
     case 'p':
       sink('0', ctx);
       sink('x', ctx);
-      emit_uint(sink, ctx, (unsigned)(__SIZE_TYPE__)va_arg(ap, void *), 16, 0, 8, 1, 0);
+      emit_uint(sink, ctx, (unsigned long)va_arg(ap, void *), 16, 0, 8, 1,
+                0); /* at least 8 digits, all of a 64-bit one */
       break;
     case '%':
       sink('%', ctx);
@@ -1189,6 +1247,7 @@ int readline(char *buf, int max)
 }
 
 /* randomness */
+#if defined(__i386__) || defined(__x86_64__)
 static int rng_have_rdrand(void)
 {
   static int cached = -1;
@@ -1215,6 +1274,21 @@ static unsigned long long rng_tsc(void)
   __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
   return ((unsigned long long)hi << 32) | lo;
 }
+#else
+/* No RDRAND: rng_bytes takes the kernel entropy pool, with the virtual counter standing in for the TSC. */
+static int rng_have_rdrand(void) { return 0; }
+static int rng_rdrand32(unsigned *out)
+{
+  (void)out;
+  return 0;
+}
+static unsigned long long rng_tsc(void)
+{
+  unsigned long long v;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+}
+#endif
 
 /* getrandom: CSPRNG bytes from the kernel entropy pool */
 int getrandom(void *buf, int len) { return syscall(SYS_GETRANDOM, UW(buf), len, 0); }

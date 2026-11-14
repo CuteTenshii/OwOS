@@ -2,11 +2,11 @@
 #include "file.h"
 #include "fs.h"
 #include "heap.h"
-#include "idt.h"
 #include "loader.h"
 #include "paging.h"
 #include "perm.h"
 #include "pipe.h"
+#include "regs.h"
 #include "sched.h"
 #include "syscall_nr.h"
 #include "syscall_path.h"
@@ -18,81 +18,82 @@ void syscall_exec_replace(struct registers *r)
 {
   char name[24], arg[128], abs[SYS_PATH_MAX];
   int have_arg = 0;
-  if (!user_range(r->ebx, 24) || copyin_str(r->ebx, name, sizeof name) != 0 ||
-      (r->ecx && (copyin_str(r->ecx, arg, sizeof arg) != 0))) {
-    r->eax = (uint32_t)-1;
+  if (!user_range(SC_ARG0(r), 24) || copyin_str(SC_ARG0(r), name, sizeof name) != 0 ||
+      (SC_ARG1(r) && (copyin_str(SC_ARG1(r), arg, sizeof arg) != 0))) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  have_arg = r->ecx != 0;
+  have_arg = SC_ARG1(r) != 0;
   if (resolve_path(name, abs, sizeof abs) != 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int acc = fs_access(abs, FS_X);
   if (acc != 0) {
-    r->eax = (uint32_t)acc;
+    SC_RET(r) = (uint32_t)acc;
     return;
   }
   int size = fs_size(abs);
   if (size <= 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   void *image = kmalloc((uint32_t)size);
   if (!image) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int n = fs_read(abs, image, (uint32_t)size);
-  uint32_t *dir, entry, brk;
+  pgdir_t *dir;
+  uaddr_t entry, brk;
   if (n < 0 || load_elf(image, (uint32_t)n, &dir, &entry, &brk) != 0) {
     kfree(image);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   kfree(image);
   char *argv[2] = {name, arg};
-  uint32_t user_esp = setup_args(dir, have_arg ? 2 : 1, argv);
+  uaddr_t user_esp = setup_args(dir, have_arg ? 2 : 1, argv);
   if (sched_replace(dir, entry, user_esp, brk, r) < 0) {
     paging_free_process_dir(dir);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
   }
 }
 
 void syscall_exec_spawn(struct registers *r)
 {
   char raw[SYS_PATH_MAX], path[SYS_PATH_MAX], arg[SYS_PATH_MAX];
-  if (copyin_str(r->ebx, raw, sizeof raw) != 0 || path_join("/", raw, path, sizeof path) != 0) {
-    r->eax = (uint32_t)-1;
+  if (copyin_str(SC_ARG0(r), raw, sizeof raw) != 0 || path_join("/", raw, path, sizeof path) != 0) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int acc = fs_access(path, FS_X);
   if (acc != 0) {
-    r->eax = (uint32_t)acc;
+    SC_RET(r) = (uint32_t)acc;
     return;
   }
   int size = fs_size(path);
   if (size < 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   uint8_t *image = kmalloc((uint32_t)size);
   if (!image) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int n = fs_read(path, image, (uint32_t)size);
   if (n < 0) {
     kfree(image);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   char *argv[2] = {path, arg};
   int argc = 1;
-  if (r->ecx) {
-    if (copyin_str(r->ecx, arg, sizeof arg) != 0) {
+  if (SC_ARG1(r)) {
+    if (copyin_str(SC_ARG1(r), arg, sizeof arg) != 0) {
       kfree(image);
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     argc = 2;
@@ -103,7 +104,7 @@ void syscall_exec_spawn(struct registers *r)
     sched_set_cwd(pid, sched_cwd());
     sched_release(pid);
   }
-  r->eax = (uint32_t)pid;
+  SC_RET(r) = (uint32_t)pid;
 }
 void syscall_exec_spawn_cap(struct registers *r)
 {
@@ -118,46 +119,32 @@ void syscall_exec_spawn_cap(struct registers *r)
    * optional: uid<0/gid<0/cwd==0 mean "inherit". PRIVILEGE RULE: only a caller running as root may hand a child a
    * uid/gid different from its own. This is the primitive that lets /bin/sshd drop from root to the authenticated user
    * for a login session. */
-  struct cap_req {
-    uint32_t path;
-    uint32_t argv;
-    int argc;
-    uint32_t rfd;
-    uint32_t wfd;
-    int uid;
-    int gid;
-    uint32_t cwd;
-    uint32_t flags;
-    int stdio[3];
-    uint32_t env;
-    uint32_t env_len;
-  };
-  if (!user_range(r->ebx, sizeof(struct cap_req))) {
-    r->eax = (uint32_t)-1;
+  if (!user_range(SC_ARG0(r), sizeof(struct spawn_req))) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  struct cap_req req;
-  if (copyin(&req, r->ebx, sizeof req) != 0) {
-    r->eax = (uint32_t)-1;
+  struct spawn_req req;
+  if (copyin(&req, SC_ARG0(r), sizeof req) != 0) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   bool pty = req.flags & SPAWN_PTY, dup_stdio = req.flags & SPAWN_STDIO, set_env = req.flags & SPAWN_ENV;
   bool want_rfd = !dup_stdio; /* the capture pipe, or the pty master */
   if (!user_range(req.path, 1) || (want_rfd && !user_out_range(req.rfd, 4)) || (pty && dup_stdio)) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int want_stdin = !pty && !dup_stdio && req.wfd != 0;
   if (want_stdin && !user_out_range(req.wfd, 4)) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   if (set_env && !user_range(req.env, req.env_len)) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   if (req.cwd && !user_range(req.cwd, 1)) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
 
@@ -168,20 +155,20 @@ void syscall_exec_spawn_cap(struct registers *r)
   bool to_root = (!set_uid || req.uid == 0) && (!set_gid || req.gid == 0);
   if (caller_uid != 0 && !(to_root && users_sudo_valid(caller_uid)) &&
       ((set_uid && (uint32_t)req.uid != caller_uid) || (set_gid && (uint32_t)req.gid != sched_gid()))) {
-    r->eax = (uint32_t)-1; /* non-root may not change creds, except to root under a sudo grant */
+    SC_RET(r) = (uint32_t)-1; /* non-root may not change creds, except to root under a sudo grant */
     return;
   }
   char cwdbuf[SYS_PATH_MAX];
   if (req.cwd) {
     if (copyin_str(req.cwd, cwdbuf, sizeof cwdbuf) != 0) {
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
   }
 
   char raw[SYS_PATH_MAX], path[SYS_PATH_MAX];
   if (copyin_str(req.path, raw, sizeof raw) != 0 || path_join("/", raw, path, sizeof path) != 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
 
@@ -200,12 +187,12 @@ void syscall_exec_spawn_cap(struct registers *r)
   for (int ai = 1; ai < argc; ai++) {
     argv[ai] = argbuf[ai];
     argbuf[ai][0] = '\0';
-    uint32_t pp = req.argv + (uint32_t)ai * 4;
-    if (!user_range(pp, 4)) {
+    uaddr_t pp = req.argv + (uaddr_t)ai * sizeof(sys_word);
+    if (!user_range(pp, sizeof(sys_word))) {
       argc = ai;
       break;
     }
-    uint32_t sp;
+    sys_word sp;
     if (copyin(&sp, pp, sizeof sp) != 0 || copyin_str(sp, argbuf[ai], MAXARG) != 0) {
       argc = ai;
       break;
@@ -214,12 +201,12 @@ void syscall_exec_spawn_cap(struct registers *r)
 
   int acc = fs_access(path, FS_X);
   if (acc != 0) {
-    r->eax = (uint32_t)acc;
+    SC_RET(r) = (uint32_t)acc;
     return;
   }
   int fsz = fs_size(path);
   if (fsz < 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   /* Reserve the caller's fd slot and the pipes before loading the image, so a failure here doesn't leak a
@@ -234,7 +221,7 @@ void syscall_exec_spawn_cap(struct registers *r)
         break;
       }
     if (rfd < 0) {
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     id = pipe_alloc();
@@ -244,14 +231,14 @@ void syscall_exec_spawn_cap(struct registers *r)
         pipe_close(id, 0);
         pipe_close(id, 1);
       }
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
   } else {
     for (int i = 0; i < 3; i++) {
       int n = req.stdio[i];
       if (n >= 0 && (n >= MAX_FD || fds[n].type == FD_NONE || fds[n].type == FD_PORT)) {
-        r->eax = (uint32_t)-1;
+        SC_RET(r) = (uint32_t)-1;
         return;
       }
       if (n >= 0)
@@ -271,7 +258,7 @@ void syscall_exec_spawn_cap(struct registers *r)
       pipe_close(id2, 0);
       pipe_close(id2, 1);
     }
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   if (pty) {
@@ -308,7 +295,7 @@ void syscall_exec_spawn_cap(struct registers *r)
   }
   if (want_rfd && copyout(req.rfd, &rfd, sizeof rfd) != 0) {
     sched_release(pid);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   /* Optional stdin pipe: our write end -> child fd 0 (its read end). If we can't allocate it, the child still
@@ -336,7 +323,7 @@ void syscall_exec_spawn_cap(struct registers *r)
     }
   }
   sched_release(pid);
-  r->eax = (uint32_t)pid;
+  SC_RET(r) = (uint32_t)pid;
 #undef MAXARGS
 #undef MAXARG
 }

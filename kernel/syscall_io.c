@@ -1,10 +1,11 @@
 #include "syscall_io.h"
 #include "console.h"
 #include "file.h"
-#include "idt.h"
 #include "ipc.h"
+#include "irqflags.h"
 #include "keyboard.h"
 #include "pipe.h"
+#include "regs.h"
 #include "sched.h"
 #include "syscall_nr.h"
 #include "uaccess.h"
@@ -15,7 +16,7 @@
 #define IO_CHUNK 512
 
 /* Write `len` user bytes at `ubuf` to pipe `id`, CRLF-translating when `tty`. Bytes written, or -1. */
-static int pipe_write_user(int id, uint32_t ubuf, uint32_t len, bool tty)
+static int pipe_write_user(int id, uaddr_t ubuf, uint32_t len, bool tty)
 {
   char kbuf[IO_CHUNK];
   uint32_t done = 0;
@@ -48,28 +49,28 @@ static int pipe_write_user(int id, uint32_t ubuf, uint32_t len, bool tty)
 
 void syscall_io_write(struct registers *r)
 {
-  int fd = (int)r->ebx;
-  uint32_t len = r->edx;
-  if (fd < 0 || fd >= MAX_FD || !user_range(r->ecx, len)) {
-    r->eax = (uint32_t)-1;
+  int fd = (int)SC_ARG0(r);
+  uint32_t len = (uint32_t)SC_ARG2(r);
+  if (fd < 0 || fd >= MAX_FD || !user_range(SC_ARG1(r), len)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  const char *buf = (const char *)r->ecx;
+  const char *buf = (const char *)SC_ARG1(r);
   struct fd *f = &sched_fds()[fd];
   if (f->type == FD_CONSOLE) {
     for (uint32_t i = 0; i < len; i++)
       con_putc(buf[i]);
-    r->eax = len;
+    SC_RET(r) = len;
   } else if (f->type == FD_PIPE_WR) {
-    r->eax = (uint32_t)pipe_write_user(f->pipe, r->ecx, len, false);
+    SC_RET(r) = (uint32_t)pipe_write_user(f->pipe, SC_ARG1(r), len, false);
   } else if (f->type == FD_TTY) {
     /* output processing of a terminal: newline becomes carriage return + newline */
-    int w = pipe_write_user(f->tx, r->ecx, len, true);
-    r->eax = w < 0 ? (uint32_t)-1 : len;
+    int w = pipe_write_user(f->tx, SC_ARG1(r), len, true);
+    SC_RET(r) = w < 0 ? (uint32_t)-1 : len;
   } else if (fd_is_channel(f)) {
-    r->eax = (uint32_t)pipe_write_user(f->tx, r->ecx, len, false);
+    SC_RET(r) = (uint32_t)pipe_write_user(f->tx, SC_ARG1(r), len, false);
   } else {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
   }
 }
 
@@ -77,28 +78,28 @@ void syscall_io_write(struct registers *r)
  * reading. Returns len, 0 when it doesn't fit yet, -1 on a closed peer or a message over IO_CHUNK. */
 void syscall_io_write_nb(struct registers *r)
 {
-  int fd = (int)r->ebx;
-  uint32_t len = r->edx;
-  if (fd < 0 || fd >= MAX_FD || len == 0 || len > IO_CHUNK || !user_range(r->ecx, len)) {
-    r->eax = (uint32_t)-1;
+  int fd = (int)SC_ARG0(r);
+  uint32_t len = (uint32_t)SC_ARG2(r);
+  if (fd < 0 || fd >= MAX_FD || len == 0 || len > IO_CHUNK || !user_range(SC_ARG1(r), len)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *f = &sched_fds()[fd];
   int id = f->type == FD_PIPE_WR ? f->pipe : fd_is_channel(f) ? f->tx : -1;
   char kbuf[IO_CHUNK];
-  if (id < 0 || copyin(kbuf, r->ecx, len) != 0) {
-    r->eax = (uint32_t)-1;
+  if (id < 0 || copyin(kbuf, SC_ARG1(r), len) != 0) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  r->eax = (uint32_t)pipe_write_nb(id, kbuf, (int)len);
+  SC_RET(r) = (uint32_t)pipe_write_nb(id, kbuf, (int)len);
 }
 
 void syscall_io_read(struct registers *r)
 {
-  int fd = (int)r->ebx;
-  uint32_t len = r->edx;
-  if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
-    r->eax = (uint32_t)-1;
+  int fd = (int)SC_ARG0(r);
+  uint32_t len = (uint32_t)SC_ARG2(r);
+  if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(SC_ARG1(r), len)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *f = &sched_fds()[fd];
@@ -108,41 +109,41 @@ void syscall_io_read(struct registers *r)
   if (f->type == FD_CONSOLE) {
     char c;
     int got = 0;
-    __asm__ volatile("sti");
+    irq_enable();
     while (!(got = keyboard_poll_text(&c, 0))) {
       if (sched_intr_pending())
         break;
-      __asm__ volatile("hlt");
+      cpu_wait();
     }
-    __asm__ volatile("cli");
+    irq_disable();
     if (!got) {
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     uint32_t n = 0;
     kbuf[n++] = c;
     while (n < len && keyboard_poll_text(&c, 0))
       kbuf[n++] = c;
-    r->eax = copyout(r->ecx, kbuf, n) == 0 ? n : (uint32_t)-1;
+    SC_RET(r) = copyout(SC_ARG1(r), kbuf, n) == 0 ? n : (uint32_t)-1;
   } else if (f->type == FD_PIPE_RD || fd_is_channel(f)) {
     int n = pipe_read(f->pipe, kbuf, (int)len);
-    if (n > 0 && copyout(r->ecx, kbuf, (uint32_t)n) != 0)
+    if (n > 0 && copyout(SC_ARG1(r), kbuf, (uint32_t)n) != 0)
       n = -1;
-    r->eax = (uint32_t)n;
+    SC_RET(r) = (uint32_t)n;
   } else {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
   }
 }
 
 void syscall_io_pipe(struct registers *r)
 {
-  if (!user_range(r->ebx, 8)) {
-    r->eax = (uint32_t)-1;
+  if (!user_range(SC_ARG0(r), 8)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int id = pipe_alloc();
   if (id < 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *fds = sched_fds();
@@ -160,7 +161,7 @@ void syscall_io_pipe(struct registers *r)
   if (rfd < 0 || wfd < 0) {
     pipe_close(id, 0);
     pipe_close(id, 1);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   fds[rfd].type = FD_PIPE_RD;
@@ -168,22 +169,22 @@ void syscall_io_pipe(struct registers *r)
   fds[wfd].type = FD_PIPE_WR;
   fds[wfd].pipe = (uint8_t)id;
   int out[2] = {rfd, wfd};
-  if (copyout(r->ebx, out, sizeof out) != 0) {
+  if (copyout(SC_ARG0(r), out, sizeof out) != 0) {
     pipe_close(id, 0);
     pipe_close(id, 1);
     fds[rfd].type = FD_NONE;
     fds[wfd].type = FD_NONE;
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
-  r->eax = 0;
+  SC_RET(r) = 0;
 }
 
 void syscall_io_close(struct registers *r)
 {
-  int fd = (int)r->ebx;
+  int fd = (int)SC_ARG0(r);
   if (fd < 0 || fd >= MAX_FD) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *f = &sched_fds()[fd];
@@ -198,28 +199,28 @@ void syscall_io_close(struct registers *r)
     ipc_port_destroy(f->pipe);
   }
   f->type = FD_NONE;
-  r->eax = 0;
+  SC_RET(r) = 0;
 }
 
 void syscall_io_read_nb(struct registers *r)
 {
-  int fd = (int)r->ebx;
-  uint32_t len = r->edx;
-  if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
-    r->eax = (uint32_t)-1;
+  int fd = (int)SC_ARG0(r);
+  uint32_t len = (uint32_t)SC_ARG2(r);
+  if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(SC_ARG1(r), len)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *f = &sched_fds()[fd];
-  r->eax = f->type == FD_PIPE_RD || fd_is_channel(f) ? (uint32_t)pipe_read_nb(f->pipe, (void *)r->ecx, (int)len)
-                                                     : (uint32_t)-1;
+  SC_RET(r) = f->type == FD_PIPE_RD || fd_is_channel(f) ? (uint32_t)pipe_read_nb(f->pipe, (void *)SC_ARG1(r), (int)len)
+                                                        : (uint32_t)-1;
 }
 
 void syscall_io_port_open(struct registers *r)
 {
-  const char *name = (const char *)r->ebx;
-  int as_server = (int)r->ecx;
-  if (!user_range(r->ebx, 16)) {
-    r->eax = (uint32_t)-1;
+  const char *name = (const char *)SC_ARG0(r);
+  int as_server = (int)SC_ARG1(r);
+  if (!user_range(SC_ARG0(r), 16)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *fds = sched_fds();
@@ -230,13 +231,13 @@ void syscall_io_port_open(struct registers *r)
       break;
     }
   if (nfd < 0) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   if (as_server) {
     int pid = ipc_port_create(name);
     if (pid < 0) {
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     fds[nfd].type = FD_PORT;
@@ -244,29 +245,29 @@ void syscall_io_port_open(struct registers *r)
   } else {
     int rx = 0, tx = 0;
     if (ipc_connect(name, &rx, &tx) < 0) {
-      r->eax = (uint32_t)-1;
+      SC_RET(r) = (uint32_t)-1;
       return;
     }
     fds[nfd].type = FD_CHANNEL;
     fds[nfd].pipe = (uint8_t)rx;
     fds[nfd].tx = (uint8_t)tx;
   }
-  r->eax = (uint32_t)nfd;
+  SC_RET(r) = (uint32_t)nfd;
 }
 
 /* ebx = listen fd, ecx = PORT_ACCEPT_NB to return -2 at once when nobody is waiting. */
 void syscall_io_port_accept(struct registers *r)
 {
-  int lfd = (int)r->ebx;
+  int lfd = (int)SC_ARG0(r);
   struct fd *fds = sched_fds();
   if (lfd < 0 || lfd >= MAX_FD || fds[lfd].type != FD_PORT) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   int rx = 0, tx = 0;
-  int got = ipc_accept(fds[lfd].pipe, &rx, &tx, !(r->ecx & PORT_ACCEPT_NB));
+  int got = ipc_accept(fds[lfd].pipe, &rx, &tx, !((uint32_t)SC_ARG1(r) & PORT_ACCEPT_NB));
   if (got != 0) {
-    r->eax = (uint32_t)(got > 0 ? -2 : -1);
+    SC_RET(r) = (uint32_t)(got > 0 ? -2 : -1);
     return;
   }
   int nfd = -1;
@@ -278,71 +279,73 @@ void syscall_io_port_accept(struct registers *r)
   if (nfd < 0) {
     pipe_close(rx, 0);
     pipe_close(tx, 1);
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   fds[nfd].type = FD_CHANNEL;
   fds[nfd].pipe = (uint8_t)rx;
   fds[nfd].tx = (uint8_t)tx;
-  r->eax = (uint32_t)nfd;
+  SC_RET(r) = (uint32_t)nfd;
 }
 
 /* SYS_PORT_PEER: ebx = channel fd, ecx = out {pid, uid, gid} of the process at the other end. 0/-1. */
 void syscall_io_port_peer(struct registers *r)
 {
-  int fd = (int)r->ebx;
+  int fd = (int)SC_ARG0(r);
   struct port_peer_u {
     uint32_t pid, uid, gid;
   } out;
-  if (fd < 0 || fd >= MAX_FD || !user_out_range(r->ecx, sizeof out)) {
-    r->eax = (uint32_t)-1;
+  if (fd < 0 || fd >= MAX_FD || !user_out_range(SC_ARG1(r), sizeof out)) {
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct fd *f = &sched_fds()[fd];
   if (f->type != FD_CHANNEL || !pipe_peer(f->pipe)->known) {
-    r->eax = (uint32_t)-1;
+    SC_RET(r) = (uint32_t)-1;
     return;
   }
   struct pipe_peer *p = pipe_peer(f->pipe);
   out.pid = p->pid;
   out.uid = p->uid;
   out.gid = p->gid;
-  r->eax = copyout(r->ecx, &out, sizeof out) == 0 ? 0 : (uint32_t)-1;
+  SC_RET(r) = copyout(SC_ARG1(r), &out, sizeof out) == 0 ? 0 : (uint32_t)-1;
 }
 
 /* SYS_TTY: terminal queries and the pty state (size, foreground job) kept on the slave-to-master pipe. */
 void syscall_io_tty(struct registers *r)
 {
-  int fd = (int)r->ebx;
+  int fd = (int)SC_ARG0(r);
   struct fd *fds = sched_fds();
-  r->eax = (uint32_t)-1;
+  SC_RET(r) = (uint32_t)-1;
   if (fd < 0 || fd >= MAX_FD || fds[fd].type == FD_NONE)
     return;
   struct fd *f = &fds[fd];
-  if (r->ecx == TTY_ISATTY) {
-    r->eax = f->type == FD_CONSOLE || f->type == FD_TTY || f->type == FD_PTY;
+  if ((uint32_t)SC_ARG1(r) == TTY_ISATTY) {
+    SC_RET(r) = f->type == FD_CONSOLE || f->type == FD_TTY || f->type == FD_PTY;
     return;
   }
   if (f->type != FD_TTY && f->type != FD_PTY)
     return;
   struct pipe_tty *t = pipe_tty(f->type == FD_PTY ? f->pipe : f->tx);
-  switch (r->ecx) {
+  switch ((uint32_t)SC_ARG1(r)) {
   case TTY_GETSIZE:
-    r->eax = (uint32_t)t->cols << 16 | t->rows;
+    SC_RET(r) = (uint32_t)t->cols << 16 | t->rows;
     break;
-  case TTY_SETSIZE:
-    if (f->type == FD_PTY && (r->edx >> 16) && (r->edx & 0xFFFF)) {
-      t->cols = (uint16_t)(r->edx >> 16);
-      t->rows = (uint16_t)r->edx;
-      r->eax = 0;
+  case TTY_SETSIZE: {
+    uint32_t size = (uint32_t)SC_ARG2(r);
+    if (f->type == FD_PTY && (size >> 16) && (size & 0xFFFF)) {
+      t->cols = (uint16_t)(size >> 16);
+      t->rows = (uint16_t)size;
+      SC_RET(r) = 0;
     }
     break;
+  }
   case TTY_SETFG:
-    t->fg_pid = (int)r->edx;
-    r->eax = 0;
+    t->fg_pid = (int)SC_ARG2(r);
+    SC_RET(r) = 0;
     break;
   case TTY_GETFG:
-    r->eax = (uint32_t)t->fg_pid;
+    SC_RET(r) = (uint32_t)t->fg_pid;
     break;
   }
 }

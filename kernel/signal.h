@@ -13,6 +13,7 @@
 #ifndef OWOS_SIGNAL_H
 #define OWOS_SIGNAL_H
 
+#include "uabi.h"
 #include <stdint.h>
 
 #define NSIG 32 /* signals 1..31; the masks are uint32_t bitsets   */
@@ -56,7 +57,7 @@
  * holds a user code pointer or SIG_DFL/SIG_IGN; `mask` is added to the blocked
  * set while the handler runs; `flags` is the SA_* set. */
 struct k_sigaction {
-  uint32_t handler;
+  sys_word handler;
   uint32_t mask;
   uint32_t flags;
 };
@@ -75,14 +76,18 @@ struct k_sigaction {
 struct k_siginfo {
   int32_t signo;
   int32_t code;    /* SI_USER, or the SEGV_/ILL_/FPE_ cause of a CPU fault */
-  uint32_t addr;   /* the faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
+  sys_word addr;   /* the faulting address: CR2 for a page fault, the instruction for #UD/#DE, else 0 */
   uint32_t trapno; /* CPU exception vector, SI_TRAP_NONE when no fault raised it */
   uint32_t err;    /* CPU error code (page fault: bit 0 present, 1 write, 2 user, 4 instruction fetch) */
 };
 
 /* The interrupted user context, restored by sigreturn (a handler may read it, and rewrite it to resume elsewhere).
- * x86_64 keeps the 32-bit names at full width and adds r8..r15, as struct registers does. */
-#ifdef __x86_64__
+ * x86_64 keeps the 32-bit names at full width and adds r8..r15, as struct registers does; AArch64 has its own. */
+#if defined(__aarch64__)
+struct k_sigctx {
+  uint64_t x[31], sp, pc, pstate; /* the EL0 general registers, stack pointer, resume address and flags */
+};
+#elif defined(__x86_64__)
 struct k_sigctx {
   uint64_t eip, eflags, esp;
   uint64_t eax, ecx, edx, ebx, ebp, esi, edi;

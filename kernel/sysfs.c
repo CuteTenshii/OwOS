@@ -39,6 +39,7 @@
 #include "firmware.h"
 #include "hda.h"
 #include "hid.h"
+#include "irqflags.h"
 #include "keyboard.h"
 #include "kstring.h"
 #include "mouse.h"
@@ -1207,7 +1208,7 @@ int sysfs_kind(const char *sub)
 
 int sysfs_read(const char *sub, char *buf, int max)
 {
-  __asm__ volatile("sti"); /* battery/ACPI reads wait on the timer */
+  irq_enable(); /* battery/ACPI reads wait on the timer */
   char seg[MAXSEG][SEGLEN];
   int n = split(sub, seg);
   int c = classify(seg, n);
@@ -1227,7 +1228,7 @@ int sysfs_writable(const char *sub)
 
 int sysfs_write(const char *sub, const char *buf, int len)
 {
-  __asm__ volatile("sti");
+  irq_enable();
   char seg[MAXSEG][SEGLEN];
   int n = split(sub, seg);
   if (classify(seg, n) != S_FILE_RW)

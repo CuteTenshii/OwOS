@@ -347,12 +347,16 @@ void crash_ingest(void)
   }
 }
 
-static const char *hex8(unsigned v, char *out)
+/* `v` in hex, at least 8 digits and all of a wider one; out holds 17 bytes. */
+static const char *hexw(sys_word v, char *out)
 {
   static const char d[] = "0123456789abcdef";
-  for (int i = 0; i < 8; i++)
-    out[i] = d[(v >> ((7 - i) * 4)) & 0xF];
-  out[8] = '\0';
+  int n = 8;
+  while (n < (int)sizeof v * 2 && (v >> (n * 4)))
+    n++;
+  for (int i = 0; i < n; i++)
+    out[i] = d[(v >> ((n - 1 - i) * 4)) & 0xF];
+  out[n] = '\0';
   return out;
 }
 static void draw_crashwin(struct crashwin *c)
@@ -368,7 +372,7 @@ static void draw_crashwin(struct crashwin *c)
   gfx_fill_rect(x0, cy, c->w, c->h - WM_TITLE_H, bg);
 
   struct crash_rec *r = &c->rec;
-  char hx[12];
+  char hx[20];
   int x = x0 + 12, y = cy + 10, lh = 16;
   char title[48];
   int t = 0;
@@ -387,22 +391,22 @@ static void draw_crashwin(struct crashwin *c)
   vs[2] = 0;
   gfx_ui_text(x + 120, y, vs, 0xe0e6ee);
   y += lh;
-  gfx_ui_text(x, y, "eip=", 0x9098a0);
-  gfx_ui_text(x + 40, y, hex8(r->eip, hx), 0x66ddff);
-  if (r->vector == 14) {
-    gfx_ui_text(x + 170, y, "cr2=", 0x9098a0);
-    gfx_ui_text(x + 210, y, hex8(r->cr2, hx), 0xffe08a);
+  gfx_ui_text(x, y, "pc=", 0x9098a0);
+  gfx_ui_text(x + 40, y, hexw(r->pc, hx), 0x66ddff);
+  if (r->page_fault) {
+    gfx_ui_text(x + 190, y, "addr=", 0x9098a0);
+    gfx_ui_text(x + 240, y, hexw(r->addr, hx), 0xffe08a);
   }
   y += lh;
   gfx_ui_text(x, y, "err=", 0x9098a0);
-  gfx_ui_text(x + 40, y, hex8(r->err, hx), 0xc8d0dc);
+  gfx_ui_text(x + 40, y, hexw(r->err, hx), 0xc8d0dc);
   y += lh + 8;
   gfx_ui_text(x, y, "stack trace:", 0x9098a0);
   y += lh;
   for (int i = 0; i < r->ntrace && i < CRASH_TRACE_MAX; i++) {
-    gfx_ui_text(x + 12, y, hex8(r->trace[i], hx), 0xb0c0d0);
+    gfx_ui_text(x + 12, y, hexw(r->trace[i], hx), 0xb0c0d0);
     if (i == 0)
-      gfx_ui_text(x + 12 + 90, y, "<- fault", 0x707880);
+      gfx_ui_text(x + 12 + 150, y, "<- fault", 0x707880);
     y += lh;
   }
 }

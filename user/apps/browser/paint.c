@@ -830,8 +830,8 @@ void draw_dt_highlight(int x, int y, int w, int h, int clip_top, int clip_bot, i
 /* The plain-language cause for the "tab crashed" page, from what the fault handler saw. */
 static const char *crash_reason(int sig, const siginfo_t *in)
 {
-  if (sig == SIGSEGV && in->si_trapno == 14) {
-    unsigned lo = (unsigned)(unsigned long)worker_stack;
+  if (sig == SIGSEGV && SI_PAGE_FAULT(in)) {
+    sys_word lo = (sys_word)(unsigned long)worker_stack;
     if (in->si_addr < lo && lo - in->si_addr <= 65536)
       return "It ran out of stack space, usually from recursion that went too deep.";
     if (in->si_addr < 0x1000)
@@ -878,17 +878,19 @@ static const char *sig_name(int sig)
 void crash_describe(int sig, const struct tab_crash *c, char *out, int cap)
 {
   const siginfo_t *in = &c->info;
-  if (sig == SIGSEGV && in->si_trapno == 14) {
+  if (sig == SIGSEGV && SI_PAGE_FAULT(in)) {
     const char *op = in->si_err & 16 ? "jump to" : in->si_err & 2 ? "write to" : "read of";
     const char *what = in->si_code == SEGV_MAPERR ? "unmapped" : "protected";
-    snprintf(out, (unsigned)cap, "%s: %s %s address 0x%08x%s", sig_name(sig), op, what, in->si_addr,
+    snprintf(out, (unsigned)cap, "%s: %s %s address %p%s", sig_name(sig), op, what, (void *)(unsigned long)in->si_addr,
              in->si_addr < 0x1000 ? " (null pointer)" : "");
+#if defined(__i386__) || defined(__x86_64__)
   } else if (sig == SIGSEGV && in->si_trapno == 13) {
     snprintf(out, (unsigned)cap, "%s: general protection fault", sig_name(sig));
   } else if (sig == SIGSEGV && in->si_trapno == 12) {
     snprintf(out, (unsigned)cap, "%s: stack fault", sig_name(sig));
+#endif
   } else if (sig == SIGILL) {
-    snprintf(out, (unsigned)cap, "%s: illegal instruction at 0x%08x", sig_name(sig), in->si_addr);
+    snprintf(out, (unsigned)cap, "%s: illegal instruction at %p", sig_name(sig), (void *)(unsigned long)in->si_addr);
   } else if (sig == SIGFPE) {
     snprintf(out, (unsigned)cap, "%s: integer division by zero", sig_name(sig));
   } else if (sig == SIGABRT) {
@@ -900,13 +902,13 @@ void crash_describe(int sig, const struct tab_crash *c, char *out, int cap)
   }
 }
 
-void crash_where(unsigned addr, char *out, int cap)
+void crash_where(sys_word addr, char *out, int cap)
 {
   char sym[96];
   if (symbolize(addr, sym, sizeof sym) == 0)
-    snprintf(out, (unsigned)cap, "%s (0x%08x)", sym, addr);
+    snprintf(out, (unsigned)cap, "%s (%p)", sym, (void *)(unsigned long)addr);
   else
-    snprintf(out, (unsigned)cap, "0x%08x", addr);
+    snprintf(out, (unsigned)cap, "%p", (void *)(unsigned long)addr);
 }
 
 /* Reload button on the crash page, remembered so handle_click can hit-test */
@@ -936,7 +938,7 @@ void draw_crash_page(int py, int pw, int phh)
   const struct tab_crash *c = &tabs[active_tab]->crash;
   char what[160], at[128], line[160];
   crash_describe(tabs[active_tab]->crash_sig, c, what, sizeof what);
-  crash_where(c->ctx.eip, at, sizeof at);
+  crash_where(SIGCONTEXT_PC(&c->ctx), at, sizeof at);
   snprintf(line, sizeof line, "at %s", at);
   int dy = cy + 40;
   gfx_ui_text(cx - gfx_ui_width(what) / 2, dy, what, 0x8a9099);

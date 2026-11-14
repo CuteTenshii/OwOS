@@ -5,9 +5,7 @@
 #include "env.h"
 #include "file.h"
 #include "fpu.h"
-#include "gdt.h"
 #include "heap.h"
-#include "idt.h"
 #include "ipc.h"
 #include "irqflags.h"
 #include "kstring.h"
@@ -15,6 +13,7 @@
 #include "net.h"
 #include "paging.h"
 #include "pipe.h"
+#include "regs.h"
 #include "shm.h"
 #include "signal.h"
 #include "smp.h"
@@ -22,6 +21,7 @@
 #include "syscall_fs.h"
 #include "syscall_graphics.h"
 #include "syscall_nr.h"
+#include "task_arch.h"
 #include "timer.h"
 #include "uaccess.h"
 #include <stdint.h>
@@ -43,10 +43,10 @@
 enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE, TASK_EMBRYO };
 
 typedef struct address_space {
-  uint32_t *dir;
+  pgdir_t *dir;
   uint32_t refs;
-  uint32_t brk;
-  uint32_t brk_base;
+  uaddr_t brk;
+  uaddr_t brk_base;
 } address_space_t;
 
 typedef struct task {
@@ -62,12 +62,12 @@ typedef struct task {
   bool self_reap; /* detached kernel thread: no parent waitpid's it, so schedule() frees its zombie instead of leaking
                      it */
   int wait_pid;   /* pid a waitpid is blocked on, -1 for any child, 0 when not in waitpid */
-  uint32_t futex_key; /* user address a futex waiter sleeps on (0 = none) */
+  uaddr_t futex_key;  /* user address a futex waiter sleeps on (0 = none) */
   uint32_t wake_tick; /* if WAITING for a timed sleep: tick to wake at (0 = not a timed sleep, e.g. a waitpid waiter) */
   int exit_status;    /* set on exit, read by waitpid */
   uint32_t sig_pending;        /* bitset of posted-but-undelivered signals */
   uint32_t sig_blocked;        /* bitset currently masked from delivery */
-  uint32_t sig_handler[NSIG];  /* disposition per signal (SIG_DFL/IGN/addr) */
+  uaddr_t sig_handler[NSIG];   /* disposition per signal (SIG_DFL/IGN/addr) */
   uint32_t sig_mask[NSIG];     /* extra signals blocked while a handler runs */
   uint32_t sig_flags[NSIG];    /* per-signal SA_* flags */
   const char *name;            /* the program: crash traces symbolize against it */
@@ -79,9 +79,9 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
-  uint32_t tls_base; /* user TLS base: %gs on i386, %fs on x86_64 (0 = none) */
-  struct env env;    /* process environment; threads use their leader's */
-  bool fpu_valid;    /* fpu holds a saved image (else the task still has the init state) */
+  uaddr_t tls_base; /* user TLS base: %gs on i386, %fs on x86_64, TPIDR_EL0 on AArch64 (0 = none) */
+  struct env env;   /* process environment; threads use their leader's */
+  bool fpu_valid;   /* fpu holds a saved image (else the task still has the init state) */
   uint8_t fpu[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1]; /* FPU state while switched out; see fpu_area */
   struct task *next;
   int running_cpu;
@@ -155,12 +155,6 @@ static void fds_close_all(task_t *t)
   }
 }
 
-/* From switch.S. */
-extern void context_switch(uintptr_t *old_esp, uintptr_t new_esp);
-extern void thread_start(void);
-extern void enter_user_task(void);
-extern void fork_child_entry(void);
-
 static task_t main_task; /* permanent head of the circular run queue (never freed) */
 static task_t idle_tasks[SMP_MAX_CPUS];
 static task_t *current_tasks[SMP_MAX_CPUS];
@@ -189,7 +183,7 @@ static void sched_lock(void)
 {
   while (__sync_lock_test_and_set(&scheduler_lock, 1)) {
     smp_tlb_service();
-    __asm__ volatile("pause");
+    cpu_relax();
   }
 }
 
@@ -200,7 +194,7 @@ static void kernel_lock_acquire(void)
   uint32_t ticket = __atomic_fetch_add(&kernel_ticket_next, 1, __ATOMIC_RELAXED);
   while (__atomic_load_n(&kernel_ticket_serving, __ATOMIC_ACQUIRE) != ticket) {
     smp_tlb_service(); /* the lock holder may be waiting on our flush */
-    __asm__ volatile("pause");
+    cpu_relax();
   }
 }
 
@@ -305,7 +299,7 @@ void thread_exit(void)
 {
   sched_exit(0);
   for (;;)
-    __asm__ volatile("sti\n\thlt"); /* unreachable; sti keeps hlt safe */
+    cpu_wait_enabled(); /* unreachable; sti keeps hlt safe */
 }
 
 void sched_init(void)
@@ -357,7 +351,7 @@ void sched_start_cpu(int cpu)
     return;
   for (;;) {
     schedule();
-    __asm__ volatile("hlt");
+    cpu_wait();
   }
 }
 
@@ -384,25 +378,7 @@ void sched_create_thread(const char *name, void (*entry)(void))
   }
   sig_init(t);
   t->kstack = stack;
-#ifdef __x86_64__
-  /* context_switch rets into thread_start, then `entry`, then thread_exit; six zeroed callee slots. */
-  uint64_t *sp = (uint64_t *)(stack + KSTACK_SIZE);
-  *--sp = (uint64_t)(uintptr_t)thread_exit;
-  *--sp = (uint64_t)(uintptr_t)entry;
-  *--sp = (uint64_t)(uintptr_t)thread_start;
-  for (int i = 0; i < 6; i++)
-    *--sp = 0;
-#else
-  uint32_t *sp = (uint32_t *)(stack + KSTACK_SIZE);
-  *--sp = (uint32_t)thread_exit;
-  *--sp = (uint32_t)entry;
-  *--sp = (uint32_t)thread_start;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0; /* ebp,ebx,esi,edi */
-#endif
-  t->esp = (uintptr_t)sp;
+  t->esp = arch_kthread_init((uintptr_t)(stack + KSTACK_SIZE), entry);
 
   enqueue(t);
 }
@@ -424,7 +400,7 @@ void sched_set_env_block(int pid, const char *block, uint32_t len)
   env_from_block(&t->env, block, len);
 }
 
-int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk, bool held)
+int sched_create_process(const char *name, uaddr_t entry, pgdir_t *dir, uaddr_t user_esp, uaddr_t brk, bool held)
 {
   task_t *t = alloc_task();
   address_space_t *as;
@@ -474,63 +450,39 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
     return -1;
   }
 
-  /* Craft the kernel stack so the first schedule rets into enter_user_task and irets to `entry`. */
-#ifdef __x86_64__
-  uint64_t *sp = (uint64_t *)(uintptr_t)t->kstack_top;
-  *--sp = 0x23;     /* user SS */
-  *--sp = user_esp; /* user RSP (points at argc) */
-  *--sp = 0x202;    /* RFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS (64-bit, DPL3) */
-  *--sp = entry;    /* user RIP */
-  *--sp = (uint64_t)(uintptr_t)enter_user_task;
-  for (int i = 0; i < 6; i++)
-    *--sp = 0; /* rbp,rbx,r12-r15 */
-#else
-  uint32_t *sp = (uint32_t *)t->kstack_top;
-  *--sp = 0x23;     /* user SS */
-  *--sp = user_esp; /* user ESP (points at argc) */
-  *--sp = 0x202;    /* EFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS */
-  *--sp = entry;    /* user EIP */
-  *--sp = (uint32_t)enter_user_task;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0; /* ebp,ebx,esi,edi */
-#endif
-  t->esp = (uintptr_t)sp;
+  t->esp = arch_user_init(t->kstack_top, entry, user_esp);
 
   enqueue(t);
   return (int)t->id;
 }
 
-/* Move the process break by `inc`; returns the previous break or (uint32_t)-1. Atomic under IF clear. */
-uint32_t sched_sbrk(int inc)
+/* Move the process break by `inc`; returns the previous break or (uaddr_t)-1. Atomic under IF clear. */
+uaddr_t sched_sbrk(int inc)
 {
   address_space_t *as = current->as;
   if (!as || as->brk == 0) /* not a process with a heap */
-    return (uint32_t)-1;
-  uint32_t old = as->brk;
+    return (uaddr_t)-1;
+  uaddr_t old = as->brk;
   if (inc == 0)
     return old;
   if (inc > 0) {
-    uint32_t add = (uint32_t)inc;
+    uaddr_t add = (uint32_t)inc;
     if (old >= USER_HEAP_MAX || add > USER_HEAP_MAX - old)
-      return (uint32_t)-1; /* would run into the user stack */
-    uint32_t newbrk = old + add;
-    uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
-    uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
+      return (uaddr_t)-1; /* would run into the user stack */
+    uaddr_t newbrk = old + add;
+    uaddr_t old_top = (old + 0xFFF) & ~(uaddr_t)0xFFF;
+    uaddr_t new_top = (newbrk + 0xFFF) & ~(uaddr_t)0xFFF;
     if (new_top > old_top && paging_user_grow(as->dir, old_top, new_top) < 0)
-      return (uint32_t)-1; /* out of physical memory */
+      return (uaddr_t)-1; /* out of physical memory */
     as->brk = newbrk;
     return old;
   }
-  uint32_t dec = (uint32_t)(-inc);
+  uaddr_t dec = (uint32_t)(-inc);
   if (dec > old - as->brk_base) /* never shrink below the heap base */
     dec = old - as->brk_base;
-  uint32_t newbrk = old - dec;
-  uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
-  uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
+  uaddr_t newbrk = old - dec;
+  uaddr_t old_top = (old + 0xFFF) & ~(uaddr_t)0xFFF;
+  uaddr_t new_top = (newbrk + 0xFFF) & ~(uaddr_t)0xFFF;
   if (old_top > new_top)
     paging_user_shrink(as->dir, new_top, old_top);
   as->brk = newbrk;
@@ -538,22 +490,22 @@ uint32_t sched_sbrk(int inc)
 }
 
 /* Reset the caller's heap base and break after an image replace. */
-void sched_set_brk(uint32_t brk)
+void sched_set_brk(uaddr_t brk)
 {
   if (current->as)
     current->as->brk = current->as->brk_base = brk;
 }
 
-void sched_set_tls(uint32_t base)
+void sched_set_tls(uaddr_t base)
 {
   uintptr_t flags = irq_save();
   current->tls_base = base;
-  gdt_set_tls(base);
+  arch_set_tls(base);
   irq_restore(flags);
 }
 
 /* Spawn a thread sharing the caller's address space; the caller must waitpid() it before exiting. */
-int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_base)
+int sched_create_user_thread(uaddr_t entry, uaddr_t user_esp, uaddr_t tls_base)
 {
   task_t *t = alloc_task();
   if (!t)
@@ -591,30 +543,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_bas
   t->kstack = kstack;
   t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
 
-#ifdef __x86_64__
-  uint64_t *sp = (uint64_t *)(uintptr_t)t->kstack_top;
-  *--sp = 0x23;     /* user SS */
-  *--sp = user_esp; /* user RSP */
-  *--sp = 0x202;    /* RFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS (64-bit, DPL3) */
-  *--sp = entry;    /* user RIP */
-  *--sp = (uint64_t)(uintptr_t)enter_user_task;
-  for (int i = 0; i < 6; i++)
-    *--sp = 0; /* rbp,rbx,r12-r15 */
-#else
-  uint32_t *sp = (uint32_t *)t->kstack_top;
-  *--sp = 0x23;     /* user SS */
-  *--sp = user_esp; /* user ESP */
-  *--sp = 0x202;    /* EFLAGS (IF set) */
-  *--sp = 0x1B;     /* user CS */
-  *--sp = entry;    /* user EIP */
-  *--sp = (uint32_t)enter_user_task;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0; /* ebp,ebx,esi,edi */
-#endif
-  t->esp = (uintptr_t)sp;
+  t->esp = arch_user_init(t->kstack_top, entry, user_esp);
 
   enqueue(t);
   return (int)t->id;
@@ -629,7 +558,7 @@ int sched_fork(struct registers *r)
     return -1;
   }
 
-  uint32_t *child_dir = paging_fork_dir(current->as ? current->as->dir : 0);
+  pgdir_t *child_dir = paging_fork_dir(current->as ? current->as->dir : 0);
   if (!child_dir) {
     kfree(t);
     return -1;
@@ -701,30 +630,7 @@ int sched_fork(struct registers *r)
       t->fds[i].type = FD_NONE; /* a listen port stays single-owner */
   }
 
-  /* Copy the parent's trap frame to the child's kernel stack with eax = 0, then a context_switch frame. */
-#ifdef __x86_64__
-  struct registers *cf = (struct registers *)((uint8_t *)(uintptr_t)t->kstack_top - sizeof *cf);
-  *cf = *r;
-  cf->eax = 0; /* rax = 0 in the child */
-  uint64_t *sp = (uint64_t *)cf;
-  *--sp = (uint64_t)(uintptr_t)fork_child_entry;
-  for (int i = 0; i < 6; i++)
-    *--sp = 0; /* rbp,rbx,r12-r15 */
-#else
-  uint32_t *frame = (uint32_t *)t->kstack_top - 16;
-  const uint32_t *src = (const uint32_t *)r;
-  for (int i = 0; i < 16; i++)
-    frame[i] = src[i];
-  frame[8] = 0; /* eax = 0 in the child */
-
-  uint32_t *sp = frame;
-  *--sp = (uint32_t)fork_child_entry;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0;
-  *--sp = 0; /* ebp,ebx,esi,edi */
-#endif
-  t->esp = (uintptr_t)sp;
+  t->esp = arch_fork_init(t->kstack_top, r);
 
   enqueue(t);
   return (int)t->id;
@@ -761,8 +667,8 @@ static void reap_task_locked(task_t *t)
     p = p->next;
   p->next = t->next;
   count--;
-  if (fl & 0x200)
-    __asm__ volatile("sti");
+  if (irq_flags_on(fl))
+    irq_enable();
 
   if (t->as_owner) {
     /* Drain the owner's threads (close fds, unlink, free) while the dir is still valid. */
@@ -784,8 +690,8 @@ static void reap_task_locked(task_t *t)
         q = q->next;
       q->next = th->next;
       count--;
-      if (fl & 0x200)
-        __asm__ volatile("sti");
+      if (irq_flags_on(fl))
+        irq_enable();
       if (th->kstack)
         kfree(th->kstack);
       if (th->self_reap && th->state == TASK_ZOMBIE && detached_zombies > 0)
@@ -837,7 +743,7 @@ static void reap_detached(void)
 struct fd *sched_fds(void) { return current->fds; }
 
 /* Active page directory, shared by a process and its user threads. */
-uint32_t *sched_current_dir(void) { return (uint32_t *)(uintptr_t)task_cr3(current); }
+pgdir_t *sched_current_dir(void) { return (pgdir_t *)task_cr3(current); }
 
 /* The current task's pid (owner id for windowing-layer bookkeeping). */
 uint32_t sched_current_id(void) { return current->id; }
@@ -965,12 +871,12 @@ void sched_sleep_until(uint32_t wake)
     schedule(); /* entered IF=0; returns once woken + rescheduled */
   } while ((int32_t)(timer_ticks() - wake) < 0 && !sched_intr_pending());
   current->wake_tick = 0;
-  if (flags & 0x200) /* restore the caller's interrupt flag */
-    __asm__ volatile("sti");
+  if (irq_flags_on(flags)) /* restore the caller's interrupt flag */
+    irq_enable();
 }
 
 /* Sleep until futex_wake(addr) unless *addr != expected; timeout 0 waits forever; 1 on timeout/interrupt. */
-bool sched_futex_wait(uint32_t addr, uint32_t expected, uint32_t ms)
+bool sched_futex_wait(uaddr_t addr, uint32_t expected, uint32_t ms)
 {
   uint32_t wake = 0;
   if (ms) {
@@ -1004,7 +910,7 @@ bool sched_futex_wait(uint32_t addr, uint32_t expected, uint32_t ms)
 }
 
 /* Wake up to n tasks of the caller's address space sleeping on addr. */
-int sched_futex_wake(uint32_t addr, int n)
+int sched_futex_wake(uaddr_t addr, int n)
 {
   int woken = 0;
   uintptr_t flags = irq_save();
@@ -1085,7 +991,7 @@ void sched_exit(int status)
   /* Notify the parent: SIGCHLD only if it has a real handler; wake a waitpid or handler waiter. */
   task_t *parent = find_task(current->parent);
   if (parent && parent->state != TASK_FREE && parent->state != TASK_ZOMBIE) {
-    uint32_t h = parent->sig_handler[SIGCHLD];
+    uaddr_t h = parent->sig_handler[SIGCHLD];
     int chld = (h != SIG_DFL && h != SIG_IGN); /* a caught SIGCHLD */
     int chld_wake = chld && !(parent->sig_blocked & SIGBIT(SIGCHLD));
     if (chld)
@@ -1123,7 +1029,7 @@ static bool sig_ignored(task_t *t, int sig)
 {
   if (sig == SIGKILL || sig == SIGSTOP)
     return false;
-  uint32_t h = t->sig_handler[sig];
+  uaddr_t h = t->sig_handler[sig];
   return h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig));
 }
 
@@ -1136,7 +1042,7 @@ static int sig_next(task_t *t)
       continue;
     if (s == SIGKILL)
       return s; /* forced terminate, never masked */
-    uint32_t h = t->sig_handler[s];
+    uaddr_t h = t->sig_handler[s];
     if (h == SIG_IGN)
       continue;
     if (h == SIG_DFL && sig_default_ignore(s))
@@ -1206,111 +1112,16 @@ uint32_t sched_sigprocmask(int how, uint32_t set, int have_set)
   return old;
 }
 
-#ifdef __x86_64__
-/* Handler frame on the user stack. The handler takes sig, &info and &uc in rdi/rsi/rdx and returns through
- * `pretcode` into `tramp` (SYS_SIGRETURN). The FPU image rides along: compiled code keeps live values in xmm
- * registers, which the handler is free to clobber. */
-struct sigframe {
-  uint64_t pretcode;      /* -> tramp */
-  uint64_t saved_blocked; /* mask to restore on sigreturn */
-  struct k_sigctx uc;     /* interrupted context to resume */
-  struct k_siginfo info;
-  uint8_t tramp[8]; /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
-  uint8_t fpu[FPU_AREA_BYTES];
-};
-#define SIG_RED_ZONE 128 /* the SysV area below rsp that the interrupted code may still be using */
-#else
-/* Handler frame on the user stack: [pretcode][sig][&info][&uc], the arguments of an SA_SIGINFO handler (a
- * one-argument handler ignores the last two); pretcode points at `tramp` (SYS_SIGRETURN). */
-struct sigframe {
-  uint32_t pretcode; /* -> tramp */
-  uint32_t sig;      /* handler arguments: sig, info, ctx */
-  uint32_t pinfo;
-  uint32_t puc;
-  uint32_t saved_blocked; /* mask to restore on sigreturn */
-  struct k_sigctx uc;     /* interrupted context to resume */
-  struct k_siginfo info;
-  uint8_t tramp[8]; /* mov $SYS_SIGRETURN,%eax ; int $0x80 */
-};
-#define SIG_RED_ZONE 0
-#endif
-
 /* Build a signal frame on the user stack (current CR3); 0, or -1 if it doesn't fit. */
 static int sigframe_setup(task_t *t, struct registers *r, const struct k_siginfo *info)
 {
-  int sig = info->signo;
-  uint64_t sp = r->useresp;
-  if (sp > USER_REGION_END || sp < USER_BASE + SIG_RED_ZONE + sizeof(struct sigframe) + 16)
-    return -1;
-  uint64_t base = sp - SIG_RED_ZONE - sizeof(struct sigframe);
-#ifdef __x86_64__
-  base = (base & ~15ull) - 8; /* a function is entered with rsp + 8 16-byte aligned */
-#else
-  base &= ~3ull;
-#endif
-  if (base < USER_BASE)
-    return -1;
-
-  struct sigframe f;
-  memset(&f, 0, sizeof f); /* padding must not carry kernel stack bytes to the user */
-  f.pretcode = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
-  f.saved_blocked = t->sig_blocked;
-  f.info = *info;
-  f.uc.eip = r->eip;
-  f.uc.eflags = r->eflags;
-  f.uc.esp = r->useresp;
-  f.uc.eax = r->eax;
-  f.uc.ecx = r->ecx;
-  f.uc.edx = r->edx;
-  f.uc.ebx = r->ebx;
-  f.uc.ebp = r->ebp;
-  f.uc.esi = r->esi;
-  f.uc.edi = r->edi;
-#ifdef __x86_64__
-  f.uc.r8 = r->r8;
-  f.uc.r9 = r->r9;
-  f.uc.r10 = r->r10;
-  f.uc.r11 = r->r11;
-  f.uc.r12 = r->r12;
-  f.uc.r13 = r->r13;
-  f.uc.r14 = r->r14;
-  f.uc.r15 = r->r15;
-  uint8_t fxbuf[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1];
-  uint8_t *fx = (uint8_t *)(((uintptr_t)fxbuf + FPU_AREA_ALIGN - 1) & ~(uintptr_t)(FPU_AREA_ALIGN - 1));
-  fpu_save(fx); /* the task's own state: the kernel never touches the FPU */
-  memcpy(f.fpu, fx, sizeof f.fpu);
-#else
-  f.sig = (uint32_t)sig;
-  f.pinfo = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, info);
-  f.puc = (uint32_t)base + (uint32_t)__builtin_offsetof(struct sigframe, uc);
-#endif
-  f.tramp[0] = 0xB8; /* mov $imm32, %eax */
-  f.tramp[1] = (uint8_t)(SYS_SIGRETURN);
-  f.tramp[2] = (uint8_t)(SYS_SIGRETURN >> 8);
-  f.tramp[3] = (uint8_t)(SYS_SIGRETURN >> 16);
-  f.tramp[4] = (uint8_t)(SYS_SIGRETURN >> 24);
-  f.tramp[5] = 0xCD; /* int $0x80 */
-  f.tramp[6] = 0x80;
-  f.tramp[7] = 0x90; /* nop pad */
-  /* The user's esp may point anywhere: an unmapped or read-only stack must fail, not fault in ring 0. */
-  if (copyout((uint32_t)base, &f, sizeof f) != 0)
-    return -1;
-
-  r->useresp = (uintptr_t)base;
-  r->eip = t->sig_handler[sig];
-#ifdef __x86_64__
-  r->edi = (uint32_t)sig;
-  r->esi = base + __builtin_offsetof(struct sigframe, info);
-  r->edx = base + __builtin_offsetof(struct sigframe, uc);
-  fpu_load_init(); /* the handler starts from a clean FPU, with the default SSE modes */
-#endif
-  return 0;
+  return arch_sigframe_setup(r, info, t->sig_blocked, t->sig_handler[info->signo]);
 }
 
 /* Deliver one pending signal as the task returns to ring 3; default-terminate never returns. */
 void sched_signal_deliver(struct registers *r)
 {
-  if ((r->cs & 3) != 3) /* only when returning to a user context */
+  if (!regs_from_user(r)) /* only when returning to a user context */
     return;
   task_t *t = current;
   int sig = sig_next(t);
@@ -1318,7 +1129,7 @@ void sched_signal_deliver(struct registers *r)
     return;
   t->sig_pending &= ~SIGBIT(sig);
 
-  uint32_t h = t->sig_handler[sig];
+  uaddr_t h = t->sig_handler[sig];
   if (sig == SIGKILL || h == SIG_DFL) {
     /* A SIG_DFL reaching here terminates (128 + sig). */
     sched_exit(128 + sig); /* never returns */
@@ -1330,80 +1141,31 @@ void sched_signal_deliver(struct registers *r)
   t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
 }
 
-/* Turn a CPU fault into a signal if a handler exists; 1 if the frame was built, else 0. EIP stays at the fault.
- * `addr` is the faulting address (CR2 for a page fault). */
-int sched_fault_signal(struct registers *r, int sig, uint32_t addr)
+/* Turn a CPU fault, described by the arch's exception handler, into a signal if a handler exists; 1 if the frame
+ * was built, else 0. The saved pc stays at the faulting instruction. */
+int sched_fault_signal(struct registers *r, const struct k_siginfo *info)
 {
   task_t *t = current;
-  uint32_t h = t->sig_handler[sig];
+  int sig = info->signo;
+  uaddr_t h = t->sig_handler[sig];
   if (h == SIG_DFL || h == SIG_IGN) /* no user handler: fatal, as before */
     return 0;
-  if (t->sig_blocked & SIGBIT(sig)) /* fault while the signal is blocked */
-    return 0;                       /* -> can't deliver safely: terminate */
-  uint32_t vec = (uint32_t)r->int_no, err = (uint32_t)r->err_code;
-  struct k_siginfo info = {sig, 0, 0, vec, err};
-  if (vec == 14) {
-    info.code = err & 1 ? SEGV_ACCERR : SEGV_MAPERR;
-    info.addr = addr;
-  } else if (vec == 6) {
-    info.code = ILL_ILLOPC;
-    info.addr = (uint32_t)r->eip;
-  } else if (vec == 0) {
-    info.code = FPE_INTDIV;
-    info.addr = (uint32_t)r->eip;
-  } else if (sig == SIGSEGV) {
-    info.code = SEGV_ACCERR; /* #GP/#SS: a protection violation, its address unknown */
-  }
-  if (sigframe_setup(t, r, &info) < 0) /* stack won't hold the frame */
+  if (t->sig_blocked & SIGBIT(sig))   /* fault while the signal is blocked */
+    return 0;                         /* -> can't deliver safely: terminate */
+  if (sigframe_setup(t, r, info) < 0) /* stack won't hold the frame */
     return 0;
   t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
   return 1;
 }
 
-/* SYS_SIGRETURN: the handler's ret popped pretcode, so the frame starts one word below useresp; restore the saved
- * context and mask. */
+/* SYS_SIGRETURN: restore the context and mask the signal frame saved. */
 int sched_sigreturn(struct registers *r)
 {
-  uint64_t base = r->useresp - sizeof(uintptr_t);
-  if (r->useresp < USER_BASE + sizeof(uintptr_t) || base + sizeof(struct sigframe) > USER_REGION_END)
+  uint32_t blocked;
+  if (arch_sigreturn(r, &blocked) != 0)
     return -1;
-  struct sigframe f;
-  if (copyin(&f, (uint32_t)base, sizeof f) != 0)
-    return -1;
-#ifdef __x86_64__
-  /* iretq to a non-canonical rip faults in ring 0, so a rewritten context must stay in the lower half. */
-  if ((f.uc.eip | f.uc.esp) >> 47)
-    return -1;
-#endif
-
   /* Strip SIGKILL/SIGSTOP so a crafted mask can't make the process unkillable. */
-  current->sig_blocked = (uint32_t)f.saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
-  r->eip = f.uc.eip;
-  r->useresp = f.uc.esp;
-  /* Sanitize user flags: keep arithmetic/DF/TF, force IF and bit1; never IOPL/NT. */
-  r->eflags = (f.uc.eflags & 0x00000DD5u) | 0x00000202u;
-  r->eax = f.uc.eax;
-  r->ecx = f.uc.ecx;
-  r->edx = f.uc.edx;
-  r->ebx = f.uc.ebx;
-  r->ebp = f.uc.ebp;
-  r->esi = f.uc.esi;
-  r->edi = f.uc.edi;
-#ifdef __x86_64__
-  r->r8 = f.uc.r8;
-  r->r9 = f.uc.r9;
-  r->r10 = f.uc.r10;
-  r->r11 = f.uc.r11;
-  r->r12 = f.uc.r12;
-  r->r13 = f.uc.r13;
-  r->r14 = f.uc.r14;
-  r->r15 = f.uc.r15;
-  uint8_t fxbuf[FPU_AREA_BYTES + FPU_AREA_ALIGN - 1];
-  uint8_t *fx = (uint8_t *)(((uintptr_t)fxbuf + FPU_AREA_ALIGN - 1) & ~(uintptr_t)(FPU_AREA_ALIGN - 1));
-  memcpy(fx, f.fpu, sizeof f.fpu);
-  fpu_sanitize(fx);
-  fpu_restore(fx);
-#endif
+  current->sig_blocked = blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
   return 0;
 }
 
@@ -1491,7 +1253,7 @@ bool sched_try_reap(int pid, int *status)
 }
 
 /* Replace the process image: new address space, trap frame returns into the new entry. */
-int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t brk, struct registers *r)
+int sched_replace(pgdir_t *new_dir, uaddr_t entry, uaddr_t user_esp, uaddr_t brk, struct registers *r)
 {
   address_space_t *next = kmalloc(sizeof *next);
   address_space_t *old = current->as;
@@ -1514,17 +1276,7 @@ int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t
     current->sig_flags[i] = 0;
   }
 
-  r->eip = entry;
-  r->cs = 0x1B;
-  r->eflags = 0x202;
-  r->useresp = user_esp;
-  r->ss = 0x23;
-  r->ds = 0x23;
-  r->eax = r->ebx = r->ecx = r->edx = 0;
-  r->esi = r->edi = r->ebp = 0;
-#ifdef __x86_64__
-  r->r8 = r->r9 = r->r10 = r->r11 = r->r12 = r->r13 = r->r14 = r->r15 = 0;
-#endif
+  arch_exec_regs(r, entry, user_esp);
   fpu_load_init(); /* the new image starts from a clean FPU, as a fresh process does */
   return 0;
 }
@@ -1568,10 +1320,10 @@ void schedule(void)
     current_tasks[cpu] = next;
     current->runs++;
     if (current->kstack_top)
-      tss_set_kernel_stack(current->kstack_top);
-    gdt_set_tls(current->tls_base);
+      arch_set_kernel_stack(current->kstack_top);
+    arch_set_tls(current->tls_base);
     if (task_cr3(current) != task_cr3(prev))
-      paging_load((uint32_t *)(uintptr_t)task_cr3(current));
+      paging_load((pgdir_t *)task_cr3(current));
     fpu_switch(prev, current);
     sched_unlock();
     context_switch(&prev->esp, current->esp);
@@ -1586,8 +1338,8 @@ void schedule(void)
     }
   }
 
-  if (flags & 0x200) /* restore the caller's interrupt flag */
-    __asm__ volatile("sti");
+  if (irq_flags_on(flags)) /* restore the caller's interrupt flag */
+    irq_enable();
 }
 
 int sched_count(void) { return count; }

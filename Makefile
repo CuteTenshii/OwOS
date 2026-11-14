@@ -48,6 +48,31 @@ TIDY_TARGET_a64 := --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/a
 TIDY_TARGET_arm := --target=armv7a-none-eabi -mcpu=cortex-a15 -marm -mfloat-abi=soft -Ikernel/arch/arm -Ikernel/arch/common
 TIDY_INC_x86     = -Ikernel/arch/x86 $(addprefix -Idrivers/,$(DRVDIRS))
 
+# $(call blob,file,name): recipe wrapping `file` into the kernel object $@ (KELF/KBFD: the target's ELF format) as _binary_<name>_{start,end}.
+# objcopy names the symbols after the input path, with every '/', '.' and '-' turned into '_'.
+blob_sym = _binary_$(subst -,_,$(subst .,_,$(subst /,_,$(1))))
+define blob
+$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
+	  --redefine-sym $(call blob_sym,$(1))_start=_binary_$(2)_start \
+	  --redefine-sym $(call blob_sym,$(1))_end=_binary_$(2)_end $(1) $@
+endef
+
+# Objects are emitted in place (kernel/foo.o, user/lib/foo.o), shared by every arch. The stamp stores the active
+# compiler configuration, so switching ARCH or OPT_LEVEL rebuilds objects. The user word size is part of it because
+# x86_64 builds once linked 32-bit user programs.
+.PHONY: FORCE
+FORCE:
+
+ARCH_STAMP  := .arch.current
+ARCH_CONFIG  = $(ARCH):O$(OPT_LEVEL):user$(UBITS)
+$(ARCH_STAMP): FORCE
+	@if [ ! -f $@ ] || [ "$$(cat $@)" != "$(ARCH_CONFIG)" ]; then \
+		rm -f .arch.*; \
+		printf '%s\n' '$(ARCH_CONFIG)' > $@; \
+		sleep 1; \
+		touch $@; \
+	fi
+
 ifeq ($(ARCH),aarch64)
 include kernel/arch/aarch64/build.mk
 else ifeq ($(ARCH),arm)
@@ -86,7 +111,7 @@ install-hooks:
 
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) owos.bin owos-x86_64.bin owos-aarch64.bin owos-aarch64.elf owos-arm.bin owos-arm.elf $(ISO) .arch.*
-	rm -f user/lib/*.o user/lib/*/*.o user/aarch64/*.o tests/aarch64/*.o tests/aarch64/*.elf kernel/arch/aarch64/*.d tests/aarch64/*.d
+	rm -f user/lib/*.o user/lib/*/*.o kernel/arch/aarch64/*.d
 	rm -f kernel/arch/x86/*.o kernel/arch/x86/*.d
 	rm -f kernel/arch/arm/*.o kernel/arch/arm/*.d tests/arm/*.o tests/arm/*.d
 	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete

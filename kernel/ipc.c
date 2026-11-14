@@ -1,6 +1,7 @@
 /* ipc.c: named local ports (see ipc.h). Each connection is two pipe-pool rings (c2s, s2c). */
 
 #include "ipc.h"
+#include "irqflags.h"
 #include "kstring.h"
 #include "pipe.h"
 #include "sched.h"
@@ -74,14 +75,14 @@ int ipc_connect(const char *name, int *rx, int *tx)
 
   /* Claim the single connection slot, waiting if one is pending. */
   for (;;) {
-    __asm__ volatile("cli");
+    irq_disable();
     if (p->used && p->gen == gen && p->pend == PEND_NONE) {
       p->pend = PEND_CLAIMED;
-      __asm__ volatile("sti");
+      irq_enable();
       break;
     }
     int gone = !p->used || p->gen != gen;
-    __asm__ volatile("sti");
+    irq_enable();
     if (gone)
       return -1;
     timer_sleep(5);
@@ -94,9 +95,9 @@ int ipc_connect(const char *name, int *rx, int *tx)
       pipe_close(c2s, 0);
       pipe_close(c2s, 1);
     }
-    __asm__ volatile("cli");
+    irq_disable();
     p->pend = PEND_NONE;
-    __asm__ volatile("sti");
+    irq_enable();
     return -1;
   }
 
@@ -104,11 +105,11 @@ int ipc_connect(const char *name, int *rx, int *tx)
   *pipe_peer(c2s) = (struct pipe_peer){sched_current_process_id(), sched_uid(), sched_gid(), true};
 
   /* Publish: the server's accept() will pick these up. */
-  __asm__ volatile("cli");
+  irq_disable();
   p->c2s = c2s;
   p->s2c = s2c;
   p->pend = PEND_READY;
-  __asm__ volatile("sti");
+  irq_enable();
 
   *rx = s2c;
   *tx = c2s;
@@ -129,10 +130,10 @@ int ipc_accept(int id, int *rx, int *tx, bool block)
     timer_sleep(10);
   }
 
-  __asm__ volatile("cli");
+  irq_disable();
   int c2s = p->c2s, s2c = p->s2c;
   p->pend = PEND_NONE;
-  __asm__ volatile("sti");
+  irq_enable();
 
   *rx = c2s;
   *tx = s2c;

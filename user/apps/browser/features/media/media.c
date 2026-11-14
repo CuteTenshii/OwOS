@@ -445,8 +445,7 @@ static struct media_el *slot_alloc(struct dom_node *node, int kind)
       sapp(m->file, &k, sizeof m->file, "/home/root/.mediacache");
       uapp(m->file, &k, sizeof m->file, (unsigned)(m - g_media));
     }
-    __asm__ volatile("" ::: "memory");
-    m->in_use = true;
+    __atomic_store_n(&m->in_use, true, __ATOMIC_RELEASE);
   }
   browser_buf_unlock();
   return m;

@@ -7,11 +7,11 @@
 /* Check and copy run with interrupts off: a preemption between them drops the kernel lock, and a sibling thread could
  * unmap the range before the copy faults on it in ring 0. */
 
-int user_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, false); }
+int user_range(uaddr_t addr, uint32_t len) { return paging_user_range(addr, len, false); }
 
-int user_out_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, true); }
+int user_out_range(uaddr_t addr, uint32_t len) { return paging_user_range(addr, len, true); }
 
-int copyin(void *dst, uint32_t src, uint32_t len)
+int copyin(void *dst, uaddr_t src, uint32_t len)
 {
   uintptr_t fl = irq_save();
   int ok = user_range(src, len);
@@ -21,7 +21,7 @@ int copyin(void *dst, uint32_t src, uint32_t len)
   return ok ? 0 : -1;
 }
 
-int copyout(uint32_t dst, const void *src, uint32_t len)
+int copyout(uaddr_t dst, const void *src, uint32_t len)
 {
   uintptr_t fl = irq_save();
   int ok = user_out_range(dst, len);
@@ -31,7 +31,7 @@ int copyout(uint32_t dst, const void *src, uint32_t len)
   return ok ? 0 : -1;
 }
 
-int copyin_str(uint32_t src, char *dst, uint32_t cap)
+int copyin_str(uaddr_t src, char *dst, uint32_t cap)
 {
   uint32_t i = 0;
   while (i < cap) {

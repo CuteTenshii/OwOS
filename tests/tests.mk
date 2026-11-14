@@ -6,7 +6,7 @@ CC      ?= cc
 B       := build/tests
 RUN     := $(abspath $(B))/run
 
-INCLUDES := -Itests -Iuser/lib $(patsubst %/,-I%,$(wildcard user/lib/*/)) -Iuser/apps/browser -Iuser/apps/browser/js
+INCLUDES := -Itests -Iuser/lib $(patsubst %/,-I%,$(wildcard user/lib/*/)) -Iuser/apps/browser -Iuser/apps/browser/js -Icommon
 CFLAGS_T := -std=gnu11 -O2 $(INCLUDES) -MMD -MP
 
 # Host compressors the btrfs test cross-checks against; each is used only when pkg-config finds it.

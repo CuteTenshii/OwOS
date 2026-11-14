@@ -25,6 +25,7 @@
 #include "cpu.h"
 #include "fs.h"
 #include "heap.h"
+#include "irqflags.h"
 #include "kstring.h"
 #include "log.h"
 #include "nvme.h"
@@ -339,7 +340,7 @@ int procfs_read(const char *sub, char *buf, int max)
 {
   /* Some generators wait on the timer (cpu_mhz calibration) or ACPI; the
    * int 0x80 gate left IF=0, so enable interrupts or they'd spin forever. */
-  __asm__ volatile("sti");
+  irq_enable();
   if (sub[0] == '/')
     sub++;
 
@@ -397,7 +398,7 @@ int procfs_read(const char *sub, char *buf, int max)
  */
 int procfs_write(const char *sub, const char *buf, int len)
 {
-  __asm__ volatile("sti"); /* dhcp/ntp wait on the timer/IRQs   */
+  irq_enable(); /* dhcp/ntp wait on the timer/IRQs   */
   if (sub[0] == '/')
     sub++;
 

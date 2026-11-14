@@ -300,6 +300,26 @@ static int fault_signal(uint32_t vec)
   }
 }
 
+/* What a handler sees of a ring-3 fault (signal.h): the cause, and the address it concerns. */
+static struct k_siginfo fault_siginfo(const struct registers *r)
+{
+  uint32_t vec = (uint32_t)r->int_no, err = (uint32_t)r->err_code;
+  struct k_siginfo info = {fault_signal(vec), 0, 0, vec, err};
+  if (vec == 14) {
+    info.code = err & 1 ? SEGV_ACCERR : SEGV_MAPERR;
+    info.addr = (uint32_t)read_cr2();
+  } else if (vec == 6) {
+    info.code = ILL_ILLOPC;
+    info.addr = (uint32_t)r->eip;
+  } else if (vec == 0) {
+    info.code = FPE_INTDIV;
+    info.addr = (uint32_t)r->eip;
+  } else if (info.signo == SIGSEGV) {
+    info.code = SEGV_ACCERR; /* #GP/#SS: a protection violation, its address unknown */
+  }
+  return info;
+}
+
 /* Called from isr_common_stub for every CPU exception. */
 void isr_handler(struct registers *r)
 {
@@ -324,7 +344,8 @@ void isr_handler(struct registers *r)
 
   /* Ring-3 fault: deliver the signal if handled, else record a crash and kill the process. */
   if (user_fault) {
-    if (sched_fault_signal(r, fault_signal(r->int_no), r->int_no == 14 ? (uint32_t)read_cr2() : 0)) {
+    struct k_siginfo info = fault_siginfo(r);
+    if (sched_fault_signal(r, &info)) {
       sched_kernel_leave();
       return;
     }
@@ -364,3 +385,11 @@ void idt_init(void)
 
 /* Load the (already-built, shared) IDT on the calling CPU, for an AP. */
 void idt_load(void) { __asm__ volatile("lidt %0" : : "m"(idt_ptr)); }
+
+extern void isr128(void); /* the int 0x80 stub (isr.S) */
+
+void syscall_init(void)
+{
+  /* 0xEE = present, DPL 3, 32-bit interrupt gate -- ring 3 may invoke it. */
+  idt_set_gate(0x80, (uintptr_t)isr128, GDT_KERNEL_CODE, 0xEE);
+}

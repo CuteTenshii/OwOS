@@ -3,14 +3,14 @@
 #include "syscall_env.h"
 #include "env.h"
 #include "heap.h"
-#include "idt.h"
 #include "kstring.h"
+#include "regs.h"
 #include "sched.h"
 #include "syscall_nr.h"
 #include "uaccess.h"
 
 /* Copy `len` bytes at user address `src` into a new NUL-terminated kernel string; NULL on failure */
-static char *copy_string(uint32_t src, uint32_t len)
+static char *copy_string(uaddr_t src, uint32_t len)
 {
   if (!user_range(src, len))
     return 0;
@@ -47,18 +47,18 @@ void syscall_env(struct registers *r)
 {
   struct env_req q;
   struct env *e = sched_env();
-  r->eax = (uint32_t)-1;
-  if (!user_range(r->ebx, sizeof q) || copyin(&q, r->ebx, sizeof q) != 0)
+  SC_RET(r) = (uint32_t)-1;
+  if (!user_range(SC_ARG0(r), sizeof q) || copyin(&q, SC_ARG0(r), sizeof q) != 0)
     return;
   if (q.cmd == ENV_CLEAR) {
     env_free(e);
-    r->eax = 0;
+    SC_RET(r) = 0;
     return;
   }
   if (q.cmd == ENV_ENTRY) {
     const char *entry = env_entry(e, q.index);
     if (entry)
-      r->eax = (uint32_t)give(&q, entry);
+      SC_RET(r) = (uint32_t)give(&q, entry);
     return;
   }
   char *name = copy_string(q.name, q.name_len);
@@ -67,15 +67,15 @@ void syscall_env(struct registers *r)
   if (q.cmd == ENV_GET) {
     const char *v = env_get(e, name);
     if (v)
-      r->eax = (uint32_t)give(&q, v);
+      SC_RET(r) = (uint32_t)give(&q, v);
   } else if (q.cmd == ENV_SET) {
     char *value = copy_string(q.value, q.value_len);
     if (value && env_set(e, name, value, q.index != 0) == 0)
-      r->eax = 0;
+      SC_RET(r) = 0;
     kfree(value);
   } else if (q.cmd == ENV_UNSET) {
     env_unset(e, name);
-    r->eax = 0;
+    SC_RET(r) = 0;
   }
   kfree(name);
 }

@@ -22,9 +22,9 @@ hang:
 /* A new thread starts here (see thread_spawn in lib.c) with %rsp at {fn, arg} and 16-byte aligned past them. A fn
  * that returns ends only its own thread, as exit does from a thread. */
 .section .text
-.global thread_start64
-.type thread_start64, @function
-thread_start64:
+.global thread_entry
+.type thread_entry, @function
+thread_entry:
 	xor  %ebp, %ebp
 	pop  %rax                      /* fn                                       */
 	pop  %rdi                      /* arg                                      */
@@ -33,7 +33,7 @@ thread_start64:
 	mov  $2, %eax                  /* SYS_EXIT                                 */
 	int  $0x80
 	jmp  hang
-.size thread_start64, . - thread_start64
+.size thread_entry, . - thread_entry
 
 /* setjmp/longjmp: the C89 non-local jump. jmp_buf is 8 quads:
  *   [0]=rbx [1]=rbp [2..5]=r12..r15 [6]=rsp(after ret) [7]=return address.

@@ -13,6 +13,7 @@
 #include "hda.h"
 #include "heap.h"
 #include "hfs.h"
+#include "irqflags.h"
 #include "iso9660.h"
 #include "keyboard.h"
 #include "kstring.h"
@@ -394,7 +395,7 @@ static void wait_reap(int pid)
   int status;
   while (!sched_try_reap(pid, &status)) {
     /* While a foreground child runs, leave keystrokes in the ring for its read(); the desktop drains keys elsewhere. */
-    __asm__ volatile("sti; hlt");
+    cpu_wait_enabled();
   }
   con_printf("[pid %u exited, status %u]\n", (uint32_t)pid, (uint32_t)status);
 }

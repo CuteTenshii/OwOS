@@ -51,6 +51,7 @@
 #include "timer.h"
 #include "ufs.h"
 #include "usb.h"
+#include "userland.h"
 #include "users.h"
 #include "virtiogpu.h"
 #include "virtioserial.h"
@@ -62,80 +63,10 @@
 const char *g_boot_stage = "early";
 static void bootmark(const char *s) { g_boot_stage = s; }
 
-static void shell_feed_locked(char c)
-{
-  uintptr_t flags = irq_save();
-  sched_kernel_enter();
-  shell_feed(c);
-  sched_kernel_leave();
-  irq_restore(flags);
-}
-
-static void shell_interrupt_locked(void)
-{
-  uintptr_t flags = irq_save();
-  sched_kernel_enter();
-  shell_interrupt();
-  sched_kernel_leave();
-  irq_restore(flags);
-}
-
-/* Create a directory / file only if absent, with an explicit mode (the boot session runs as root). */
-static void mkdir_mode(const char *path, uint32_t mode)
-{
-  if (fs_mkdir(path) == 0)
-    fs_chmod(path, mode);
-}
-
-/* Add a daemon line to an inittab that predates it (seed_file only writes a missing file). */
-static void inittab_ensure(const char *daemon)
-{
-  char buf[256];
-  int n = fs_read("/etc/inittab", buf, sizeof buf - 1);
-  uint32_t dl = (uint32_t)strlen(daemon);
-  if (n < 0 || (uint32_t)n + dl + 2 > sizeof buf)
-    return;
-  buf[n] = '\0';
-  for (const char *p = buf; *p; p++)
-    if ((p == buf || p[-1] == '\n') && memcmp(p, daemon, dl) == 0 && (p[dl] == '\n' || p[dl] == '\0'))
-      return;
-  if (n > 0 && buf[n - 1] != '\n')
-    buf[n++] = '\n';
-  memcpy(buf + n, daemon, dl);
-  buf[n + (int)dl] = '\n';
-  fs_delete("/etc/inittab");
-  fs_create("/etc/inittab", buf, (uint32_t)n + dl + 1);
-  fs_chmod("/etc/inittab", 0644);
-}
-
-static void seed_file(const char *path, const char *data, uint32_t len, uint32_t mode)
-{
-  char probe;
-  if (fs_read(path, &probe, 0) >= 0)
-    return;
-  fs_create(path, data, len);
-  fs_chmod(path, mode);
-}
-
-/* Load a /bin program and run it as a detached root process. */
-static void spawn_bin_detached(const char *path, char *arg0)
-{
-  int sz = fs_size(path);
-  uint8_t *buf = sz > 0 ? kmalloc((uint32_t)sz) : 0;
-  if (!buf)
-    return;
-  int n = fs_read(path, buf, (uint32_t)sz);
-  char *argv[1] = {arg0};
-  if (n > 0)
-    exec_program(buf, (uint32_t)n, 1, argv);
-  kfree(buf);
-}
-
 /* Slow post-sti bring-up in a background thread so the shell loop starts at once. */
 static void boot_bringup(void)
 {
-  /* PID 1 runs as root so the daemons it spawns inherit uid 0. */
-  spawn_bin_detached("/bin/init", "init");
+  userland_start();
 
   bootmark("usb");
   usb_boot();
@@ -372,27 +303,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   syscall_init();
 
-  {
-    mkdir_mode("/bin", 0755);
-    mkdir_mode("/home", 0755);
-    mkdir_mode("/home/root", 0700);
-    mkdir_mode("/home/root/Downloads", 0755);
-    mkdir_mode("/var", 0755);
-    mkdir_mode("/var/lib", 0755);
-    mkdir_mode("/etc", 0755);
-    install_payload();
-
-    /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
-    seed_file("/etc/passwd", "root::0:0:/home/root\n", 21, 0600);
-    seed_file("/etc/group", "root:0:\n", 8, 0644);
-    /* mdnsd advertisements, one "type port [txt...]" per line. */
-    seed_file("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26, 0644);
-    /* init's service table, one /bin daemon per line; compositor first. */
-    seed_file("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n", 41, 0644);
-    inittab_ensure("ntpd");
-    inittab_ensure("mediad");
-    users_init();
-  }
+  /* init's service table, one /bin daemon per line; compositor first. */
+  userland_prepare("compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n");
   con_write("usermode: ready ('curl <url>').\n");
 
   timer_init();
@@ -425,12 +337,12 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     /* The kernel drains the keyboard only while no compositor owns it (recovery console). */
     if (!graphics_fb_owned()) {
       if (keyboard_take_interrupt())
-        shell_interrupt_locked();
+        console_interrupt();
       while (keyboard_poll_text(&c, &mods))
-        shell_feed_locked(c);
+        console_feed(c);
     }
     while (serial_poll(&c))
-      shell_feed_locked(c);
+      console_feed(c);
     __asm__ volatile("hlt");
   }
 }

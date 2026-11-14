@@ -34,7 +34,7 @@ static __thread int conn_id;
 static __thread char rbuf[2 * WM_MSG_MAX];
 static __thread int rlen;
 
-static unsigned slot_addr(const struct lwin *w) { return SHM_LOW_ADDR + (unsigned)(w - wins) * SHM_SLOT_SIZE; }
+static sys_word slot_addr(const struct lwin *w) { return SHM_LOW_ADDR + (sys_word)(w - wins) * SHM_SLOT_SIZE; }
 
 static struct lwin *find(int id)
 {

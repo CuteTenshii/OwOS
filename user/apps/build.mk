@@ -55,12 +55,23 @@ APP_LIBS_upnpc := $(UPNP)
 APP_LIBS_vmclipd := $(CLIPBOARD)
 APP_LIBS_webp := $(WEBP) $(PNGDEC)
 
+# Programs link at USER_BASE from common/uabi.h, as the target's preprocessor evaluates it (C suffixes dropped for ld).
+# Make 4.3+ keeps the backslash of `\#` inside a function call and older versions need it; UABI_HASH works in both.
+UABI_HASH := \#
+UBASE := $(shell printf '$(UABI_HASH)include "uabi.h"\nUSER_BASE\n' | $(UCC) $(UARCHFLAGS) -E -P -Icommon -x c - | \
+           tail -n 1 | sed -E 's/(0x[0-9a-fA-F]+|[0-9]+)[uUlL]+/\1/g')
+
 # $(call app_rule,name): link rule for one app.
 define app_rule
 user/apps/$(1)/$(1).elf: $(call app_objs,$(1)) $(APP_LIBS_$(1)) $(if $(filter $(1),$(GUI_APPS)),$$(GUILIB)) $$(ULIB) user/user.ld
-	$$(ULD) -m $(UEMU) -z max-page-size=4096 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
+	$$(ULD) $(ULDFLAGS) -z max-page-size=4096 --defsym=__user_base='$(UBASE)' -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
 endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
+
+# Every program, on any ARCH (make user).
+APP_ELFS := $(foreach a,$(APPS),user/apps/$(a)/$(a).elf)
+.PHONY: user
+user: $(APP_ELFS)
 
 INSTALL_NAME_notifysend := notify-send
 
@@ -71,12 +82,14 @@ DESKTOP_APPS := term files archive editor browser pdfview player clock calc noti
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
 SYM_APPS := browser files archive editor term calc imgview pdfview player settings devhub notifyd about clock cliphist installowos
-kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
-	@: > kernel/appsyms.dat
-	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
-	  $(CROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
-	$(call blob,kernel/appsyms.dat,appsyms)
-	@rm -f kernel/appsyms.dat
+APPSYMS_OBJ ?= kernel/appsyms.o
+$(APPSYMS_OBJ): $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf)
+	@mkdir -p $(@D)
+	@: > $(@:.o=.dat)
+	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> $(@:.o=.dat); \
+	  $(CROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> $(@:.o=.dat); done
+	$(call blob,$(@:.o=.dat),appsyms)
+	@rm -f $(@:.o=.dat)
 
 # Every fonts/*.ttf and *.otf is installed to /etc/fonts; gfx loads them at runtime
 # instead of every app baking in a bitmap atlas. Drop one in fonts/ to ship it.
@@ -90,11 +103,11 @@ ICON_NAMES := utilities-terminal system-file-manager utilities-file-archiver acc
               battery-low battery-medium battery-full battery-charging \
               network-ethernet network-ethernet-disconnected
 
-# GRUB images the Installer writes to a disk, built when the host has GRUB for every platform. They carry
+# GRUB images the Installer writes to a disk, built for x86 when the host has GRUB for every platform. They carry
 # every module they need, since the disk gets no module directory, and find their ESP by a marker file
 # the live ISO lacks.
 GRUB_PLATFORMS := i386-pc i386-efi x86_64-efi
-HAVE_GRUB := $(if $(shell command -v $(GRUB_MKIMAGE) 2>/dev/null),$(if $(strip $(foreach p,$(GRUB_PLATFORMS),$(if $(wildcard $(GRUB_DIR)/$(p)/kernel.img),,missing))),,y))
+HAVE_GRUB := $(if $(filter i386 x86_64,$(ARCH)),$(if $(shell command -v $(GRUB_MKIMAGE) 2>/dev/null),$(if $(strip $(foreach p,$(GRUB_PLATFORMS),$(if $(wildcard $(GRUB_DIR)/$(p)/kernel.img),,missing))),,y)))
 GRUB_MODULES := part_gpt fat search search_fs_file configfile normal multiboot2 all_video
 GRUB_IMAGES := build/grub/core.img build/grub/bootia32.efi build/grub/bootx64.efi
 build/grub/early.cfg:

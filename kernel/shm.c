@@ -31,8 +31,8 @@ struct shm_mapping {
   bool used;
   int obj;
   uint32_t pid;
-  uint32_t *dir;
-  uint32_t at;
+  pgdir_t *dir;
+  uaddr_t at;
 };
 
 static struct shm_obj objs[SHM_MAX];
@@ -63,11 +63,12 @@ static bool may_map(const struct shm_obj *o, uint32_t pid)
   return false;
 }
 
-static bool slot_ok(uint32_t at)
+static bool slot_ok(uaddr_t at)
 {
-  if (at % SHM_SLOT_BYTES)
+  if (at % SHM_SLOT_SIZE)
     return false;
-  return (at >= SHM_LOW_BASE && at < SHM_LOW_END) || at >= SHM_HIGH_BASE;
+  uint64_t high_end = (uint64_t)SHM_HIGH_ADDR + (uint64_t)SHM_HIGH_SLOTS * SHM_SLOT_SIZE; /* 4 GiB on x86 */
+  return (at >= SHM_LOW_ADDR && at < COMPOSITOR_FB_ADDR) || (at >= SHM_HIGH_ADDR && (uint64_t)at < high_end);
 }
 
 static void zero_frames(uint32_t phys, int npages)
@@ -95,13 +96,13 @@ static void maybe_free(struct shm_obj *o)
 static void drop_mapping(struct shm_mapping *m)
 {
   struct shm_obj *o = &objs[m->obj];
-  paging_unmap_user_at(m->dir, m->at, SHM_SLOT_BYTES);
+  paging_unmap_user_at(m->dir, m->at, SHM_SLOT_SIZE);
   m->used = false;
   o->nmaps--;
   maybe_free(o);
 }
 
-static struct shm_mapping *mapping_at(uint32_t *dir, uint32_t at)
+static struct shm_mapping *mapping_at(pgdir_t *dir, uaddr_t at)
 {
   for (int i = 0; i < SHM_MAPS_MAX; i++)
     if (maps[i].used && maps[i].dir == dir && maps[i].at == at)
@@ -111,7 +112,7 @@ static struct shm_mapping *mapping_at(uint32_t *dir, uint32_t at)
 
 int shm_create(uint32_t bytes)
 {
-  if (bytes == 0 || bytes > SHM_SLOT_BYTES)
+  if (bytes == 0 || bytes > SHM_SLOT_SIZE)
     return -1;
   int idx = -1;
   for (int i = 0; i < SHM_MAX; i++)
@@ -157,14 +158,14 @@ int shm_grant(int h, uint32_t pid)
   return 0;
 }
 
-int shm_map(int h, uint32_t at)
+int shm_map(int h, uaddr_t at)
 {
   int idx;
   struct shm_obj *o = lookup(h, &idx);
   uint32_t pid = sched_current_process_id();
   if (!o || !may_map(o, pid) || !slot_ok(at))
     return -1;
-  uint32_t *dir = sched_current_dir();
+  pgdir_t *dir = sched_current_dir();
   struct shm_mapping *m = mapping_at(dir, at);
   if (m && m->obj == idx)
     return 0;
@@ -180,7 +181,7 @@ int shm_map(int h, uint32_t at)
   if (m)
     drop_mapping(m);
   if (paging_map_user_at(dir, at, o->phys, o->npages) < 0) {
-    paging_unmap_user_at(dir, at, SHM_SLOT_BYTES);
+    paging_unmap_user_at(dir, at, SHM_SLOT_SIZE);
     o->nmaps--;
     maybe_free(o);
     return -1;
@@ -193,7 +194,7 @@ int shm_map(int h, uint32_t at)
   return 0;
 }
 
-int shm_unmap(uint32_t at)
+int shm_unmap(uaddr_t at)
 {
   struct shm_mapping *m = mapping_at(sched_current_dir(), at);
   if (!m)
@@ -221,7 +222,7 @@ int shm_size(int h)
   return (int)o->bytes;
 }
 
-void shm_process_exiting(uint32_t pid, uint32_t *dir)
+void shm_process_exiting(uint32_t pid, pgdir_t *dir)
 {
   /* Unmap rather than forget: a sibling thread may still run until the leader's reap, and the frames may go now. */
   for (int i = 0; i < SHM_MAPS_MAX; i++)

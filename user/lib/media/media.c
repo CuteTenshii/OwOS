@@ -27,11 +27,7 @@ static void mlock(void)
   while (xchg32(&g_lock, 1))
     msleep(0);
 }
-static void munlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  g_lock = 0;
-}
+static void munlock(void) { __atomic_store_n(&g_lock, 0, __ATOMIC_RELEASE); }
 
 /* ---- decoder ------------------------------------------------------------- */
 struct media_decoder {
@@ -1097,7 +1093,7 @@ static void mixer_thread(void)
       int filled, f, vol;
       if (!s->in_use || s->free_pending)
         continue;
-      if (s->seek_pending) {
+      if (__atomic_load_n(&s->seek_pending, __ATOMIC_ACQUIRE)) {
         media_seek_ms(s->dec, s->seek_ms);
         s->seek_pending = 0;
         s->ended = 0;
@@ -1191,8 +1187,7 @@ media_source *media_source_new(media_decoder *d, media_end_cb on_end, void *user
     slot->user = user;
     slot->end_fired = 0;
     slot->free_pending = 0;
-    __asm__ volatile("" ::: "memory");
-    slot->in_use = 1;
+    __atomic_store_n(&slot->in_use, 1, __ATOMIC_RELEASE);
   }
   munlock();
   return slot;
@@ -1203,8 +1198,7 @@ void media_source_free(media_source *s)
   if (!s)
     return;
   s->playing = 0;
-  __asm__ volatile("" ::: "memory");
-  s->free_pending = 1;
+  __atomic_store_n(&s->free_pending, 1, __ATOMIC_RELEASE);
 }
 
 void media_source_play(media_source *s)
@@ -1241,8 +1235,7 @@ void media_source_seek_ms(media_source *s, unsigned ms)
   s->seek_ms = ms;
   s->pos_ms = ms;
   s->ended = 0;
-  __asm__ volatile("" ::: "memory");
-  s->seek_pending = 1;
+  __atomic_store_n(&s->seek_pending, 1, __ATOMIC_RELEASE); /* the mixer reads seek_ms once it sees this */
 }
 
 int media_source_playing(const media_source *s) { return s ? (s->playing && !s->ended) : 0; }

@@ -44,6 +44,13 @@ extern const unsigned char __text_start[], __text_end[];
 /* Whether stack word `w` is a return address: inside the code, right after a call instruction. */
 static bool after_call(unsigned long w)
 {
+#if defined(__aarch64__)
+  if ((w & 3) || w < (unsigned long)__text_start + 4 || w > (unsigned long)__text_end)
+    return false;
+  unsigned insn = ((const unsigned *)w)[-1];
+  return (insn & 0xFC000000u) == 0x94000000u     /* bl label */
+         || (insn & 0xFFFFFC1Fu) == 0xD63F0000u; /* blr reg */
+#else
   if (w < (unsigned long)__text_start + 7 || w > (unsigned long)__text_end)
     return false;
   const unsigned char *c = (const unsigned char *)w;
@@ -54,6 +61,7 @@ static bool after_call(unsigned long w)
          || (c[-4] == 0xFF && c[-3] == 0x54)                                                /* call *d8(sib) */
          || (c[-6] == 0xFF && ((c[-5] & 0xF8) == 0x90 || c[-5] == 0x15))                    /* call *d32(%reg), *abs */
          || (c[-7] == 0xFF && c[-6] == 0x94);                                               /* call *d32(sib) */
+#endif
 }
 
 static void worker_crash_handler(int sig, siginfo_t *info, void *ctx)
@@ -63,12 +71,13 @@ static void worker_crash_handler(int sig, siginfo_t *info, void *ctx)
   g_crash.ctx = *sc;
   g_crash.ncallers = 0;
   unsigned long lo = (unsigned long)worker_stack, hi = lo + sizeof worker_stack, word = sizeof(void *);
-  if (sc->esp >= lo && sc->esp < hi) /* a wild esp would fault again in here: only scan our own stack */
-    for (unsigned long p = sc->esp & ~(word - 1);
-         p + word <= hi && p - sc->esp < 32768 && g_crash.ncallers < CRASH_CALLERS; p += word) {
+  unsigned long sp = SIGCONTEXT_SP(sc);
+  if (sp >= lo && sp < hi) /* a wild sp would fault again in here: only scan our own stack */
+    for (unsigned long p = sp & ~(word - 1); p + word <= hi && p - sp < 32768 && g_crash.ncallers < CRASH_CALLERS;
+         p += word) {
       unsigned long w = *(const unsigned long *)p;
       if (after_call(w))
-        g_crash.callers[g_crash.ncallers++] = (unsigned)w;
+        g_crash.callers[g_crash.ncallers++] = (sys_word)w;
     }
   /* Carry the signal out as the setjmp return value so the recovery point knows WHICH fault fired */
   longjmp(worker_recovery, sig);
@@ -87,11 +96,16 @@ static void crash_log(int sig, const struct tab_crash *c, const char *url)
 {
   char line[160], at[128], thread[THREAD_NAME_MAX] = "";
   crash_describe(sig, c, line, sizeof line);
-  crash_where(c->ctx.eip, at, sizeof at);
+  crash_where(SIGCONTEXT_PC(&c->ctx), at, sizeof at);
   thread_getname(thread, sizeof thread); /* we log from the thread that faulted */
   printf("browser [%s]: tab crashed on %s\n  %s\n  at %s\n", thread[0] ? thread : "?", url, line, at);
+#if defined(__aarch64__)
+  printf("  x0=%p x1=%p x2=%p x3=%p fp=%p lr=%p sp=%p\n", (void *)c->ctx.x[0], (void *)c->ctx.x[1], (void *)c->ctx.x[2],
+         (void *)c->ctx.x[3], (void *)c->ctx.x[29], (void *)c->ctx.x[30], (void *)c->ctx.sp);
+#else
   printf("  eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n", c->ctx.eax, c->ctx.ebx,
          c->ctx.ecx, c->ctx.edx, c->ctx.esi, c->ctx.edi, c->ctx.ebp, c->ctx.esp);
+#endif
   for (int i = 0; i < c->ncallers; i++) {
     crash_where(c->callers[i], at, sizeof at);
     printf("  called from %s\n", at);
