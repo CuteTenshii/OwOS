@@ -15,6 +15,7 @@ uint32_t smp_cpu_count(void) { return (uint32_t)online; }
 /* A secondary CPU's C entry (boot.S), on its boot stack, which becomes its idle task's. */
 void secondary_main(int cpu)
 {
+  cpu_record(cpu);
   gic_cpu_init();
   fpu_cpu_init();
   timer_init();

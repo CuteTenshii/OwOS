@@ -62,6 +62,9 @@ int uart_getc_nb(char *out);
 
 void mmu_init(void);
 
+/* Note this CPU's MIDR for cpu_brand (cpu.c); each CPU calls it once as it comes up. */
+void cpu_record(int cpu);
+
 /* Size RAM from the DTB, then bring up the frame allocator and the kernel heap. Returns 0 on success. */
 int arch_mem_init(const void *dtb);
 

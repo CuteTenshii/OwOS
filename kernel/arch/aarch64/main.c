@@ -194,6 +194,7 @@ void arch_main(void)
   tegra_start();
   con_printf("RAM free %u KiB\n", pmm_free_kib());
 
+  cpu_record(0);
   fpu_cpu_init();
   entropy_init();
   gic_init();

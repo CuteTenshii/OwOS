@@ -18,6 +18,16 @@
 	msr	icc_sre_el2, x0
 	isb
 1:
+	/* MDCR_EL2 resets to UNKNOWN: hand EL1 every PMU counter, untrapped, or nothing when there is no PMU. */
+	mov	x0, xzr
+	mrs	x1, id_aa64dfr0_el1
+	ubfx	x1, x1, #8, #4               /* PMUVer: 0 none, 0xf IMPLEMENTATION DEFINED */
+	cbz	x1, 2f
+	cmp	x1, #0xf
+	b.eq	2f
+	mrs	x0, pmcr_el0
+	ubfx	x0, x0, #11, #5              /* PMCR_EL0.N into MDCR_EL2.HPMN; TPM and TPMCR stay 0 */
+2:	msr	mdcr_el2, x0
 	mov	x0, #0x3c5                   /* SPSR: EL1h, DAIF masked */
 	msr	spsr_el2, x0
 	adr	x0, \target
