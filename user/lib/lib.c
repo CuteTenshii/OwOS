@@ -932,6 +932,21 @@ char *strchr(const char *s, int c)
   }
 }
 
+char *strstr(const char *s, const char *needle)
+{
+  for (;; s++) {
+    const char *a = s, *b = needle;
+    while (*b && *a == *b) {
+      a++;
+      b++;
+    }
+    if (!*b)
+      return (char *)s;
+    if (!*s)
+      return 0;
+  }
+}
+
 void strcpy(char *d, const char *s)
 {
   while ((*d++ = *s++))

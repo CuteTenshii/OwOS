@@ -127,14 +127,6 @@ static const char *after(const char *s, const char *prefix)
   return s;
 }
 
-static const char *find(const char *hay, const char *needle)
-{
-  for (; *hay; hay++)
-    if (after(hay, needle))
-      return hay;
-  return 0;
-}
-
 static int hexv(char c)
 {
   return c >= '0' && c <= '9'   ? c - '0'
@@ -420,14 +412,14 @@ static bool conn_listed(const char *addr)
   char needle[48];
   slurp(STATUS_PATH, text, sizeof text);
   snprintf(needle, sizeof needle, "connection %s le", addr);
-  return find(text, needle) != 0;
+  return strstr(text, needle) != 0;
 }
 
 static bool gatt_ready(void)
 {
   static char text[8192];
   slurp(GATT_PATH, text, sizeof text);
-  return find(text, "state ready") != 0;
+  return strstr(text, "state ready") != 0;
 }
 
 static void parse_gatt(struct gsvc *svcs, int *nsvc, struct gchr *chrs, int *nchr)
@@ -1191,7 +1183,7 @@ static int add_device(const struct adv *a)
 
 static void page_host(char *out, int cap)
 {
-  const char *u = g_page_url_buf, *p = find(u, "://");
+  const char *u = g_page_url_buf, *p = strstr(u, "://");
   int n = 0;
   p = p ? p + 3 : u;
   while (p[n] && p[n] != '/' && p[n] != '?' && n < cap - 1) {

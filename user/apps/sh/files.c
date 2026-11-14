@@ -561,19 +561,7 @@ void bi_grep(int argc, char **argv)
     while (i < n && iobuf[i] != '\n')
       i++;
     iobuf[i < n ? i : n - 1] = '\0'; /* terminate the line for strstr */
-    int hit = 0;
-    for (const char *s = &iobuf[ls]; *s; s++) { /* substring search */
-      const char *a = s, *b = pat;
-      while (*a && *b && *a == *b) {
-        a++;
-        b++;
-      }
-      if (!*b) {
-        hit = 1;
-        break;
-      }
-    }
-    if (hit) {
+    if (strstr(&iobuf[ls], pat)) {
       tputs(&iobuf[ls]);
       tputc('\n');
     }
