@@ -244,7 +244,7 @@ static void build_info(void)
     if (uname(&u) == 0) {
       as("owos (");
       as(u.machine);
-      as(u.machine[0] == 'x' ? ", 64-bit)" : ", 32-bit)");
+      as(strstr(u.machine, "64") ? ", 64-bit)" : ", 32-bit)"); /* x86_64, aarch64 */
     } else {
       as("owos");
     }
