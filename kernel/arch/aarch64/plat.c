@@ -1,6 +1,7 @@
 /* plat.c: discover the UART, interrupt controller, PSCI conduit, CPU list and SoC blocks from the device tree. */
 #include "plat.h"
 #include "arch.h"
+#include "smbios.h"
 #include "tegra_car.h"
 
 struct plat plat = {
@@ -106,6 +107,13 @@ static void find_soc_blocks(const void *dtb)
     plat.infracfg_base = base;
   if (!fdt_compat_reg(dtb, "mediatek,mt6765-pinctrl", 0, 0, &base, &size))
     plat.gpio_base = base;
+}
+
+static void find_rtc(const void *dtb)
+{
+  uint64_t base, size;
+  if (!fdt_compat_reg(dtb, "arm,pl031", 0, 0, &base, &size) && !node_disabled(dtb, "arm,pl031", 0))
+    plat.rtc_base = base;
 }
 
 static void find_pwrap(const void *dtb)
@@ -233,10 +241,18 @@ void plat_init(const void *dtb)
   find_gic(dtb);
   find_psci(dtb);
   find_pwrap(dtb);
+  find_rtc(dtb);
   find_soc_blocks(dtb);
   find_i2c(dtb);
   find_tegra(dtb);
   drop_dead_tegra_uart();
   find_fb(dtb);
   find_cpus(dtb);
+  if (fdt_path_str(dtb, "/", "model", plat.model, sizeof plat.model) &&
+      fdt_path_str(dtb, "/", "compatible", plat.model, sizeof plat.model))
+    plat.model[0] = '\0';
 }
+
+/* Device trees name the board but carry no separate manufacturer field, so the model stands for both. */
+const char *smbios_vendor(void) { return ""; }
+const char *smbios_product(void) { return plat.model; }

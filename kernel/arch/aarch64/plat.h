@@ -35,6 +35,7 @@ struct plat {
   uintptr_t topckgen_base, infracfg_base; /* 0 when absent */
   uintptr_t gpio_base;
   uintptr_t pwrap_base; /* 0 when the device tree has no PMIC wrapper */
+  uintptr_t rtc_base;   /* a PL031 real-time clock, 0 when absent */
   int ni2c;
   struct plat_i2c i2c[PLAT_I2C_MAX];
   uintptr_t car_base, tegra_gpio_base, pmc_base; /* Tegra clock-and-reset, GPIO and power blocks, 0 when absent */
@@ -45,6 +46,7 @@ struct plat {
   int psci_smc; /* -1: pick from the boot exception level */
   int ncpus;
   uint64_t cpu_mpidr[MAX_CPUS]; /* affinity bits, boot CPU first */
+  char model[64];               /* the tree's /model, else its first /compatible; "" without a tree */
 };
 
 extern struct plat plat;

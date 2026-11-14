@@ -47,6 +47,7 @@ TIDY_TARGET_x86  = --target=$(if $(filter x86_64,$(ARCH)),x86_64,i386)-none-elf
 TIDY_TARGET_a64 := --target=aarch64-none-elf -mgeneral-regs-only -Ikernel/arch/aarch64 -Ikernel/arch/common
 TIDY_TARGET_arm := --target=armv7a-none-eabi -mcpu=cortex-a15 -marm -mfloat-abi=soft -Ikernel/arch/arm -Ikernel/arch/common
 TIDY_INC_x86     = -Ikernel/arch/x86 $(addprefix -Idrivers/,$(DRVDIRS))
+TIDY_INC_a64     = $(addprefix -Idrivers/,$(DRVDIRS))
 
 # $(call blob,file,name): recipe wrapping `file` into the kernel object $@ (KELF/KBFD: the target's ELF format) as _binary_<name>_{start,end}.
 # objcopy names the symbols after the input path, with every '/', '.' and '-' turned into '_'.

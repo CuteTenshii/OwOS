@@ -1,10 +1,11 @@
 /* i2c_mtk_host.h: a fake MT6765 I2C controller and AP-DMA channel with an EEPROM on the bus, in place of mmio.h,
- * cache.h and counter.h, for i2c_mtk_test.c. The fake cache is not coherent: DMA reads only what was cleaned and the
- * CPU sees DMA writes only after an invalidate. */
+ * cache.h, counter.h and sched.h, for i2c_mtk_test.c. The fake cache is not coherent: DMA reads only what was cleaned
+ * and the CPU sees DMA writes only after an invalidate. */
 #ifndef OWOS_ARCH_AARCH64_MMIO_H
 #define OWOS_ARCH_AARCH64_MMIO_H
 #define OWOS_ARCH_AARCH64_CACHE_H
 #define OWOS_ARCH_AARCH64_COUNTER_H
+#define OWOS_SCHED_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -44,6 +45,7 @@ void fake_i2c_write32(uintptr_t a, uint32_t v);
 
 void dcache_clean(const void *p, size_t len);
 void dcache_inval(void *p, size_t len);
+void sched_yield(void);
 
 static inline uint64_t counter_now(void) { return i2c_fake.now += 10; }
 static inline uint64_t counter_hz(void) { return 1000000; }

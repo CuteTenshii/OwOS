@@ -7,6 +7,7 @@
 
 #define UARTDR 0x00
 #define UARTFR 0x18
+#define UARTFR_RXFE (1u << 4)
 #define UARTFR_TXFF (1u << 5)
 #define UARTIBRD 0x24
 #define UARTFBRD 0x28
@@ -14,7 +15,9 @@
 #define UARTCR 0x30
 
 #define NS_THR 0x00
+#define NS_RBR 0x00
 #define NS_LSR 0x14
+#define NS_LSR_DR (1u << 0)
 #define NS_LSR_THRE (1u << 5)
 #define NS_TX_POLLS 100000
 
@@ -83,4 +86,19 @@ void uart_puthex(uint64_t v)
   for (int i = 60; i >= 0; i -= 4)
     uart_write("0123456789abcdef"[(v >> i) & 0xf]);
   spin_unlock_irqrestore(&uart_lock, f);
+}
+
+int uart_getc_nb(char *out)
+{
+  if (plat.uart_kind == UART_PL011) {
+    if (mmio_read32(plat.uart_base + UARTFR) & UARTFR_RXFE)
+      return 0;
+    *out = (char)mmio_read32(plat.uart_base + UARTDR);
+    return 1;
+  }
+  if (plat.uart_kind == UART_16550 && !ns_dead && (mmio_read32(plat.uart_base + NS_LSR) & NS_LSR_DR)) {
+    *out = (char)mmio_read32(plat.uart_base + NS_RBR);
+    return 1;
+  }
+  return 0;
 }

@@ -1,4 +1,4 @@
-/* vectors.S: EL1 exception vector table and register save/restore. */
+/* vectors.S: EL1 exception vector table and the trap frame (struct registers, regs.h) around arch_exception. */
 
 .macro ventry kind
 	.balign 128
@@ -28,9 +28,10 @@ vector_table:
 	ventry 14
 	ventry 15
 
-/* Frame is struct trap_frame (272 bytes); x29/x30 were already pushed by ventry. */
+/* struct registers is 320 bytes: x0..x30 at 0..240, sp 248, pc 256, pstate 264, sa[3] 272..288, esr 296, far 304,
+ * pad 312. ventry already pushed x29/x30 where far and pad go, so they are moved to their slots first. */
 trap_common:
-	sub	sp, sp, #256
+	sub	sp, sp, #304
 	stp	x0, x1, [sp, #0]
 	stp	x2, x3, [sp, #16]
 	stp	x4, x5, [sp, #32]
@@ -46,19 +47,28 @@ trap_common:
 	stp	x24, x25, [sp, #192]
 	stp	x26, x27, [sp, #208]
 	str	x28, [sp, #224]
-	ldp	x0, x1, [sp, #256]           /* original x29, x30 */
+	ldp	x0, x1, [sp, #304]           /* original x29, x30 */
 	stp	x0, x1, [sp, #232]
 	mrs	x0, sp_el0
 	mrs	x1, elr_el1
-	mrs	x2, spsr_el1
 	stp	x0, x1, [sp, #248]
-	str	x2, [sp, #264]
+	mrs	x0, spsr_el1
+	str	x0, [sp, #264]
+	mrs	x0, esr_el1
+	mrs	x1, far_el1
+	str	x0, [sp, #296]
+	stp	x1, xzr, [sp, #304]
 
-	/* x29 still holds the vector kind; tf lives at sp, which now spans 272 bytes. */
+	/* x29 still holds the vector kind. */
 	mov	x1, x29
 	mov	x0, sp
 	bl	arch_exception
 
+/* Return to the context in the frame at sp; a forked child enters here on its copy of the parent's frame. */
+.global trap_restore
+trap_restore:
+	/* The handler may return with interrupts on; one taken from here on would overwrite ELR and SPSR. */
+	msr	daifset, #0xf
 	ldr	x2, [sp, #264]
 	ldp	x0, x1, [sp, #248]
 	msr	sp_el0, x0
@@ -80,5 +90,5 @@ trap_common:
 	ldp	x26, x27, [sp, #208]
 	ldr	x28, [sp, #224]
 	ldp	x29, x30, [sp, #232]
-	add	sp, sp, #272
+	add	sp, sp, #320
 	eret

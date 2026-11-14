@@ -1,4 +1,4 @@
-/* arch.c: AArch64 platform support: stage-1 MMU, generic timer, exception dispatch and PSCI. */
+/* arch.c: AArch64 platform support: the stage-1 MMU and PSCI. */
 #include "arch.h"
 #include <stdbool.h>
 
@@ -6,7 +6,8 @@
 #define PTE_ATTR(n) ((uint64_t)(n) << 2)
 #define PTE_SH_ISH (3ULL << 8)
 #define PTE_AF (1ULL << 10)
-#define PTE_XN ((1ULL << 53) | (1ULL << 54))
+#define PTE_UXN (1ULL << 54)
+#define PTE_XN ((1ULL << 53) | PTE_UXN)
 #define MAIR_DEVICE 0
 #define MAIR_NORMAL 1
 
@@ -21,7 +22,8 @@ void mmu_init(void)
   for (int i = 0; i < 4; i++) {
     uint64_t base = (uint64_t)i << 30;
     bool ram = ram_base < base + (1ULL << 30) && ram_base + ram_size > base;
-    kernel_l1[i] = ram ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF)
+    /* EL0 fetches obey UXN alone, not the EL1-only access bits, so kernel memory must say it explicitly. */
+    kernel_l1[i] = ram ? (base | PTE_BLOCK | PTE_ATTR(MAIR_NORMAL) | PTE_SH_ISH | PTE_AF | PTE_UXN)
                        : (base | PTE_BLOCK | PTE_ATTR(MAIR_DEVICE) | PTE_AF | PTE_XN);
   }
 
@@ -48,76 +50,9 @@ void mmu_init(void)
   __asm__ volatile("isb");
 }
 
-static volatile uint64_t ticks;
-static uint64_t tick_interval;
-
-void timer_init(void)
-{
-  tick_interval = SYSREG_READ(cntfrq_el0) / TICK_HZ;
-  SYSREG_WRITE(cntp_tval_el0, tick_interval);
-  SYSREG_WRITE(cntp_ctl_el0, 1);
-}
-
-uint64_t timer_ticks(void) { return ticks; }
-
-static void irq_dispatch(void)
-{
-  uint32_t iar = gic_ack();
-  uint32_t id = iar & 0x3ff;
-  if (id == IRQ_TIMER_PPI) {
-    SYSREG_WRITE(cntp_tval_el0, tick_interval);
-    if (cpu_id() == 0)
-      ticks++;
-  }
-  if (id < 1020)
-    gic_eoi(iar);
-  if (id == IRQ_TIMER_PPI)
-    schedule();
-}
-
-static void exception_fatal(struct trap_frame *tf, uint64_t kind)
-{
-  uart_puts("\nexception kind=");
-  uart_puthex(kind);
-  uart_puts(" esr=");
-  uart_puthex(SYSREG_READ(esr_el1));
-  uart_puts(" elr=");
-  uart_puthex(tf->elr);
-  uart_puts(" far=");
-  uart_puthex(SYSREG_READ(far_el1));
-  uart_putc('\n');
-  for (;;)
-    __asm__ volatile("wfe");
-}
-
-volatile uint64_t svc_count;
-
-/* kind = vector index: 0-3 current EL SP0, 4-7 current EL SPx, 8-11 lower EL A64, 12-15 lower EL A32;
- * within each group 0 sync, 1 irq, 2 fiq, 3 serror. */
-void arch_exception(struct trap_frame *tf, uint64_t kind)
-{
-  uint64_t type = kind & 3;
-  if (type == 1) {
-    irq_dispatch();
-    return;
-  }
-  uint64_t ec = SYSREG_READ(esr_el1) >> 26;
-  if (type == 0 && kind >= 8 && kind < 12) {
-    if (ec == 0x15)
-      syscall_dispatch(tf);
-    else
-      task_fault(tf);
-    return;
-  }
-  if (type == 0 && ec == 0x15) { /* SVC from EL1 */
-    svc_count++;
-    return;
-  }
-  exception_fatal(tf, kind);
-}
-
 #define PSCI_CPU_ON 0xc4000003UL
 #define PSCI_SYSTEM_OFF 0x84000008UL
+#define PSCI_SYSTEM_RESET 0x84000009UL
 
 static int64_t psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -144,17 +79,6 @@ void arch_poweroff(void)
   psci_call(PSCI_SYSTEM_OFF, 0, 0, 0);
   if (arch_poweroff_fallback)
     arch_poweroff_fallback();
-  for (;;)
-    __asm__ volatile("wfi");
 }
 
-uintptr_t context_init(void *stack_top, void (*entry)(void *), void *arg)
-{
-  uint64_t *sp = (uint64_t *)((uintptr_t)stack_top - 96);
-  for (int i = 0; i < 12; i++)
-    sp[i] = 0;
-  sp[0] = (uint64_t)entry;              /* x19, called by the trampoline */
-  sp[1] = (uint64_t)arg;                /* x20 */
-  sp[11] = (uint64_t)thread_trampoline; /* x30 */
-  return (uintptr_t)sp;
-}
+void arch_reset(void) { psci_call(PSCI_SYSTEM_RESET, 0, 0, 0); }

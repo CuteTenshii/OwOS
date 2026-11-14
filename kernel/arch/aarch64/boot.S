@@ -149,7 +149,7 @@ secondary_el1:
 .balign 16
 .global __stack_bottom
 __stack_bottom:
-	.skip	16384
+	.skip	65536                        /* the boot task's: it runs the recovery shell's commands */
 .global __stack_top
 __stack_top:
 

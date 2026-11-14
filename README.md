@@ -73,6 +73,23 @@ Note QEMU's built-in `-kernel` multiboot loader only loads 32-bit ELF, so
 (GRUB's multiboot2 loads ELF64) - which means the `iso` toolchain (Linux-only) is
 required to run it.
 
+### AArch64 build
+
+`make ARCH=aarch64` builds `owos-aarch64.bin`, a position-independent Linux-style
+`Image` for QEMU's `virt` machine and the boards whose device trees
+`kernel/arch/aarch64/` reads. It runs the same shared kernel and the same user
+programs, compiled as ELF64 AArch64 (Linux hosts: `CROSS=aarch64-linux-gnu-`).
+User space sits 3 GiB higher than on x86 (at 4 GiB and up), so the syscall ABI's
+address words are 64 bits wide there. The kernel brings up the board's UART,
+GIC, generic timer, PSCI CPUs and PL031 clock, but none of the PC drivers: with
+no disk, NIC, sound or display driver it runs from its RAM filesystem, with the
+recovery console on the UART.
+
+| Command | What it does |
+|---|---|
+| `make ARCH=aarch64 run` | Boot it headless on QEMU `virt`, the console on the terminal. |
+| `make ARCH=aarch64 check` | Boot it and run programs from the console and from `sh`; fails unless they print what they should. |
+
 On Linux there is **no cross-compiler**: the kernel is built with the host
 `gcc -m32 -ffreestanding -nostdlib` and linked at 1 MiB by `kernel/arch/x86/linker.ld` (on macOS the
 `i686-elf-` cross-toolchain above plays that role). QEMU's `-kernel` is itself a
@@ -156,7 +173,7 @@ private address space). The full lifecycle works:
 Processes carry a **cwd**, so `curl -o out.txt` lands in the current directory.
 Each has a file-descriptor table (0/1/2 = console); `pipe` creates a kernel ring
 buffer, fds survive `fork`/`exec`, and the shell wires `a | b` pipelines
-kernel-side. User programs are freestanding ELF (ELF32 on i386, ELF64 on x86_64)
+kernel-side. User programs are freestanding ELF (ELF32 on i386, ELF64 on x86_64 and AArch64)
 linked at the user window and embedded into the kernel image; the loader parses the program headers into a
 fresh address space.
 

@@ -1,20 +1,33 @@
-/* main.c: AArch64 bring-up: console, MMU, memory, scheduler, interrupts and the other CPUs. */
+/* main.c: AArch64 boot: console, MMU, memory and the board's devices, then the shared kernel (scheduler, live
+ * filesystem, the embedded programs and init) and the recovery console on the UART. */
 #include "arch.h"
+#include "blk.h"
 #include "clk.h"
+#include "console.h"
+#include "entropy.h"
+#include "fpu.h"
+#include "fs.h"
 #include "gpio.h"
 #include "i2c_mtk.h"
 #include "i2c_tegra.h"
+#include "install.h"
+#include "irqflags.h"
+#include "keyboard.h"
 #include "kstring.h"
 #include "max77620.h"
+#include "net.h"
 #include "pwrap.h"
+#include "sched.h"
+#include "shell.h"
 #include "tegra_car.h"
 #include "tegra_gpio.h"
+#include "timer.h"
+#include "userland.h"
+#include "wallclock.h"
 
 #define I2C_SRC_HZ 26000000 /* i2c_sel parent 0: the crystal */
 
 _Static_assert(I2C_MTK_DMA_MAX <= PMM_FRAME_SIZE, "an I2C DMA buffer is one frame");
-
-int selftest_run(void);
 
 static struct i2c_mtk i2c_ctl[PLAT_I2C_MAX];
 
@@ -132,6 +145,13 @@ static void tegra_start(void)
     tegra_pmic_start();
 }
 
+/* Started after interrupts are on, so the console comes up at once. */
+static void boot_bringup(void)
+{
+  userland_start();
+  sched_exit(0);
+}
+
 static const char *uart_name(void)
 {
   return plat.uart_kind == UART_PL011   ? ", uart pl011, "
@@ -172,15 +192,33 @@ void arch_main(void)
   }
   i2c_start();
   tegra_start();
-  uart_puts("RAM free KiB ");
-  uart_puthex(pmm_free_kib());
-  uart_putc('\n');
-  sched_init();
+  con_printf("RAM free %u KiB\n", pmm_free_kib());
+
+  fpu_cpu_init();
+  entropy_init();
   gic_init();
   timer_init();
-  __asm__ volatile("msr daifclr, #2");
-  smp_start();
+  sched_init();
+  net_init();
+  blk_init();
+  /* Live owofs adds per-file cluster rounding and its directory on top of the payload itself. */
+  fs_init(install_payload_bytes() / 512u * 9u / 8u + 8u * 2048u);
+  /* No daemons yet: the compositor, network and audio services have no devices to drive here. */
+  userland_prepare("");
+  con_write("usermode: ready.\n");
+  wallclock_init();
 
-  selftest_run();
-  arch_poweroff();
+  irq_enable();
+  con_printf("smp: %d/%d cores online.\n", smp_start(), plat.ncpus);
+  sched_create_thread("bootup", boot_bringup);
+  shell_init();
+
+  for (;;) {
+    char c;
+    if (keyboard_take_interrupt())
+      console_interrupt();
+    while (keyboard_poll_text(&c, 0))
+      console_feed(c);
+    cpu_wait();
+  }
 }

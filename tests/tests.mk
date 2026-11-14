@@ -55,7 +55,6 @@ ZSTD_RENAME       := -Dzstd_decompress=user_zstd_decompress
 ARCHIVE_HOST_FS   := -Dmkdir=archive_test_mkdir -Dstream_begin=archive_test_stream_begin \
                      -Dstream_write=archive_test_stream_write -Dstream_end=archive_test_stream_end -include tests/archive_fs.h
 EXTRA_zstd        := $(ZSTD_RENAME)
-EXTRA_a64_elf     := -Ikernel
 EXTRA_wm          := -Iuser/apps/compositor
 
 # Objects rebuilt with test-specific defines or a fake system layer: impl_<name> := <source> <extra flags>
@@ -78,6 +77,9 @@ impl_vary_fs       := tests/vary_fs.c -DCACHE_DIR='"$(RUN)/vary-cache"'
 # The UVC driver against kernel service stand-ins (tests/uvc_host); sched_yield is renamed so the test supplies it
 impl_uvc           := drivers/usb/uvc.c -Itests/uvc_host -Dsched_yield=uvc_host_yield
 impl_tz            := $(LIB)/tz/tz.c -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
+# The portable libm primitives (AArch64's), renamed to sit beside the host libm they are checked against
+MATH_SOFT_NAMES    := floor ceil trunc rint fmod scalbn sqrt exp exp2 expm1 log log2 log10 log1p sin cos tan atan2
+impl_math_soft     := $(LIB)/math/math_soft.c -ffp-contract=off $(foreach f,$(MATH_SOFT_NAMES),-D$(f)=soft_$(f))
 # The window protocol's client and server, over the fake kernel in wm_test.c
 impl_wmclient      := $(LIB)/win/win.c -include tests/wm_host.h
 impl_wmserver      := user/apps/compositor/wmserver.c -Iuser/apps/compositor -include tests/wm_host.h
@@ -91,7 +93,6 @@ impl_test_runner   := tests/test_runner.c
 impl_brotli_dict   := $(B)/impl/brotli_dict.c
 # Kernel sources behind a host stand-in for their hardware layer (interrupt flags, physical frame access)
 impl_pmm           := kernel/pmm.c -include tests/irqflags_host.h
-impl_a64_elf       := kernel/arch/aarch64/elf.c -Ikernel -include tests/a64_host.h
 impl_fbcon         := kernel/arch/aarch64/fbcon.c -Ikernel
 impl_clk           := kernel/arch/aarch64/clk.c -include tests/clk_host.h
 impl_gpio          := kernel/arch/aarch64/gpio.c -Ikernel -include tests/gpio_host.h -include tests/spinlock_host.h

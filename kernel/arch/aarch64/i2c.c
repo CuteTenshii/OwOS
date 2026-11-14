@@ -1,6 +1,7 @@
 /* i2c.c: bus registry, request checks and the per-bus lock; controllers only see transfers they can run. */
 #include "i2c.h"
 #include "arch.h"
+#include "sched.h"
 
 static struct i2c_bus *buses[I2C_MAX_BUSES];
 
@@ -41,7 +42,7 @@ int i2c_transfer(struct i2c_bus *bus, struct i2c_msg *msgs, int n)
     return I2C_ERR_INVAL;
   /* A transfer can take hundreds of milliseconds, too long to hold interrupts off or spin. */
   while (__atomic_exchange_n(&bus->busy, 1, __ATOMIC_ACQUIRE))
-    thread_yield();
+    sched_yield();
   int rc = bus->xfer(bus, msgs, n);
   __atomic_store_n(&bus->busy, 0, __ATOMIC_RELEASE);
   return rc;

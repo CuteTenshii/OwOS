@@ -43,7 +43,7 @@ static uint8_t rx_buf[I2C_MTK_DMA_MAX] __attribute__((aligned(64)));
 static struct i2c_mtk ctl;
 
 /* The core only yields when a bus is contended, which a single-threaded test never makes it. */
-void thread_yield(void) {}
+void sched_yield(void) {}
 
 static uint16_t *reg(uint32_t off) { return &i2c_fake.reg[off / 2]; }
 static uint32_t *dreg(uint32_t off) { return &i2c_fake.dma[off / 4]; }

@@ -10,7 +10,8 @@ boot and low-level CPU code.
 - `kernel/arch/x86/` holds the x86 CPU layer shared by i386 and x86_64: Multiboot boot code, linker scripts,
   GDT/IDT and entry stubs, context switch, SMP bring-up, paging, and the PIT, CMOS RTC and COM port. Files that
   differ by word size come as `_32`/`_64` pairs, and `kernel/build.mk` picks the half matching `ARCH`.
-  `kernel/arch/aarch64/` and `kernel/arch/arm/` are separate bring-up kernels with their own builds.
+  `kernel/arch/aarch64/` is the AArch64 layer under the same shared kernel and user programs, with its own
+  `build.mk`; `kernel/arch/arm/` is a separate 32-bit bring-up kernel.
 - `drivers/` contains hardware drivers grouped by device area.
 - `user/lib/` contains user-space libraries, and `user/apps/<name>/` contains one directory per program,
   embedded into the kernel image.
@@ -28,7 +29,7 @@ make run                     # Boot the kernel in graphical QEMU
 make debug                   # Boot headless with serial output in the terminal
 make ARCH=x86_64             # Build the 64-bit kernel image
 make iso                     # Build a GRUB BIOS+UEFI ISO (Linux)
-make ARCH=aarch64 check      # Build the AArch64 bring-up kernel and boot its self-test in QEMU (tests/aarch64)
+make ARCH=aarch64 check      # Build the AArch64 kernel, boot it on QEMU virt and run programs from its console
 make ARCH=arm check          # Build the 32-bit ARMv7-A bring-up kernel and boot its self-test in QEMU (tests/arm)
 make clean                   # Remove build artifacts, keeping disk images
 ```

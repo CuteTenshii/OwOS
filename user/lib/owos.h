@@ -360,7 +360,7 @@ struct utsname {
   char nodename[65]; /* hostname (/etc/hostname) */
   char release[65];  /* OWOS_VERSION */
   char version[65];  /* build/version string */
-  char machine[65];  /* "i386" | "x86_64" */
+  char machine[65];  /* "i386", "x86_64" or "aarch64" */
 };
 int uname(struct utsname *out); /* 0/-1 */
 
