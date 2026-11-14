@@ -531,10 +531,10 @@ static void cmd_cat(const char *name)
 /* torrent subcommands: info, peers, peer, get, test, peers test. */
 
 /* System identity, the fields a POSIX uname reports. */
-#define UNAME_SYSNAME "OwOS"  /* -s kernel name */
-#define UNAME_NODENAME "owos" /* -n network node name */
-#define UNAME_RELEASE "0.1"   /* -r kernel release */
-#define UNAME_MACHINE "i386"  /* -m hardware */
+#define UNAME_SYSNAME "OwOS"      /* -s kernel name */
+#define UNAME_NODENAME "owos"     /* -n network node name */
+#define UNAME_RELEASE "0.1"       /* -r kernel release */
+#define UNAME_MACHINE CPU_MACHINE /* -m hardware */
 
 /* "uname [-asnrmo]": print system identity; -s is the default. */
 

@@ -4,6 +4,15 @@
 
 #include <stdint.h>
 
+/* The machine name uname reports. */
+#if defined(__aarch64__)
+#define CPU_MACHINE "aarch64"
+#elif defined(__x86_64__)
+#define CPU_MACHINE "x86_64"
+#else
+#define CPU_MACHINE "i386"
+#endif
+
 void cpu_vendor(char *buf13); /* 12-char vendor string + NUL ("GenuineIntel") */
 void cpu_brand(char *buf49);  /* up to 48-char brand string + NUL            */
 

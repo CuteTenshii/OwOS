@@ -1,5 +1,6 @@
 #include "syscall_fs.h"
 #include "blk.h"
+#include "cpu.h"
 #include "fs.h"
 #include "fsmount.h"
 #include "irqflags.h"
@@ -455,11 +456,7 @@ void syscall_fs_uname(struct registers *r)
   strlcpy(out->sysname, "OwOS", sizeof out->sysname);
   strlcpy(out->release, OWOS_VERSION, sizeof out->release);
   strlcpy(out->version, OWOS_VERSION, sizeof out->version);
-#if defined(__x86_64__)
-  strlcpy(out->machine, "x86_64", sizeof out->machine);
-#else
-  strlcpy(out->machine, "i386", sizeof out->machine);
-#endif
+  strlcpy(out->machine, CPU_MACHINE, sizeof out->machine);
   SC_RET(r) = 0;
 }
 
